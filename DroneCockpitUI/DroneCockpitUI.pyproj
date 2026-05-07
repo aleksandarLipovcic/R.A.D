@@ -5,12 +5,13 @@
     <ProjectGuid>f88caf8a-b9ee-4054-861c-8666670e9e5f</ProjectGuid>
     <ProjectHome>.</ProjectHome>
     <StartupFile>DroneCockpitUI.py</StartupFile>
-    <SearchPath>
-    </SearchPath>
+    <SearchPath>..\x64\Debug</SearchPath>
     <WorkingDirectory>.</WorkingDirectory>
     <OutputPath>.</OutputPath>
     <Name>DroneCockpitUI</Name>
     <RootNamespace>DroneCockpitUI</RootNamespace>
+    <LaunchProvider>Standard Python launcher</LaunchProvider>
+    <EnableNativeCodeDebugging>False</EnableNativeCodeDebugging>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
     <DebugSymbols>true</DebugSymbols>
@@ -22,6 +23,9 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="DroneCockpitUI.py" />
+    <Compile Include="DroneTest.py">
+      <SubType>Code</SubType>
+    </Compile>
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\DroneBackend\DroneBackend.vcxproj">

@@ -1,21 +1,25 @@
 #pragma once
 #include <windows.h>
-#include <vector>
 #include <string>
+#include <vector>
 
 class DroneLink {
 private:
-    HANDLE hSerial;
+    HANDLE hSerial = INVALID_HANDLE_VALUE;
     bool connected = false;
 
 public:
-    DroneLink();
-    ~DroneLink();
+    DroneLink();   // Constructor
+    ~DroneLink();  // Destructor
 
+    // Connection methods
     bool connect(std::string portName);
     void disconnect();
 
-    // MSP Commands
-    std::vector<float> getAttitude(); // Returns [roll, pitch, yaw]
+    // Data methods
+    std::vector<float> getAttitude();
     float getBatteryVoltage();
 };
+
+// Standalone helper function
+std::string AutoDetectF405();
