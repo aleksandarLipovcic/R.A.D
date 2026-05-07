@@ -4,6 +4,9 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
+  <Folder Name="/Solution Items/">
+    <File Path=".gitignore" />
+  </Folder>
   <Project Path="DroneBackend/DroneBackend.vcxproj" Id="9baff06c-9db1-499e-80eb-7d2681e22b08" />
   <Project Path="DroneCockpitUI/DroneCockpitUI.pyproj" Type="888888a0-9f3d-457c-b088-3a5042f75d52" Id="f88caf8a-b9ee-4054-861c-8666670e9e5f">
     <Platform Project="AnyCPU" />
