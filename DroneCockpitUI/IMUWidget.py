@@ -6,9 +6,9 @@ class IMUWidget(ttk.LabelFrame):
         super().__init__(parent, text="MPU-6500 Long-Range Flight Hub", padding=10)
         
         # --- 1. Pilot-Grade UI Colors ---
-        self.CLR_SAFE = "#99FF99"      # Green: Stable cruising
-        self.CLR_WARN = "#FFFF99"      # Yellow: Unexpected turbulence/movement
-        self.CLR_CRITICAL = "#FF4444"  # Red: Potential loss of control
+        self.CLR_SAFE = "#99FF99"      # Green
+        self.CLR_WARN = "#FFFF99"      # Yellow
+        self.CLR_CRITICAL = "#FF4444"  # Red
         self.CLR_TEXT = "#000000"
 
         # --- 2. Research Data Toggle ---
@@ -22,7 +22,7 @@ class IMUWidget(ttk.LabelFrame):
 
         self.create_pfd_grid()
 
-        # --- 3. Diagnostics Frame (Latency Tracking) ---
+        # --- 3. Diagnostics Frame ---
         self.diag_frame = ttk.LabelFrame(self, text="Link Performance Breakdown (ms)")
         self.rtt_val = ttk.Label(self.diag_frame, text="Total RTT: 0.00ms")
         self.fc_val = ttk.Label(self.diag_frame, text="FC Internal: 0.00ms")
@@ -32,7 +32,6 @@ class IMUWidget(ttk.LabelFrame):
         self.link_val.pack(anchor="w")
 
     def create_pfd_grid(self):
-        """Creates the grid where data backgrounds change color."""
         self.grid_container = tk.Frame(self, bd=1, relief="solid", padx=5, pady=5)
         self.grid_container.grid(row=1, column=0, columnspan=3, sticky="nsew")
 
@@ -46,38 +45,41 @@ class IMUWidget(ttk.LabelFrame):
         for i, (key, label) in enumerate(axis_names, 1):
             tk.Label(self.grid_container, text=f"{label}:", font=('Arial', 10)).grid(row=i, column=0, sticky="e")
             
-            # Peak-Hold Rotation Cells
             rot_lbl = tk.Label(self.grid_container, text="0.00", font=('Consolas', 12, 'bold'), width=10, bg=self.CLR_SAFE)
             rot_lbl.grid(row=i, column=1, padx=2, pady=2)
             
-            # Static Angle/G-Force Cells
             acc_lbl = tk.Label(self.grid_container, text="0.00", font=('Consolas', 12, 'bold'), width=10, bg=self.CLR_SAFE)
             acc_lbl.grid(row=i, column=2, padx=2, pady=2)
             
-            self.axes[key] = {'rot_lbl': rot_lbl, 'acc_lbl': acc_lbl, 'reset_id': None}
+            # alert_level: 0=Green, 1=Yellow, 2=Red
+            self.axes[key] = {
+                'rot_lbl': rot_lbl, 
+                'acc_lbl': acc_lbl, 
+                'reset_id': None, 
+                'alert_level': 0 
+            }
 
     def reset_rotation_color(self, axis_key):
-        """Returns the specific rotation cell back to green."""
+        """Returns the specific rotation cell back to green and clears priority."""
         if axis_key in self.axes:
             self.axes[axis_key]['rot_lbl'].config(bg=self.CLR_SAFE)
             self.axes[axis_key]['reset_id'] = None
+            self.axes[axis_key]['alert_level'] = 0
 
     def get_accel_color(self, val, is_z=False):
         """Tuned for 10-inch cruiser stability limits."""
         abs_v = abs(val)
         if is_z:
-            # Z-axis: Safety is about vertical lift
-            if val < 0.50: return self.CLR_CRITICAL # Critical lift loss
-            if val < 0.85: return self.CLR_WARN     # Cruiser warning: excessive tilt
+            if val < 0.50: return self.CLR_CRITICAL
+            if val < 0.85: return self.CLR_WARN
             return self.CLR_SAFE
         else:
-            # X/Y: Safety is about staying level for efficient long-range cruise
             if abs_v > 0.70: return self.CLR_CRITICAL
             if abs_v > 0.25: return self.CLR_WARN
             return self.CLR_SAFE
 
     def update_ui(self, result):
-        """Updates UI with Peak-Hold logic for 10-inch frame dynamics."""
+        """Updates UI with Priority-Locked Peak-Hold for rotation."""
         data = result['data']
         GYRO_SCALE = 16.4   #
         ACCEL_SCALE = 2048.0 #
@@ -89,36 +91,48 @@ class IMUWidget(ttk.LabelFrame):
         }
 
         for key, (rot, acc, is_z) in axis_mapping.items():
-            # 1. Update G-Force (Current Position)
+            # 1. Update G-Force (Instant/Standard behavior)
             self.axes[key]['acc_lbl'].config(text=f"{acc:>7.2f}", bg=self.get_accel_color(acc, is_z))
 
-            # 2. Update Rotation (Long-Range Sensitive Peak-Hold)
+            # 2. Update Rotation (Priority Peak-Hold)
             self.axes[key]['rot_lbl'].config(text=f"{rot:>7.2f}")
             
             abs_rot = abs(rot)
+            current_level = self.axes[key]['alert_level']
+            
+            # Determine potential new alert level
+            new_level = 0
             spike_color = None
             hold_time = 0
 
-            # On a 10-inch cruiser, 80+ deg/s is a massive, sharp disturbance.
             if abs_rot > 80:
+                new_level = 2 # Red Priority
                 spike_color = self.CLR_CRITICAL
-                hold_time = 2500 # Keep alert for 2.5s (Long distance needs more notice)
+                hold_time = 2500
             elif abs_rot > 30:
+                new_level = 1 # Yellow Priority
                 spike_color = self.CLR_WARN
-                hold_time = 1500 # Keep alert for 1.5s
+                hold_time = 1500
 
-            if spike_color:
+            # PRIORITY RULE: Only update if the new spike is higher or equal to current color
+            if new_level >= current_level and new_level > 0:
+                # Cancel existing reset timer
                 if self.axes[key]['reset_id']:
                     self.after_cancel(self.axes[key]['reset_id'])
+                
+                # Apply high-priority color and level
                 self.axes[key]['rot_lbl'].config(bg=spike_color)
+                self.axes[key]['alert_level'] = new_level
+                
+                # Schedule reset back to green (Level 0)
                 self.axes[key]['reset_id'] = self.after(hold_time, lambda k=key: self.reset_rotation_color(k))
 
         # 3. Update Thesis Diagnostics
         if self.show_diag.get():
             rtt, fc = result['rtt_ms'], result['fc_cycle_ms']
-            self.rtt_val.config(text=f"Total RTT:     {rtt:>6.2f} ms") #
-            self.fc_val.config(text=f"FC Internal:   {fc:>6.2f} ms") #
-            self.link_val.config(text=f"One-Way Link:  {max(0, (rtt-fc)/2):>6.2f} ms") #
+            self.rtt_val.config(text=f"Total RTT:     {rtt:>6.2f} ms")
+            self.fc_val.config(text=f"FC Internal:   {fc:>6.2f} ms")
+            self.link_val.config(text=f"One-Way Link:  {max(0, (rtt-fc)/2):>6.2f} ms")
 
     def refresh_layout(self):
         if self.show_diag.get():
