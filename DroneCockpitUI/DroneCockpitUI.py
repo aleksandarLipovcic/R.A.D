@@ -1,10 +1,11 @@
 import sys
 import os
 import tkinter as tk
+from tkinter import ttk
 from IMUWidget import IMUWidget
+from Drone3DView import Drone3DView
 
 # --- Backend Path Configuration ---
-# This ensures Python finds the .pyd file in your Visual Studio output folder
 script_dir = os.path.dirname(os.path.abspath(__file__))
 backend_path = os.path.abspath(os.path.join(script_dir, '..', 'x64', 'Debug'))
 sys.path.append(backend_path)
@@ -21,46 +22,69 @@ class DroneCockpitApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Project R.A.D - Master's Research Cockpit")
-        self.root.geometry("450x550")
         self.root.configure(bg="#f0f0f0")
 
-        # Initialize Backend Hub
         self.hub = DroneBackend.DroneLink()
         self.imu_sensor = None
         
-        # Setup UI Components
         self.setup_ui()
         
-        # Start Connection Scan
+        # --- FIX: Dynamic Geometry to prevent window clipping ---
+        self.root.update_idletasks()
+        # Calculate required width/height and add a small buffer for padding
+        req_width = self.root.winfo_reqwidth() + 20
+        req_height = self.root.winfo_reqheight() + 20
+        
+        # Set geometry and center the window on screen
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = (screen_width // 2) - (req_width // 2)
+        y = (screen_height // 2) - (req_height // 2)
+        
+        self.root.geometry(f"{req_width}x{req_height}+{x}+{y}")
+        self.root.minsize(req_width, req_height)
+
         self.auto_connect()
 
     def setup_ui(self):
-        # Header Label
-        header = tk.Label(self.root, text="DRONE TELEMETRY SYSTEM", 
-                         font=('Arial', 12, 'bold'), bg="#f0f0f0")
-        header.pack(pady=(10, 0))
+        # --- Top Navigation/Status Bar ---
+        self.top_frame = tk.Frame(self.root, bg="#f0f0f0")
+        self.top_frame.pack(side="top", fill="x", pady=10)
 
-        # Connection Status
-        self.status_label = tk.Label(self.root, text="Status: Searching...", 
+        header = tk.Label(self.top_frame, text="DRONE TELEMETRY SYSTEM", 
+                         font=('Arial', 14, 'bold'), bg="#f0f0f0")
+        header.pack()
+
+        self.status_label = tk.Label(self.top_frame, text="Status: Searching...", 
                                     fg="orange", bg="#f0f0f0", font=('Arial', 10))
-        self.status_label.pack(pady=5)
+        self.status_label.pack()
 
-        # Integrate our Modular IMU Widget (Now with Thesis Latency fields)
-        self.imu_view = IMUWidget(self.root)
-        self.imu_view.pack(padx=20, pady=10, fill="both", expand=True)
+        # --- Main Workspace (Grid Layout) ---
+        self.main_container = tk.Frame(self.root, bg="#f0f0f0")
+        self.main_container.pack(fill="both", expand=True, padx=20) # Increased padding
 
-        # Control Frame (Optional: for manual disconnect/reconnect)
-        self.btn_frame = tk.Frame(self.root, bg="#f0f0f0")
-        self.btn_frame.pack(pady=10)
+        # Left Column: Telemetry Table
+        self.imu_view = IMUWidget(self.main_container)
+        self.imu_view.grid(row=0, column=0, sticky="nsew", padx=10)
+
+        # Right Column: 3D Visualization
+        self.visual_frame = ttk.LabelFrame(self.main_container, text="Spatial Orientation")
+        self.visual_frame.grid(row=0, column=1, sticky="nsew", padx=10)
         
-        self.reconnect_btn = tk.Button(self.btn_frame, text="Force Reconnect", 
+        # Using the improved Drone3DView with isometric projection
+        self.drone_3d = Drone3DView(self.visual_frame, width=400, height=350)
+        self.drone_3d.pack(padx=10, pady=10, expand=True, fill="both")
+
+        # --- Bottom Control Bar ---
+        self.btn_frame = tk.Frame(self.root, bg="#f0f0f0")
+        self.btn_frame.pack(side="bottom", fill="x", pady=20)
+        
+        self.reconnect_btn = ttk.Button(self.btn_frame, text="Force Reconnect", 
                                       command=self.auto_connect)
         self.reconnect_btn.pack()
 
     def auto_connect(self):
-        # Attempt to find the F405 automatically
         port = DroneBackend.AutoDetectF405()
-        
         if port != "NOT_FOUND":
             if self.hub.connect(port):
                 self.status_label.config(text=f"Status: Connected on {port}", fg="green")
@@ -70,25 +94,25 @@ class DroneCockpitApp:
                 self.status_label.config(text="Status: Connection Failed", fg="red")
         else:
             self.status_label.config(text="Status: Searching for Drone...", fg="orange")
-            # Poll every 2 seconds if not found
             self.root.after(2000, self.auto_connect)
 
     def update_loop(self):
-        """
-        Main telemetry loop. Fetches 6-axis data + RTT + FC Cycle time
-        in a single call for precision research.
-        """
         if self.imu_sensor:
             try:
-                # Call the new thesis-specific C++ method
-                # This returns a dict: {'data': {...}, 'rtt_ms': float, 'fc_cycle_ms': float}
                 result = self.imu_sensor.getThesisData(self.hub)
                 
-                # Pass the complex result to the Widget for processing
+                # 1. Update the Telemetry Numbers (This handles its own calibration/filtering)
                 self.imu_view.update_ui(result)
                 
-                # Run at ~20Hz (50ms) to keep UI smooth without flooding the serial bus
-                self.root.after(50, self.update_loop)
+                # 2. Update the 3D Model using the IMU's filtered angles
+                # We pull the processed pitch/roll directly from the widget for consistency
+                self.drone_3d.update_orientation(
+                    roll=self.imu_view.roll_angle,
+                    pitch=self.imu_view.pitch_angle,
+                    yaw=0 # Magnetometer logic will go here next
+                )
+                
+                self.root.after(30, self.update_loop) # Faster 30ms refresh for smoother 3D
             except Exception as e:
                 print(f"Telemetry Lost: {e}")
                 self.status_label.config(text="Status: Data Stream Interrupted", fg="red")
@@ -98,7 +122,6 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = DroneCockpitApp(root)
     
-    # Clean exit logic
     def on_closing():
         if app.hub:
             app.hub.disconnect()
