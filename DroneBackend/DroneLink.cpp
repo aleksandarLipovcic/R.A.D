@@ -1,10 +1,13 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include "DroneLink.h"
+#include "IMUSensor.h" // Include your new sensor header
 #include <iostream>
 #include <vector>
+#include <string>
 
 namespace py = pybind11;
+using namespace pybind11::literals; // Enables the _a suffix for arguments
 
 // --- Constructor & Destructor ---
 DroneLink::DroneLink() {
@@ -47,6 +50,13 @@ bool DroneLink::connect(std::string portName) {
         return false;
     }
 
+    // Set timeouts to ensure ReadFile doesn't hang forever
+    COMMTIMEOUTS timeouts = { 0 };
+    timeouts.ReadIntervalTimeout = 50;
+    timeouts.ReadTotalTimeoutConstant = 50;
+    timeouts.ReadTotalTimeoutMultiplier = 10;
+    SetCommTimeouts(hSerial, &timeouts);
+
     connected = true;
     return true;
 }
@@ -59,51 +69,59 @@ void DroneLink::disconnect() {
     connected = false;
 }
 
-// --- Telemetry Methods ---
-std::vector<float> DroneLink::getAttitude() {
-    if (!connected) return { 0.0f, 0.0f, 0.0f };
+// --- The "Hub" Method ---
+// This is the single pipe that handles all MSP traffic
+std::vector<uint8_t> DroneLink::sendRequest(uint8_t mspID) {
+    if (!connected || hSerial == INVALID_HANDLE_VALUE) return {};
 
-    uint8_t request[] = { '$', 'M', '<', 0, 108, 108 };
+    // Header: [$, M, <, data_size, message_id, checksum]
+    uint8_t request[] = { '$', 'M', '<', 0, mspID, mspID };
     DWORD written;
-    // Fix for C6031: Check the return value of WriteFile
-    if (!WriteFile(hSerial, request, sizeof(request), &written, NULL)) return { 0.0f, 0.0f, 0.0f };
 
-    uint8_t rx[12];
+    if (!WriteFile(hSerial, request, sizeof(request), &written, NULL)) return {};
+
+    uint8_t buffer[64]; // Large enough for most MSP responses
     DWORD read;
-    // Fix for C6031: Check the return value of ReadFile
-    if (ReadFile(hSerial, rx, 12, &read, NULL) && read >= 11 && rx[4] == 108) {
-        int16_t roll = (rx[5] | (rx[6] << 8));
-        int16_t pitch = (rx[7] | (rx[8] << 8));
-        int16_t yaw = (rx[9] | (rx[10] << 8));
-        return { roll / 10.0f, pitch / 10.0f, (float)yaw };
+
+    if (ReadFile(hSerial, buffer, sizeof(buffer), &read, NULL) && read > 5) {
+        return std::vector<uint8_t>(buffer, buffer + read);
     }
-    return { 0.0f, 0.0f, 0.0f };
+    return {};
 }
 
-float DroneLink::getBatteryVoltage() {
-    if (!connected) return 0.0f;
+// --- Standalone Helper ---
+std::string AutoDetectF405() {
+    for (int i = 1; i < 30; ++i) {
+        std::string portName = "\\\\.\\COM" + std::to_string(i);
+        HANDLE testHandle = CreateFileA(portName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 
-    uint8_t request[] = { '$', 'M', '<', 0, 110, 110 };
-    DWORD written;
-    if (!WriteFile(hSerial, request, sizeof(request), &written, NULL)) return -1.0f;
-
-    uint8_t buffer[16];
-    DWORD read;
-    if (ReadFile(hSerial, buffer, 16, &read, NULL) && read >= 6) {
-        return (float)buffer[5] / 10.0f;
+        if (testHandle != INVALID_HANDLE_VALUE) {
+            CloseHandle(testHandle);
+            return "COM" + std::to_string(i);
+        }
     }
-    return -1.0f;
+    return "NOT_FOUND";
 }
 
-// --- THE PYBIND11 MODULE ---
-// Ensure this name matches your Project Name exactly
+// --- The Bridge Module ---
 PYBIND11_MODULE(DroneBackend, m) {
-    m.doc() = "Drone F405 MSP Bridge";
+    m.doc() = "Project R.A.D Modular Backend";
 
+    // 1. Expose the Hub
     py::class_<DroneLink>(m, "DroneLink")
         .def(py::init<>())
         .def("connect", &DroneLink::connect)
-        .def("disconnect", &DroneLink::disconnect)
-        .def("getAttitude", &DroneLink::getAttitude)
-        .def("getBatteryVoltage", &DroneLink::getBatteryVoltage);
+        .def("disconnect", &DroneLink::disconnect);
+
+    // 2. Expose the IMU Sensor
+    py::class_<IMUSensor>(m, "IMUSensor")
+        .def(py::init<DroneLink*>())
+        .def("getRawData", [](IMUSensor& self) {
+        auto d = self.getRawData();
+        // Returning a dictionary makes it very easy to read in Python/YOLO
+        return py::dict("ax"_a = d.accX, "ay"_a = d.accY, "az"_a = d.accZ,
+            "gx"_a = d.gyroX, "gy"_a = d.gyroY, "gz"_a = d.gyroZ);
+            });
+
+    m.def("AutoDetectF405", &AutoDetectF405);
 }

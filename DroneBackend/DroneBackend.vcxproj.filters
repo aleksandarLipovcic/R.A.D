@@ -18,9 +18,15 @@
     <ClInclude Include="DroneLink.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="IMUSensor.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="DroneLink.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="IMUSensor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

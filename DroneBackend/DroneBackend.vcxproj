@@ -133,9 +133,11 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="DroneLink.h" />
+    <ClInclude Include="IMUSensor.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="DroneLink.cpp" />
+    <ClCompile Include="IMUSensor.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

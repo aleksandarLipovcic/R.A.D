@@ -9,17 +9,12 @@ private:
     bool connected = false;
 
 public:
-    DroneLink();   // Constructor
-    ~DroneLink();  // Destructor
+    DroneLink();
+    ~DroneLink();
 
-    // Connection methods
     bool connect(std::string portName);
     void disconnect();
 
-    // Data methods
-    std::vector<float> getAttitude();
-    float getBatteryVoltage();
+    // The "Pipe" - sends a request and returns the raw byte response
+    std::vector<uint8_t> sendRequest(uint8_t mspID);
 };
-
-// Standalone helper function
-std::string AutoDetectF405();

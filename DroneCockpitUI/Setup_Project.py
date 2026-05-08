@@ -16,16 +16,14 @@ def install_and_import(package, import_name=None):
 
 def check_dependencies():
     print("--- 1. Checking Python Dependencies ---")
-    # Install pybind11 and pyserial if they are missing
     install_and_import("pybind11")
     install_and_import("pyserial", "serial")
     print("✅ All Python dependencies are ready.")
 
 def check_cpp_backend():
     print("\n--- 2. Checking C++ Backend Build ---")
-    # Get the directory where this setup script lives
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    # Look one level up in the 'x64' folder
+    # Moves up to 'Project RAD' level to find the x64 folder
     root_dir = os.path.dirname(base_dir)
     
     search_paths = [
@@ -42,7 +40,6 @@ def check_cpp_backend():
             
     if not found:
         print("⚠️  Warning: DroneBackend.pyd not found.")
-        print(f"   Looked in: {root_dir}\\x64\\...")
         print("   Action: Open Visual Studio and 'Rebuild' the DroneBackend project.")
 
 def check_hardware():
@@ -50,19 +47,12 @@ def check_hardware():
     import serial.tools.list_ports
     ports = list(serial.tools.list_ports.comports())
     
-    if not ports:
-        print("❌ No COM ports found. Is the drone plugged in?")
-        return
-
     for port in ports:
-        # F405 usually identifies as STM32 or USB Serial
-        if "STM" in port.description or "USB Serial" in port.description or "COM3" in port.device:
+        if "STM" in port.description or "USB Serial" in port.description:
             print(f"✅ Drone detected on {port.device} ({port.description})")
             return
             
-    print("❓ Devices found, but none look like an F405 Flight Controller.")
-    for p in ports:
-        print(f"   - Found: {p.device} ({p.description})")
+    print("❌ Drone not detected. Check USB connection and drivers.")
 
 if __name__ == "__main__":
     print("========================================")
@@ -73,5 +63,4 @@ if __name__ == "__main__":
     check_cpp_backend()
     check_hardware()
     
-    print("\n" + "="*40)
-    print("Initialization complete.")
+    print("\nInitialization complete. Run DroneTest.py to start.")
