@@ -4,319 +4,468 @@ import math
 
 class Drone3DView(tk.Canvas):
     """
-    Software 3D renderer for a 10-inch X-frame long-range quadcopter.
+    Attitude Indicator (ADI / artificial horizon) display for a 10-inch
+    long-range quadcopter.
 
     ═══════════════════════════════════════════════════════════════════════════
-    COORDINATE SYSTEM  (right-hand, body frame)
+    LAYOUT
     ═══════════════════════════════════════════════════════════════════════════
-        +X  =  forward  (nose direction)
-        +Y  =  right    (starboard)
-        +Z  =  up       (away from ground when level)
+
+        ┌──────────────────────────────────────────────────────────────┐
+        │          ╔═ bank arc + graduation marks ═╗                  │
+        │          ║  ▼ roll pointer moves here   ║                  │
+        │   ───────╫──────────────────────────────╫───────           │
+        │           ║    SKY  (dark blue)          ║                  │
+        │   +10°  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─                   │
+        │   ════════════════ horizon ═══════════════  ← tilts/shifts  │
+        │            ──[drone symbol, fixed]──                        │
+        │   -10°  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─                   │
+        │           GROUND (dark amber)                               │
+        │   ──────────────────────────────────────────────            │
+        │   [    yaw heading compass strip    Y: +53°    ]           │
+        └──────────────────────────────────────────────────────────────┘
 
     ═══════════════════════════════════════════════════════════════════════════
-    BETAFLIGHT MSP_ATTITUDE SIGN CONVENTION
+    WHY ADI INSTEAD OF 3D MODEL
     ═══════════════════════════════════════════════════════════════════════════
-        roll  > 0  →  right side drops  (right-wing-down)
-        pitch > 0  →  nose drops        (nose-down)
-        yaw   > 0  →  nose turns right  (CW from above)
+    A fixed isometric 3D camera creates ambiguity: at large angles the
+    perspective changes so much that the pilot loses situational awareness.
+    ADI removes that ambiguity:
+      • Roll  — horizon tilt, bank arc pointer.  Immediately obvious.
+      • Pitch — horizon shift up/down.  Immediately obvious.
+      • Yaw   — compass strip.  Heading readout.
+      • Warnings — background colour + arm colours on drone symbol.
 
     ═══════════════════════════════════════════════════════════════════════════
-    WARNING THRESHOLDS  — must match IMUWidget exactly
+    WARNING THRESHOLDS  (must match IMUWidget)
     ═══════════════════════════════════════════════════════════════════════════
-    10-inch long-range quad flight envelope:
-        WARN_ANGLE     = 20°   gentle bank, start alerting
-        CRITICAL_ANGLE = 40°   aggressive for LR, definitely alert
-
-    ═══════════════════════════════════════════════════════════════════════════
-    PERSPECTIVE
-    ═══════════════════════════════════════════════════════════════════════════
-    FOV = 1000 → near-orthographic.  Near/far size ratio ≈ 1.35× instead of
-    2.5× at FOV=350.  The model no longer balloons toward the camera on pitch.
+    WARN_ANGLE     = 20°
+    CRITICAL_ANGLE = 40°
     """
 
-    # ── Warning thresholds — MUST match IMUWidget.ANGLE_WARN_DEG / ANGLE_CRIT_DEG
+    # ── Warning thresholds — must match IMUWidget.ANGLE_WARN_DEG / ANGLE_CRIT_DEG
     WARN_ANGLE     = 20.0
     CRITICAL_ANGLE = 40.0
 
-    # ── Colours shared with IMUWidget for visual consistency ──────────────────
-    CLR_SAFE     = "#99FF99"
-    CLR_WARN     = "#FFFF99"
+    # ── Pitch scale: pixels per degree of pitch ───────────────────────────────
+    # 3.5 px/° → ±30° covers ±105 px, keeps the ladder readable.
+    PITCH_PX_PER_DEG = 3.5
+
+    # ── Colours ───────────────────────────────────────────────────────────────
+    CLR_SAFE     = "#00FF44"
+    CLR_WARN     = "#FFFF44"
     CLR_CRITICAL = "#FF4444"
 
     def __init__(self, parent, width=500, height=450):
         super().__init__(
             parent,
             width=width, height=height,
-            bg="#1a1a1a", highlightthickness=0
+            bg="#0d1b2a", highlightthickness=0
         )
-        self.width  = width
-        self.height = height
-        self.cx     = width  // 2
-        self.cy     = height // 2
-        self.scale  = 75            # world-unit → pixels
+        self.width   = width
+        self.height  = height
+        self.cx      = width  // 2
 
-        # ── Camera ────────────────────────────────────────────────────────────
-        # Fixed isometric-style camera sitting above-right-behind the drone.
-        # Drone rotates; camera never moves.
-        self._cam_azimuth   = math.radians(35)   # orbit left/right
-        self._cam_elevation = math.radians(28)   # tilt down onto the drone
-
-        # ── Perspective FOV ───────────────────────────────────────────────────
-        # High value = near-orthographic = stable size during pitch/roll.
-        # 1000 gives near/far ratio ≈ 1.35× (was 2.5× at 350).
-        self._fov = 1000.0
-
-        # ── 10-inch X-frame geometry (body frame) ─────────────────────────────
-        # +X forward, +Y right, +Z up
-        d = 1.15   # arm length from centre to motor
-        self._motors = {
-            "FL": [ d, -d, 0.0],   # Front-Left  — green
-            "FR": [ d,  d, 0.0],   # Front-Right — green
-            "RL": [-d, -d, 0.0],   # Rear-Left   — red
-            "RR": [-d,  d, 0.0],   # Rear-Right  — red
-        }
-        self._body = {
-            "CTR":  [ 0.0,  0.0,  0.0],
-            "NOSE": [ 1.6,  0.0,  0.0],
-            "TAIL": [-0.9,  0.0,  0.0],
-            "BF_L": [ 0.4, -0.25, 0.05],
-            "BF_R": [ 0.4,  0.25, 0.05],
-            "BB_L": [-0.4, -0.25, 0.05],
-            "BB_R": [-0.4,  0.25, 0.05],
-        }
+        # ADI area takes the top 78% of the canvas; compass strip gets 22%.
+        self.adi_h   = int(height * 0.78)
+        self.comp_y0 = self.adi_h          # top of compass strip
+        self.adi_cy  = int(self.adi_h * 0.50)   # vertical centre of ADI area
 
     # ══════════════════════════════════════════════════════════════════════════
-    # MATH CORE
-    # ══════════════════════════════════════════════════════════════════════════
-
-    @staticmethod
-    def _rot_roll(x, y, z, phi):
-        """Around X (forward)."""
-        cp, sp = math.cos(phi), math.sin(phi)
-        return x, y * cp - z * sp, y * sp + z * cp
-
-    @staticmethod
-    def _rot_pitch(x, y, z, theta):
-        """Around Y (right)."""
-        ct, st = math.cos(theta), math.sin(theta)
-        return x * ct + z * st, y, -x * st + z * ct
-
-    @staticmethod
-    def _rot_yaw(x, y, z, psi):
-        """Around Z (up)."""
-        cp, sp = math.cos(psi), math.sin(psi)
-        return x * cp - y * sp, x * sp + y * cp, z
-
-    def _body_to_world(self, x, y, z, roll_r, pitch_r, yaw_r):
-        """Roll → Pitch → Yaw intrinsic body-frame rotations."""
-        x, y, z = self._rot_roll(x, y, z, roll_r)
-        x, y, z = self._rot_pitch(x, y, z, pitch_r)
-        x, y, z = self._rot_yaw(x, y, z, yaw_r)
-        return x, y, z
-
-    def _world_to_screen(self, x, y, z):
-        """
-        Fixed camera transform then perspective projection.
-
-        After both camera rotations, X is depth (into screen), Y is
-        camera-right, Z is camera-up.  Canvas Y is inverted so we negate Z.
-
-        Key: depth = FOV + x*scale.  High FOV keeps the factor near 1.0
-        even when x swings ±1.5, preventing the balloon effect on pitch.
-        """
-        # Camera elevation — tilt so we see the top of the drone
-        el  = self._cam_elevation
-        x1  =  x * math.cos(el) + z * math.sin(el)
-        z1  = -x * math.sin(el) + z * math.cos(el)
-        x, z = x1, z1
-
-        # Camera azimuth — orbit around the drone
-        az  = self._cam_azimuth
-        x2  =  x * math.cos(az) + y * math.sin(az)
-        y2  = -x * math.sin(az) + y * math.cos(az)
-        x, y = x2, y2
-
-        # Perspective divide — FOV=1000 makes this near-orthographic
-        depth  = self._fov + x * self.scale
-        factor = self._fov / max(depth, 1.0)
-
-        sx =  y * self.scale * factor + self.cx
-        sy = -z * self.scale * factor + self.cy
-
-        return sx, sy, x   # x = raw depth for sorting / prop sizing
-
-    def _project_pt(self, pt, roll_r, pitch_r, yaw_r):
-        x, y, z = self._body_to_world(*pt, roll_r, pitch_r, yaw_r)
-        return self._world_to_screen(x, y, z)
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # RENDERING
+    # PUBLIC API
     # ══════════════════════════════════════════════════════════════════════════
 
     def update_orientation(self, roll: float, pitch: float, yaw: float = 0.0):
         """
-        Redraw the drone model.
-        roll, pitch, yaw in degrees — already ÷10 from MSP in main.py.
+        Redraw the full display.
+        roll, pitch, yaw in degrees (already ÷10 from MSP in main.py).
+        Betaflight sign convention:
+            roll  > 0  →  right side drops
+            pitch > 0  →  nose drops
+            yaw   > 0  →  nose turns right (CW from above)
         """
         self.delete("all")
 
-        roll_r  =  math.radians(roll)
-        pitch_r =  math.radians(pitch)   # BF pitch+ = nose-down = correct as-is
-        yaw_r   =  math.radians(yaw)     # BF yaw+ = CW from above.
-                                          # _rot_yaw: nose(1,0,0) at +90 -> (0,1,0) = RIGHT ✓
-
         max_tilt = max(abs(roll), abs(pitch))
 
-        # ── Background tint — matches IMUWidget colour thresholds ─────────────
-        if max_tilt >= self.CRITICAL_ANGLE:
-            self.config(bg="#3a0000")
-        elif max_tilt >= self.WARN_ANGLE:
-            self.config(bg="#1e1e00")
-        else:
-            self.config(bg="#1a1a1a")
+        if   max_tilt >= self.CRITICAL_ANGLE: level = "critical"
+        elif max_tilt >= self.WARN_ANGLE:     level = "warn"
+        else:                                 level = "safe"
 
-        # ── Static ground grid (world space — never rotates with drone) ───────
-        self._draw_ground_grid()
+        self._draw_adi_background(roll, pitch, level)
+        self._draw_pitch_ladder(roll, pitch)
+        self._draw_bank_arc(roll, level)
+        self._draw_drone_symbol(roll, level)
+        self._draw_centre_marker()
+        self._draw_adi_border()
+        self._draw_compass(yaw)
+        self._draw_hud(roll, pitch, yaw, level)
 
-        # ── Project all motor positions ───────────────────────────────────────
-        proj_motors = {
-            k: self._project_pt(v, roll_r, pitch_r, yaw_r)
-            for k, v in self._motors.items()
-        }
-        ctr = self._project_pt(self._body["CTR"], roll_r, pitch_r, yaw_r)
+        if level != "safe":
+            self._draw_warning_banner(level, max_tilt)
 
-        # Draw far-to-near so near propellers render on top
-        motor_order = sorted(
-            proj_motors.items(), key=lambda kv: kv[1][2], reverse=True
+    # ══════════════════════════════════════════════════════════════════════════
+    # ADI BACKGROUND  (sky / ground / horizon line)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _draw_adi_background(self, roll: float, pitch: float, level: str):
+        """
+        Fill sky (above horizon) and ground (below) using a rotated/shifted
+        horizon line.  The horizon:
+          • tilts  by roll  (right side drops for positive roll)
+          • shifts by pitch (nose-down → horizon shifts UP, showing more sky)
+        """
+        roll_r = math.radians(roll)
+
+        # Pitch shifts the horizon DOWN when pitch > 0 (nose drops → horizon goes up
+        # from pilot's view, i.e. we shift the horizon DOWN in screen coords).
+        pitch_offset = pitch * self.PITCH_PX_PER_DEG    # positive = horizon shifts down
+
+        hcx = self.cx
+        hcy = self.adi_cy + pitch_offset
+
+        # Unit vectors along and perpendicular to the tilted horizon
+        hdx = math.cos(roll_r)      # along horizon
+        hdy = math.sin(roll_r)
+        sdx =  math.sin(roll_r)     # toward sky  (perpendicular, upward in tilted frame)
+        sdy = -math.cos(roll_r)
+
+        L = self.width + self.height   # large enough to cover canvas
+
+        # Sky polygon
+        sky = [
+            hcx - L * hdx + L * sdx,  hcy - L * hdy + L * sdy,
+            hcx + L * hdx + L * sdx,  hcy + L * hdy + L * sdy,
+            hcx + L * hdx,            hcy + L * hdy,
+            hcx - L * hdx,            hcy - L * hdy,
+        ]
+        # Ground polygon
+        gnd = [
+            hcx - L * hdx - L * sdx,  hcy - L * hdy - L * sdy,
+            hcx + L * hdx - L * sdx,  hcy + L * hdy - L * sdy,
+            hcx + L * hdx,            hcy + L * hdy,
+            hcx - L * hdx,            hcy - L * hdy,
+        ]
+
+        sky_clr = {
+            "safe":     "#0d1b2a",
+            "warn":     "#1a1a04",
+            "critical": "#280404",
+        }[level]
+        gnd_clr = {
+            "safe":     "#1f1006",
+            "warn":     "#1f1404",
+            "critical": "#240404",
+        }[level]
+
+        # Clip ADI to its area (draw sky/ground clipped vertically)
+        self.create_rectangle(0, 0, self.width, self.adi_h,
+                              fill=sky_clr, outline="")   # base sky fill
+        self.create_polygon(gnd, fill=gnd_clr, outline="")
+        self.create_polygon(sky, fill=sky_clr, outline="")
+
+        # Horizon line
+        self.create_line(
+            hcx - L * hdx, hcy - L * hdy,
+            hcx + L * hdx, hcy + L * hdy,
+            fill="#AAAAAA", width=2
         )
 
-        # ── Arms + propeller discs ────────────────────────────────────────────
-        for key, (sx, sy, depth) in motor_order:
-            is_front   = key.startswith("F")
-            arm_color  = "#00DD00" if is_front else "#DD2222"
-            prop_color = "#00FF44" if is_front else "#FF4444"
+    # ══════════════════════════════════════════════════════════════════════════
+    # PITCH LADDER
+    # ══════════════════════════════════════════════════════════════════════════
 
-            self.create_line(ctr[0], ctr[1], sx, sy,
-                             fill=arm_color, width=4, capstyle=tk.ROUND)
-            self.create_oval(sx - 5, sy - 5, sx + 5, sy + 5,
-                             fill=arm_color, outline="")
+    def _draw_pitch_ladder(self, roll: float, pitch: float):
+        """
+        Horizontal tick marks at ±5°, ±10°, ±20°, ±30° from the horizon.
+        They move with the horizon (roll + pitch) so the pilot can read
+        pitch angle directly.
+        """
+        roll_r = math.radians(roll)
+        pitch_offset = pitch * self.PITCH_PX_PER_DEG
 
-            # Prop disc — near-orthographic means depth_factor stays ~1.0
-            # so props stay consistent size regardless of attitude
-            depth_factor = max(0.5, min(1.0, 1.0 / (1.0 + depth * 0.15)))
-            pr  = 26 * depth_factor
-            pry = pr * 0.28
+        # Horizon centre
+        hcx = self.cx
+        hcy = self.adi_cy + pitch_offset
 
-            self.create_oval(sx - pr,  sy - pry,
-                             sx + pr,  sy + pry,
-                             outline=prop_color, width=2)
-            self.create_line(sx - pr, sy, sx + pr, sy,
-                             fill=prop_color, width=1)
-            self.create_line(sx, sy - pry, sx, sy + pry,
-                             fill=prop_color, width=1)
+        # Along-horizon unit vector (for drawing horizontal ticks)
+        hdx = math.cos(roll_r)
+        hdy = math.sin(roll_r)
+        # Sky direction (perpendicular, toward sky)
+        sdx =  math.sin(roll_r)
+        sdy = -math.cos(roll_r)
 
-        # ── Fuselage plate ────────────────────────────────────────────────────
-        body_pts   = ["BF_L", "BF_R", "BB_R", "BB_L"]
-        proj_body  = [self._project_pt(self._body[k], roll_r, pitch_r, yaw_r)
-                      for k in body_pts]
-        flat_body  = [coord for sx, sy, _ in proj_body for coord in (sx, sy)]
-        if len(flat_body) >= 6:
-            self.create_polygon(flat_body, fill="#444444",
-                                outline="#888888", width=1)
+        for deg in (-30, -20, -10, -5, 5, 10, 20, 30):
+            half_w = 55 if abs(deg) % 10 == 0 else 28
+            offset_px = -deg * self.PITCH_PX_PER_DEG    # neg: + pitch → line above
 
-        # ── Nose arrow ────────────────────────────────────────────────────────
-        nose = self._project_pt(self._body["NOSE"], roll_r, pitch_r, yaw_r)
-        tail = self._project_pt(self._body["TAIL"], roll_r, pitch_r, yaw_r)
-        self.create_line(tail[0], tail[1], nose[0], nose[1],
-                         fill="#FFFFFF", width=2,
-                         arrow=tk.LAST, arrowshape=(10, 12, 4))
+            lx = hcx + offset_px * sdx
+            ly = hcy + offset_px * sdy
 
-        # ── Attitude indicator bars ───────────────────────────────────────────
-        self._draw_attitude_bars(roll, pitch)
+            # Clamp to ADI area
+            if not (0 < ly < self.adi_h):
+                continue
 
-        # ── HUD text overlay ──────────────────────────────────────────────────
-        hud = "#FF4444" if max_tilt >= self.CRITICAL_ANGLE else \
-              "#FFFF44" if max_tilt >= self.WARN_ANGLE      else "#00FF00"
+            self.create_line(
+                lx - half_w * hdx, ly - half_w * hdy,
+                lx + half_w * hdx, ly + half_w * hdy,
+                fill="#556677", width=1
+            )
+            # Label on the right side for multiples of 10
+            if abs(deg) % 10 == 0:
+                lbl_x = lx + (half_w + 8) * hdx
+                lbl_y = ly + (half_w + 8) * hdy
+                if 0 < lbl_y < self.adi_h:
+                    self.create_text(
+                        lbl_x, lbl_y,
+                        text=f"{abs(deg)}",
+                        fill="#556677", font=("Consolas", 7)
+                    )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # BANK ARC  (roll angle arc at top of ADI)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _draw_bank_arc(self, roll: float, level: str):
+        """
+        Semicircular arc with graduation marks at ±10°, ±20°, ±30°, ±45°, ±60°.
+        A pointer triangle moves along the arc to show current bank angle.
+        The arc lives at the top of the ADI area.
+        """
+        arc_cx = self.cx
+        arc_cy = int(self.adi_h * 0.92)   # near top, radius points upward
+        arc_r  = int(self.adi_h * 0.88)
+
+        arc_color = {
+            "safe": "#446688", "warn": "#888822", "critical": "#882222"
+        }[level]
+
+        # Draw partial arc (bottom semicircle: from 180° to 360° in standard coords,
+        # but in Tk the arc goes from startangle counterclockwise.
+        # We want an arc that opens UPWARD (like a ∩ shape) centred at arc_cy.
+        self.create_arc(
+            arc_cx - arc_r, arc_cy - arc_r,
+            arc_cx + arc_r, arc_cy + arc_r,
+            start=0, extent=180,
+            style=tk.ARC, outline=arc_color, width=2
+        )
+
+        # Graduation marks
+        for deg in (-60, -45, -30, -20, -10, 10, 20, 30, 45, 60):
+            # On the top semicircle: deg=0 → top (270° in Tk = -90° math)
+            # Betaflight convention: positive roll = right side down
+            # Bank arc: pointer at 0° is top; positive roll pointer moves right
+            angle_rad = math.radians(-deg - 90)   # screen angle for this bank mark
+            tick_outer_x = arc_cx + arc_r * math.cos(angle_rad)
+            tick_outer_y = arc_cy + arc_r * math.sin(angle_rad)
+            tick_len = 10 if abs(deg) % 30 == 0 else 6
+            tick_inner_x = arc_cx + (arc_r - tick_len) * math.cos(angle_rad)
+            tick_inner_y = arc_cy + (arc_r - tick_len) * math.sin(angle_rad)
+            self.create_line(tick_inner_x, tick_inner_y,
+                             tick_outer_x, tick_outer_y,
+                             fill=arc_color, width=1)
+
+        # Roll pointer triangle — tracks current bank angle
+        ptr_angle_rad = math.radians(-roll - 90)
+        ptr_tip_x = arc_cx + (arc_r - 2) * math.cos(ptr_angle_rad)
+        ptr_tip_y = arc_cy + (arc_r - 2) * math.sin(ptr_angle_rad)
+        # Pointer base (slightly inside the arc)
+        base_r = arc_r - 14
+        perp   = ptr_angle_rad + math.pi / 2
+        base_x1 = arc_cx + base_r * math.cos(ptr_angle_rad) + 6 * math.cos(perp)
+        base_y1 = arc_cy + base_r * math.sin(ptr_angle_rad) + 6 * math.sin(perp)
+        base_x2 = arc_cx + base_r * math.cos(ptr_angle_rad) - 6 * math.cos(perp)
+        base_y2 = arc_cy + base_r * math.sin(ptr_angle_rad) - 6 * math.sin(perp)
+
+        ptr_color = {
+            "safe": "#FFFFFF", "warn": "#FFFF44", "critical": "#FF4444"
+        }[level]
+        self.create_polygon(
+            ptr_tip_x, ptr_tip_y,
+            base_x1, base_y1,
+            base_x2, base_y2,
+            fill=ptr_color, outline=""
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # DRONE SYMBOL  (fixed position, centred in ADI — arms change colour)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _draw_drone_symbol(self, roll: float, level: str):
+        """
+        The drone symbol stays fixed at the ADI centre.  In a true ADI the
+        aircraft symbol never moves — the horizon moves around it, and the
+        pilot reads bank from the horizon tilt and the bank pointer.
+
+        Arms are coloured by warning level so the pilot has an immediate
+        at-a-glance status even without reading the table.
+
+        Front arms (top two) are always green-tinted at SAFE so the pilot
+        can identify drone orientation; both pairs go WARN/CRITICAL together.
+        """
+        cx  = self.cx
+        cy  = self.adi_cy
+        arm = 55    # pixel length from centre to motor
+
+        # Warning colours override the normal green/red arm split
+        if level == "critical":
+            front_clr = rear_clr = "#FF4444"
+            body_clr  = "#441111"
+        elif level == "warn":
+            front_clr = rear_clr = "#FFFF44"
+            body_clr  = "#333310"
+        else:
+            front_clr = "#00DD44"   # green — front
+            rear_clr  = "#DD2222"   # red   — rear
+            body_clr  = "#444444"
+
+        # Arm direction: X-frame, 45° arms
+        # Viewed from behind: front-right goes upper-right, front-left upper-left
+        angles = {
+            "FR": math.radians(-45),    # upper-right
+            "FL": math.radians(-135),   # upper-left
+            "RR": math.radians( 45),    # lower-right
+            "RL": math.radians( 135),   # lower-left
+        }
+        colors = {
+            "FR": front_clr, "FL": front_clr,
+            "RR": rear_clr,  "RL": rear_clr,
+        }
+
+        prop_r = 18
+
+        for key, ang in angles.items():
+            ex = cx + arm * math.cos(ang)
+            ey = cy + arm * math.sin(ang)
+            clr = colors[key]
+
+            # Arm
+            self.create_line(cx, cy, ex, ey, fill=clr, width=4, capstyle=tk.ROUND)
+            # Motor hub
+            self.create_oval(ex - 5, ey - 5, ex + 5, ey + 5,
+                             fill=clr, outline="")
+            # Propeller disc
+            self.create_oval(ex - prop_r, ey - prop_r * 0.35,
+                             ex + prop_r, ey + prop_r * 0.35,
+                             outline=clr, width=2)
+            # Prop cross-hair
+            self.create_line(ex - prop_r, ey, ex + prop_r, ey,
+                             fill=clr, width=1)
+            self.create_line(ex, ey - prop_r * 0.35,
+                             ex, ey + prop_r * 0.35,
+                             fill=clr, width=1)
+
+        # Central body
+        self.create_oval(cx - 12, cy - 12, cx + 12, cy + 12,
+                         fill=body_clr, outline="#888888", width=2)
+
+        # Forward direction indicator: small triangle pointing upward
+        # (toward "front" in the behind-view projection)
+        tri = [cx, cy - 22, cx - 7, cy - 12, cx + 7, cy - 12]
+        self.create_polygon(tri, fill=front_clr, outline="")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CENTRE REFERENCE MARKER
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _draw_centre_marker(self):
+        """Fixed horizon reference lines at the centre — like real ADI."""
+        cx, cy = self.cx, self.adi_cy
+        clr = "#DDDDDD"
+        # Left wing bar
+        self.create_line(cx - 80, cy, cx - 30, cy, fill=clr, width=3)
+        self.create_line(cx - 30, cy, cx - 30, cy + 12, fill=clr, width=3)
+        # Right wing bar
+        self.create_line(cx + 30, cy, cx + 80, cy, fill=clr, width=3)
+        self.create_line(cx + 30, cy, cx + 30, cy + 12, fill=clr, width=3)
+        # Centre dot
+        self.create_oval(cx - 4, cy - 4, cx + 4, cy + 4,
+                         fill="#FFFFFF", outline="")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ADI BORDER
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _draw_adi_border(self):
+        self.create_rectangle(0, 0, self.width - 1, self.adi_h - 1,
+                              outline="#333333", width=1)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # COMPASS STRIP  (yaw / heading)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _draw_compass(self, yaw: float):
+        """
+        Scrolling compass tape at the bottom.  The tape moves so the current
+        heading is always centred.  Marks every 10°, labels every 30°.
+        Cardinal directions labelled N/E/S/W.
+        """
+        y0   = self.comp_y0
+        y1   = self.height
+        cy_c = (y0 + y1) // 2
+        cx   = self.cx
+
+        self.create_rectangle(0, y0, self.width, y1,
+                              fill="#111111", outline="#333333")
+
+        px_per_deg = 3.5    # pixels per degree of heading
+
+        # Draw ticks centred on current yaw
+        for offset_deg in range(-90, 91, 10):
+            hdg = (yaw + offset_deg) % 360
+            x   = cx + offset_deg * px_per_deg
+
+            tick_h = 10 if hdg % 30 == 0 else 5
+            self.create_line(x, y0 + 2, x, y0 + 2 + tick_h,
+                             fill="#666666", width=1)
+
+            if hdg % 30 == 0:
+                label = {0: "N", 90: "E", 180: "S", 270: "W"}.get(int(hdg),
+                         f"{int(hdg)}")
+                self.create_text(x, y0 + 18,
+                                 text=label, fill="#888888",
+                                 font=("Consolas", 8))
+
+        # Centre pointer
+        self.create_line(cx, y0, cx, y0 + 6, fill="#FFFFFF", width=2)
+
+        # Heading readout
+        self.create_text(cx, cy_c + 6,
+                         text=f"HDG  {yaw % 360:>5.1f}°",
+                         fill="#00FF88", font=("Consolas", 10, "bold"))
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # HUD TEXT
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _draw_hud(self, roll: float, pitch: float, yaw: float, level: str):
+        hud = {
+            "safe":     "#00FF00",
+            "warn":     "#FFFF44",
+            "critical": "#FF4444",
+        }[level]
 
         for i, txt in enumerate([
             f"R: {roll:>+7.1f}°",
             f"P: {pitch:>+7.1f}°",
-            f"Y: {yaw:>+7.1f}°",
         ]):
             self.create_text(10, 10 + i * 16, anchor="nw",
                              text=txt, fill=hud, font=("Consolas", 10, "bold"))
 
-        # ── Warning banner ────────────────────────────────────────────────────
-        if max_tilt >= self.CRITICAL_ANGLE:
-            self.create_text(self.cx, 22, text="⚠  CRITICAL ATTITUDE  ⚠",
-                             fill="#FF4444", font=("Consolas", 11, "bold"))
-        elif max_tilt >= self.WARN_ANGLE:
-            self.create_text(self.cx, 22, text="ATTITUDE CAUTION",
-                             fill="#FFFF44", font=("Consolas", 10, "bold"))
-
     # ══════════════════════════════════════════════════════════════════════════
-    # HELPERS
+    # WARNING BANNER
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _draw_ground_grid(self):
-        """Flat reference grid on the world Z=-1.8 plane — never rotates."""
-        gz   = -1.8
-        ext  = 5.0
-        step = 1.0
-        v = -ext
-        while v <= ext + 0.001:
-            x1, y1, _ = self._world_to_screen( ext, v, gz)
-            x2, y2, _ = self._world_to_screen(-ext, v, gz)
-            self.create_line(x1, y1, x2, y2, fill="#303030", width=1)
-            x3, y3, _ = self._world_to_screen(v,  ext, gz)
-            x4, y4, _ = self._world_to_screen(v, -ext, gz)
-            self.create_line(x3, y3, x4, y4, fill="#303030", width=1)
-            v += step
-        xh1, yh1, _ = self._world_to_screen( ext, 0, gz)
-        xh2, yh2, _ = self._world_to_screen(-ext, 0, gz)
-        self.create_line(xh1, yh1, xh2, yh2, fill="#505050", width=2)
-
-    def _draw_attitude_bars(self, roll: float, pitch: float):
-        """
-        2D overlay attitude bars — same colour thresholds as the 3D model
-        and the IMUWidget table, so all three displays agree.
-        """
-        def bar_color(deg):
-            a = abs(deg)
-            if   a >= self.CRITICAL_ANGLE: return self.CLR_CRITICAL
-            elif a >= self.WARN_ANGLE:     return self.CLR_WARN
-            else:                          return self.CLR_SAFE
-
-        # ── Roll bar (bottom-centre, horizontal) ──────────────────────────────
-        bar_w  = 80
-        bar_cx = self.cx
-        bar_y  = self.height - 20
-        pct_r  = max(-1.0, min(1.0, roll / 45.0))   # ±45° = full scale
-        clr_r  = bar_color(roll)
-
-        self.create_line(bar_cx - bar_w, bar_y, bar_cx + bar_w, bar_y,
-                         fill="#444444", width=4)
-        self.create_line(bar_cx, bar_y - 6, bar_cx, bar_y + 6,
-                         fill="#888888", width=2)
-        bx = bar_cx + int(pct_r * bar_w)
-        self.create_oval(bx - 6, bar_y - 6, bx + 6, bar_y + 6,
-                         fill=clr_r, outline="")
-        self.create_text(bar_cx, bar_y + 14,
-                         text="ROLL", fill="#666666", font=("Consolas", 8))
-
-        # ── Pitch bar (right side, vertical) ─────────────────────────────────
-        bar_h  = 80
-        bar_x  = self.width - 18
-        bar_cy = self.cy
-        pct_p  = max(-1.0, min(1.0, pitch / 45.0))   # positive = nose down = bar moves down
-        clr_p  = bar_color(pitch)
-
-        self.create_line(bar_x, bar_cy - bar_h, bar_x, bar_cy + bar_h,
-                         fill="#444444", width=4)
-        self.create_line(bar_x - 6, bar_cy, bar_x + 6, bar_cy,
-                         fill="#888888", width=2)
-        by = bar_cy + int(pct_p * bar_h)
-        self.create_oval(bar_x - 6, by - 6, bar_x + 6, by + 6,
-                         fill=clr_p, outline="")
-        self.create_text(bar_x, bar_cy - bar_h - 12,
-                         text="PTCH", fill="#666666", font=("Consolas", 8))
+    def _draw_warning_banner(self, level: str, max_tilt: float):
+        if level == "critical":
+            self.create_text(
+                self.cx, 22,
+                text=f"⚠  CRITICAL  {max_tilt:.0f}°  ⚠",
+                fill="#FF4444", font=("Consolas", 11, "bold")
+            )
+        else:
+            self.create_text(
+                self.cx, 22,
+                text=f"CAUTION  {max_tilt:.0f}°",
+                fill="#FFFF44", font=("Consolas", 10, "bold")
+            )
