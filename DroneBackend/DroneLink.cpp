@@ -1,171 +1,316 @@
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-#include "DroneLink.h"
-#include "IMUSensor.h"
+﻿#include "DroneLink.h"
 #include <iostream>
-#include <vector>
-#include <string>
 #include <chrono>
+#include <thread>
 
-namespace py = pybind11;
-using namespace pybind11::literals;
+// ─────────────────────────────────────────────────────────────────────────────
+// Constructor / Destructor
+// ─────────────────────────────────────────────────────────────────────────────
 
-// --- Constructor & Destructor ---
-DroneLink::DroneLink() {
-    hSerial = INVALID_HANDLE_VALUE;
-    connected = false;
+DroneLink::DroneLink()
+    : hSerial(INVALID_HANDLE_VALUE)
+    , connected(false)
+    , keepRunning(false)
+    , pollIntervalMs(POLL_INTERVAL_MS)
+{
 }
 
 DroneLink::~DroneLink() {
     disconnect();
 }
 
-// --- Connection Logic ---
-bool DroneLink::connect(std::string portName) {
+// ─────────────────────────────────────────────────────────────────────────────
+// connect() — open serial port, configure it, start worker thread
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool DroneLink::connect(const std::string& portName) {
+    if (connected.load()) disconnect();
+
     std::string fullPath = "\\\\.\\" + portName;
 
-    hSerial = CreateFileA(fullPath.c_str(),
+    hSerial = CreateFileA(
+        fullPath.c_str(),
         GENERIC_READ | GENERIC_WRITE,
         0, NULL, OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL, NULL);
+        FILE_ATTRIBUTE_NORMAL, NULL
+    );
 
-    if (hSerial == INVALID_HANDLE_VALUE) {
-        connected = false;
-        return false;
-    }
+    if (hSerial == INVALID_HANDLE_VALUE) return false;
 
-    DCB dcbSerialParams = { 0 };
-    dcbSerialParams.DCBlength = sizeof(dcbSerialParams);
-    if (!GetCommState(hSerial, &dcbSerialParams)) {
+    // ── Baud / framing ───────────────────────────────────────────────────────
+    DCB dcb = { 0 };
+    dcb.DCBlength = sizeof(dcb);
+    if (!GetCommState(hSerial, &dcb)) {
         CloseHandle(hSerial);
+        hSerial = INVALID_HANDLE_VALUE;
         return false;
     }
-
-    dcbSerialParams.BaudRate = CBR_115200; // MSP Standard
-    dcbSerialParams.ByteSize = 8;
-    dcbSerialParams.StopBits = ONESTOPBIT;
-    dcbSerialParams.Parity = NOPARITY;
-
-    if (!SetCommState(hSerial, &dcbSerialParams)) {
+    dcb.BaudRate = CBR_115200;
+    dcb.ByteSize = 8;
+    dcb.StopBits = ONESTOPBIT;
+    dcb.Parity = NOPARITY;
+    if (!SetCommState(hSerial, &dcb)) {
         CloseHandle(hSerial);
+        hSerial = INVALID_HANDLE_VALUE;
         return false;
     }
 
-    // Crucial for precise timing: reduce wait times
-    COMMTIMEOUTS timeouts = { 0 };
-    timeouts.ReadIntervalTimeout = 50;
-    timeouts.ReadTotalTimeoutConstant = 50;
-    timeouts.ReadTotalTimeoutMultiplier = 10;
-    SetCommTimeouts(hSerial, &timeouts);
+    // ── Timeouts ─────────────────────────────────────────────────────────────
+    // Short absolute timeout so the worker loop can stay responsive and detect
+    // link loss quickly.  50 ms total read timeout is generous for 115200 baud.
+    COMMTIMEOUTS to = { 0 };
+    to.ReadIntervalTimeout = 10;   // ms between characters
+    to.ReadTotalTimeoutConstant = 50;   // ms base
+    to.ReadTotalTimeoutMultiplier = 2;    // ms per byte requested
+    to.WriteTotalTimeoutConstant = 50;
+    to.WriteTotalTimeoutMultiplier = 2;
+    SetCommTimeouts(hSerial, &to);
 
-    connected = true;
+    // ── Start worker ─────────────────────────────────────────────────────────
+    connected.store(true);
+    keepRunning.store(true);
+    workerThread = std::thread(&DroneLink::communicationLoop, this);
+
     return true;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// disconnect() — signal worker to stop, join it, close port
+// ─────────────────────────────────────────────────────────────────────────────
+
 void DroneLink::disconnect() {
+    keepRunning.store(false);
+    connected.store(false);
+
+    if (workerThread.joinable())
+        workerThread.join();
+
     if (hSerial != INVALID_HANDLE_VALUE) {
         CloseHandle(hSerial);
         hSerial = INVALID_HANDLE_VALUE;
     }
-    connected = false;
 }
 
-// --- Communication Methods ---
-std::vector<uint8_t> DroneLink::sendRequest(uint8_t mspID) {
-    if (!connected || hSerial == INVALID_HANDLE_VALUE) return {};
+// ─────────────────────────────────────────────────────────────────────────────
+// getLatestState() — safe snapshot for the Python / GUI thread
+// ─────────────────────────────────────────────────────────────────────────────
 
-    uint8_t request[] = { '$', 'M', '<', 0, mspID, mspID };
-    DWORD written;
-    if (!WriteFile(hSerial, request, sizeof(request), &written, NULL)) return {};
+DroneState DroneLink::getLatestState() {
+    std::lock_guard<std::mutex> lock(dataMutex);
+    return currentState;   // value copy — caller owns it
+}
 
-    uint8_t buffer[64];
-    DWORD read;
-    if (ReadFile(hSerial, buffer, sizeof(buffer), &read, NULL) && read > 5) {
-        return std::vector<uint8_t>(buffer, buffer + read);
+// ─────────────────────────────────────────────────────────────────────────────
+// communicationLoop() — runs on workerThread
+//
+// Design intent:
+//   • One iteration = request every active sensor in sequence.
+//   • Each sendMSP() call is synchronous (write → read) but only this thread
+//     ever touches hSerial, so there is no contention.
+//   • After all sensors are polled, a single mutex lock commits the new state.
+//   • The thread then sleeps for the remainder of the poll interval, keeping
+//     CPU usage low and making the interval easy to tune from Python.
+//
+// Adding a new sensor later:
+//   1. Add an MSP ID to the MSP namespace in the header.
+//   2. Add a parseXxx() method declaration in the header.
+//   3. Call sendMSP() + parseXxx() in the block below marked "SENSOR POLL".
+//   4. Add the new fields to DroneState.
+//   That's it — no threading changes required.
+// ─────────────────────────────────────────────────────────────────────────────
+
+void DroneLink::communicationLoop() {
+    int consecutiveFails = 0;
+
+    while (keepRunning.load()) {
+        auto loopStart = std::chrono::steady_clock::now();
+
+        // Accumulate new readings into a local copy so we hold the mutex for
+        // the shortest possible time (one swap at the end, not per-sensor).
+        DroneState pending;
+        {
+            // Seed with the previous state so fields we don't poll this tick
+            // keep their last known value rather than resetting to zero.
+            std::lock_guard<std::mutex> lock(dataMutex);
+            pending = currentState;
+        }
+
+        bool anySuccess = false;
+
+        // ── SENSOR POLL ──────────────────────────────────────────────────────
+        // Each block is independent. A failure on one sensor does not skip
+        // the others, so a missing GPS won't break IMU data.
+
+        // 1. IMU (MPU-6500 accel + gyro) — highest priority, poll every tick
+        {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            auto buf = sendMSP(MSP::RAW_IMU);
+            auto t1 = std::chrono::high_resolution_clock::now();
+
+            if (parseIMU(buf, pending)) {
+                std::chrono::duration<double, std::milli> rtt = t1 - t0;
+                pending.lastRttMs = rtt.count();
+                anySuccess = true;
+            }
+        }
+
+        // 2. Attitude (roll / pitch / yaw from FC fusion)
+        {
+            auto buf = sendMSP(MSP::ATTITUDE);
+            parseAttitude(buf, pending);
+        }
+
+        // 3. Analog (battery voltage, RSSI)
+        {
+            auto buf = sendMSP(MSP::ANALOG);
+            parseAnalog(buf, pending);
+        }
+
+        // 4. FC internal cycle time via MSP_DEBUG
+        //    Requires `set debug_mode = CYCLETIME` in Betaflight CLI.
+        {
+            auto buf = sendMSP(MSP::DEBUG);
+            parseDebug(buf, pending);
+        }
+
+        // ── ADD FUTURE SENSORS HERE ──────────────────────────────────────────
+        // Example (uncomment when GPS is wired):
+        // {
+        //     auto buf = sendMSP(MSP::GPS);
+        //     parseGPS(buf, pending);
+        // }
+        // ─────────────────────────────────────────────────────────────────────
+
+        // ── Health tracking ──────────────────────────────────────────────────
+        if (anySuccess) {
+            consecutiveFails = 0;
+            pending.linkHealthy = true;
+            pending.packetCount++;
+        }
+        else {
+            consecutiveFails++;
+            if (consecutiveFails >= FAIL_THRESHOLD)
+                pending.linkHealthy = false;
+        }
+
+        // ── Commit ───────────────────────────────────────────────────────────
+        commitState(pending);
+
+        // ── Sleep remainder of poll interval ─────────────────────────────────
+        // This keeps the loop at ~pollIntervalMs cadence regardless of how
+        // long the sensor queries took, and avoids busy-spinning.
+        auto elapsed = std::chrono::steady_clock::now() - loopStart;
+        auto budget = std::chrono::milliseconds(pollIntervalMs.load());
+        if (elapsed < budget)
+            std::this_thread::sleep_for(budget - elapsed);
     }
-    return {};
 }
 
-TelemetryResult DroneLink::sendRequestWithTiming(uint8_t mspID) {
-    if (!connected) return { {}, 0.0 };
+// ─────────────────────────────────────────────────────────────────────────────
+// sendMSP() — build MSP v1 request, write, read response
+// Called ONLY from workerThread; no mutex needed.
+// ─────────────────────────────────────────────────────────────────────────────
 
-    auto start = std::chrono::high_resolution_clock::now();
+std::vector<uint8_t> DroneLink::sendMSP(uint8_t mspID) {
+    if (hSerial == INVALID_HANDLE_VALUE) return {};
 
-    uint8_t request[] = { '$', 'M', '<', 0, mspID, mspID };
-    DWORD written;
-    WriteFile(hSerial, request, sizeof(request), &written, NULL);
+    // MSP v1 request frame: $ M < <size=0> <cmd> <checksum>
+    // For requests with no payload, checksum = cmd XOR 0 = cmd.
+    uint8_t req[] = { '$', 'M', '<', 0, mspID, mspID };
+    DWORD written = 0;
+    if (!WriteFile(hSerial, req, sizeof(req), &written, NULL) || written != sizeof(req))
+        return {};
 
-    uint8_t buffer[64];
-    DWORD read;
-    ReadFile(hSerial, buffer, sizeof(buffer), &read, NULL);
+    // Read up to 64 bytes. The FC will reply with:
+    // $ M > <size> <cmd> [payload...] <checksum>
+    uint8_t buf[64];
+    DWORD   rd = 0;
+    if (!ReadFile(hSerial, buf, sizeof(buf), &rd, NULL) || rd < 6)
+        return {};
 
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> elapsed = end - start;
-
-    return { std::vector<uint8_t>(buffer, buffer + read), elapsed.count() };
+    return std::vector<uint8_t>(buf, buf + rd);
 }
 
-// --- Standalone Helper ---
+// ─────────────────────────────────────────────────────────────────────────────
+// Parsers — each validates the response header and extracts fields.
+// Return true on success, false on short/malformed packet.
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool DroneLink::parseIMU(const std::vector<uint8_t>& buf, DroneState& s) {
+    // Expected: $ M > 12 102 [6×int16] checksum  → minimum 18 bytes
+    if (buf.size() < 18 || buf[4] != MSP::RAW_IMU) return false;
+
+    // Bytes are little-endian int16 pairs starting at index 5
+    auto read16 = [&](int i) -> int16_t {
+        return static_cast<int16_t>(buf[i] | (buf[i + 1] << 8));
+        };
+    s.ax = read16(5);
+    s.ay = read16(7);
+    s.az = read16(9);
+    s.gx = read16(11);
+    s.gy = read16(13);
+    s.gz = read16(15);
+    return true;
+}
+
+bool DroneLink::parseAttitude(const std::vector<uint8_t>& buf, DroneState& s) {
+    // MSP_ATTITUDE: $ M > 6 108 [roll pitch yaw] checksum → 12 bytes
+    if (buf.size() < 12 || buf[4] != MSP::ATTITUDE) return false;
+
+    auto read16 = [&](int i) -> int16_t {
+        return static_cast<int16_t>(buf[i] | (buf[i + 1] << 8));
+        };
+    s.roll = read16(5);   // degrees × 10
+    s.pitch = read16(7);   // degrees × 10
+    s.yaw = read16(9);   // degrees (already ×1 on most FC builds)
+    return true;
+}
+
+bool DroneLink::parseAnalog(const std::vector<uint8_t>& buf, DroneState& s) {
+    // MSP_ANALOG: $ M > 7 110 [vbat mah_l mah_h rssi pow_l pow_h pow2] → 14 bytes
+    if (buf.size() < 14 || buf[4] != MSP::ANALOG) return false;
+
+    // vbat is in units of 0.1 V
+    s.batteryVoltage = buf[5] / 10.0f;
+    // RSSI is at byte 8 (0-255)
+    s.rssi = buf[8];
+    return true;
+}
+
+bool DroneLink::parseDebug(const std::vector<uint8_t>& buf, DroneState& s) {
+    // MSP_DEBUG with CYCLETIME mode: debug[0] = FC loop time in microseconds
+    // Frame: $ M > 8 254 [d0_l d0_h d1_l d1_h ...] → minimum 14 bytes
+    if (buf.size() < 14 || buf[4] != MSP::DEBUG) return false;
+
+    uint16_t cycleUs = static_cast<uint16_t>(buf[5] | (buf[6] << 8));
+    s.fcCycleMs = cycleUs / 1000.0;
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// commitState() — swap pending state into shared state under lock
+// ─────────────────────────────────────────────────────────────────────────────
+
+void DroneLink::commitState(const DroneState& s) {
+    std::lock_guard<std::mutex> lock(dataMutex);
+    currentState = s;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AutoDetectF405() — scan COM1-COM29, return first that opens
+// ─────────────────────────────────────────────────────────────────────────────
+
 std::string AutoDetectF405() {
     for (int i = 1; i < 30; ++i) {
-        std::string portName = "\\\\.\\COM" + std::to_string(i);
-        HANDLE testHandle = CreateFileA(portName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (testHandle != INVALID_HANDLE_VALUE) {
-            CloseHandle(testHandle);
+        std::string path = "\\\\.\\COM" + std::to_string(i);
+        HANDLE h = CreateFileA(path.c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            0, NULL, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            CloseHandle(h);
             return "COM" + std::to_string(i);
         }
     }
     return "NOT_FOUND";
-}
-
-// --- The Bridge Module ---
-PYBIND11_MODULE(DroneBackend, m) {
-    m.doc() = "Project R.A.D Thesis Backend";
-
-    py::class_<DroneLink>(m, "DroneLink")
-        .def(py::init<>())
-        .def("connect", &DroneLink::connect)
-        .def("disconnect", &DroneLink::disconnect);
-
-    py::class_<IMUSensor>(m, "IMUSensor")
-        .def(py::init<DroneLink*>())
-        // Standard high-speed data
-        .def("getRawData", [](IMUSensor& self) {
-        auto d = self.getRawData();
-        return py::dict("ax"_a = d.accX, "ay"_a = d.accY, "az"_a = d.accZ,
-            "gx"_a = d.gyroX, "gy"_a = d.gyroY, "gz"_a = d.gyroZ);
-            })
-        // Precision Thesis Measurement
-        .def("getThesisData", [](IMUSensor& self, DroneLink* hub) {
-        // 1. Get IMU Data and measure RTT
-        auto imu_res = hub->sendRequestWithTiming(102); // MSP_RAW_IMU
-
-        // 2. Get FC Internal Cycle Time (Requires debug_mode = CYCLETIME set in CLI)
-        auto debug_res = hub->sendRequest(254); // MSP_DEBUG
-
-        uint16_t fc_cycle_us = 0;
-        if (debug_res.size() >= 7 && debug_res[4] == 254) {
-            // Debug 0 index (bytes 5 and 6) contains cycle time
-            fc_cycle_us = (debug_res[5] | (debug_res[6] << 8));
-        }
-
-        IMUSensor::IMUData d = { 0 };
-        if (imu_res.data.size() >= 18 && imu_res.data[4] == 102) {
-            d.accX = (imu_res.data[5] | (imu_res.data[6] << 8));
-            d.accY = (imu_res.data[7] | (imu_res.data[8] << 8));
-            d.accZ = (imu_res.data[9] | (imu_res.data[10] << 8));
-            d.gyroX = (imu_res.data[11] | (imu_res.data[12] << 8));
-            d.gyroY = (imu_res.data[13] | (imu_res.data[14] << 8));
-            d.gyroZ = (imu_res.data[15] | (imu_res.data[16] << 8));
-        }
-
-        return py::dict(
-            "data"_a = py::dict("ax"_a = d.accX, "ay"_a = d.accY, "az"_a = d.accZ,
-                "gx"_a = d.gyroX, "gy"_a = d.gyroY, "gz"_a = d.gyroZ),
-            "rtt_ms"_a = imu_res.latencyMs,
-            "fc_cycle_ms"_a = fc_cycle_us / 1000.0 // Convert microseconds to ms
-        );
-            });
-
-    m.def("AutoDetectF405", &AutoDetectF405);
 }

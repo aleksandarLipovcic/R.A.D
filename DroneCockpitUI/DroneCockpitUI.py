@@ -5,8 +5,9 @@ from tkinter import ttk
 from IMUWidget import IMUWidget
 from Drone3DView import Drone3DView
 
-# --- Backend Path Configuration ---
-script_dir = os.path.dirname(os.path.abspath(__file__))
+# ── Path configuration ────────────────────────────────────────────────────────
+# Adjust 'x64/Debug' to 'x64/Release' when building for release.
+script_dir   = os.path.dirname(os.path.abspath(__file__))
 backend_path = os.path.abspath(os.path.join(script_dir, '..', 'x64', 'Debug'))
 sys.path.append(backend_path)
 
@@ -14,118 +15,180 @@ if hasattr(os, 'add_dll_directory'):
     try:
         os.add_dll_directory(backend_path)
     except Exception as e:
-        print(f"Note: DLL directory already added or inaccessible: {e}")
+        print(f"[DroneBackend] DLL directory notice: {e}")
 
 import DroneBackend
 
+# ── Constants ─────────────────────────────────────────────────────────────────
+UI_REFRESH_MS    = 20     # 50 Hz display refresh
+RECONNECT_MS     = 2000   # retry interval when searching for drone
+BG_COLOR         = "#f0f0f0"
+
+
 class DroneCockpitApp:
-    def __init__(self, root):
+    def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Project R.A.D - Master's Research Cockpit")
-        self.root.configure(bg="#f0f0f0")
+        self.root.title("Project R.A.D — Master's Research Cockpit")
+        self.root.configure(bg=BG_COLOR)
 
+        # C++ threaded backend — serial I/O runs in its own thread
         self.hub = DroneBackend.DroneLink()
-        self.imu_sensor = None
-        
-        self.setup_ui()
-        
-        # --- FIX: Dynamic Geometry to prevent window clipping ---
-        self.root.update_idletasks()
-        # Calculate required width/height and add a small buffer for padding
-        req_width = self.root.winfo_reqwidth() + 20
-        req_height = self.root.winfo_reqheight() + 20
-        
-        # Set geometry and center the window on screen
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        x = (screen_width // 2) - (req_width // 2)
-        y = (screen_height // 2) - (req_height // 2)
-        
-        self.root.geometry(f"{req_width}x{req_height}+{x}+{y}")
-        self.root.minsize(req_width, req_height)
 
-        self.auto_connect()
+        # Track whether the update loop is already scheduled
+        self._update_job = None
 
-    def setup_ui(self):
-        # --- Top Navigation/Status Bar ---
-        self.top_frame = tk.Frame(self.root, bg="#f0f0f0")
-        self.top_frame.pack(side="top", fill="x", pady=10)
+        self._setup_ui()
+        self._center_window()
+        self._auto_connect()
 
-        header = tk.Label(self.top_frame, text="DRONE TELEMETRY SYSTEM", 
-                         font=('Arial', 14, 'bold'), bg="#f0f0f0")
-        header.pack()
+    # ── Layout ────────────────────────────────────────────────────────────────
 
-        self.status_label = tk.Label(self.top_frame, text="Status: Searching...", 
-                                    fg="orange", bg="#f0f0f0", font=('Arial', 10))
+    def _setup_ui(self):
+        # Status bar
+        top = tk.Frame(self.root, bg=BG_COLOR)
+        top.pack(side="top", fill="x", pady=10)
+
+        self.status_label = tk.Label(
+            top,
+            text="Status: Searching...",
+            fg="orange", bg=BG_COLOR,
+            font=("Arial", 10, "bold")
+        )
         self.status_label.pack()
 
-        # --- Main Workspace (Grid Layout) ---
-        self.main_container = tk.Frame(self.root, bg="#f0f0f0")
-        self.main_container.pack(fill="both", expand=True, padx=20) # Increased padding
+        # Main content row
+        main = tk.Frame(self.root, bg=BG_COLOR)
+        main.pack(fill="both", expand=True, padx=20, pady=10)
+        main.columnconfigure(0, weight=1)
+        main.columnconfigure(1, weight=1)
 
-        # Left Column: Telemetry Table
-        self.imu_view = IMUWidget(self.main_container)
+        # Left — IMU numerical widget
+        self.imu_view = IMUWidget(main)
         self.imu_view.grid(row=0, column=0, sticky="nsew", padx=10)
 
-        # Right Column: 3D Visualization
-        self.visual_frame = ttk.LabelFrame(self.main_container, text="Spatial Orientation")
-        self.visual_frame.grid(row=0, column=1, sticky="nsew", padx=10)
-        
-        # Using the improved Drone3DView with isometric projection
-        self.drone_3d = Drone3DView(self.visual_frame, width=400, height=350)
+        # Right — 3D orientation view
+        visual = ttk.LabelFrame(main, text="Spatial Orientation")
+        visual.grid(row=0, column=1, sticky="nsew", padx=10)
+        self.drone_3d = Drone3DView(visual, width=400, height=350)
         self.drone_3d.pack(padx=10, pady=10, expand=True, fill="both")
 
-        # --- Bottom Control Bar ---
-        self.btn_frame = tk.Frame(self.root, bg="#f0f0f0")
-        self.btn_frame.pack(side="bottom", fill="x", pady=20)
-        
-        self.reconnect_btn = ttk.Button(self.btn_frame, text="Force Reconnect", 
-                                      command=self.auto_connect)
-        self.reconnect_btn.pack()
+    def _center_window(self):
+        self.root.update_idletasks()
+        w = self.root.winfo_reqwidth()  + 20
+        h = self.root.winfo_reqheight() + 20
+        x = (self.root.winfo_screenwidth()  // 2) - (w // 2)
+        y = (self.root.winfo_screenheight() // 2) - (h // 2)
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
 
-    def auto_connect(self):
-        port = DroneBackend.AutoDetectF405()
-        if port != "NOT_FOUND":
-            if self.hub.connect(port):
-                self.status_label.config(text=f"Status: Connected on {port}", fg="green")
-                self.imu_sensor = DroneBackend.IMUSensor(self.hub)
-                self.update_loop()
-            else:
-                self.status_label.config(text="Status: Connection Failed", fg="red")
+    # ── Connection ────────────────────────────────────────────────────────────
+
+    def _auto_connect(self):
+        """Scan COM ports (via C++ helper) and connect when the drone is found."""
+        port = DroneBackend.auto_detect_f405()
+
+        if port == "NOT_FOUND":
+            self.status_label.config(
+                text="Status: Searching for drone on COM ports...", fg="orange"
+            )
+            self.root.after(RECONNECT_MS, self._auto_connect)
+            return
+
+        if self.hub.connect(port):
+            self.status_label.config(
+                text=f"Status: Connected on {port}", fg="green"
+            )
+            self._schedule_update()
         else:
-            self.status_label.config(text="Status: Searching for Drone...", fg="orange")
-            self.root.after(2000, self.auto_connect)
+            self.status_label.config(
+                text=f"Status: Found {port} but connection failed (port busy?)", fg="red"
+            )
+            self.root.after(RECONNECT_MS, self._auto_connect)
 
-    def update_loop(self):
-        if self.imu_sensor:
-            try:
-                result = self.imu_sensor.getThesisData(self.hub)
-                
-                # 1. Update the Telemetry Numbers (This handles its own calibration/filtering)
-                self.imu_view.update_ui(result)
-                
-                # 2. Update the 3D Model using the IMU's filtered angles
-                # We pull the processed pitch/roll directly from the widget for consistency
-                self.drone_3d.update_orientation(
-                    roll=self.imu_view.roll_angle,
-                    pitch=self.imu_view.pitch_angle,
-                    yaw=0 # Magnetometer logic will go here next
-                )
-                
-                self.root.after(30, self.update_loop) # Faster 30ms refresh for smoother 3D
-            except Exception as e:
-                print(f"Telemetry Lost: {e}")
-                self.status_label.config(text="Status: Data Stream Interrupted", fg="red")
-                self.auto_connect()
+    def _reconnect(self):
+        """Called when telemetry is lost mid-session."""
+        self.hub.disconnect()
+        self.status_label.config(text="Status: Link lost — reconnecting...", fg="red")
+        self.root.after(RECONNECT_MS, self._auto_connect)
+
+    # ── Update loop ───────────────────────────────────────────────────────────
+
+    def _schedule_update(self):
+        """Kick off the 50 Hz UI refresh cycle (idempotent)."""
+        if self._update_job is None:
+            self._update_job = self.root.after(UI_REFRESH_MS, self._update_loop)
+
+    def _update_loop(self):
+        """
+        Pull the latest snapshot from the C++ background thread and
+        push it into the widgets.  Runs entirely on the Tk main thread —
+        no locking needed here because getLatestState() does the locking
+        inside C++.
+        """
+        self._update_job = None   # reset so _schedule_update can re-arm
+
+        if not self.hub.is_connected():
+            self._reconnect()
+            return
+
+        try:
+            state = self.hub.get_latest_state()
+
+            # ── Warn if link is degraded but not yet dropped ──────────────────
+            if not state.link_healthy:
+                self.status_label.config(text="Status: Link degraded", fg="orange")
+            else:
+                self.status_label.config(text="Status: Connected ✓", fg="green")
+
+            # ── IMU widget data ───────────────────────────────────────────────
+            # roll/pitch come from FC as degrees × 10; divide here so every
+            # widget receives plain degrees.
+            ui_data = {
+                "ax":      state.ax,
+                "ay":      state.ay,
+                "az":      state.az,
+                "gx":      state.gx,
+                "gy":      state.gy,
+                "gz":      state.gz,
+                "roll":    state.roll  / 10.0,
+                "pitch":   state.pitch / 10.0,
+                "yaw":     float(state.yaw),
+                "voltage": state.battery_voltage,
+                "rssi":        state.rssi,
+                "rtt_ms":      state.last_rtt_ms,
+                "fc_cycle_ms": state.fc_cycle_ms,
+            }
+            self.imu_view.update_ui(ui_data)
+
+            # ── 3D view ───────────────────────────────────────────────────────
+            self.drone_3d.update_orientation(
+                roll=ui_data["roll"],
+                pitch=ui_data["pitch"],
+                yaw=ui_data["yaw"],
+            )
+
+
+        except Exception as e:
+            print(f"[update_loop] {e}")
+            self._reconnect()
+            return
+
+        # Re-arm for next tick
+        self._update_job = self.root.after(UI_REFRESH_MS, self._update_loop)
+
+    # ── Clean shutdown ────────────────────────────────────────────────────────
+
+    def shutdown(self):
+        """Stop the C++ worker thread before destroying the window."""
+        if self._update_job is not None:
+            self.root.after_cancel(self._update_job)
+        self.hub.disconnect()
+        self.root.destroy()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = DroneCockpitApp(root)
-    
-    def on_closing():
-        if app.hub:
-            app.hub.disconnect()
-        root.destroy()
-        
-    root.protocol("WM_DELETE_WINDOW", on_closing)
+    app  = DroneCockpitApp(root)
+    root.protocol("WM_DELETE_WINDOW", app.shutdown)
     root.mainloop()
