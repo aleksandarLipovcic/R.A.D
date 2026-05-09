@@ -139,6 +139,7 @@
     <ClCompile Include="DroneLink.cpp" />
     <ClCompile Include="IMUSensor.cpp" />
     <ClCompile Include="Bindings.cpp" />
+    <ClCompile Include="BaroBMP280.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
