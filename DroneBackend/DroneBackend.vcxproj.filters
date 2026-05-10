@@ -21,6 +21,9 @@
     <ClInclude Include="IMUSensor.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="BaroBMP280.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="DroneLink.cpp">

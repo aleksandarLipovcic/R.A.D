@@ -15,10 +15,10 @@ namespace MSP {
     constexpr uint8_t RAW_IMU = 102;
     constexpr uint8_t ATTITUDE = 108;
     constexpr uint8_t ANALOG = 110;  // battery voltage, RSSI
+    constexpr uint8_t ALTITUDE = 109;  // BMP280 fused altitude + vario (MSP_ALTITUDE)
     constexpr uint8_t DEBUG = 254;
     // Add future IDs here:
-    // constexpr uint8_t GPS    = 106;
-    // constexpr uint8_t BARO   = 109;
+    // constexpr uint8_t GPS = 106;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -36,13 +36,20 @@ struct DroneState {
     int16_t yaw = 0;
 
     // Power
-    float batteryVoltage = 0.0f;  // volts
+    float   batteryVoltage = 0.0f;  // volts
     uint8_t rssi = 0;     // 0-255
 
+    // Barometer — BMP280 via MSP_ALTITUDE
+    // Requires: Barometer enabled in Betaflight Configurator
+    //           (Configuration tab -> Sensors -> Barometer)
+    int32_t baroAltitudeCm = 0;     // FC-fused altitude above home, cm
+    int16_t baroVarioCmPerSec = 0;     // vertical speed (vario), cm/s
+    bool    baroValid = false; // false until first successful parse
+
     // Diagnostics
-    double lastRttMs = 0.0;   // last measured round-trip time
-    double fcCycleMs = 0.0;   // FC internal loop time (from MSP_DEBUG)
-    bool   linkHealthy = false; // worker sets false on consecutive failures
+    double   lastRttMs = 0.0;   // last measured round-trip time
+    double   fcCycleMs = 0.0;   // FC internal loop time (from MSP_DEBUG)
+    bool     linkHealthy = false; // worker sets false on consecutive failures
     uint32_t packetCount = 0;     // total successful packets received
 };
 
@@ -111,6 +118,7 @@ private:
     bool parseAttitude(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseAnalog(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseDebug(const std::vector<uint8_t>& buf, DroneState& s);
+    bool parseBaro(const std::vector<uint8_t>& buf, DroneState& s);  // BMP280
 
     // Atomically push a fully-populated state snapshot to currentState.
     void commitState(const DroneState& s);

@@ -22,6 +22,9 @@
     <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="BaroWidget.py">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="DroneCockpitUI.py" />
     <Compile Include="DroneTest.py">
       <SubType>Code</SubType>

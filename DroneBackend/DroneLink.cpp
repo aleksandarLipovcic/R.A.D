@@ -1,4 +1,5 @@
 ﻿#include "DroneLink.h"
+#include "BaroBMP280.h"
 #include <iostream>
 #include <chrono>
 #include <thread>
@@ -56,12 +57,10 @@ bool DroneLink::connect(const std::string& portName) {
     }
 
     // ── Timeouts ─────────────────────────────────────────────────────────────
-    // Short absolute timeout so the worker loop can stay responsive and detect
-    // link loss quickly.  50 ms total read timeout is generous for 115200 baud.
     COMMTIMEOUTS to = { 0 };
-    to.ReadIntervalTimeout = 10;   // ms between characters
-    to.ReadTotalTimeoutConstant = 50;   // ms base
-    to.ReadTotalTimeoutMultiplier = 2;    // ms per byte requested
+    to.ReadIntervalTimeout = 10;
+    to.ReadTotalTimeoutConstant = 50;
+    to.ReadTotalTimeoutMultiplier = 2;
     to.WriteTotalTimeoutConstant = 50;
     to.WriteTotalTimeoutMultiplier = 2;
     SetCommTimeouts(hSerial, &to);
@@ -75,7 +74,7 @@ bool DroneLink::connect(const std::string& portName) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// disconnect() — signal worker to stop, join it, close port
+// disconnect()
 // ─────────────────────────────────────────────────────────────────────────────
 
 void DroneLink::disconnect() {
@@ -92,31 +91,16 @@ void DroneLink::disconnect() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// getLatestState() — safe snapshot for the Python / GUI thread
+// getLatestState()
 // ─────────────────────────────────────────────────────────────────────────────
 
 DroneState DroneLink::getLatestState() {
     std::lock_guard<std::mutex> lock(dataMutex);
-    return currentState;   // value copy — caller owns it
+    return currentState;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // communicationLoop() — runs on workerThread
-//
-// Design intent:
-//   • One iteration = request every active sensor in sequence.
-//   • Each sendMSP() call is synchronous (write → read) but only this thread
-//     ever touches hSerial, so there is no contention.
-//   • After all sensors are polled, a single mutex lock commits the new state.
-//   • The thread then sleeps for the remainder of the poll interval, keeping
-//     CPU usage low and making the interval easy to tune from Python.
-//
-// Adding a new sensor later:
-//   1. Add an MSP ID to the MSP namespace in the header.
-//   2. Add a parseXxx() method declaration in the header.
-//   3. Call sendMSP() + parseXxx() in the block below marked "SENSOR POLL".
-//   4. Add the new fields to DroneState.
-//   That's it — no threading changes required.
 // ─────────────────────────────────────────────────────────────────────────────
 
 void DroneLink::communicationLoop() {
@@ -125,12 +109,8 @@ void DroneLink::communicationLoop() {
     while (keepRunning.load()) {
         auto loopStart = std::chrono::steady_clock::now();
 
-        // Accumulate new readings into a local copy so we hold the mutex for
-        // the shortest possible time (one swap at the end, not per-sensor).
         DroneState pending;
         {
-            // Seed with the previous state so fields we don't poll this tick
-            // keep their last known value rather than resetting to zero.
             std::lock_guard<std::mutex> lock(dataMutex);
             pending = currentState;
         }
@@ -138,10 +118,8 @@ void DroneLink::communicationLoop() {
         bool anySuccess = false;
 
         // ── SENSOR POLL ──────────────────────────────────────────────────────
-        // Each block is independent. A failure on one sensor does not skip
-        // the others, so a missing GPS won't break IMU data.
 
-        // 1. IMU (MPU-6500 accel + gyro) — highest priority, poll every tick
+        // 1. IMU (MPU-6500 accel + gyro)
         {
             auto t0 = std::chrono::high_resolution_clock::now();
             auto buf = sendMSP(MSP::RAW_IMU);
@@ -166,20 +144,22 @@ void DroneLink::communicationLoop() {
             parseAnalog(buf, pending);
         }
 
-        // 4. FC internal cycle time via MSP_DEBUG
-        //    Requires `set debug_mode = CYCLETIME` in Betaflight CLI.
+        // 4. FC internal cycle time
+        //    Requires: set debug_mode = CYCLETIME  in Betaflight CLI
         {
             auto buf = sendMSP(MSP::DEBUG);
             parseDebug(buf, pending);
         }
 
+        // 5. Barometer — BMP280 altitude + vertical speed via MSP_ALTITUDE
+        //    Requires: Barometer toggle ON in Betaflight Configurator
+        //              (Configuration tab -> Sensors -> Barometer)
+        {
+            auto buf = sendMSP(MSP::ALTITUDE);
+            parseBaro(buf, pending);
+        }
+
         // ── ADD FUTURE SENSORS HERE ──────────────────────────────────────────
-        // Example (uncomment when GPS is wired):
-        // {
-        //     auto buf = sendMSP(MSP::GPS);
-        //     parseGPS(buf, pending);
-        // }
-        // ─────────────────────────────────────────────────────────────────────
 
         // ── Health tracking ──────────────────────────────────────────────────
         if (anySuccess) {
@@ -193,12 +173,8 @@ void DroneLink::communicationLoop() {
                 pending.linkHealthy = false;
         }
 
-        // ── Commit ───────────────────────────────────────────────────────────
         commitState(pending);
 
-        // ── Sleep remainder of poll interval ─────────────────────────────────
-        // This keeps the loop at ~pollIntervalMs cadence regardless of how
-        // long the sensor queries took, and avoids busy-spinning.
         auto elapsed = std::chrono::steady_clock::now() - loopStart;
         auto budget = std::chrono::milliseconds(pollIntervalMs.load());
         if (elapsed < budget)
@@ -207,22 +183,17 @@ void DroneLink::communicationLoop() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// sendMSP() — build MSP v1 request, write, read response
-// Called ONLY from workerThread; no mutex needed.
+// sendMSP()
 // ─────────────────────────────────────────────────────────────────────────────
 
 std::vector<uint8_t> DroneLink::sendMSP(uint8_t mspID) {
     if (hSerial == INVALID_HANDLE_VALUE) return {};
 
-    // MSP v1 request frame: $ M < <size=0> <cmd> <checksum>
-    // For requests with no payload, checksum = cmd XOR 0 = cmd.
     uint8_t req[] = { '$', 'M', '<', 0, mspID, mspID };
     DWORD written = 0;
     if (!WriteFile(hSerial, req, sizeof(req), &written, NULL) || written != sizeof(req))
         return {};
 
-    // Read up to 64 bytes. The FC will reply with:
-    // $ M > <size> <cmd> [payload...] <checksum>
     uint8_t buf[64];
     DWORD   rd = 0;
     if (!ReadFile(hSerial, buf, sizeof(buf), &rd, NULL) || rd < 6)
@@ -232,15 +203,12 @@ std::vector<uint8_t> DroneLink::sendMSP(uint8_t mspID) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Parsers — each validates the response header and extracts fields.
-// Return true on success, false on short/malformed packet.
+// Parsers
 // ─────────────────────────────────────────────────────────────────────────────
 
 bool DroneLink::parseIMU(const std::vector<uint8_t>& buf, DroneState& s) {
-    // Expected: $ M > 12 102 [6×int16] checksum  → minimum 18 bytes
     if (buf.size() < 18 || buf[4] != MSP::RAW_IMU) return false;
 
-    // Bytes are little-endian int16 pairs starting at index 5
     auto read16 = [&](int i) -> int16_t {
         return static_cast<int16_t>(buf[i] | (buf[i + 1] << 8));
         };
@@ -254,32 +222,26 @@ bool DroneLink::parseIMU(const std::vector<uint8_t>& buf, DroneState& s) {
 }
 
 bool DroneLink::parseAttitude(const std::vector<uint8_t>& buf, DroneState& s) {
-    // MSP_ATTITUDE: $ M > 6 108 [roll pitch yaw] checksum → 12 bytes
     if (buf.size() < 12 || buf[4] != MSP::ATTITUDE) return false;
 
     auto read16 = [&](int i) -> int16_t {
         return static_cast<int16_t>(buf[i] | (buf[i + 1] << 8));
         };
-    s.roll = read16(5);   // degrees × 10
-    s.pitch = read16(7);   // degrees × 10
-    s.yaw = read16(9);   // degrees (already ×1 on most FC builds)
+    s.roll = read16(5);   // degrees * 10
+    s.pitch = read16(7);   // degrees * 10
+    s.yaw = read16(9);   // degrees * 1
     return true;
 }
 
 bool DroneLink::parseAnalog(const std::vector<uint8_t>& buf, DroneState& s) {
-    // MSP_ANALOG: $ M > 7 110 [vbat mah_l mah_h rssi pow_l pow_h pow2] → 14 bytes
     if (buf.size() < 14 || buf[4] != MSP::ANALOG) return false;
 
-    // vbat is in units of 0.1 V
-    s.batteryVoltage = buf[5] / 10.0f;
-    // RSSI is at byte 8 (0-255)
-    s.rssi = buf[8];
+    s.batteryVoltage = buf[5] / 10.0f;   // units of 0.1 V
+    s.rssi = buf[8];            // 0-255
     return true;
 }
 
 bool DroneLink::parseDebug(const std::vector<uint8_t>& buf, DroneState& s) {
-    // MSP_DEBUG with CYCLETIME mode: debug[0] = FC loop time in microseconds
-    // Frame: $ M > 8 254 [d0_l d0_h d1_l d1_h ...] → minimum 14 bytes
     if (buf.size() < 14 || buf[4] != MSP::DEBUG) return false;
 
     uint16_t cycleUs = static_cast<uint16_t>(buf[5] | (buf[6] << 8));
@@ -287,8 +249,32 @@ bool DroneLink::parseDebug(const std::vector<uint8_t>& buf, DroneState& s) {
     return true;
 }
 
+bool DroneLink::parseBaro(const std::vector<uint8_t>& buf, DroneState& s) {
+    // MSP_ALTITUDE response layout:
+    //   [0]      '$'
+    //   [1]      'M'
+    //   [2]      '>'
+    //   [3]      0x06        payload size = 6 bytes
+    //   [4]      0x6D (109)  MSP_ALTITUDE command ID
+    //   [5..8]   int32_t     FC-fused altitude above home, cm  (little-endian)
+    //   [9..10]  int16_t     vertical speed (vario), cm/s      (little-endian)
+    //   [11]     checksum
+    //
+    // Betaflight fuses the BMP280 reading internally; we get the result here.
+    // Requires Barometer enabled in Betaflight Configurator.
+    BaroReading raw;
+    if (!BaroBMP280::parse(buf, raw)) {
+        s.baroValid = false;
+        return false;
+    }
+    s.baroAltitudeCm = raw.altitudeCm;
+    s.baroVarioCmPerSec = raw.varioCmPerSec;
+    s.baroValid = true;
+    return true;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// commitState() — swap pending state into shared state under lock
+// commitState()
 // ─────────────────────────────────────────────────────────────────────────────
 
 void DroneLink::commitState(const DroneState& s) {
@@ -297,7 +283,7 @@ void DroneLink::commitState(const DroneState& s) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AutoDetectF405() — scan COM1-COM29, return first that opens
+// AutoDetectF405()
 // ─────────────────────────────────────────────────────────────────────────────
 
 std::string AutoDetectF405() {

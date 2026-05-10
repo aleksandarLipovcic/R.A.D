@@ -1,13 +1,13 @@
 import sys
 import os
-import ctypes 
+import ctypes
 import tkinter as tk
 from tkinter import ttk
-from IMUWidget import IMUWidget
+from IMUWidget  import IMUWidget
 from Drone3DView import Drone3DView
+from BaroWidget  import BaroWidget
 
 # ── Path configuration ────────────────────────────────────────────────────────
-# Adjust 'x64/Debug' to 'x64/Release' when building for release.
 script_dir   = os.path.dirname(os.path.abspath(__file__))
 backend_path = os.path.abspath(os.path.join(script_dir, '..', 'x64', 'Debug'))
 sys.path.append(backend_path)
@@ -29,16 +29,14 @@ BG_COLOR      = "#f0f0f0"
 class DroneCockpitApp:
     def __init__(self, root: tk.Tk):
         self.root = root
+
         # ── Window title ──────────────────────────────────────────────────────
-        # Use only ASCII characters — Windows mangles Unicode em-dashes and
         self.root.title("Drone Control Ground Station")
         try:
-            # Find the window handle (HWND)
             hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-            # Directly set the window text in the OS layer
             ctypes.windll.user32.SetWindowTextW(hwnd, "Drone Control Ground Station")
         except Exception as e:
-            print(f"Windows API Title Force failed: {e}")
+            print(f"Windows API title force failed: {e}")
 
         self.root.configure(bg=BG_COLOR)
 
@@ -55,7 +53,7 @@ class DroneCockpitApp:
     # ── Layout ────────────────────────────────────────────────────────────────
 
     def _setup_ui(self):
-        # Status bar
+        # ── Status bar ────────────────────────────────────────────────────────
         top = tk.Frame(self.root, bg=BG_COLOR)
         top.pack(side="top", fill="x", pady=10)
 
@@ -67,17 +65,23 @@ class DroneCockpitApp:
         )
         self.status_label.pack()
 
-        # Main content row
+        # ── Main content (2 columns) ──────────────────────────────────────────
         main = tk.Frame(self.root, bg=BG_COLOR)
         main.pack(fill="both", expand=True, padx=20, pady=10)
         main.columnconfigure(0, weight=1)
         main.columnconfigure(1, weight=1)
 
-        # Left — IMU numerical widget
-        self.imu_view = IMUWidget(main)
-        self.imu_view.grid(row=0, column=0, sticky="nsew", padx=10)
+        # ── Left column: IMU table (top) + Baro table (bottom) ───────────────
+        left = tk.Frame(main, bg=BG_COLOR)
+        left.grid(row=0, column=0, sticky="nsew", padx=10)
 
-        # Right — ADI / Spatial Orientation view
+        self.imu_view = IMUWidget(left)
+        self.imu_view.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
+
+        self.baro_view = BaroWidget(left)
+        self.baro_view.grid(row=1, column=0, sticky="nsew")
+
+        # ── Right column: ADI / Spatial Orientation ───────────────────────────
         visual = ttk.LabelFrame(main, text="Spatial Orientation")
         visual.grid(row=0, column=1, sticky="nsew", padx=10)
         self.drone_3d = Drone3DView(visual, width=400, height=350)
@@ -134,7 +138,7 @@ class DroneCockpitApp:
     def _update_loop(self):
         """
         Pull the latest snapshot from the C++ background thread and push it
-        into the widgets.  Runs entirely on the Tk main thread — no locking
+        into all widgets.  Runs entirely on the Tk main thread — no locking
         needed here because get_latest_state() does the locking inside C++.
         """
         self._update_job = None   # reset so _schedule_update can re-arm
@@ -148,35 +152,40 @@ class DroneCockpitApp:
 
             # ── Link health indicator ─────────────────────────────────────────
             if not state.link_healthy:
-                self.status_label.config(
-                    text="Status: Link degraded", fg="orange"
-                )
+                self.status_label.config(text="Status: Link degraded", fg="orange")
             else:
-                self.status_label.config(
-                    text="Status: Connected", fg="green"
-                )
+                self.status_label.config(text="Status: Connected", fg="green")
 
-            # ── IMU widget data ───────────────────────────────────────────────
-            # roll/pitch arrive from FC as degrees x 10; divide here so every
-            # widget receives plain degrees.
+            # ── Build shared ui_data dict ─────────────────────────────────────
+            # roll/pitch arrive from FC as degrees * 10 — divide to plain degrees
             ui_data = {
+                # IMU raw counts (scaled inside IMUWidget)
                 "ax":          state.ax,
                 "ay":          state.ay,
                 "az":          state.az,
                 "gx":          state.gx,
                 "gy":          state.gy,
                 "gz":          state.gz,
+                # Attitude
                 "roll":        state.roll  / 10.0,
                 "pitch":       state.pitch / 10.0,
                 "yaw":         float(state.yaw),
+                # Link quality
                 "voltage":     state.battery_voltage,
                 "rssi":        state.rssi,
                 "rtt_ms":      state.last_rtt_ms,
                 "fc_cycle_ms": state.fc_cycle_ms,
+                # Barometer — BMP280 via MSP_ALTITUDE
+                # getattr fallback allows the GUI to run even if the C++ baro
+                # integration is not yet compiled (shows "NO SIGNAL" safely).
+                "baro_altitude_cm":      getattr(state, "baro_altitude_cm",      0),
+                "baro_vario_cm_per_sec": getattr(state, "baro_vario_cm_per_sec", 0),
+                "baro_valid":            getattr(state, "baro_valid",             False),
             }
-            self.imu_view.update_ui(ui_data)
 
-            # ── ADI / 3-D view ────────────────────────────────────────────────
+            # ── Push to widgets ───────────────────────────────────────────────
+            self.imu_view.update_ui(ui_data)
+            self.baro_view.update_baro(ui_data)
             self.drone_3d.update_orientation(
                 roll=ui_data["roll"],
                 pitch=ui_data["pitch"],
@@ -188,7 +197,7 @@ class DroneCockpitApp:
             self._reconnect()
             return
 
-        # Re-arm for next tick
+        # Re-arm for the next tick
         self._update_job = self.root.after(UI_REFRESH_MS, self._update_loop)
 
     # ── Clean shutdown ────────────────────────────────────────────────────────
