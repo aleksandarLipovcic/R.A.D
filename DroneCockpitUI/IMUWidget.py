@@ -8,72 +8,75 @@ class IMUWidget(ttk.LabelFrame):
     MPU-6500 sensor display for a 10-inch long-range quadcopter cockpit.
 
     ┌──────────────────────────────────────────────────────────────────────────┐
-    │  COLUMNS                                                                 │
-    │  Rotation (°/s) — gyro rate, peak-hold spike detector                  │
-    │  G-force  (g)   — accelerometer in physical g                           │
-    │  Angle    (°)   — fused attitude from Betaflight MSP_ATTITUDE           │
+    │  COLUMN MEANINGS                                                         │
+    │                                                                          │
+    │  Rotation (°/s) — raw gyro rate with auto-reset peak-hold alarm         │
+    │  G-force  (g)   — accelerometer in physical g units                     │
+    │  Angle    (°)   — FC-fused attitude from MSP_ATTITUDE                   │
     └──────────────────────────────────────────────────────────────────────────┘
 
-    SCALE CONSTANTS
-    ───────────────
-    ACCEL_SCALE = 2048  (Betaflight internal ±16 g normalisation unit)
-    GYRO_SCALE  = 16.4  (Betaflight MSP RAW_IMU gyro unit, 1 LSB = 1/16.4 °/s)
+    ── ACCEL SCALE = 2048 ────────────────────────────────────────────────────
+    Betaflight normalises MSP RAW_IMU accel to its internal ±16 g unit:
+        1 LSB = 1/2048 g
+    Verified: raw_az ≈ 2047 at rest → 2047/2048 ≈ 1.000 g ✓
 
-    GYRO PEAK-HOLD  (auto-resetting, no latch, no calibrate-button involvement)
-    ──────────────────────────────────────────────────────────────────────────
-    safe     (green):  |°/s| < 30
-    warn     (yellow): |°/s| ≥ 30   hold 2 s after drop → green
-    critical (red):    |°/s| ≥ 100  hold 4 s after drop → green directly
+    ── THRESHOLD DESIGN (10-inch long-range quad) ────────────────────────────
+    LR quads fly gently; thresholds are LOWER than freestyle values.
 
-    ANGLE THRESHOLDS  (long-range 10-inch quad — gentle flight profile)
-    ──────────────────────────────────────────────────────────────────────────
-    green  |°| <  15    normal cruise
-    yellow |°| <  30    moderate manoeuvre, pilot awareness
-    red    |°| ≥  30    aggressive for LR — alert
+    Angle (°):
+        green  |°| <  20   normal hover / gentle cruise
+        yellow |°| <  40   moderate bank — pilot awareness
+        red    |°| ≥  40   aggressive for LR — critical
 
-    MUST match Drone3DView.WARN_ANGLE / CRITICAL_ANGLE = 15 / 30.
+    Gyro peak-hold (°/s)  — LR drone turns gently, 10-20°/s is normal:
+        green           |°/s| <  30    normal flight input
+        yellow (2 s hold) |°/s| < 100  noticeable snap / gust
+        red    (4 s hold) |°/s| ≥ 100  severe event — drone likely in trouble
+        Both auto-reset after their hold window expires.
+        "Calibrate gyro" resets gyro offsets only — not an alarm button.
 
-    G-FORCE THRESHOLDS
-    ──────────────────────────────────────────────────────────────────────────
-    Lateral (ax, ay): ~0 g rest, →±1 g at 90° tilt
-        green  |g| < 0.25
-        yellow |g| < 0.65
-        red    |g| ≥ 0.65
+    G-force lateral (ax, ay — Roll/Pitch rows) — physics-aligned with angle:
+        green  |g| < sin(20°) = 0.34   within angle warn threshold
+        yellow |g| < sin(40°) = 0.64   between warn and critical
+        red    |g| ≥ sin(40°) = 0.64   at or past angle critical threshold ✓
 
-    Vertical (az): ~1 g rest (gravity)
-        green  0.70 < az < 1.30
-        yellow 0.40 < az < 1.60
-        red    az ≤ 0.40 or az ≥ 1.60
+    G-force vertical (az — Yaw row, ≈ 1 g at rest):
+        green  0.85 < az < 1.15   roughly within 30° of level
+        yellow 0.64 < az < 0.85   20°–50° tilt range
+        red    az ≤ 0.64 or az ≥ 1.36   severe tilt (cos 50° ≈ 0.64)
+
+    ── CONSISTENCY ───────────────────────────────────────────────────────────
+    ANGLE_WARN_DEG / ANGLE_CRIT_DEG must match Drone3DView.WARN_ANGLE /
+    CRITICAL_ANGLE so the table and the 3D model warn at the same moment.
     """
 
-    # ── Scale ─────────────────────────────────────────────────────────────────
-    GYRO_SCALE  = 16.4
-    ACCEL_SCALE = 2048.0
+    # ── Scale factors ─────────────────────────────────────────────────────────
+    GYRO_SCALE  = 16.4      # LSB/(°/s)  — Betaflight MSP RAW_IMU gyro
+    ACCEL_SCALE = 2048.0    # LSB/g      — Betaflight internal ±16 g norm
 
     # ── Colours ───────────────────────────────────────────────────────────────
     CLR_SAFE     = "#99FF99"
     CLR_WARN     = "#FFFF99"
     CLR_CRITICAL = "#FF4444"
     CLR_OFF      = "#E0E0E0"
-    CLR_BTN_NORM = "SystemButtonFace"
 
-    # ── Gyro thresholds (tuned for 10-inch LR quad) ───────────────────────────
-    GYRO_WARN_DPS  =  30.0   # °/s — meaningful gust on a large-prop LR quad
-    GYRO_CRIT_DPS  = 100.0   # °/s — strong shake / hard impact
+    # ── Angle thresholds — MUST match Drone3DView.WARN_ANGLE / CRITICAL_ANGLE ─
+    ANGLE_WARN_DEG = 15.0   # LR quad: warn at 15°
+    ANGLE_CRIT_DEG = 30.0   # LR quad: critical at 30°
+
+    # ── Gyro peak-hold thresholds ─────────────────────────────────────────────
+    GYRO_WARN_DPS  =  30.0   # LR drone: gentle turns are 10-20°/s; 30 = noticeable snap
+    GYRO_CRIT_DPS  = 100.0   # crash/severe gust — LR drone should never reach this
     HOLD_WARN_SEC  =   2.0
     HOLD_CRIT_SEC  =   4.0
 
     # ── G-force thresholds ────────────────────────────────────────────────────
-    ACC_LAT_WARN   = 0.25
-    ACC_LAT_CRIT   = 0.65
-    ACC_VERT_LO_OK = 0.70
-    ACC_VERT_HI_OK = 1.30
-    ACC_VERT_LO_CR = 0.40
-    ACC_VERT_HI_CR = 1.60
-
-    # ── Angle thresholds — MUST match Drone3DView ─────────────────────────────
-    ANGLE_WARN_DEG = 15.0
-    ANGLE_CRIT_DEG = 30.0
+    ACC_LAT_WARN     = 0.26   # sin(15°) — aligns with ANGLE_WARN_DEG = 15°
+    ACC_LAT_CRIT     = 0.50   # sin(30°) — aligns with ANGLE_CRIT_DEG = 30°
+    ACC_VERT_LO_OK   = 0.87   # cos(30°) = 0.866 — green while within crit angle threshold
+    ACC_VERT_HI_OK   = 1.13   # symmetric upper green bound
+    ACC_VERT_LO_CR   = 0.64   # cos(50°) = 0.643 — warn-to-critical boundary
+    ACC_VERT_HI_CR   = 1.36   # symmetric upper critical bound
 
     def __init__(self, parent):
         super().__init__(parent, text="MPU-6500 Long-Range Flight Hub", padding=10)
@@ -82,10 +85,10 @@ class IMUWidget(ttk.LabelFrame):
         self.is_calibrating = False
         self.calib_samples  = []
 
-        # Gyro state machine per axis: "safe" | "warn" | "critical"
+        # Per-axis gyro state machine: "safe" | "warn" | "critical"
         self._gyro_state = {
-            a: {"state": "safe", "hold_until": 0.0}
-            for a in ("roll", "pitch", "yaw")
+            axis: {"state": "safe", "hold_until": 0.0}
+            for axis in ("roll", "pitch", "yaw")
         }
 
         self._setup_header()
@@ -100,13 +103,19 @@ class IMUWidget(ttk.LabelFrame):
         ctrl.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 10))
 
         self.show_diag = tk.BooleanVar(value=True)
-        ttk.Checkbutton(ctrl, text="Show thesis latency data",
-                        variable=self.show_diag,
-                        command=self.refresh_layout).pack(side="left")
+        ttk.Checkbutton(
+            ctrl,
+            text="Show thesis latency data",
+            variable=self.show_diag,
+            command=self.refresh_layout
+        ).pack(side="left")
 
-        self.calib_btn = tk.Button(ctrl, text="Calibrate gyro",
-                                   command=self._start_calibration,
-                                   relief="raised", padx=6, pady=2)
+        # tk.Button so we can set bg colour during calibration
+        self.calib_btn = tk.Button(
+            ctrl, text="Calibrate gyro",
+            command=self._start_calibration,
+            relief="raised", padx=6, pady=2
+        )
         self.calib_btn.pack(side="left", padx=10)
 
     def _setup_grid(self):
@@ -116,27 +125,23 @@ class IMUWidget(ttk.LabelFrame):
         for col, text in enumerate(
             ["Flight axis", "Rotation (°/s)", "G-force (g)", "Angle (°)"]
         ):
-            tk.Label(container, text=text,
-                     font=("Arial", 10, "bold")).grid(
-                row=0, column=col, padx=12, pady=5)
+            tk.Label(container, text=text, font=("Arial", 10, "bold")
+                     ).grid(row=0, column=col, padx=12, pady=5)
 
         self.axes = {}
         for row_idx, (key, label) in enumerate(
             [("roll", "Roll  (X)"), ("pitch", "Pitch (Y)"), ("yaw", "Yaw   (Z)")],
             start=1
         ):
-            tk.Label(container, text=f"{label}:",
-                     font=("Arial", 10)).grid(row=row_idx, column=0, sticky="e")
+            tk.Label(container, text=f"{label}:", font=("Arial", 10)
+                     ).grid(row=row_idx, column=0, sticky="e")
 
             rot = tk.Label(container, text="  0.00",
-                           font=("Consolas", 12, "bold"),
-                           width=10, bg=self.CLR_SAFE)
+                           font=("Consolas", 12, "bold"), width=10, bg=self.CLR_SAFE)
             acc = tk.Label(container, text="  0.000",
-                           font=("Consolas", 12, "bold"),
-                           width=10, bg=self.CLR_SAFE)
+                           font=("Consolas", 12, "bold"), width=10, bg=self.CLR_SAFE)
             ang = tk.Label(container, text="  0.0",
-                           font=("Consolas", 12, "bold"),
-                           width=10, bg=self.CLR_SAFE)
+                           font=("Consolas", 12, "bold"), width=10, bg=self.CLR_SAFE)
 
             rot.grid(row=row_idx, column=1, padx=2, pady=2)
             acc.grid(row=row_idx, column=2, padx=2, pady=2)
@@ -164,11 +169,10 @@ class IMUWidget(ttk.LabelFrame):
     # ── Calibration ───────────────────────────────────────────────────────────
 
     def _start_calibration(self):
+        """Average 50 gyro samples at rest to compute zero-rate drift offsets."""
         self.is_calibrating = True
         self.calib_samples  = []
-        self.calib_btn.config(text="Calibrating...", state="disabled",
-                              bg=self.CLR_BTN_NORM, fg="black",
-                              font=("Arial", 9))
+        self.calib_btn.config(text="Calibrating...", state="disabled")
 
     def _finish_calibration(self, samples):
         n = len(samples)
@@ -178,9 +182,7 @@ class IMUWidget(ttk.LabelFrame):
             "z": sum(s[2] for s in samples) / n,
         }
         self.is_calibrating = False
-        self.calib_btn.config(text="Calibrate gyro", state="normal",
-                              bg=self.CLR_BTN_NORM, fg="black",
-                              font=("Arial", 9))
+        self.calib_btn.config(text="Calibrate gyro", state="normal")
 
     # ── Main update ───────────────────────────────────────────────────────────
 
@@ -206,18 +208,20 @@ class IMUWidget(ttk.LabelFrame):
         pitch = data.get("pitch", 0.0)
         now   = time.monotonic()
 
+        # Row: (key, gyro_val, accel_val, angle_val|None, accel_is_vertical)
+        # az on the Yaw row because az is the body Z = vertical = gravity axis
         rows = [
             ("roll",  gx, ax, roll,  False),
             ("pitch", gy, ay, pitch, False),
-            ("yaw",   gz, az, None,  True),
+            ("yaw",   gz, az, None,  True ),
         ]
 
-        for key, rot_val, acc_val, ang_val, is_vert in rows:
+        for key, rot_val, acc_val, ang_val, is_vertical in rows:
             w = self.axes[key]
             w["rot"].config(text=f"{rot_val:>7.2f}",
                             bg=self._gyro_color(key, abs(rot_val), now))
             w["acc"].config(text=f"{acc_val:>7.3f}",
-                            bg=self._accel_color(acc_val, is_vert))
+                            bg=self._accel_color(acc_val, is_vertical))
             if ang_val is None:
                 w["ang"].config(text="  N/A", bg=self.CLR_OFF)
             else:
@@ -236,38 +240,37 @@ class IMUWidget(ttk.LabelFrame):
     def _gyro_color(self, axis: str, abs_dps: float, now: float) -> str:
         """
         Auto-resetting three-state peak-hold.
-        critical → red, hold 4 s, then safe (no yellow on way out)
-        warn     → yellow, hold 2 s, then safe
-        Calibrate button never involved.
+
+        critical (≥250 °/s): red held for HOLD_CRIT_SEC, then safe directly
+        warn     (≥ 80 °/s): yellow held for HOLD_WARN_SEC, then safe
+        While red hold is active: new warn events don't downgrade to yellow.
+        Calibrate gyro is a drift-zeroing tool, not an alarm reset.
         """
         s = self._gyro_state[axis]
 
         if abs_dps >= self.GYRO_CRIT_DPS:
             s["state"]      = "critical"
             s["hold_until"] = now + self.HOLD_CRIT_SEC
+
         elif abs_dps >= self.GYRO_WARN_DPS:
             if s["state"] != "critical":
                 s["state"]      = "warn"
                 s["hold_until"] = now + self.HOLD_WARN_SEC
+
         else:
             if now >= s["hold_until"]:
                 s["state"]      = "safe"
                 s["hold_until"] = 0.0
 
-        return {
-            "critical": self.CLR_CRITICAL,
-            "warn":     self.CLR_WARN,
-            "safe":     self.CLR_SAFE,
-        }[s["state"]]
+        if s["state"] == "critical": return self.CLR_CRITICAL
+        if s["state"] == "warn":     return self.CLR_WARN
+        return self.CLR_SAFE
 
     def _accel_color(self, val: float, is_vertical: bool) -> str:
         if is_vertical:
-            if   self.ACC_VERT_LO_OK < val < self.ACC_VERT_HI_OK:
-                return self.CLR_SAFE
-            elif self.ACC_VERT_LO_CR < val < self.ACC_VERT_HI_CR:
-                return self.CLR_WARN
-            else:
-                return self.CLR_CRITICAL
+            if   self.ACC_VERT_LO_OK < val < self.ACC_VERT_HI_OK: return self.CLR_SAFE
+            elif self.ACC_VERT_LO_CR < val < self.ACC_VERT_HI_CR: return self.CLR_WARN
+            else:                                                  return self.CLR_CRITICAL
         else:
             a = abs(val)
             if   a < self.ACC_LAT_WARN: return self.CLR_SAFE

@@ -1,5 +1,6 @@
 import sys
 import os
+import ctypes 
 import tkinter as tk
 from tkinter import ttk
 from IMUWidget import IMUWidget
@@ -20,15 +21,25 @@ if hasattr(os, 'add_dll_directory'):
 import DroneBackend
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-UI_REFRESH_MS    = 20     # 50 Hz display refresh
-RECONNECT_MS     = 2000   # retry interval when searching for drone
-BG_COLOR         = "#f0f0f0"
+UI_REFRESH_MS = 20      # 50 Hz display refresh
+RECONNECT_MS  = 2000    # retry interval when searching for drone
+BG_COLOR      = "#f0f0f0"
 
 
 class DroneCockpitApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Project R.A.D — Master's Research Cockpit")
+        # ── Window title ──────────────────────────────────────────────────────
+        # Use only ASCII characters — Windows mangles Unicode em-dashes and
+        self.root.title("Drone Control Ground Station")
+        try:
+            # Find the window handle (HWND)
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            # Directly set the window text in the OS layer
+            ctypes.windll.user32.SetWindowTextW(hwnd, "Drone Control Ground Station")
+        except Exception as e:
+            print(f"Windows API Title Force failed: {e}")
+
         self.root.configure(bg=BG_COLOR)
 
         # C++ threaded backend — serial I/O runs in its own thread
@@ -66,7 +77,7 @@ class DroneCockpitApp:
         self.imu_view = IMUWidget(main)
         self.imu_view.grid(row=0, column=0, sticky="nsew", padx=10)
 
-        # Right — 3D orientation view
+        # Right — ADI / Spatial Orientation view
         visual = ttk.LabelFrame(main, text="Spatial Orientation")
         visual.grid(row=0, column=1, sticky="nsew", padx=10)
         self.drone_3d = Drone3DView(visual, width=400, height=350)
@@ -100,14 +111,17 @@ class DroneCockpitApp:
             self._schedule_update()
         else:
             self.status_label.config(
-                text=f"Status: Found {port} but connection failed (port busy?)", fg="red"
+                text=f"Status: Found {port} but connection failed (port busy?)",
+                fg="red"
             )
             self.root.after(RECONNECT_MS, self._auto_connect)
 
     def _reconnect(self):
         """Called when telemetry is lost mid-session."""
         self.hub.disconnect()
-        self.status_label.config(text="Status: Link lost — reconnecting...", fg="red")
+        self.status_label.config(
+            text="Status: Link lost - reconnecting...", fg="red"
+        )
         self.root.after(RECONNECT_MS, self._auto_connect)
 
     # ── Update loop ───────────────────────────────────────────────────────────
@@ -119,10 +133,9 @@ class DroneCockpitApp:
 
     def _update_loop(self):
         """
-        Pull the latest snapshot from the C++ background thread and
-        push it into the widgets.  Runs entirely on the Tk main thread —
-        no locking needed here because getLatestState() does the locking
-        inside C++.
+        Pull the latest snapshot from the C++ background thread and push it
+        into the widgets.  Runs entirely on the Tk main thread — no locking
+        needed here because get_latest_state() does the locking inside C++.
         """
         self._update_job = None   # reset so _schedule_update can re-arm
 
@@ -133,39 +146,42 @@ class DroneCockpitApp:
         try:
             state = self.hub.get_latest_state()
 
-            # ── Warn if link is degraded but not yet dropped ──────────────────
+            # ── Link health indicator ─────────────────────────────────────────
             if not state.link_healthy:
-                self.status_label.config(text="Status: Link degraded", fg="orange")
+                self.status_label.config(
+                    text="Status: Link degraded", fg="orange"
+                )
             else:
-                self.status_label.config(text="Status: Connected ✓", fg="green")
+                self.status_label.config(
+                    text="Status: Connected", fg="green"
+                )
 
             # ── IMU widget data ───────────────────────────────────────────────
-            # roll/pitch come from FC as degrees × 10; divide here so every
+            # roll/pitch arrive from FC as degrees x 10; divide here so every
             # widget receives plain degrees.
             ui_data = {
-                "ax":      state.ax,
-                "ay":      state.ay,
-                "az":      state.az,
-                "gx":      state.gx,
-                "gy":      state.gy,
-                "gz":      state.gz,
-                "roll":    state.roll  / 10.0,
-                "pitch":   state.pitch / 10.0,
-                "yaw":     float(state.yaw),
-                "voltage": state.battery_voltage,
+                "ax":          state.ax,
+                "ay":          state.ay,
+                "az":          state.az,
+                "gx":          state.gx,
+                "gy":          state.gy,
+                "gz":          state.gz,
+                "roll":        state.roll  / 10.0,
+                "pitch":       state.pitch / 10.0,
+                "yaw":         float(state.yaw),
+                "voltage":     state.battery_voltage,
                 "rssi":        state.rssi,
                 "rtt_ms":      state.last_rtt_ms,
                 "fc_cycle_ms": state.fc_cycle_ms,
             }
             self.imu_view.update_ui(ui_data)
 
-            # ── 3D view ───────────────────────────────────────────────────────
+            # ── ADI / 3-D view ────────────────────────────────────────────────
             self.drone_3d.update_orientation(
                 roll=ui_data["roll"],
                 pitch=ui_data["pitch"],
                 yaw=ui_data["yaw"],
             )
-
 
         except Exception as e:
             print(f"[update_loop] {e}")
