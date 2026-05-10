@@ -61,8 +61,8 @@ class IMUWidget(ttk.LabelFrame):
     CLR_OFF      = "#E0E0E0"
 
     # ── Angle thresholds — MUST match Drone3DView.WARN_ANGLE / CRITICAL_ANGLE ─
-    ANGLE_WARN_DEG = 20.0
-    ANGLE_CRIT_DEG = 40.0
+    ANGLE_WARN_DEG = 15.0   # LR quad: warn at 15°
+    ANGLE_CRIT_DEG = 30.0   # LR quad: critical at 30°
 
     # ── Gyro peak-hold thresholds ─────────────────────────────────────────────
     GYRO_WARN_DPS  =  30.0   # LR drone: gentle turns are 10-20°/s; 30 = noticeable snap
@@ -71,12 +71,12 @@ class IMUWidget(ttk.LabelFrame):
     HOLD_CRIT_SEC  =   4.0
 
     # ── G-force thresholds ────────────────────────────────────────────────────
-    ACC_LAT_WARN     = 0.34   # sin(20°) — aligns with ANGLE_WARN_DEG
-    ACC_LAT_CRIT     = 0.64   # sin(40°) — aligns with ANGLE_CRIT_DEG
-    ACC_VERT_LO_OK   = 0.85   # cos(32°)≈0.85 — green within ~30° of level
-    ACC_VERT_HI_OK   = 1.15    # symmetric upper green bound
-    ACC_VERT_LO_CR   = 0.64   # cos(50°)≈0.64 — critical for vertical axis
-    ACC_VERT_HI_CR   = 1.36    # symmetric upper critical bound
+    ACC_LAT_WARN     = 0.26   # sin(15°) — aligns with ANGLE_WARN_DEG = 15°
+    ACC_LAT_CRIT     = 0.50   # sin(30°) — aligns with ANGLE_CRIT_DEG = 30°
+    ACC_VERT_LO_OK   = 0.87   # cos(30°) = 0.866 — green while within crit angle threshold
+    ACC_VERT_HI_OK   = 1.13   # symmetric upper green bound
+    ACC_VERT_LO_CR   = 0.64   # cos(50°) = 0.643 — warn-to-critical boundary
+    ACC_VERT_HI_CR   = 1.36   # symmetric upper critical bound
 
     def __init__(self, parent):
         super().__init__(parent, text="MPU-6500 Long-Range Flight Hub", padding=10)

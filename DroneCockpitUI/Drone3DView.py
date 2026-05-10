@@ -4,468 +4,572 @@ import math
 
 class Drone3DView(tk.Canvas):
     """
-    Attitude Indicator (ADI / artificial horizon) display for a 10-inch
-    long-range quadcopter.
+    Professional Attitude Direction Indicator (ADI / Artificial Horizon)
+    for a 10-inch long-range quadcopter — aviation instrument standard.
 
-    ═══════════════════════════════════════════════════════════════════════════
-    LAYOUT
-    ═══════════════════════════════════════════════════════════════════════════
+    BETAFLIGHT SIGN CONVENTION  (MSP_ATTITUDE, verified)
+        roll  > 0  →  right side drops
+        pitch > 0  →  nose drops
+        yaw   > 0  →  nose turns right (CW from above)
 
-        ┌──────────────────────────────────────────────────────────────┐
-        │          ╔═ bank arc + graduation marks ═╗                  │
-        │          ║  ▼ roll pointer moves here   ║                  │
-        │   ───────╫──────────────────────────────╫───────           │
-        │           ║    SKY  (dark blue)          ║                  │
-        │   +10°  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─                   │
-        │   ════════════════ horizon ═══════════════  ← tilts/shifts  │
-        │            ──[drone symbol, fixed]──                        │
-        │   -10°  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─                   │
-        │           GROUND (dark amber)                               │
-        │   ──────────────────────────────────────────────            │
-        │   [    yaw heading compass strip    Y: +53°    ]           │
-        └──────────────────────────────────────────────────────────────┘
+    ADI behaviour:
+        roll  > 0  →  horizon tilts: right end goes DOWN
+        pitch > 0  →  horizon shifts UP on screen (nose drops → more sky)
+        yaw        →  compass tape scrolls right
 
-    ═══════════════════════════════════════════════════════════════════════════
-    WHY ADI INSTEAD OF 3D MODEL
-    ═══════════════════════════════════════════════════════════════════════════
-    A fixed isometric 3D camera creates ambiguity: at large angles the
-    perspective changes so much that the pilot loses situational awareness.
-    ADI removes that ambiguity:
-      • Roll  — horizon tilt, bank arc pointer.  Immediately obvious.
-      • Pitch — horizon shift up/down.  Immediately obvious.
-      • Yaw   — compass strip.  Heading readout.
-      • Warnings — background colour + arm colours on drone symbol.
+    FIXES IN THIS VERSION
+    ─────────────────────
+    1.  BORDER / BLEED FIX
+        All drawing is confined to the inset region [M, M, W-M, H-M] where
+        M = MARGIN = 2 px. Two opaque "curtain" rectangles are drawn last,
+        one over the full left/right edges and one over top/bottom, covering
+        any polygon overshoot from the sky/ground fill (which uses L >> W to
+        guarantee full coverage). The curtains use the same black as the
+        canvas background so the instrument appears perfectly bounded.
 
-    ═══════════════════════════════════════════════════════════════════════════
-    WARNING THRESHOLDS  (must match IMUWidget)
-    ═══════════════════════════════════════════════════════════════════════════
-    WARN_ANGLE     = 20°
-    CRITICAL_ANGLE = 40°
+    2.  ADI / COMPASS BOUNDARY
+        The ADI occupies rows [M .. adi_h-1].
+        The compass strip occupies rows [adi_h .. H-M-1].
+        A solid separator line is drawn at exactly y=adi_h.
+        Both regions start at x=M and end at x=W-M so left/right edges align.
+
+    3.  STAIRCASE / ALIASING ON TILTED LINES
+        The horizon line is drawn as a filled polygon (a thick stripe) instead
+        of a single Tkinter line. Tkinter rounds line endpoints to integer
+        pixels which causes a staircase on near-horizontal lines. Drawing a
+        thin polygon whose top and bottom edges are the two y-values of a
+        thick line forces Tk to scanline-fill between them, producing a smooth
+        appearance without the staircase.
+        Pitch-ladder lines use the same polygon technique.
+
+    4.  COMPASS ALWAYS VISIBLE AND ALIGNED
+        The compass background exactly covers [M, adi_h, W-M, H-M].
+        Tick/label positions are computed by snapping to exact 10° multiples
+        so they never miss due to floating-point rounding.
     """
 
-    # ── Warning thresholds — must match IMUWidget.ANGLE_WARN_DEG / ANGLE_CRIT_DEG
-    WARN_ANGLE     = 20.0
-    CRITICAL_ANGLE = 40.0
+    # ── Margin — all drawing inset from canvas edge by this many pixels ───────
+    MARGIN = 2
 
-    # ── Pitch scale: pixels per degree of pitch ───────────────────────────────
-    # 3.5 px/° → ±30° covers ±105 px, keeps the ladder readable.
-    PITCH_PX_PER_DEG = 3.5
+    # ── Warning thresholds — must match IMUWidget ─────────────────────────────
+    WARN_ANGLE     = 15.0
+    CRITICAL_ANGLE = 30.0
 
-    # ── Colours ───────────────────────────────────────────────────────────────
-    CLR_SAFE     = "#00FF44"
-    CLR_WARN     = "#FFFF44"
-    CLR_CRITICAL = "#FF4444"
+    # ── Pitch ladder scale ────────────────────────────────────────────────────
+    PITCH_PX_PER_DEG = 4.5   # slightly increased for better readability
+
+    # ── Aviation colour palette ───────────────────────────────────────────────
+    C_SKY_SAFE  = "#1565C0"    # deep aviation blue
+    C_SKY_WARN  = "#0a2a0a"
+    C_SKY_CRIT  = "#3a0808"
+    C_GND_SAFE  = "#7B3F00"    # warm brown
+    C_GND_WARN  = "#4a3000"
+    C_GND_CRIT  = "#4a0808"
+    C_HORIZON      = "#FFFFFF"
+    C_AIRCRAFT     = "#FFD700"   # aviation gold
+    C_PITCH_LADDER = "#FFFFFF"
+    C_BANK_ARC     = "#FFFFFF"
+    C_BANK_PTR     = "#FFD700"
+    C_WARN         = "#FFD700"
+    C_CRITICAL     = "#FF3333"
+    C_SAFE_HUD     = "#00FF44"
+    C_BLACK        = "#000000"
+    C_COMP_BG      = "#0a0a0a"   # near-black for compass strip
+    C_COMP_SEP     = "#444444"   # separator line colour
 
     def __init__(self, parent, width=500, height=450):
         super().__init__(
             parent,
             width=width, height=height,
-            bg="#0d1b2a", highlightthickness=0
+            bg=self.C_BLACK,
+            highlightthickness=0
         )
-        self.width   = width
-        self.height  = height
-        self.cx      = width  // 2
+        # Nominal size used only before the widget is mapped.
+        # _recompute_geometry() refreshes these from winfo_width/height each frame.
+        self._nominal_w = width
+        self._nominal_h = height
+        self._recompute_geometry(width, height)
 
-        # ADI area takes the top 78% of the canvas; compass strip gets 22%.
-        self.adi_h   = int(height * 0.78)
-        self.comp_y0 = self.adi_h          # top of compass strip
-        self.adi_cy  = int(self.adi_h * 0.50)   # vertical centre of ADI area
+    def _recompute_geometry(self, W: int, H: int):
+        """
+        Compute all layout variables from the actual rendered canvas size.
+        Called at the start of every update_orientation() so the instrument
+        fills whatever pixel area the canvas actually occupies, regardless of
+        how the widget was packed/placed by the parent.
+        """
+        M = self.MARGIN
+        self.W  = W
+        self.H  = H
+        self.cx = W // 2
+
+        # ADI drawing region
+        self.adi_x0 = M
+        self.adi_x1 = W - M
+        self.adi_y0 = M
+        # ADI takes 76 % of height; compass strip gets the remaining 24 %
+        self.adi_h  = int(H * 0.76)
+        self.adi_y1 = self.adi_h
+        self.adi_cy = M + int((self.adi_h - M) * 0.54)   # aircraft-symbol row
+
+        # Compass strip
+        self.comp_y0 = self.adi_y1
+        self.comp_y1 = H - M
+        self.comp_cx = self.cx
+
+        # Bank arc — centred at aircraft symbol
+        self.arc_cx = self.cx
+        self.arc_cy = self.adi_cy
+        self.arc_r  = min(self.adi_cy - M - 10,
+                          self.cx     - M - 20)
 
     # ══════════════════════════════════════════════════════════════════════════
     # PUBLIC API
     # ══════════════════════════════════════════════════════════════════════════
 
     def update_orientation(self, roll: float, pitch: float, yaw: float = 0.0):
-        """
-        Redraw the full display.
-        roll, pitch, yaw in degrees (already ÷10 from MSP in main.py).
-        Betaflight sign convention:
-            roll  > 0  →  right side drops
-            pitch > 0  →  nose drops
-            yaw   > 0  →  nose turns right (CW from above)
-        """
+        # ── Read actual rendered canvas size every frame ───────────────────────
+        # winfo_width/height return 1 before the widget is mapped; fall back to
+        # the nominal size passed to __init__ in that case.
+        W = self.winfo_width()
+        H = self.winfo_height()
+        if W < 10 or H < 10:
+            W = self._nominal_w
+            H = self._nominal_h
+        self._recompute_geometry(W, H)
+
         self.delete("all")
 
-        max_tilt = max(abs(roll), abs(pitch))
+        # Full-canvas black base — covers every pixel at the true rendered size
+        self.create_rectangle(0, 0, W, H, fill=self.C_BLACK, outline="")
 
+        max_tilt = max(abs(roll), abs(pitch))
         if   max_tilt >= self.CRITICAL_ANGLE: level = "critical"
         elif max_tilt >= self.WARN_ANGLE:     level = "warn"
         else:                                 level = "safe"
 
-        self._draw_adi_background(roll, pitch, level)
+        # ── ADI layers (back → front) ─────────────────────────────────────────
+        self._draw_adi_ball(roll, pitch, level)
         self._draw_pitch_ladder(roll, pitch)
         self._draw_bank_arc(roll, level)
-        self._draw_drone_symbol(roll, level)
-        self._draw_centre_marker()
-        self._draw_adi_border()
-        self._draw_compass(yaw)
-        self._draw_hud(roll, pitch, yaw, level)
+        self._draw_aircraft_symbol(level)
+        self._draw_horizon_ref_bars()
 
+        # ── Edge curtains — hide polygon overshoot at every canvas edge ──────
+        M   = self.MARGIN
+        clr = self.C_BLACK
+        self.create_rectangle(0,     0,       M,    H,    fill=clr, outline="")  # left
+        self.create_rectangle(W - M, 0,       W,    H,    fill=clr, outline="")  # right
+        self.create_rectangle(0,     0,       W,    M,    fill=clr, outline="")  # top
+        self.create_rectangle(0,     self.adi_y1, W, H,   fill=clr, outline="")  # below ADI
+
+        # ── ADI bezel (drawn over curtains so border is sharp) ────────────────
+        self._draw_adi_bezel()
+
+        # ── HUD text (drawn after bezel so text is on top) ────────────────────
+        self._draw_hud_numerics(roll, pitch, level)
+
+        # ── Compass strip (fills exactly from adi_y1 to comp_y1) ─────────────
+        self._draw_compass_strip(yaw)
+
+        # ── Warning banner (topmost layer) ────────────────────────────────────
         if level != "safe":
             self._draw_warning_banner(level, max_tilt)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # ADI BACKGROUND  (sky / ground / horizon line)
+    # 1. ADI BALL — sky / ground fill
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _draw_adi_background(self, roll: float, pitch: float, level: str):
+    def _draw_adi_ball(self, roll: float, pitch: float, level: str):
         """
-        Fill sky (above horizon) and ground (below) using a rotated/shifted
-        horizon line.  The horizon:
-          • tilts  by roll  (right side drops for positive roll)
-          • shifts by pitch (nose-down → horizon shifts UP, showing more sky)
+        Sky above horizon (blue), ground below (brown).
+
+        Vector maths
+        ────────────
+        Along-horizon unit vector at bank angle r (r > 0 → right side drops):
+            hdx = cos(r),   hdy = sin(r)
+
+        Sky-direction perpendicular (points screen-UP at r=0):
+            sdx = sin(r),   sdy = -cos(r)
+
+        Betaflight pitch+ = nose-down → horizon moves UP on screen:
+            hcy = adi_cy - pitch * PITCH_PX_PER_DEG
         """
         roll_r = math.radians(roll)
-
-        # Pitch shifts the horizon DOWN when pitch > 0 (nose drops → horizon goes up
-        # from pilot's view, i.e. we shift the horizon DOWN in screen coords).
-        pitch_offset = pitch * self.PITCH_PX_PER_DEG    # positive = horizon shifts down
-
         hcx = self.cx
-        hcy = self.adi_cy + pitch_offset
+        hcy = self.adi_cy - pitch * self.PITCH_PX_PER_DEG
 
-        # Unit vectors along and perpendicular to the tilted horizon
-        hdx = math.cos(roll_r)      # along horizon
-        hdy = math.sin(roll_r)
-        sdx =  math.sin(roll_r)     # toward sky  (perpendicular, upward in tilted frame)
-        sdy = -math.cos(roll_r)
+        hdx =  math.cos(roll_r);  hdy =  math.sin(roll_r)
+        sdx =  math.sin(roll_r);  sdy = -math.cos(roll_r)
 
-        L = self.width + self.height   # large enough to cover canvas
+        # L large enough to guarantee full coverage; curtains hide the excess
+        L = self.W + self.H + 200
 
-        # Sky polygon
-        sky = [
-            hcx - L * hdx + L * sdx,  hcy - L * hdy + L * sdy,
-            hcx + L * hdx + L * sdx,  hcy + L * hdy + L * sdy,
-            hcx + L * hdx,            hcy + L * hdy,
-            hcx - L * hdx,            hcy - L * hdy,
-        ]
-        # Ground polygon
-        gnd = [
+        sky_clr = {"safe": self.C_SKY_SAFE,
+                   "warn": self.C_SKY_WARN,
+                   "critical": self.C_SKY_CRIT}[level]
+        gnd_clr = {"safe": self.C_GND_SAFE,
+                   "warn": self.C_GND_WARN,
+                   "critical": self.C_GND_CRIT}[level]
+
+        # Sky base fill (entire ADI area; ground polygon overwrites lower half)
+        self.create_rectangle(self.adi_x0, self.adi_y0,
+                              self.adi_x1, self.adi_y1,
+                              fill=sky_clr, outline="")
+
+        # Ground half-plane polygon
+        gnd_poly = [
             hcx - L * hdx - L * sdx,  hcy - L * hdy - L * sdy,
             hcx + L * hdx - L * sdx,  hcy + L * hdy - L * sdy,
-            hcx + L * hdx,            hcy + L * hdy,
-            hcx - L * hdx,            hcy - L * hdy,
+            hcx + L * hdx,             hcy + L * hdy,
+            hcx - L * hdx,             hcy - L * hdy,
         ]
+        self.create_polygon(gnd_poly, fill=gnd_clr, outline="")
 
-        sky_clr = {
-            "safe":     "#0d1b2a",
-            "warn":     "#1a1a04",
-            "critical": "#280404",
-        }[level]
-        gnd_clr = {
-            "safe":     "#1f1006",
-            "warn":     "#1f1404",
-            "critical": "#240404",
-        }[level]
-
-        # Clip ADI to its area (draw sky/ground clipped vertically)
-        self.create_rectangle(0, 0, self.width, self.adi_h,
-                              fill=sky_clr, outline="")   # base sky fill
-        self.create_polygon(gnd, fill=gnd_clr, outline="")
-        self.create_polygon(sky, fill=sky_clr, outline="")
-
-        # Horizon line
-        self.create_line(
-            hcx - L * hdx, hcy - L * hdy,
-            hcx + L * hdx, hcy + L * hdy,
-            fill="#AAAAAA", width=2
-        )
+        # ── Horizon rendered as a filled polygon stripe (fixes staircase) ─────
+        # A thick horizon "band" is a parallelogram of height `hw` pixels,
+        # centred on the horizon line. Scanline-filling this polygon is smooth
+        # whereas a Tkinter line would round each endpoint separately.
+        hw = 2.0   # half-width of horizon stripe in pixels
+        pts = [
+            hcx - L * hdx + hw * sdx,  hcy - L * hdy + hw * sdy,
+            hcx + L * hdx + hw * sdx,  hcy + L * hdy + hw * sdy,
+            hcx + L * hdx - hw * sdx,  hcy + L * hdy - hw * sdy,
+            hcx - L * hdx - hw * sdx,  hcy - L * hdy - hw * sdy,
+        ]
+        self.create_polygon(pts, fill=self.C_HORIZON, outline="")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # PITCH LADDER
+    # 2. PITCH LADDER
     # ══════════════════════════════════════════════════════════════════════════
 
     def _draw_pitch_ladder(self, roll: float, pitch: float):
         """
-        Horizontal tick marks at ±5°, ±10°, ±20°, ±30° from the horizon.
-        They move with the horizon (roll + pitch) so the pilot can read
-        pitch angle directly.
+        Pitch graduation lines drawn as thin filled polygons (not lines) to
+        avoid the staircase effect on tilted segments.
+        Labels on both sides of major (10°-multiple) lines.
         """
         roll_r = math.radians(roll)
-        pitch_offset = pitch * self.PITCH_PX_PER_DEG
-
-        # Horizon centre
         hcx = self.cx
-        hcy = self.adi_cy + pitch_offset
+        hcy = self.adi_cy - pitch * self.PITCH_PX_PER_DEG
 
-        # Along-horizon unit vector (for drawing horizontal ticks)
-        hdx = math.cos(roll_r)
-        hdy = math.sin(roll_r)
-        # Sky direction (perpendicular, toward sky)
-        sdx =  math.sin(roll_r)
-        sdy = -math.cos(roll_r)
+        hdx =  math.cos(roll_r);  hdy =  math.sin(roll_r)
+        sdx =  math.sin(roll_r);  sdy = -math.cos(roll_r)
 
-        for deg in (-30, -20, -10, -5, 5, 10, 20, 30):
-            half_w = 55 if abs(deg) % 10 == 0 else 28
-            offset_px = -deg * self.PITCH_PX_PER_DEG    # neg: + pitch → line above
+        for deg in (-30, -25, -20, -15, -10, -5, 5, 10, 15, 20, 25, 30):
+            is_major = (abs(deg) % 10 == 0)
+            half_w   = 52 if is_major else 30
+            hw       = 1.5 if is_major else 0.8   # polygon half-height
 
+            # Centre of this tick line in screen coords
+            offset_px = deg * self.PITCH_PX_PER_DEG
             lx = hcx + offset_px * sdx
             ly = hcy + offset_px * sdy
 
-            # Clamp to ADI area
-            if not (0 < ly < self.adi_h):
+            if ly < self.adi_y0 - 5 or ly > self.adi_y1 + 5:
                 continue
 
-            self.create_line(
-                lx - half_w * hdx, ly - half_w * hdy,
-                lx + half_w * hdx, ly + half_w * hdy,
-                fill="#556677", width=1
-            )
-            # Label on the right side for multiples of 10
-            if abs(deg) % 10 == 0:
-                lbl_x = lx + (half_w + 8) * hdx
-                lbl_y = ly + (half_w + 8) * hdy
-                if 0 < lbl_y < self.adi_h:
-                    self.create_text(
-                        lbl_x, lbl_y,
-                        text=f"{abs(deg)}",
-                        fill="#556677", font=("Consolas", 7)
-                    )
+            # Four corners of the line-as-polygon
+            x1 = lx - half_w * hdx;  y1 = ly - half_w * hdy
+            x2 = lx + half_w * hdx;  y2 = ly + half_w * hdy
+
+            pts = [
+                x1 + hw * sdx, y1 + hw * sdy,
+                x2 + hw * sdx, y2 + hw * sdy,
+                x2 - hw * sdx, y2 - hw * sdy,
+                x1 - hw * sdx, y1 - hw * sdy,
+            ]
+            self.create_polygon(pts, fill=self.C_PITCH_LADDER, outline="")
+
+            # End-cap ticks on major lines (also as polygons)
+            if is_major:
+                cap = 9
+                cap_hw = 0.8
+                for ex, ey in [(x1, y1), (x2, y2)]:
+                    tx = ex - cap * sdx;  ty = ey - cap * sdy
+                    # Cap as a thin polygon along the sky direction
+                    cpts = [
+                        ex + cap_hw * hdx, ey + cap_hw * hdy,
+                        tx + cap_hw * hdx, ty + cap_hw * hdy,
+                        tx - cap_hw * hdx, ty - cap_hw * hdy,
+                        ex - cap_hw * hdx, ey - cap_hw * hdy,
+                    ]
+                    self.create_polygon(cpts, fill=self.C_PITCH_LADDER,
+                                        outline="")
+
+                # Labels on both sides
+                gap = half_w + 16
+                for sign in (-1, 1):
+                    lbl_x = lx + sign * gap * hdx
+                    lbl_y = ly + sign * gap * hdy
+                    if self.adi_y0 < lbl_y < self.adi_y1:
+                        self.create_text(lbl_x, lbl_y,
+                                         text=f"{abs(deg)}",
+                                         fill=self.C_PITCH_LADDER,
+                                         font=("Consolas", 9, "bold"))
 
     # ══════════════════════════════════════════════════════════════════════════
-    # BANK ARC  (roll angle arc at top of ADI)
+    # 3. BANK ARC
     # ══════════════════════════════════════════════════════════════════════════
 
     def _draw_bank_arc(self, roll: float, level: str):
         """
-        Semicircular arc with graduation marks at ±10°, ±20°, ±30°, ±45°, ±60°.
-        A pointer triangle moves along the arc to show current bank angle.
-        The arc lives at the top of the ADI area.
+        Upper semicircle bank scale.
+        Centre = (arc_cx, arc_cy) = (cx, adi_cy) = aircraft symbol centre.
+        0° mark at top (12-o'clock), ±90° at aircraft-symbol height.
+        Tick marks at ±10°, ±20°, ±30°, ±45°, ±60°, ±90°.
+        Moving gold pointer triangle: tip inward, base on arc.
+        Fixed white reference tick at 0°.
         """
-        arc_cx = self.cx
-        arc_cy = int(self.adi_h * 0.92)   # near top, radius points upward
-        arc_r  = int(self.adi_h * 0.88)
+        acx = self.arc_cx
+        acy = self.arc_cy
+        ar  = self.arc_r
 
-        arc_color = {
-            "safe": "#446688", "warn": "#888822", "critical": "#882222"
-        }[level]
+        arc_clr = {"safe":     self.C_BANK_ARC,
+                   "warn":     self.C_WARN,
+                   "critical": self.C_CRITICAL}[level]
 
-        # Draw partial arc (bottom semicircle: from 180° to 360° in standard coords,
-        # but in Tk the arc goes from startangle counterclockwise.
-        # We want an arc that opens UPWARD (like a ∩ shape) centred at arc_cy.
+        # Semicircular arc — Tk arc: start=0 is 3-o'clock, extent=180 → top half
         self.create_arc(
-            arc_cx - arc_r, arc_cy - arc_r,
-            arc_cx + arc_r, arc_cy + arc_r,
+            acx - ar, acy - ar, acx + ar, acy + ar,
             start=0, extent=180,
-            style=tk.ARC, outline=arc_color, width=2
+            style=tk.ARC, outline=arc_clr, width=2
         )
 
         # Graduation marks
-        for deg in (-60, -45, -30, -20, -10, 10, 20, 30, 45, 60):
-            # On the top semicircle: deg=0 → top (270° in Tk = -90° math)
-            # Betaflight convention: positive roll = right side down
-            # Bank arc: pointer at 0° is top; positive roll pointer moves right
-            angle_rad = math.radians(-deg - 90)   # screen angle for this bank mark
-            tick_outer_x = arc_cx + arc_r * math.cos(angle_rad)
-            tick_outer_y = arc_cy + arc_r * math.sin(angle_rad)
-            tick_len = 10 if abs(deg) % 30 == 0 else 6
-            tick_inner_x = arc_cx + (arc_r - tick_len) * math.cos(angle_rad)
-            tick_inner_y = arc_cy + (arc_r - tick_len) * math.sin(angle_rad)
-            self.create_line(tick_inner_x, tick_inner_y,
-                             tick_outer_x, tick_outer_y,
-                             fill=arc_color, width=1)
+        for bank_deg, tick_len, label_str in [
+            (-90, 16, "90"), (-60, 16, "60"), (-45, 12, None),
+            (-30, 16, "30"), (-20,  8, None), (-10,  8, None),
+            ( 10,  8, None), ( 20,  8, None), ( 30, 16, "30"),
+            ( 45, 12, None), ( 60, 16, "60"), ( 90, 16, "90"),
+        ]:
+            # math_angle: bank=0 → 90° (top); positive bank → pointer moves right
+            ma = math.radians(90 - bank_deg)
+            ox = acx + ar * math.cos(ma)
+            oy = acy - ar * math.sin(ma)
+            if oy > acy + 4:
+                continue   # skip bottom-half ticks
+            ix = acx + (ar - tick_len) * math.cos(ma)
+            iy = acy - (ar - tick_len) * math.sin(ma)
+            self.create_line(ix, iy, ox, oy, fill=arc_clr, width=2)
 
-        # Roll pointer triangle — tracks current bank angle
-        ptr_angle_rad = math.radians(-roll - 90)
-        ptr_tip_x = arc_cx + (arc_r - 2) * math.cos(ptr_angle_rad)
-        ptr_tip_y = arc_cy + (arc_r - 2) * math.sin(ptr_angle_rad)
-        # Pointer base (slightly inside the arc)
-        base_r = arc_r - 14
-        perp   = ptr_angle_rad + math.pi / 2
-        base_x1 = arc_cx + base_r * math.cos(ptr_angle_rad) + 6 * math.cos(perp)
-        base_y1 = arc_cy + base_r * math.sin(ptr_angle_rad) + 6 * math.sin(perp)
-        base_x2 = arc_cx + base_r * math.cos(ptr_angle_rad) - 6 * math.cos(perp)
-        base_y2 = arc_cy + base_r * math.sin(ptr_angle_rad) - 6 * math.sin(perp)
+            if label_str:
+                lx = acx + (ar + 14) * math.cos(ma)
+                ly = acy - (ar + 14) * math.sin(ma)
+                if self.adi_x0 < lx < self.adi_x1 and self.adi_y0 < ly < self.adi_y1:
+                    self.create_text(lx, ly, text=label_str,
+                                     fill=arc_clr, font=("Consolas", 8))
 
-        ptr_color = {
-            "safe": "#FFFFFF", "warn": "#FFFF44", "critical": "#FF4444"
-        }[level]
-        self.create_polygon(
-            ptr_tip_x, ptr_tip_y,
-            base_x1, base_y1,
-            base_x2, base_y2,
-            fill=ptr_color, outline=""
-        )
+        # Moving roll-pointer triangle (tip inward, base on arc)
+        pa = math.radians(90 - roll)
+        tip_x = acx + (ar - 20) * math.cos(pa)
+        tip_y = acy - (ar - 20) * math.sin(pa)
+        bas_x = acx + ar * math.cos(pa)
+        bas_y = acy - ar * math.sin(pa)
+        perp  = pa + math.pi / 2
+        b1x = bas_x + 8 * math.cos(perp);  b1y = bas_y - 8 * math.sin(perp)
+        b2x = bas_x - 8 * math.cos(perp);  b2y = bas_y + 8 * math.sin(perp)
+        ptr_clr = {"safe":     self.C_BANK_PTR,
+                   "warn":     self.C_WARN,
+                   "critical": self.C_CRITICAL}[level]
+        self.create_polygon(tip_x, tip_y, b1x, b1y, b2x, b2y,
+                            fill=ptr_clr, outline=arc_clr, width=1)
+
+        # Fixed 0° reference tick (pointing inward from top)
+        self.create_line(acx, acy - ar,
+                         acx, acy - ar + 20,
+                         fill=self.C_BANK_ARC, width=3)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # DRONE SYMBOL  (fixed position, centred in ADI — arms change colour)
+    # 4. AIRCRAFT SYMBOL — fixed yellow T-bar
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _draw_drone_symbol(self, roll: float, level: str):
-        """
-        The drone symbol stays fixed at the ADI centre.  In a true ADI the
-        aircraft symbol never moves — the horizon moves around it, and the
-        pilot reads bank from the horizon tilt and the bank pointer.
-
-        Arms are coloured by warning level so the pilot has an immediate
-        at-a-glance status even without reading the table.
-
-        Front arms (top two) are always green-tinted at SAFE so the pilot
-        can identify drone orientation; both pairs go WARN/CRITICAL together.
-        """
+    def _draw_aircraft_symbol(self, level: str):
         cx  = self.cx
         cy  = self.adi_cy
-        arm = 55    # pixel length from centre to motor
+        clr = {"safe":     self.C_AIRCRAFT,
+               "warn":     self.C_WARN,
+               "critical": self.C_CRITICAL}[level]
 
-        # Warning colours override the normal green/red arm split
-        if level == "critical":
-            front_clr = rear_clr = "#FF4444"
-            body_clr  = "#441111"
-        elif level == "warn":
-            front_clr = rear_clr = "#FFFF44"
-            body_clr  = "#333310"
-        else:
-            front_clr = "#00DD44"   # green — front
-            rear_clr  = "#DD2222"   # red   — rear
-            body_clr  = "#444444"
+        bar_len = 55;  bar_w = 5;  drop = 12;  gap = 12
 
-        # Arm direction: X-frame, 45° arms
-        # Viewed from behind: front-right goes upper-right, front-left upper-left
-        angles = {
-            "FR": math.radians(-45),    # upper-right
-            "FL": math.radians(-135),   # upper-left
-            "RR": math.radians( 45),    # lower-right
-            "RL": math.radians( 135),   # lower-left
-        }
-        colors = {
-            "FR": front_clr, "FL": front_clr,
-            "RR": rear_clr,  "RL": rear_clr,
-        }
-
-        prop_r = 18
-
-        for key, ang in angles.items():
-            ex = cx + arm * math.cos(ang)
-            ey = cy + arm * math.sin(ang)
-            clr = colors[key]
-
-            # Arm
-            self.create_line(cx, cy, ex, ey, fill=clr, width=4, capstyle=tk.ROUND)
-            # Motor hub
-            self.create_oval(ex - 5, ey - 5, ex + 5, ey + 5,
-                             fill=clr, outline="")
-            # Propeller disc
-            self.create_oval(ex - prop_r, ey - prop_r * 0.35,
-                             ex + prop_r, ey + prop_r * 0.35,
-                             outline=clr, width=2)
-            # Prop cross-hair
-            self.create_line(ex - prop_r, ey, ex + prop_r, ey,
-                             fill=clr, width=1)
-            self.create_line(ex, ey - prop_r * 0.35,
-                             ex, ey + prop_r * 0.35,
-                             fill=clr, width=1)
-
-        # Central body
-        self.create_oval(cx - 12, cy - 12, cx + 12, cy + 12,
-                         fill=body_clr, outline="#888888", width=2)
-
-        # Forward direction indicator: small triangle pointing upward
-        # (toward "front" in the behind-view projection)
-        tri = [cx, cy - 22, cx - 7, cy - 12, cx + 7, cy - 12]
-        self.create_polygon(tri, fill=front_clr, outline="")
+        self.create_line(cx - gap, cy, cx - gap - bar_len, cy,
+                         fill=clr, width=bar_w, capstyle=tk.ROUND)
+        self.create_line(cx - gap - bar_len, cy,
+                         cx - gap - bar_len, cy + drop,
+                         fill=clr, width=bar_w, capstyle=tk.ROUND)
+        self.create_line(cx + gap, cy, cx + gap + bar_len, cy,
+                         fill=clr, width=bar_w, capstyle=tk.ROUND)
+        self.create_line(cx + gap + bar_len, cy,
+                         cx + gap + bar_len, cy + drop,
+                         fill=clr, width=bar_w, capstyle=tk.ROUND)
+        r = 6
+        self.create_oval(cx - r, cy - r, cx + r, cy + r,
+                         fill=clr, outline="#333333", width=1)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # CENTRE REFERENCE MARKER
+    # 5. HORIZON REFERENCE BARS (fixed, white)
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _draw_centre_marker(self):
-        """Fixed horizon reference lines at the centre — like real ADI."""
-        cx, cy = self.cx, self.adi_cy
-        clr = "#DDDDDD"
-        # Left wing bar
-        self.create_line(cx - 80, cy, cx - 30, cy, fill=clr, width=3)
-        self.create_line(cx - 30, cy, cx - 30, cy + 12, fill=clr, width=3)
-        # Right wing bar
-        self.create_line(cx + 30, cy, cx + 80, cy, fill=clr, width=3)
-        self.create_line(cx + 30, cy, cx + 30, cy + 12, fill=clr, width=3)
-        # Centre dot
-        self.create_oval(cx - 4, cy - 4, cx + 4, cy + 4,
-                         fill="#FFFFFF", outline="")
+    def _draw_horizon_ref_bars(self):
+        cx = self.cx;  cy = self.adi_cy
+        self.create_line(cx - 11, cy, cx - 4,  cy, fill="#CCCCCC", width=2)
+        self.create_line(cx + 4,  cy, cx + 11, cy, fill="#CCCCCC", width=2)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # ADI BORDER
+    # 6. ADI BEZEL
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _draw_adi_border(self):
-        self.create_rectangle(0, 0, self.width - 1, self.adi_h - 1,
-                              outline="#333333", width=1)
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # COMPASS STRIP  (yaw / heading)
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _draw_compass(self, yaw: float):
+    def _draw_adi_bezel(self):
         """
-        Scrolling compass tape at the bottom.  The tape moves so the current
-        heading is always centred.  Marks every 10°, labels every 30°.
-        Cardinal directions labelled N/E/S/W.
+        Two-pixel border drawn exactly at the inset boundary.
+        This sits on top of the edge curtains, so the instrument edge is crisp.
         """
-        y0   = self.comp_y0
-        y1   = self.height
-        cy_c = (y0 + y1) // 2
-        cx   = self.cx
-
-        self.create_rectangle(0, y0, self.width, y1,
-                              fill="#111111", outline="#333333")
-
-        px_per_deg = 3.5    # pixels per degree of heading
-
-        # Draw ticks centred on current yaw
-        for offset_deg in range(-90, 91, 10):
-            hdg = (yaw + offset_deg) % 360
-            x   = cx + offset_deg * px_per_deg
-
-            tick_h = 10 if hdg % 30 == 0 else 5
-            self.create_line(x, y0 + 2, x, y0 + 2 + tick_h,
-                             fill="#666666", width=1)
-
-            if hdg % 30 == 0:
-                label = {0: "N", 90: "E", 180: "S", 270: "W"}.get(int(hdg),
-                         f"{int(hdg)}")
-                self.create_text(x, y0 + 18,
-                                 text=label, fill="#888888",
-                                 font=("Consolas", 8))
-
-        # Centre pointer
-        self.create_line(cx, y0, cx, y0 + 6, fill="#FFFFFF", width=2)
-
-        # Heading readout
-        self.create_text(cx, cy_c + 6,
-                         text=f"HDG  {yaw % 360:>5.1f}°",
-                         fill="#00FF88", font=("Consolas", 10, "bold"))
+        M = self.MARGIN
+        # Outer border
+        self.create_rectangle(M, M, self.W - M - 1, self.adi_y1 - 1,
+                              outline="#666666", width=1, fill="")
+        # Separator between ADI and compass
+        self.create_line(M, self.adi_y1,
+                         self.W - M, self.adi_y1,
+                         fill=self.C_COMP_SEP, width=2)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # HUD TEXT
+    # 7. HUD NUMERICS
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _draw_hud(self, roll: float, pitch: float, yaw: float, level: str):
-        hud = {
-            "safe":     "#00FF00",
-            "warn":     "#FFFF44",
-            "critical": "#FF4444",
-        }[level]
-
-        for i, txt in enumerate([
-            f"R: {roll:>+7.1f}°",
-            f"P: {pitch:>+7.1f}°",
-        ]):
-            self.create_text(10, 10 + i * 16, anchor="nw",
-                             text=txt, fill=hud, font=("Consolas", 10, "bold"))
+    def _draw_hud_numerics(self, roll: float, pitch: float, level: str):
+        hud = {"safe":     self.C_SAFE_HUD,
+               "warn":     self.C_WARN,
+               "critical": self.C_CRITICAL}[level]
+        M = self.MARGIN + 4
+        self.create_text(M,      M + 4,  anchor="nw",
+                         text=f"R  {roll:>+6.1f}\u00b0",
+                         fill=hud, font=("Consolas", 10, "bold"))
+        self.create_text(M,      M + 22, anchor="nw",
+                         text=f"P  {pitch:>+6.1f}\u00b0",
+                         fill=hud, font=("Consolas", 10, "bold"))
 
     # ══════════════════════════════════════════════════════════════════════════
-    # WARNING BANNER
+    # 8. COMPASS STRIP — always visible, aligned with ADI edges
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _draw_compass_strip(self, yaw: float):
+        """
+        Scrolling heading tape that fills exactly [adi_x0, comp_y0, adi_x1, comp_y1].
+        Left and right edges align perfectly with the ADI bezel.
+
+        Tick algorithm
+        ──────────────
+        Snap the leftmost heading to the nearest lower multiple of 10°, then
+        step 10° at a time computing the exact screen X for each.  No
+        floating-point rounding miss possible — each label position is exact.
+
+        Small ticks (5° marks) are added in a separate pass.
+        """
+        x0  = self.adi_x0        # left  edge — same as ADI
+        x1  = self.adi_x1        # right edge — same as ADI
+        y0  = self.comp_y0       # top of compass
+        y1  = self.comp_y1       # bottom of compass
+        cx  = self.comp_cx
+        ppd = 3.0                # pixels per degree — tuned to strip width
+
+        # ── Background — exactly fills the compass region ─────────────────────
+        self.create_rectangle(x0, y0, x1, y1,
+                              fill=self.C_COMP_BG, outline="")
+
+        # ── Top separator already drawn by _draw_adi_bezel; draw bottom border
+        self.create_line(x0, y1 - 1, x1, y1 - 1,
+                         fill="#444444", width=1)
+
+        strip_half_deg = (x1 - x0) / ppd / 2.0 + 15.0
+
+        # Small ticks every 5°
+        off = -strip_half_deg
+        while off <= strip_half_deg:
+            sx = cx + off * ppd
+            if x0 <= sx <= x1:
+                self.create_line(sx, y0 + 3, sx, y0 + 8,
+                                 fill="#555555", width=1)
+            off += 5.0
+
+        # Major ticks + labels every 10°
+        start_hdg = math.floor((yaw - strip_half_deg) / 10.0) * 10.0
+
+        hdg = start_hdg
+        while True:
+            offset_deg = hdg - yaw
+            # Wrap offset into [-180, +180)
+            while offset_deg >  180.0: offset_deg -= 360.0
+            while offset_deg < -180.0: offset_deg += 360.0
+
+            sx = cx + offset_deg * ppd
+            if sx > x1 + 20:
+                break
+
+            if x0 <= sx <= x1:
+                hdg_norm = int(round(hdg)) % 360
+                if hdg_norm < 0:
+                    hdg_norm += 360
+
+                is_30    = (hdg_norm % 30 == 0)
+                tick_h   = 14 if is_30 else 9
+                tick_w   =  2 if is_30 else 1
+                tick_clr = "#EEEEEE" if is_30 else "#888888"
+
+                self.create_line(sx, y0 + 3, sx, y0 + 3 + tick_h,
+                                 fill=tick_clr, width=tick_w)
+
+                if is_30:
+                    label = {0: "N", 90: "E", 180: "S", 270: "W"}.get(
+                        hdg_norm, f"{hdg_norm:03d}"
+                    )
+                    is_card = hdg_norm in (0, 90, 180, 270)
+                    self.create_text(
+                        sx, y0 + 26,
+                        text=label,
+                        fill="#FFFFFF" if is_card else "#BBBBBB",
+                        font=("Consolas", 9, "bold") if is_card
+                             else ("Consolas", 8)
+                    )
+
+            hdg += 10.0
+
+        # ── Centre reference triangle ─────────────────────────────────────────
+        self.create_polygon(cx - 6, y0,
+                            cx + 6, y0,
+                            cx,     y0 + 9,
+                            fill="#FFFFFF", outline="")
+
+        # ── Heading readout box — centred in strip ────────────────────────────
+        box_w, box_h = 120, 22
+        ccy = (y0 + y1) // 2
+        bx  = cx - box_w // 2
+        by  = ccy + 1
+        self.create_rectangle(bx, by, bx + box_w, by + box_h,
+                              fill="#0a1a0a", outline="#00AA44", width=1)
+        self.create_text(cx, by + box_h // 2,
+                         text=f"HDG  {yaw % 360:05.1f}\u00b0",
+                         fill="#00FF88",
+                         font=("Consolas", 10, "bold"))
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 9. WARNING BANNER
     # ══════════════════════════════════════════════════════════════════════════
 
     def _draw_warning_banner(self, level: str, max_tilt: float):
         if level == "critical":
-            self.create_text(
-                self.cx, 22,
-                text=f"⚠  CRITICAL  {max_tilt:.0f}°  ⚠",
-                fill="#FF4444", font=("Consolas", 11, "bold")
-            )
+            txt = f"\u26a0  CRITICAL  {max_tilt:.0f}\u00b0  \u26a0"
+            clr = self.C_CRITICAL
+            fnt = ("Consolas", 11, "bold")
         else:
-            self.create_text(
-                self.cx, 22,
-                text=f"CAUTION  {max_tilt:.0f}°",
-                fill="#FFFF44", font=("Consolas", 10, "bold")
-            )
+            txt = f"CAUTION  {max_tilt:.0f}\u00b0"
+            clr = self.C_WARN
+            fnt = ("Consolas", 10, "bold")
+            
+        M = self.MARGIN
+        bw = 120
+        self.create_rectangle(self.cx - bw, M + 36,
+                              self.cx + bw, M + 57,
+                              fill=self.C_BLACK, outline=clr, width=1)
+        self.create_text(self.cx, M + 46,
+                         text=txt, fill=clr, font=fnt)
