@@ -1,5 +1,6 @@
 ﻿#include "DroneLink.h"
 #include "BaroBMP280.h"
+#include "MagQMC5883L.h"    // ← QMC5883L parser (NEO-M10 I2C magnetometer)
 #include <iostream>
 #include <chrono>
 #include <thread>
@@ -13,6 +14,8 @@ DroneLink::DroneLink()
     , connected(false)
     , keepRunning(false)
     , pollIntervalMs(POLL_INTERVAL_MS)
+    , magCalRequested(false)
+    , magCalActive_(false)
 {
 }
 
@@ -100,6 +103,17 @@ DroneState DroneLink::getLatestState() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// startMagCalibration()
+//
+// Safe to call from any thread (Python GUI button handler).
+// The atomic flag is consumed by the worker on its next loop tick.
+// ─────────────────────────────────────────────────────────────────────────────
+
+void DroneLink::startMagCalibration() {
+    magCalRequested.store(true);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // communicationLoop() — runs on workerThread
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -116,6 +130,43 @@ void DroneLink::communicationLoop() {
         }
 
         bool anySuccess = false;
+
+        // ── MAGNETOMETER CALIBRATION (highest priority, before sensor poll) ──
+        //
+        // If Python called startMagCalibration(), fire MSP_MAG_CALIBRATION (205)
+        // once and start the local countdown.  Betaflight expects the drone to be
+        // rotated on all axes during the ~30 s window that follows.
+        //
+        // MSP_MAG_CALIBRATION packet layout (command only, zero payload):
+        //   '$' 'M' '<'  0x00  0xCD  0xCD
+        //   preamble      len   id  checksum  (checksum = len XOR id = 0^205 = 205)
+        if (magCalRequested.exchange(false)) {
+            sendMSP(MSP::MAG_CAL);                  // fire-and-forget; FC acks with empty frame
+            magCalActive_ = true;
+            magCalStartTime_ = std::chrono::steady_clock::now();
+        }
+
+        // Update calibration countdown every loop tick so Python sees a smooth
+        // second-by-second countdown without any additional MSP traffic.
+        if (magCalActive_) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - magCalStartTime_).count();
+
+            int remaining = MAG_CAL_DURATION_S - static_cast<int>(elapsed);
+            if (remaining <= 0) {
+                magCalActive_ = false;
+                pending.magCalActive = false;
+                pending.magCalSecondsRemaining = 0;
+            }
+            else {
+                pending.magCalActive = true;
+                pending.magCalSecondsRemaining = remaining;
+            }
+        }
+        else {
+            pending.magCalActive = false;
+            pending.magCalSecondsRemaining = 0;
+        }
 
         // ── SENSOR POLL ──────────────────────────────────────────────────────
 
@@ -157,6 +208,16 @@ void DroneLink::communicationLoop() {
         {
             auto buf = sendMSP(MSP::ALTITUDE);
             parseBaro(buf, pending);
+        }
+
+        // 6. Magnetometer — QMC5883L on NEO-M10 GPS module via I2C → MSP_RAW_MAG
+        //    Requires: Magnetometer toggle ON in Betaflight Configurator
+        //              (Configuration tab -> Sensors -> Magnetometer)
+        //    The NEO-M10 exposes the QMC5883L over its I2C bus; Betaflight reads
+        //    it at boot and serves the calibrated raw counts via MSP_RAW_MAG (130).
+        {
+            auto buf = sendMSP(MSP::RAW_MAG);
+            parseMag(buf, pending);
         }
 
         // ── ADD FUTURE SENSORS HERE ──────────────────────────────────────────
@@ -270,6 +331,45 @@ bool DroneLink::parseBaro(const std::vector<uint8_t>& buf, DroneState& s) {
     s.baroAltitudeCm = raw.altitudeCm;
     s.baroVarioCmPerSec = raw.varioCmPerSec;
     s.baroValid = true;
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// parseMag() — QMC5883L magnetometer via NEO-M10 I2C → MSP_RAW_MAG (130)
+//
+// MSP_RAW_MAG response layout:
+//   [0]      '$'
+//   [1]      'M'
+//   [2]      '>'
+//   [3]      0x06       payload size = 6 bytes  (3 × int16_t)
+//   [4]      0x82 (130) MSP_RAW_MAG command ID
+//   [5..6]   int16_t    mag X  (little-endian, FC sensor frame)
+//   [7..8]   int16_t    mag Y
+//   [9..10]  int16_t    mag Z
+//   [11]     checksum   (XOR of bytes [3..10])
+//
+// The NEO-M10 GPS module connects to the FC over I2C and acts as the
+// magnetometer host.  Betaflight reads the QMC5883L through that I2C bus
+// at startup, applies any stored calibration offsets, and serves the
+// calibrated raw counts here.
+//
+// Requires: Magnetometer enabled in Betaflight Configurator
+//           (Configuration tab -> Sensors -> Magnetometer)
+//           Mag device set to QMC5883 in the CLI:
+//             set mag_hardware = QMC5883
+//             save
+// ─────────────────────────────────────────────────────────────────────────────
+bool DroneLink::parseMag(const std::vector<uint8_t>& buf, DroneState& s) {
+    MagReading raw;
+    if (!MagQMC5883L::parse(buf, raw)) {
+        s.magValid = false;
+        return false;
+    }
+    s.magX = raw.x;
+    s.magY = raw.y;
+    s.magZ = raw.z;
+    s.magHeadingDeg = raw.headingDeg;
+    s.magValid = true;
     return true;
 }
 

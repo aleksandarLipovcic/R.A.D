@@ -35,6 +35,31 @@ PYBIND11_MODULE(DroneBackend, m) {
         .def_readonly("baro_valid",
             &DroneState::baroValid,
             "True when a valid MSP_ALTITUDE frame was received.")
+        // Magnetometer (QMC5883L via NEO-M10 I2C → MSP_RAW_MAG)
+        .def_readonly("mag_x",
+            &DroneState::magX,
+            "Raw magnetic field, X axis (FC sensor frame, ADC counts).")
+        .def_readonly("mag_y",
+            &DroneState::magY,
+            "Raw magnetic field, Y axis (FC sensor frame, ADC counts).")
+        .def_readonly("mag_z",
+            &DroneState::magZ,
+            "Raw magnetic field, Z axis (FC sensor frame, ADC counts).")
+        .def_readonly("mag_heading_deg",
+            &DroneState::magHeadingDeg,
+            "Tilt-uncorrected 2-D magnetic heading, 0-360°. "
+            "Accurate only when the drone is level.")
+        .def_readonly("mag_valid",
+            &DroneState::magValid,
+            "True when a valid MSP_RAW_MAG frame was received.")
+        // Magnetometer calibration state
+        .def_readonly("mag_cal_active",
+            &DroneState::magCalActive,
+            "True while the FC is in magnetometer calibration mode. "
+            "Rotate the drone on all axes during this window.")
+        .def_readonly("mag_cal_seconds_remaining",
+            &DroneState::magCalSecondsRemaining,
+            "Seconds left in the calibration window (counts down from 30 to 0).")
         // Diagnostics
         .def_readonly("last_rtt_ms", &DroneState::lastRttMs)
         .def_readonly("fc_cycle_ms", &DroneState::fcCycleMs)
@@ -59,6 +84,15 @@ PYBIND11_MODULE(DroneBackend, m) {
             "baro_vario_mps"_a = s.baroVarioCmPerSec * 0.01,
             "baro_vario_fpm"_a = s.baroVarioCmPerSec * 1.9685,
             "baro_valid"_a = s.baroValid,
+            // Magnetometer — QMC5883L via NEO-M10 I2C
+            "mag_x"_a = s.magX,
+            "mag_y"_a = s.magY,
+            "mag_z"_a = s.magZ,
+            "mag_heading_deg"_a = s.magHeadingDeg,
+            "mag_valid"_a = s.magValid,
+            // Magnetometer calibration state
+            "mag_cal_active"_a = s.magCalActive,
+            "mag_cal_seconds_remaining"_a = s.magCalSecondsRemaining,
             // Diagnostics
             "rtt_ms"_a = s.lastRttMs,
             "fc_cycle_ms"_a = s.fcCycleMs,
@@ -80,7 +114,12 @@ PYBIND11_MODULE(DroneBackend, m) {
             "Return a thread-safe snapshot of the latest telemetry.")
         .def("set_poll_interval_ms", &DroneLink::setPollIntervalMs,
             py::arg("ms"),
-            "Tune background thread cadence (default 10 ms = 100 Hz).");
+            "Tune background thread cadence (default 10 ms = 100 Hz).")
+        .def("start_mag_calibration", &DroneLink::startMagCalibration,
+            "Send MSP_MAG_CALIBRATION (205) to the FC and start the 30 s countdown.\n"
+            "Rotate the drone on all axes during the calibration window.\n"
+            "Monitor state.mag_cal_active and state.mag_cal_seconds_remaining\n"
+            "via get_latest_state() to drive a GUI progress indicator.");
 
     // ── IMUSensor ─────────────────────────────────────────────────────────────
     py::class_<IMUSensor>(m, "IMUSensor")

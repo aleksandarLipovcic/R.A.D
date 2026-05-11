@@ -1,11 +1,11 @@
 import sys
 import os
-import ctypes
 import tkinter as tk
 from tkinter import ttk
 from IMUWidget   import IMUWidget
 from Drone3DView import Drone3DView
 from BaroWidget  import BaroWidget
+from MagWidget   import MagWidget
 
 # ── Path configuration ────────────────────────────────────────────────────────
 script_dir   = os.path.dirname(os.path.abspath(__file__))
@@ -31,24 +31,18 @@ class DroneCockpitApp:
         self.root = root
 
         # ── Window title ──────────────────────────────────────────────────────
+        # Note: the ctypes SetWindowTextW block was removed — it was corrupting
+        # the title bar when run under the VS debug host (GetParent returns the
+        # wrong handle).  root.title() alone is correct and sufficient.
         self.root.title("Drone Control Ground Station")
-        try:
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-            ctypes.windll.user32.SetWindowTextW(
-                hwnd, "Drone Control Ground Station"
-            )
-        except Exception:
-            pass
-
         self.root.configure(bg=BG_COLOR)
-        # Allow Tk to resize the window to fit content, but not smaller
         self.root.resizable(True, True)
 
         self.hub = DroneBackend.DroneLink()
         self._update_job = None
 
         self._setup_ui()
-        self._fit_window()       # auto-size after all widgets are built
+        self._fit_window()
         self._auto_connect()
 
     # ── Layout ────────────────────────────────────────────────────────────────
@@ -67,54 +61,43 @@ class DroneCockpitApp:
         self.status_label.pack()
 
         # ── Main content frame ────────────────────────────────────────────────
-        # Two columns side by side, anchored to top so rows don't stretch.
+        # Two columns:
+        #   col 0 — left panel: IMU (row 0) + Mag widget (row 1)
+        #   col 1 — PFD: ADI + Baro side by side
+        #
+        # sticky="n" on both columns prevents vertical stretching.
         main = tk.Frame(self.root, bg=BG_COLOR)
         main.pack(side="top", fill="both", expand=True, padx=16, pady=(4, 12))
 
-        # ── Left column: IMU table ────────────────────────────────────────────
-        # sticky="n" is critical — prevents this column from forcing the right
-        # column to grow taller, which was stretching the ADI canvas.
-        left = tk.Frame(main, bg=BG_COLOR)
-        left.grid(row=0, column=0, sticky="n", padx=(0, 14))
+        # ── Col 0, Row 0: IMU table ───────────────────────────────────────────
+        self.imu_view = IMUWidget(main)
+        self.imu_view.grid(row=0, column=0, sticky="new", padx=(0, 14))
 
-        self.imu_view = IMUWidget(left)
-        self.imu_view.grid(row=0, column=0, sticky="nsew")
+        # ── Col 0, Row 1: Magnetometer widget ────────────────────────────────
+        # Placed directly below the IMU — the left column has plenty of vertical
+        # room and this avoids widening the window beyond the screen edge.
+        self.mag_view = MagWidget(
+            main,
+            on_calibrate=self.hub.start_mag_calibration
+        )
+        self.mag_view.grid(row=1, column=0, sticky="new", padx=(0, 14), pady=(10, 0))
 
-        # ── Right column: Primary Flight Display ──────────────────────────────
-        # Contains the ADI (left) and the altitude tape + VSI (right),
-        # matching the layout of a real PFD (e.g. Garmin G1000).
+        # ── Col 1: Primary Flight Display ────────────────────────────────────
         pfd = ttk.LabelFrame(main, text="Primary Flight Display")
-        pfd.grid(row=0, column=1, sticky="n")
+        pfd.grid(row=0, column=1, rowspan=2, sticky="n")
 
-        # ADI canvas — fixed size, packed without fill/expand so it never
-        # grows beyond the requested width/height.  Drone3DView reads its
-        # actual pixel size via winfo_width/height on every frame so it will
-        # still adapt if the user manually resizes the window.
         adi_frame = tk.Frame(pfd, bg=BG_COLOR)
         adi_frame.pack(side="left", padx=(8, 4), pady=8)
 
         self.drone_3d = Drone3DView(adi_frame, width=420, height=340)
-        self.drone_3d.pack()   # no fill="both" — keeps the canvas at exact size
+        self.drone_3d.pack()
 
-        # Altitude tape + VSI — immediately to the right of the ADI
         self.baro_view = BaroWidget(pfd)
         self.baro_view.pack(side="left", padx=(4, 8), pady=8, anchor="n")
 
     # ── Auto window sizing ────────────────────────────────────────────────────
 
     def _fit_window(self):
-        """
-        Size the window to exactly fit its content with a small margin.
-
-        Two-pass approach:
-          1. update_idletasks() — lets Tk calculate preferred widget sizes
-          2. update()           — processes any pending layout events so
-                                  winfo_reqwidth/height return final values
-          3. geometry(WxH)      — lock the window to that size and centre it
-
-        This eliminates the need for the user to manually drag the window
-        corner after launch.
-        """
         self.root.update_idletasks()
         self.root.update()
 
@@ -127,7 +110,6 @@ class DroneCockpitApp:
         y  = (sh - h) // 2
 
         self.root.geometry(f"{w}x{h}+{x}+{y}")
-        # Set minimum size = natural size so user can only make it larger
         self.root.minsize(w, h)
 
     # ── Connection ────────────────────────────────────────────────────────────
@@ -178,12 +160,12 @@ class DroneCockpitApp:
             state = self.hub.get_latest_state()
 
             if not state.link_healthy:
-                self.status_label.config(text="Status: Link degraded",  fg="orange")
+                self.status_label.config(text="Status: Link degraded", fg="orange")
             else:
-                self.status_label.config(text="Status: Connected",       fg="green")
+                self.status_label.config(text="Status: Connected",      fg="green")
 
             ui_data = {
-                # IMU raw counts (divided by scale inside IMUWidget)
+                # IMU raw counts
                 "ax":          state.ax,
                 "ay":          state.ay,
                 "az":          state.az,
@@ -204,6 +186,14 @@ class DroneCockpitApp:
                 "baro_altitude_cm":      getattr(state, "baro_altitude_cm",      0),
                 "baro_vario_cm_per_sec": getattr(state, "baro_vario_cm_per_sec", 0),
                 "baro_valid":            getattr(state, "baro_valid",             False),
+                # Magnetometer — same getattr pattern for safe pre-compile runs
+                "mag_x":                     getattr(state, "mag_x",                     0),
+                "mag_y":                     getattr(state, "mag_y",                     0),
+                "mag_z":                     getattr(state, "mag_z",                     0),
+                "mag_heading_deg":           getattr(state, "mag_heading_deg",           0.0),
+                "mag_valid":                 getattr(state, "mag_valid",                 False),
+                "mag_cal_active":            getattr(state, "mag_cal_active",            False),
+                "mag_cal_seconds_remaining": getattr(state, "mag_cal_seconds_remaining", 0),
             }
 
             self.imu_view.update_ui(ui_data)
@@ -213,6 +203,7 @@ class DroneCockpitApp:
                 pitch=ui_data["pitch"],
                 yaw=ui_data["yaw"],
             )
+            self.mag_view.update_mag(ui_data)
 
         except Exception as e:
             print(f"[update_loop] {e}")

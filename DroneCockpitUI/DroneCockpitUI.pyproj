@@ -35,6 +35,9 @@
     <Compile Include="Drone3DView.py">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="MagWidget.py">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="Setup_Project.py">
       <SubType>Code</SubType>
     </Compile>

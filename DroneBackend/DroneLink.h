@@ -14,12 +14,19 @@
 namespace MSP {
     constexpr uint8_t RAW_IMU = 102;
     constexpr uint8_t ATTITUDE = 108;
-    constexpr uint8_t ANALOG = 110;  // battery voltage, RSSI
-    constexpr uint8_t ALTITUDE = 109;  // BMP280 fused altitude + vario (MSP_ALTITUDE)
+    constexpr uint8_t ANALOG = 110;   // battery voltage, RSSI
+    constexpr uint8_t ALTITUDE = 109;   // BMP280 fused altitude + vario (MSP_ALTITUDE)
     constexpr uint8_t DEBUG = 254;
+    constexpr uint8_t RAW_MAG = 130;   // QMC5883L via NEO-M10 I2C → MSP_RAW_MAG
+    constexpr uint8_t MAG_CAL = 205;   // Trigger mag calibration → MSP_MAG_CALIBRATION
     // Add future IDs here:
     // constexpr uint8_t GPS = 106;
 }
+
+// Betaflight holds the FC in mag-calibration mode for this many seconds after
+// receiving MSP_MAG_CALIBRATION.  We mirror it locally so the GUI can show an
+// accurate countdown without any extra MSP polling.
+static constexpr int MAG_CAL_DURATION_S = 30;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DroneState — written exclusively by the worker thread,
@@ -45,6 +52,24 @@ struct DroneState {
     int32_t baroAltitudeCm = 0;     // FC-fused altitude above home, cm
     int16_t baroVarioCmPerSec = 0;     // vertical speed (vario), cm/s
     bool    baroValid = false; // false until first successful parse
+
+    // Magnetometer — QMC5883L via NEO-M10 I2C → MSP_RAW_MAG
+    // Requires: Magnetometer enabled in Betaflight Configurator
+    //           (Configuration tab -> Sensors -> Magnetometer)
+    int16_t magX = 0;     // raw field, X axis (FC frame)
+    int16_t magY = 0;     // raw field, Y axis (FC frame)
+    int16_t magZ = 0;     // raw field, Z axis (FC frame)
+    float   magHeadingDeg = 0.0f;  // tilt-uncorrected 2-D heading, 0-360°
+    bool    magValid = false; // false until first successful parse
+
+    // Magnetometer calibration state
+    // Set by the worker thread after startMagCalibration() is called.
+    // magCalActive stays true for MAG_CAL_DURATION_S seconds, then clears.
+    // magCalSecondsRemaining counts down from MAG_CAL_DURATION_S to 0.
+    // Python should show a progress indicator while magCalActive == true
+    // and prompt the user to rotate the drone on all axes during that window.
+    bool magCalActive = false;
+    int  magCalSecondsRemaining = 0;
 
     // Diagnostics
     double   lastRttMs = 0.0;   // last measured round-trip time
@@ -86,6 +111,14 @@ public:
     // Returns a snapshot copy — safe to call from any thread.
     DroneState getLatestState();
 
+    // ── Magnetometer calibration ──────────────────────────────────────────────
+    // Call from any thread (Python GUI button handler).
+    // Sets an atomic flag; the worker thread picks it up on the next loop tick,
+    // fires MSP_MAG_CALIBRATION (205) to the FC, and starts the countdown.
+    // Progress is visible via DroneState::magCalActive and
+    // DroneState::magCalSecondsRemaining in getLatestState().
+    void startMagCalibration();
+
     // ── Poll interval tuning (call before connect, or at runtime) ────────────
     void setPollIntervalMs(int ms) { pollIntervalMs.store(ms); }
 
@@ -98,6 +131,14 @@ private:
     std::thread       workerThread;
     std::atomic<bool> keepRunning;
     std::atomic<int>  pollIntervalMs;
+
+    // ── Calibration flag (written by public API, consumed by worker) ──────────
+    // Using atomic so startMagCalibration() needs no mutex.
+    std::atomic<bool> magCalRequested;
+
+    // ── Calibration timing (worker-thread-private, no mutex needed) ──────────
+    bool                                  magCalActive_;
+    std::chrono::steady_clock::time_point magCalStartTime_;
 
     // ── Shared state (guarded by dataMutex) ──────────────────────────────────
     mutable std::mutex dataMutex;
@@ -119,6 +160,7 @@ private:
     bool parseAnalog(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseDebug(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseBaro(const std::vector<uint8_t>& buf, DroneState& s);  // BMP280
+    bool parseMag(const std::vector<uint8_t>& buf, DroneState& s);  // QMC5883L via NEO-M10
 
     // Atomically push a fully-populated state snapshot to currentState.
     void commitState(const DroneState& s);
