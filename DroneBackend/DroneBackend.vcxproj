@@ -135,12 +135,14 @@
     <ClInclude Include="BaroBMP280.h" />
     <ClInclude Include="DroneLink.h" />
     <ClInclude Include="IMUSensor.h" />
+    <ClInclude Include="MagQMC5883L.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="DroneLink.cpp" />
     <ClCompile Include="IMUSensor.cpp" />
     <ClCompile Include="Bindings.cpp" />
     <ClCompile Include="BaroBMP280.cpp" />
+    <ClCompile Include="MagQMC5883L.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
