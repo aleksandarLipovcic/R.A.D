@@ -1,4 +1,6 @@
 import tkinter as tk
+import time
+import collections
 
 
 class BaroWidget(tk.Frame):
@@ -12,18 +14,17 @@ class BaroWidget(tk.Frame):
         │    ├───────┘        │      │      ├────────┤  +390
         │    │ +161.0  tip►───┤      ├──────┤        │  (spine)
         │    ├───────┐        │      │      ├────────┤  +380
-        │    │       │        │      │      │        │
 
-    Pentagon (tip ► points RIGHT toward spine):
-      A = (TIP_X,    cy)       rightmost tip — sits at spine edge
-      B = (SHOULDER, cy - bh)  upper-right shoulder of box
-      C = (BOX_L,    cy - bh)  upper-left corner
-      D = (BOX_L,    cy + bh)  lower-left corner
-      E = (SHOULDER, cy + bh)  lower-right shoulder of box
+    VARIO NOTE
+    ──────────
+    Betaflight's MSP_ALTITUDE varioCmPerSec field is often zero or near-zero
+    because the FC's internal vario estimator is tuned for stabilisation, not
+    for a readable climb-rate display.  We therefore compute our own vario by
+    differentiating altitude over a short rolling window (VARIO_WINDOW_S) and
+    applying a simple exponential smoothing filter (VARIO_ALPHA).
 
-    Scale numbers are centred inside the box body (BOX_L … SHOULDER).
-    Ticks extend LEFT from SPINE_X.
-    Spine is the rightmost vertical line.
+    The FC vario is accepted only as a fallback when we have fewer than
+    MIN_SAMPLES_FOR_DERIVED samples in the window.
 
     ALTITUDE THRESHOLDS (drone operational envelope):
       Green   0 – 800 m
@@ -40,23 +41,21 @@ class BaroWidget(tk.Frame):
     LABEL_STEP = 10
     TICK_STEP  =  5
 
-    # ── Tape x-coordinate layout (all measured from left = 0) ────────────────
-    #
-    #   BOX_L   SHOULDER   TIP_X   MIN_L   MAJ_L   SPINE_X
-    #     5       100       110     114     120      150
-    #
-    #   Box body  : BOX_L … SHOULDER  (95 px wide — fits ±9999.9)
-    #   Angled tip: SHOULDER … TIP_X  (10 px ramp)
-    #   Gap       : TIP_X … MIN_L     (4 px clear of ticks)
-    #   Minor tick: MIN_L … SPINE_X   (36 px)   — actually just 7 px:
-    #               ticks hang LEFT from SPINE_X
-    #
-    SPINE_X  = 150   # rightmost spine line
-    MAJ_L    = 138   # left end of major tick  (12 px wide tick)
-    MIN_L    = 143   # left end of minor tick  ( 7 px wide tick)
-    TIP_X    = 130   # rightmost tip of pentagon (≈ MAJ_L - 8, clears ticks)
-    SHOULDER = 120   # angled corner x  (TIP_X - 10)
-    BOX_L    =   5   # left wall of box
+    # ── Tape x-coordinate layout ──────────────────────────────────────────────
+    SPINE_X  = 150
+    MAJ_L    = 138
+    MIN_L    = 143
+    TIP_X    = 130
+    SHOULDER = 120
+    BOX_L    =   5
+
+    # ── Vario derivation parameters ───────────────────────────────────────────
+    # Rolling window of (timestamp, altitude_m) samples used to compute dh/dt.
+    # A 2-second window smooths noise without lagging too much.
+    VARIO_WINDOW_S       = 2.0    # seconds of history to keep
+    VARIO_ALPHA          = 0.25   # EMA smoothing  (lower = smoother, more lag)
+    MIN_SAMPLES_FOR_DERIVED = 3   # need at least this many samples before
+                                  # we trust the derived value over FC vario
 
     # ── Warning thresholds ────────────────────────────────────────────────────
     WARN_ALT_M  =  800.0
@@ -67,7 +66,7 @@ class BaroWidget(tk.Frame):
 
     # ── Anti-flicker gates ────────────────────────────────────────────────────
     ALT_THR   = 0.05
-    VARIO_THR = 0.03
+    VARIO_THR = 0.02   # tighter than before since derived vario is smoother
 
     # ── Cockpit palette ───────────────────────────────────────────────────────
     C_BG      = "#0d0d1a"
@@ -90,13 +89,18 @@ class BaroWidget(tk.Frame):
     def __init__(self, parent):
         super().__init__(parent, bg=self.C_FRAME)
         self._alt_m     = 0.0
-        self._vario_mps = 0.0
+        self._vario_mps = 0.0   # smoothed derived vario
         self._valid     = False
         self._qnh_ref_m = 0.0
 
         self._last_alt   = None
         self._last_vario = None
         self._last_valid = None
+
+        # ── Vario derivation state ─────────────────────────────────────────────
+        # deque of (time_s, alt_m) — automatically discards old samples
+        self._alt_history: collections.deque = collections.deque()
+        self._vario_ema   = 0.0   # exponential moving average of raw dh/dt
 
         self._build_ui()
 
@@ -193,6 +197,56 @@ class BaroWidget(tk.Frame):
         self._agl_lbl.config(text=f"AGL {agl:+.1f} m", fg=clr)
         self._qnh_lbl.config(text=f"QNH ref: {self._qnh_ref_m:+.1f} m")
 
+    # ── Vario derivation ──────────────────────────────────────────────────────
+
+    def _update_vario(self, alt_m: float, fc_vario_mps: float) -> float:
+        """
+        Compute a smoothed vertical speed from the altitude history.
+
+        Algorithm:
+          1. Push (now, alt_m) onto a rolling deque.
+          2. Evict samples older than VARIO_WINDOW_S.
+          3. If we have enough samples, estimate dh/dt by linear regression
+             over the window (least-squares slope = Σ(t·h) / Σ(t²) after
+             mean-centring).  This is more robust than a simple endpoint diff.
+          4. Apply exponential smoothing to suppress noise.
+          5. Fall back to the FC-supplied vario until the window fills up.
+
+        Returns the smoothed vario in m/s.
+        """
+        now = time.monotonic()
+        self._alt_history.append((now, alt_m))
+
+        # Evict old samples
+        cutoff = now - self.VARIO_WINDOW_S
+        while self._alt_history and self._alt_history[0][0] < cutoff:
+            self._alt_history.popleft()
+
+        n = len(self._alt_history)
+
+        if n < self.MIN_SAMPLES_FOR_DERIVED:
+            # Not enough data yet — trust the FC value and seed the EMA
+            self._vario_ema = fc_vario_mps
+            return fc_vario_mps
+
+        # ── Linear regression slope (dh/dt) over the window ──────────────────
+        times = [s[0] for s in self._alt_history]
+        alts  = [s[1] for s in self._alt_history]
+
+        t_mean = sum(times) / n
+        h_mean = sum(alts)  / n
+
+        num = sum((t - t_mean) * (h - h_mean) for t, h in zip(times, alts))
+        den = sum((t - t_mean) ** 2            for t      in times)
+
+        raw_vario = (num / den) if den > 1e-9 else 0.0
+
+        # ── Exponential moving average ────────────────────────────────────────
+        self._vario_ema = (self.VARIO_ALPHA * raw_vario
+                           + (1.0 - self.VARIO_ALPHA) * self._vario_ema)
+
+        return self._vario_ema
+
     # ── Altitude tape ─────────────────────────────────────────────────────────
 
     def _draw_tape(self):
@@ -224,8 +278,8 @@ class BaroWidget(tk.Frame):
         )
 
         # ── 2. Ticks + scale numbers ───────────────────────────────────────────
-        bh       = 14        # pentagon half-height
-        label_cx = (self.BOX_L + self.SHOULDER) // 2   # centre of box body
+        bh       = 14
+        label_cx = (self.BOX_L + self.SHOULDER) // 2
 
         for a in range(lo, hi + 1, self.TICK_STEP):
             y = cy - (a - alt) * ppm
@@ -235,12 +289,10 @@ class BaroWidget(tk.Frame):
             behind_box = abs(y - cy) < bh + 2
 
             if a % self.LABEL_STEP == 0:
-                # major tick — always drawn
                 cv.create_line(
                     self.MAJ_L, y, self.SPINE_X, y,
                     fill=self.C_SPINE, width=2
                 )
-                # label — only hidden when behind the box
                 if not behind_box:
                     cv.create_text(
                         label_cx, y,
@@ -250,20 +302,12 @@ class BaroWidget(tk.Frame):
                         anchor="center"
                     )
             else:
-                # minor tick — always drawn
                 cv.create_line(
                     self.MIN_L, y, self.SPINE_X, y,
                     fill=self.C_MIN, width=1
                 )
 
-        # ── 3. Pentagon altitude box  ◄ tip points RIGHT ► into spine ──────────
-        #
-        #   C(BOX_L, cy-bh) ──── B(SHOULDER, cy-bh)
-        #   |                                        \
-        #   |   readout text                 tip► A(TIP_X, cy)
-        #   |                                        /
-        #   D(BOX_L, cy+bh) ──── E(SHOULDER, cy+bh)
-        #
+        # ── 3. Pentagon altitude box ───────────────────────────────────────────
         box_col = self._alt_color(alt)
 
         A = (self.TIP_X,    cy)
@@ -275,7 +319,6 @@ class BaroWidget(tk.Frame):
         pts = [A[0],A[1], B[0],B[1], C[0],C[1], D[0],D[1], E[0],E[1]]
         cv.create_polygon(pts, fill=self.C_BOX_BG, outline=box_col, width=2)
 
-        # Readout centred in the rectangular body (BOX_L … SHOULDER)
         text_cx = (self.BOX_L + self.SHOULDER) // 2
         cv.create_text(
             text_cx, cy,
@@ -350,17 +393,30 @@ class BaroWidget(tk.Frame):
 
     def update_baro(self, data: dict):
         """
-        Keys expected in ui_data:
+        Keys expected in data:
             baro_altitude_cm       int   FC-fused altitude above home, cm
-            baro_vario_cm_per_sec  int   vertical speed, cm/s
+            baro_vario_cm_per_sec  int   vertical speed from FC, cm/s
+                                         (used only as fallback seed)
             baro_valid             bool  True when MSP_ALTITUDE decoded OK
+
+        Vario is derived internally from the altitude history rather than
+        relying on the FC value, which Betaflight often reports as zero.
         """
         valid    = data.get("baro_valid", False)
         alt_cm   = int(data.get("baro_altitude_cm",      0)) if valid else 0
         vario_cm = int(data.get("baro_vario_cm_per_sec", 0)) if valid else 0
 
-        new_alt   = alt_cm   * self.CM_TO_M
-        new_vario = vario_cm * self.CM_TO_M
+        new_alt      = alt_cm   * self.CM_TO_M
+        fc_vario_mps = vario_cm * self.CM_TO_M
+
+        # Derive vario from altitude history (ignores FC value unless warming up)
+        if valid:
+            new_vario = self._update_vario(new_alt, fc_vario_mps)
+        else:
+            # Invalid signal — reset history so we start fresh on reconnect
+            self._alt_history.clear()
+            self._vario_ema = 0.0
+            new_vario = 0.0
 
         alt_dirty   = (self._last_alt   is None or
                        abs(new_alt   - self._last_alt)   > self.ALT_THR)
