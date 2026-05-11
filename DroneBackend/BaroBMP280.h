@@ -29,83 +29,61 @@
 
 #include <cstdint>
 #include <vector>
-#include <cmath>   // std::round
+#include <cmath>
 
-// ── Physical constants ────────────────────────────────────────────────────────
-// ISA standard lapse rate conversion: pressure altitude → metres
-// We use the simpler barometric formula P = P0 * (1 - L*h/T0)^(g*M/R*L)
-// but since Betaflight already integrates the baro and gives us altitude in cm,
-// we just do unit conversions here.
 static constexpr double CM_TO_M = 0.01;
 static constexpr double M_TO_FT = 3.28084;
 static constexpr double CM_TO_FT = CM_TO_M * M_TO_FT;
 
-// ── Raw parsed data from one MSP_ALTITUDE frame ───────────────────────────────
 struct BaroReading {
-    int32_t altitudeCm = 0;   // FC-fused altitude above home point, cm
-    int16_t varioCmPerSec = 0;   // Vertical speed, cm/s (positive = climb)
+    int32_t altitudeCm = 0;
+    int16_t varioCmPerSec = 0;
     bool    valid = false;
 };
 
-// ── Scaled / display-ready values ─────────────────────────────────────────────
 struct BaroData {
     // Altitude
-    double  altitudeM = 0.0;   // metres above home / QNH reference
-    double  altitudeFt = 0.0;   // feet   above home / QNH reference
-    int32_t altitudeCm = 0;     // raw cm (for logging)
+    double  altitudeM = 0.0;
+    double  altitudeFt = 0.0;
+    int32_t altitudeCm = 0;
 
-    // Vertical speed
-    double  varioMps = 0.0;   // m/s  (positive = climbing)
-    double  varioFpm = 0.0;   // ft/min (positive = climbing)
+    // Vertical speed — raw cm/s kept so the Python UI dict can use it directly
+    int16_t varioCmPerSec = 0;   // ← NEW: raw value, same unit as BaroReading
+    double  varioMps = 0.0;
+    double  varioFpm = 0.0;
 
-    // QNH-corrected altitude (pilot can zero the altimeter on the ground)
-    double  altitudeMqnh = 0.0;   // metres relative to QNH zero point
-    double  altitudeFtqnh = 0.0;   // feet   relative to QNH zero point
+    // QNH-corrected altitude
+    double  altitudeMqnh = 0.0;
+    double  altitudeFtqnh = 0.0;
 
     bool    valid = false;
 };
-
-// ─────────────────────────────────────────────────────────────────────────────
-// BaroBMP280 — stateless parser + unit converter
-// ─────────────────────────────────────────────────────────────────────────────
 
 class BaroBMP280 {
 public:
     BaroBMP280() = default;
 
-    // ── Parse MSP_ALTITUDE response ───────────────────────────────────────────
-    // Call from DroneLink::communicationLoop() after sendMSP(MSP::ALTITUDE).
-    // Returns true on success; writes parsed raw values into `out`.
-    // Frame: $ M > 06 6D [bytes 5..10] checksum  — minimum 12 bytes total.
     static bool parse(const std::vector<uint8_t>& buf, BaroReading& out) {
-        // Minimum frame: header(3) + size(1) + cmd(1) + payload(6) + crc(1) = 12
-        if (buf.size() < 12 || buf[4] != 109 /* MSP_ALTITUDE */) {
+        if (buf.size() < 12 || buf[4] != 109) {
             out.valid = false;
             return false;
         }
-
-        // Payload starts at index 5
         out.altitudeCm =
             static_cast<int32_t>(
                 static_cast<uint32_t>(buf[5]) |
                 (static_cast<uint32_t>(buf[6]) << 8) |
                 (static_cast<uint32_t>(buf[7]) << 16) |
-                (static_cast<uint32_t>(buf[8]) << 24)
-                );
+                (static_cast<uint32_t>(buf[8]) << 24));
 
         out.varioCmPerSec =
             static_cast<int16_t>(
                 static_cast<uint16_t>(buf[9]) |
-                (static_cast<uint16_t>(buf[10]) << 8)
-                );
+                (static_cast<uint16_t>(buf[10]) << 8));
 
         out.valid = true;
         return true;
     }
 
-    // ── Convert raw reading → display-ready BaroData ─────────────────────────
-    // qnhOffsetCm: altitude bias set when pilot presses "Set QNH" (cm).
-    //              Pass 0 to show altitude above FC home point.
     static BaroData scale(const BaroReading& raw, int32_t qnhOffsetCm = 0) {
         BaroData d;
         d.valid = raw.valid;
@@ -115,6 +93,7 @@ public:
         d.altitudeM = raw.altitudeCm * CM_TO_M;
         d.altitudeFt = raw.altitudeCm * CM_TO_FT;
 
+        d.varioCmPerSec = raw.varioCmPerSec;          // ← pass through raw
         d.varioMps = raw.varioCmPerSec * CM_TO_M;
         d.varioFpm = d.varioMps * (M_TO_FT * 60.0);
 

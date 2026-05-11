@@ -3,7 +3,7 @@ import os
 import ctypes
 import tkinter as tk
 from tkinter import ttk
-from IMUWidget  import IMUWidget
+from IMUWidget   import IMUWidget
 from Drone3DView import Drone3DView
 from BaroWidget  import BaroWidget
 
@@ -34,20 +34,21 @@ class DroneCockpitApp:
         self.root.title("Drone Control Ground Station")
         try:
             hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-            ctypes.windll.user32.SetWindowTextW(hwnd, "Drone Control Ground Station")
-        except Exception as e:
-            print(f"Windows API title force failed: {e}")
+            ctypes.windll.user32.SetWindowTextW(
+                hwnd, "Drone Control Ground Station"
+            )
+        except Exception:
+            pass
 
         self.root.configure(bg=BG_COLOR)
+        # Allow Tk to resize the window to fit content, but not smaller
+        self.root.resizable(True, True)
 
-        # C++ threaded backend — serial I/O runs in its own thread
         self.hub = DroneBackend.DroneLink()
-
-        # Track whether the update loop is already scheduled
         self._update_job = None
 
         self._setup_ui()
-        self._center_window()
+        self._fit_window()       # auto-size after all widgets are built
         self._auto_connect()
 
     # ── Layout ────────────────────────────────────────────────────────────────
@@ -55,7 +56,7 @@ class DroneCockpitApp:
     def _setup_ui(self):
         # ── Status bar ────────────────────────────────────────────────────────
         top = tk.Frame(self.root, bg=BG_COLOR)
-        top.pack(side="top", fill="x", pady=10)
+        top.pack(side="top", fill="x", pady=(8, 4))
 
         self.status_label = tk.Label(
             top,
@@ -65,40 +66,73 @@ class DroneCockpitApp:
         )
         self.status_label.pack()
 
-        # ── Main content (2 columns) ──────────────────────────────────────────
+        # ── Main content frame ────────────────────────────────────────────────
+        # Two columns side by side, anchored to top so rows don't stretch.
         main = tk.Frame(self.root, bg=BG_COLOR)
-        main.pack(fill="both", expand=True, padx=20, pady=10)
-        main.columnconfigure(0, weight=1)
-        main.columnconfigure(1, weight=1)
+        main.pack(side="top", fill="both", expand=True, padx=16, pady=(4, 12))
 
-        # ── Left column: IMU table (top) + Baro table (bottom) ───────────────
+        # ── Left column: IMU table ────────────────────────────────────────────
+        # sticky="n" is critical — prevents this column from forcing the right
+        # column to grow taller, which was stretching the ADI canvas.
         left = tk.Frame(main, bg=BG_COLOR)
-        left.grid(row=0, column=0, sticky="nsew", padx=10)
+        left.grid(row=0, column=0, sticky="n", padx=(0, 14))
 
         self.imu_view = IMUWidget(left)
-        self.imu_view.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
+        self.imu_view.grid(row=0, column=0, sticky="nsew")
 
-        self.baro_view = BaroWidget(left)
-        self.baro_view.grid(row=1, column=0, sticky="nsew")
+        # ── Right column: Primary Flight Display ──────────────────────────────
+        # Contains the ADI (left) and the altitude tape + VSI (right),
+        # matching the layout of a real PFD (e.g. Garmin G1000).
+        pfd = ttk.LabelFrame(main, text="Primary Flight Display")
+        pfd.grid(row=0, column=1, sticky="n")
 
-        # ── Right column: ADI / Spatial Orientation ───────────────────────────
-        visual = ttk.LabelFrame(main, text="Spatial Orientation")
-        visual.grid(row=0, column=1, sticky="nsew", padx=10)
-        self.drone_3d = Drone3DView(visual, width=400, height=350)
-        self.drone_3d.pack(padx=10, pady=10, expand=True, fill="both")
+        # ADI canvas — fixed size, packed without fill/expand so it never
+        # grows beyond the requested width/height.  Drone3DView reads its
+        # actual pixel size via winfo_width/height on every frame so it will
+        # still adapt if the user manually resizes the window.
+        adi_frame = tk.Frame(pfd, bg=BG_COLOR)
+        adi_frame.pack(side="left", padx=(8, 4), pady=8)
 
-    def _center_window(self):
+        self.drone_3d = Drone3DView(adi_frame, width=420, height=340)
+        self.drone_3d.pack()   # no fill="both" — keeps the canvas at exact size
+
+        # Altitude tape + VSI — immediately to the right of the ADI
+        self.baro_view = BaroWidget(pfd)
+        self.baro_view.pack(side="left", padx=(4, 8), pady=8, anchor="n")
+
+    # ── Auto window sizing ────────────────────────────────────────────────────
+
+    def _fit_window(self):
+        """
+        Size the window to exactly fit its content with a small margin.
+
+        Two-pass approach:
+          1. update_idletasks() — lets Tk calculate preferred widget sizes
+          2. update()           — processes any pending layout events so
+                                  winfo_reqwidth/height return final values
+          3. geometry(WxH)      — lock the window to that size and centre it
+
+        This eliminates the need for the user to manually drag the window
+        corner after launch.
+        """
         self.root.update_idletasks()
-        w = self.root.winfo_reqwidth()  + 20
-        h = self.root.winfo_reqheight() + 20
-        x = (self.root.winfo_screenwidth()  // 2) - (w // 2)
-        y = (self.root.winfo_screenheight() // 2) - (h // 2)
+        self.root.update()
+
+        w = self.root.winfo_reqwidth()  + 24
+        h = self.root.winfo_reqheight() + 24
+
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        x  = (sw - w) // 2
+        y  = (sh - h) // 2
+
         self.root.geometry(f"{w}x{h}+{x}+{y}")
+        # Set minimum size = natural size so user can only make it larger
+        self.root.minsize(w, h)
 
     # ── Connection ────────────────────────────────────────────────────────────
 
     def _auto_connect(self):
-        """Scan COM ports (via C++ helper) and connect when the drone is found."""
         port = DroneBackend.auto_detect_f405()
 
         if port == "NOT_FOUND":
@@ -121,7 +155,6 @@ class DroneCockpitApp:
             self.root.after(RECONNECT_MS, self._auto_connect)
 
     def _reconnect(self):
-        """Called when telemetry is lost mid-session."""
         self.hub.disconnect()
         self.status_label.config(
             text="Status: Link lost - reconnecting...", fg="red"
@@ -131,17 +164,11 @@ class DroneCockpitApp:
     # ── Update loop ───────────────────────────────────────────────────────────
 
     def _schedule_update(self):
-        """Kick off the 50 Hz UI refresh cycle (idempotent)."""
         if self._update_job is None:
             self._update_job = self.root.after(UI_REFRESH_MS, self._update_loop)
 
     def _update_loop(self):
-        """
-        Pull the latest snapshot from the C++ background thread and push it
-        into all widgets.  Runs entirely on the Tk main thread — no locking
-        needed here because get_latest_state() does the locking inside C++.
-        """
-        self._update_job = None   # reset so _schedule_update can re-arm
+        self._update_job = None
 
         if not self.hub.is_connected():
             self._reconnect()
@@ -150,23 +177,20 @@ class DroneCockpitApp:
         try:
             state = self.hub.get_latest_state()
 
-            # ── Link health indicator ─────────────────────────────────────────
             if not state.link_healthy:
-                self.status_label.config(text="Status: Link degraded", fg="orange")
+                self.status_label.config(text="Status: Link degraded",  fg="orange")
             else:
-                self.status_label.config(text="Status: Connected", fg="green")
+                self.status_label.config(text="Status: Connected",       fg="green")
 
-            # ── Build shared ui_data dict ─────────────────────────────────────
-            # roll/pitch arrive from FC as degrees * 10 — divide to plain degrees
             ui_data = {
-                # IMU raw counts (scaled inside IMUWidget)
+                # IMU raw counts (divided by scale inside IMUWidget)
                 "ax":          state.ax,
                 "ay":          state.ay,
                 "az":          state.az,
                 "gx":          state.gx,
                 "gy":          state.gy,
                 "gz":          state.gz,
-                # Attitude
+                # Attitude — FC sends degrees*10, divide here
                 "roll":        state.roll  / 10.0,
                 "pitch":       state.pitch / 10.0,
                 "yaw":         float(state.yaw),
@@ -175,15 +199,13 @@ class DroneCockpitApp:
                 "rssi":        state.rssi,
                 "rtt_ms":      state.last_rtt_ms,
                 "fc_cycle_ms": state.fc_cycle_ms,
-                # Barometer — BMP280 via MSP_ALTITUDE
-                # getattr fallback allows the GUI to run even if the C++ baro
-                # integration is not yet compiled (shows "NO SIGNAL" safely).
+                # Barometer — getattr fallback so GUI runs before C++ baro
+                # integration is compiled (BaroWidget shows "NO SIG" safely)
                 "baro_altitude_cm":      getattr(state, "baro_altitude_cm",      0),
                 "baro_vario_cm_per_sec": getattr(state, "baro_vario_cm_per_sec", 0),
                 "baro_valid":            getattr(state, "baro_valid",             False),
             }
 
-            # ── Push to widgets ───────────────────────────────────────────────
             self.imu_view.update_ui(ui_data)
             self.baro_view.update_baro(ui_data)
             self.drone_3d.update_orientation(
@@ -197,13 +219,11 @@ class DroneCockpitApp:
             self._reconnect()
             return
 
-        # Re-arm for the next tick
         self._update_job = self.root.after(UI_REFRESH_MS, self._update_loop)
 
     # ── Clean shutdown ────────────────────────────────────────────────────────
 
     def shutdown(self):
-        """Stop the C++ worker thread before destroying the window."""
         if self._update_job is not None:
             self.root.after_cancel(self._update_job)
         self.hub.disconnect()
