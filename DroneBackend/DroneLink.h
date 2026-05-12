@@ -9,165 +9,187 @@
 #include <cstdint>
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MSP command IDs — extend here as new sensors are added
+// MSP Command IDs — verified against Betaflight 4.5.x msp_protocol.h
+//
+// IMPORTANT — MSP_RAW_MAG DOES NOT EXIST IN BETAFLIGHT:
+//   ID 130 = MSP_BATTERY_STATE in all Betaflight 4.x releases.
+//   There is no MSP command that directly returns raw mag X/Y/Z.
+//
+// CORRECT MAG DATA PATH (official — same as BF Configurator Sensors tab):
+//   1. Set  debug_mode = MAG_CALIB  in the Betaflight CLI.
+//   2. Poll MSP_DEBUG (254) → debug[0]=magX, debug[1]=magY, debug[2]=magZ.
+//
+// DEBUG MODE MANAGEMENT:
+//   The GCS must switch debug_mode between MAG_CALIB and FLIGHT_CONTROLLER
+//   (or whatever the user's preferred mode is) so that:
+//     - During normal operation: FLIGHT_CONTROLLER debug data is available.
+//     - While mag widget is open / mag cal active: MAG_CALIB provides X/Y/Z.
+//   This is done via MSP_SET_DEBUG_CONFIG (not a real MSP command — we use
+//   the Betaflight CLI passthrough approach via MSP_DEBUGMSG / direct CLI).
+//   Simplest GCS approach: keep MAG_CALIB set permanently in BF CLI, and
+//   expose fcCycleMs via MSP_STATUS (101) instead of MSP_DEBUG.
+//
+// CALIBRATION COMMANDS:
+//   MSP_ACC_CALIBRATION (205) — triggers accelerometer/gyro calibration.
+//   MSP_MAG_CALIBRATION (206) — triggers magnetometer calibration (30s window).
+//   Both are fire-and-forget: FC acks with an empty response frame.
 // ─────────────────────────────────────────────────────────────────────────────
 namespace MSP {
-    constexpr uint8_t RAW_IMU = 102;
-    constexpr uint8_t ATTITUDE = 108;
-    constexpr uint8_t ANALOG = 110;   // battery voltage, RSSI
-    constexpr uint8_t ALTITUDE = 109;   // BMP280 fused altitude + vario (MSP_ALTITUDE)
-    constexpr uint8_t DEBUG = 254;
-    constexpr uint8_t RAW_MAG = 130;   // QMC5883L via NEO-M10 I2C → MSP_RAW_MAG
-    constexpr uint8_t MAG_CAL = 205;   // Trigger mag calibration → MSP_MAG_CALIBRATION
-    // Add future IDs here:
-    // constexpr uint8_t GPS = 106;
+    // ── Telemetry — out messages (FC → host) ─────────────────────────────────
+    constexpr uint8_t STATUS = 101;  // FC cycle time, arming flags, sensor status
+    constexpr uint8_t RAW_IMU = 102;  // accel + gyro raw (9 DOF)
+    constexpr uint8_t ATTITUDE = 108;  // fused roll / pitch / yaw (deg × 10)
+    constexpr uint8_t ALTITUDE = 109;  // BMP280 fused altitude (cm) + vario (cm/s)
+    constexpr uint8_t ANALOG = 110;  // battery voltage, mAh drawn, RSSI
+    constexpr uint8_t DEBUG = 254;  // 4 × int16_t debug values (mode-dependent)
+
+    // ── Calibration — in messages (host → FC, fire-and-forget) ───────────────
+    constexpr uint8_t ACC_CAL = 205;  // MSP_ACC_CALIBRATION — gyro + accel
+    constexpr uint8_t MAG_CAL = 206;  // MSP_MAG_CALIBRATION — magnetometer
+
+    // ── Battery (for reference — do NOT send as a telemetry request) ─────────
+    // constexpr uint8_t BATTERY_STATE = 130;  // NOT RAW_MAG — battery data only
 }
 
-// Betaflight holds the FC in mag-calibration mode for this many seconds after
-// receiving MSP_MAG_CALIBRATION.  We mirror it locally so the GUI can show an
-// accurate countdown without any extra MSP polling.
-static constexpr int MAG_CAL_DURATION_S = 30;
+// ─────────────────────────────────────────────────────────────────────────────
+// Calibration durations
+// ─────────────────────────────────────────────────────────────────────────────
+static constexpr int MAG_CAL_DURATION_S = 30;  // BF holds mag-cal mode for 30 s
+static constexpr int ACC_CAL_DURATION_S = 5;  // gyro+accel cal completes in ~5 s
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DroneState — written exclusively by the worker thread,
-//              read by Python via getLatestState() (mutex-protected copy)
+// DroneState
+//
+// Written exclusively by the worker thread.
+// Read by Python via getLatestState() — mutex-protected snapshot copy.
 // ─────────────────────────────────────────────────────────────────────────────
 struct DroneState {
-    // MPU-6500 raw values (ADC counts, not scaled)
-    int16_t ax = 0, ay = 0, az = 0;
-    int16_t gx = 0, gy = 0, gz = 0;
+    // ── IMU — MPU-6500 raw ADC counts (not scaled) ───────────────────────────
+    int16_t ax = 0, ay = 0, az = 0;   // accelerometer
+    int16_t gx = 0, gy = 0, gz = 0;   // gyroscope
 
-    // Attitude (degrees × 10 as sent by FC, divide in Python)
+    // ── Attitude — degrees × 10 as sent by FC; divide by 10.0 in Python ─────
     int16_t roll = 0;
     int16_t pitch = 0;
-    int16_t yaw = 0;
+    int16_t yaw = 0;   // yaw is already in full degrees (not × 10)
 
-    // Power
-    float   batteryVoltage = 0.0f;  // volts
-    uint8_t rssi = 0;     // 0-255
+    // ── Power ─────────────────────────────────────────────────────────────────
+    float   batteryVoltage = 0.0f;   // volts (buf[5] / 10.0)
+    uint8_t rssi = 0;      // 0–255
 
-    // Barometer — BMP280 via MSP_ALTITUDE
-    // Requires: Barometer enabled in Betaflight Configurator
-    //           (Configuration tab -> Sensors -> Barometer)
-    int32_t baroAltitudeCm = 0;     // FC-fused altitude above home, cm
-    int16_t baroVarioCmPerSec = 0;     // vertical speed (vario), cm/s
-    bool    baroValid = false; // false until first successful parse
+    // ── Barometer — BMP280 via MSP_ALTITUDE (109) ────────────────────────────
+    // Requires: Barometer enabled in BF Configurator → Configuration → Sensors
+    int32_t baroAltitudeCm = 0;
+    int16_t baroVarioCmPerSec = 0;
+    bool    baroValid = false;
 
-    // Magnetometer — QMC5883L via NEO-M10 I2C → MSP_RAW_MAG
-    // Requires: Magnetometer enabled in Betaflight Configurator
-    //           (Configuration tab -> Sensors -> Magnetometer)
-    int16_t magX = 0;     // raw field, X axis (FC frame)
-    int16_t magY = 0;     // raw field, Y axis (FC frame)
-    int16_t magZ = 0;     // raw field, Z axis (FC frame)
-    float   magHeadingDeg = 0.0f;  // tilt-uncorrected 2-D heading, 0-360°
-    bool    magValid = false; // false until first successful parse
+    // ── Magnetometer — QMC5883L via MSP_DEBUG (254) + debug_mode=MAG_CALIB ──
+    //
+    // PREREQUISITE (Betaflight CLI — one time):
+    //   set debug_mode = MAG_CALIB
+    //   save
+    //
+    // When set, MSP_DEBUG returns:
+    //   debug[0] = raw mag X (int16, ADC counts)
+    //   debug[1] = raw mag Y
+    //   debug[2] = raw mag Z
+    //   debug[3] = heading error / calibration quality
+    //
+    // magValid is false (and all values are 0) when:
+    //   a) debug_mode ≠ MAG_CALIB, OR
+    //   b) Magnetometer sensor is not detected/enabled in BF
+    int16_t magX = 0;
+    int16_t magY = 0;
+    int16_t magZ = 0;
+    float   magHeadingDeg = 0.0f;   // tilt-uncorrected 2-D heading, 0–360°
+    bool    magValid = false;
 
-    // Magnetometer calibration state
-    // Set by the worker thread after startMagCalibration() is called.
-    // magCalActive stays true for MAG_CAL_DURATION_S seconds, then clears.
-    // magCalSecondsRemaining counts down from MAG_CAL_DURATION_S to 0.
-    // Python should show a progress indicator while magCalActive == true
-    // and prompt the user to rotate the drone on all axes during that window.
+    // ── Magnetometer calibration state ───────────────────────────────────────
     bool magCalActive = false;
     int  magCalSecondsRemaining = 0;
 
-    // Diagnostics
-    double   lastRttMs = 0.0;   // last measured round-trip time
-    double   fcCycleMs = 0.0;   // FC internal loop time (from MSP_DEBUG)
-    bool     linkHealthy = false; // worker sets false on consecutive failures
-    uint32_t packetCount = 0;     // total successful packets received
+    // ── Gyro/Accel calibration state ─────────────────────────────────────────
+    bool accCalActive = false;
+    int  accCalSecondsRemaining = 0;
+
+    // ── Diagnostics ──────────────────────────────────────────────────────────
+    double   lastRttMs = 0.0;
+    double   fcCycleMs = 0.0;   // from MSP_STATUS (101); 0 if STATUS not polled
+    bool     linkHealthy = false;
+    uint32_t packetCount = 0;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DroneLink
-//
-// One object, one serial port, one worker thread.
-// Python calls connect() once; the worker handles all serial I/O from that
-// point on.  Python never touches the serial port directly.
 // ─────────────────────────────────────────────────────────────────────────────
 class DroneLink {
 public:
-    // Default poll interval (ms). Lower = more responsive, higher CPU.
-    // 10 ms → 100 Hz max, well within MPU-6500's 1 kHz native rate.
-    static constexpr int POLL_INTERVAL_MS = 10;
-
-    // How many consecutive failed packets before linkHealthy = false
-    static constexpr int FAIL_THRESHOLD = 5;
+    static constexpr int POLL_INTERVAL_MS = 10;   // 100 Hz poll rate
+    static constexpr int FAIL_THRESHOLD = 5;   // consecutive failures before unhealthy
 
     DroneLink();
     ~DroneLink();
 
     // ── Connection ────────────────────────────────────────────────────────────
-    // Opens the serial port AND starts the worker thread.
-    // portName: "COM3" style (no "\\\\.\\")
     bool connect(const std::string& portName);
-
-    // Stops the worker thread and closes the port cleanly.
     void disconnect();
-
     bool isConnected() const { return connected.load(); }
 
-    // ── Data access (call from Python / GUI thread) ───────────────────────────
-    // Returns a snapshot copy — safe to call from any thread.
+    // ── State snapshot ────────────────────────────────────────────────────────
     DroneState getLatestState();
 
-    // ── Magnetometer calibration ──────────────────────────────────────────────
-    // Call from any thread (Python GUI button handler).
-    // Sets an atomic flag; the worker thread picks it up on the next loop tick,
-    // fires MSP_MAG_CALIBRATION (205) to the FC, and starts the countdown.
-    // Progress is visible via DroneState::magCalActive and
-    // DroneState::magCalSecondsRemaining in getLatestState().
+    // ── Calibration triggers ─────────────────────────────────────────────────
+    // startMagCalibration()  — sends MSP_MAG_CALIBRATION (206) to FC and starts
+    //                          the 30-second countdown in DroneState.
+    //                          Rotate the drone on all axes during this window.
+    //
+    // startAccCalibration()  — sends MSP_ACC_CALIBRATION (205) to FC and starts
+    //                          the ~5-second countdown in DroneState.
+    //                          Keep the drone perfectly level and still.
     void startMagCalibration();
+    void startAccCalibration();
 
-    // ── Poll interval tuning (call before connect, or at runtime) ────────────
+    // ── Tuning ────────────────────────────────────────────────────────────────
     void setPollIntervalMs(int ms) { pollIntervalMs.store(ms); }
 
 private:
-    // ── Serial port ──────────────────────────────────────────────────────────
     HANDLE            hSerial;
     std::atomic<bool> connected;
-
-    // ── Worker thread ────────────────────────────────────────────────────────
     std::thread       workerThread;
     std::atomic<bool> keepRunning;
     std::atomic<int>  pollIntervalMs;
 
-    // ── Calibration flag (written by public API, consumed by worker) ──────────
-    // Using atomic so startMagCalibration() needs no mutex.
+    // Calibration request flags (set from Python thread, consumed by worker)
     std::atomic<bool> magCalRequested;
+    std::atomic<bool> accCalRequested;
 
-    // ── Calibration timing (worker-thread-private, no mutex needed) ──────────
+    // Calibration countdown state (worker-thread only, committed via commitState)
     bool                                  magCalActive_;
     std::chrono::steady_clock::time_point magCalStartTime_;
+    bool                                  accCalActive_;
+    std::chrono::steady_clock::time_point accCalStartTime_;
 
-    // ── Shared state (guarded by dataMutex) ──────────────────────────────────
     mutable std::mutex dataMutex;
     DroneState         currentState;
 
-    // ── Internal helpers ─────────────────────────────────────────────────────
-
-    // Main loop running on workerThread
+    // ── Worker ────────────────────────────────────────────────────────────────
     void communicationLoop();
 
-    // Build and send an MSP request packet, return raw response bytes.
-    // Called ONLY from workerThread.
+    // ── MSP transport ────────────────────────────────────────────────────────
     std::vector<uint8_t> sendMSP(uint8_t mspID);
 
-    // Parse individual MSP responses and update fields on pendingState.
-    // Returns true if the response was valid for that command.
+    // ── Parsers — one per MSP response type ──────────────────────────────────
+    bool parseStatus(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseIMU(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseAttitude(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseAnalog(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseDebug(const std::vector<uint8_t>& buf, DroneState& s);
-    bool parseBaro(const std::vector<uint8_t>& buf, DroneState& s);  // BMP280
-    bool parseMag(const std::vector<uint8_t>& buf, DroneState& s);  // QMC5883L via NEO-M10
+    bool parseBaro(const std::vector<uint8_t>& buf, DroneState& s);
 
-    // Atomically push a fully-populated state snapshot to currentState.
     void commitState(const DroneState& s);
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Free function — scan COM1-COM29, return first that opens.
-// Returns "NOT_FOUND" if nothing responds.
+// AutoDetectF405() — scans COM1–COM29, returns first port that opens
 // ─────────────────────────────────────────────────────────────────────────────
 std::string AutoDetectF405();

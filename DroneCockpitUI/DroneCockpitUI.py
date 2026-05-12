@@ -30,7 +30,6 @@ class DroneCockpitApp:
     def __init__(self, root: tk.Tk):
         self.root = root
 
-        # ── Window title ──────────────────────────────────────────────────────
         # Note: the ctypes SetWindowTextW block was removed — it was corrupting
         # the title bar when run under the VS debug host (GetParent returns the
         # wrong handle).  root.title() alone is correct and sufficient.
@@ -64,8 +63,6 @@ class DroneCockpitApp:
         # Two columns:
         #   col 0 — left panel: IMU (row 0) + Mag widget (row 1)
         #   col 1 — PFD: ADI + Baro side by side
-        #
-        # sticky="n" on both columns prevents vertical stretching.
         main = tk.Frame(self.root, bg=BG_COLOR)
         main.pack(side="top", fill="both", expand=True, padx=16, pady=(4, 12))
 
@@ -73,12 +70,14 @@ class DroneCockpitApp:
         self.imu_view = IMUWidget(main)
         self.imu_view.grid(row=0, column=0, sticky="new", padx=(0, 14))
 
-        # ── Col 0, Row 1: Magnetometer widget ────────────────────────────────
-        # Placed directly below the IMU — the left column has plenty of vertical
-        # room and this avoids widening the window beyond the screen edge.
+        # ── Col 0, Row 1: Magnetometer + calibration widget ───────────────────
+        # Both mag calibration AND gyro/accel calibration buttons live here.
+        # on_mag_calibrate → DroneLink.start_mag_calibration()  (MSP 206)
+        # on_acc_calibrate → DroneLink.start_acc_calibration()  (MSP 205)
         self.mag_view = MagWidget(
             main,
-            on_calibrate=self.hub.start_mag_calibration
+            on_mag_calibrate=self.hub.start_mag_calibration,
+            on_acc_calibrate=self.hub.start_acc_calibration,
         )
         self.mag_view.grid(row=1, column=0, sticky="new", padx=(0, 14), pady=(10, 0))
 
@@ -165,35 +164,42 @@ class DroneCockpitApp:
                 self.status_label.config(text="Status: Connected",      fg="green")
 
             ui_data = {
-                # IMU raw counts
+                # ── IMU raw counts ────────────────────────────────────────────
                 "ax":          state.ax,
                 "ay":          state.ay,
                 "az":          state.az,
                 "gx":          state.gx,
                 "gy":          state.gy,
                 "gz":          state.gz,
-                # Attitude — FC sends degrees*10, divide here
+                # ── Attitude — FC sends degrees*10, divide here ───────────────
                 "roll":        state.roll  / 10.0,
                 "pitch":       state.pitch / 10.0,
                 "yaw":         float(state.yaw),
-                # Link quality
+                # ── Link quality ──────────────────────────────────────────────
                 "voltage":     state.battery_voltage,
                 "rssi":        state.rssi,
                 "rtt_ms":      state.last_rtt_ms,
                 "fc_cycle_ms": state.fc_cycle_ms,
-                # Barometer — getattr fallback so GUI runs before C++ baro
-                # integration is compiled (BaroWidget shows "NO SIG" safely)
+                # ── Barometer ─────────────────────────────────────────────────
+                # getattr fallback keeps the GUI running before the C++ baro
+                # integration is compiled (BaroWidget shows "NO SIG" safely).
                 "baro_altitude_cm":      getattr(state, "baro_altitude_cm",      0),
                 "baro_vario_cm_per_sec": getattr(state, "baro_vario_cm_per_sec", 0),
                 "baro_valid":            getattr(state, "baro_valid",             False),
-                # Magnetometer — same getattr pattern for safe pre-compile runs
+                # ── Magnetometer ──────────────────────────────────────────────
+                # Raw X/Y/Z comes from MSP_DEBUG (254) with debug_mode=MAG_CALIB.
+                # mag_valid is False when debug_mode is wrong or sensor missing.
                 "mag_x":                     getattr(state, "mag_x",                     0),
                 "mag_y":                     getattr(state, "mag_y",                     0),
                 "mag_z":                     getattr(state, "mag_z",                     0),
                 "mag_heading_deg":           getattr(state, "mag_heading_deg",           0.0),
                 "mag_valid":                 getattr(state, "mag_valid",                 False),
+                # ── Magnetometer calibration (MSP_MAG_CALIBRATION = 206) ──────
                 "mag_cal_active":            getattr(state, "mag_cal_active",            False),
                 "mag_cal_seconds_remaining": getattr(state, "mag_cal_seconds_remaining", 0),
+                # ── Gyro/Accel calibration (MSP_ACC_CALIBRATION = 205) ────────
+                "acc_cal_active":            getattr(state, "acc_cal_active",            False),
+                "acc_cal_seconds_remaining": getattr(state, "acc_cal_seconds_remaining", 0),
             }
 
             self.imu_view.update_ui(ui_data)
