@@ -29,6 +29,9 @@
     <Compile Include="DroneTest.py">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="GPSWidget.py">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="IMUWidget.py">
       <SubType>Code</SubType>
     </Compile>
