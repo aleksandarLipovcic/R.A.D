@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include "GPSNeoM10.h"           // GPSReading + GPSNeoM10 static parsers
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MSP Command IDs — verified against Betaflight 4.5.x msp_protocol.h
@@ -38,6 +39,8 @@ namespace MSP {
     // ── Telemetry — out messages (FC → host) ─────────────────────────────────
     constexpr uint8_t STATUS = 101;  // FC cycle time, arming flags, sensor status
     constexpr uint8_t RAW_IMU = 102;  // accel + gyro raw (9 DOF)
+    constexpr uint8_t RAW_GPS = 106;  // fix, sats, lat/lon, alt, speed, course, HDOP
+    constexpr uint8_t COMP_GPS = 107;  // distance-to-home, bearing, heartbeat
     constexpr uint8_t ATTITUDE = 108;  // fused roll / pitch / yaw (deg × 10)
     constexpr uint8_t ALTITUDE = 109;  // BMP280 fused altitude (cm) + vario (cm/s)
     constexpr uint8_t ANALOG = 110;  // battery voltage, mAh drawn, RSSI
@@ -112,6 +115,26 @@ struct DroneState {
     bool accCalActive = false;
     int  accCalSecondsRemaining = 0;
 
+    // ── GPS — NEO-M10 via MSP_RAW_GPS (106) + MSP_COMP_GPS (107) ────────────
+    // Populated when gps.rawValid / gps.compValid are true.
+    // All fields are already in SI-friendly units (see GPSNeoM10.h).
+    //
+    //   gps.fixType        — 0 = no fix, 1 = 2D, 2 = 3D
+    //   gps.numSat         — satellites used
+    //   gps.latitude       — decimal degrees (+ = N, − = S)
+    //   gps.longitude      — decimal degrees (+ = E, − = W)
+    //   gps.altitudeM      — MSL altitude, metres
+    //   gps.groundSpeedMs  — ground speed, cm/s  (÷100 → m/s)
+    //   gps.groundCourse   — ground course, decidegrees (0–3599)
+    //   gps.hdop           — HDOP × 100  (9999 = unknown; good fix < 200)
+    //   gps.distToHomM     — distance to home point, metres
+    //   gps.bearingToHome  — bearing to home, degrees (−180 … +180)
+    //   gps.gpsHeartbeat   — toggles each time FC receives a fresh GPS frame
+    //
+    // Requires: GPS enabled in BF Configurator → Configuration → Sensors
+    //           and a valid UART assigned to GPS in the Ports tab.
+    GPSReading gps;
+
     // ── Diagnostics ──────────────────────────────────────────────────────────
     double   lastRttMs = 0.0;
     double   fcCycleMs = 0.0;   // from MSP_STATUS (101); 0 if STATUS not polled
@@ -124,8 +147,8 @@ struct DroneState {
 // ─────────────────────────────────────────────────────────────────────────────
 class DroneLink {
 public:
-    static constexpr int POLL_INTERVAL_MS = 10;   // 100 Hz poll rate
-    static constexpr int FAIL_THRESHOLD = 5;   // consecutive failures before unhealthy
+    static constexpr int POLL_INTERVAL_MS = 10;  // 100 Hz poll rate
+    static constexpr int FAIL_THRESHOLD = 5;  // consecutive failures before unhealthy
 
     DroneLink();
     ~DroneLink();
@@ -175,16 +198,20 @@ private:
     // ── Worker ────────────────────────────────────────────────────────────────
     void communicationLoop();
 
-    // ── MSP transport ────────────────────────────────────────────────────────
+    // ── MSP transport ─────────────────────────────────────────────────────────
     std::vector<uint8_t> sendMSP(uint8_t mspID);
 
-    // ── Parsers — one per MSP response type ──────────────────────────────────
+    // ── Parsers — one per MSP response type ───────────────────────────────────
     bool parseStatus(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseIMU(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseAttitude(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseAnalog(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseDebug(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseBaro(const std::vector<uint8_t>& buf, DroneState& s);
+
+    // GPS parsers — thin wrappers around GPSNeoM10 static methods
+    bool parseGPSRaw(const std::vector<uint8_t>& buf, DroneState& s);
+    bool parseGPSComp(const std::vector<uint8_t>& buf, DroneState& s);
 
     void commitState(const DroneState& s);
 };
