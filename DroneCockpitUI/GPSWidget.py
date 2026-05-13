@@ -19,14 +19,63 @@ Map notes
 
 Satellite tab notes
 -------------------
-• Populated when ui_data["gps_sv_list"] is a non-empty list.
-• Each item must be a dict with keys:
-      gnss_id (str)   e.g. "GPS", "GLONASS", "BeiDou", "SBAS"
-      sv_id   (int)   satellite PRN / slot number
-      cno     (int)   carrier-to-noise ratio in dB-Hz  (0 = no signal)
-      used    (bool)  contributing to the current fix
-      quality (int 0-7 or str)  0=idle … 7=fully locked
-• If the list is empty a "No satellite data — upgrade backend" hint is shown.
+• Populated from DroneState.sv_list (list of SVInfoEntry C++ objects),
+  OR from ui_data["gps_sv_list"] if you pre-convert them yourself.
+
+  SVInfoEntry attributes (from pybind11 binding):
+      gnss_name  (str)   "GPS", "GLONASS", "BeiDou", "Galileo", "SBAS", "QZSS"
+      svid       (int)   satellite PRN / slot number
+      cno        (int)   carrier-to-noise ratio in dB-Hz  (0 = no signal)
+      used       (bool)  contributing to the current fix
+      quality    (int)   0=idle … 7=fully locked
+      elev       (int)   elevation degrees above horizon
+      azim       (int)   azimuth degrees 0-360
+      status_str (str)   "used", "tracked", "acquired", "searching", "idle"
+
+  _normalize_sv_list() converts SVInfoEntry objects (or already-correct dicts)
+  into the internal dict format used by _SatCanvas.  Pass either form via
+  ui_data["gps_sv_list"].
+
+How to feed this widget from your main loop
+-------------------------------------------
+    With the updated bindings.cpp, to_dict() now includes ALL required keys,
+    so a single call is sufficient:
+
+        state = drone_link.get_latest_state()
+        d = state.to_dict()
+        gps_widget.update_gps(d)
+
+    If you are still using the old bindings.cpp you need to splice three keys
+    manually after to_dict():
+
+        state = drone_link.get_latest_state()
+        d = state.to_dict()
+        d["gps_sv_list"]          = list(state.sv_list)        # satellite tab
+        d["gps_ground_speed_cms"] = state.gps.ground_speed_cms # nav tab speed
+        d["gps_ground_course"]    = state.gps.ground_course     # nav tab track
+        gps_widget.update_gps(d)
+
+Key reference — what update_gps() reads from ui_data
+-----------------------------------------------------
+    (navigation tab)
+    gps_fix_type          int   0=no fix, 1=2D, 2=3D
+    gps_num_sat           int   satellites in solution
+    gps_hdop              float real HDOP (already divided by 100)
+    gps_latitude          float decimal degrees
+    gps_longitude         float decimal degrees
+    gps_altitude_m        float MSL metres
+    gps_ground_speed_cms  int   cm/s  ← added to to_dict() in updated bindings
+    gps_ground_course     int   decidegrees 0-3599  ← added to to_dict()
+    gps_dist_to_home_m    float metres   ← note: old key was gps_dist_home_m
+    gps_bearing_to_home   int   degrees -180…+180  ← old key was gps_bearing_home
+    gps_heartbeat         int   toggles on each new GPS frame
+    gps_raw_valid         bool
+    gps_comp_valid        bool
+    gps_position_usable   bool
+
+    (satellite tab)
+    gps_sv_list           list  SVInfoEntry objects OR normalised dicts
+                                ← added to to_dict() in updated bindings
 """
 
 import tkinter as tk
@@ -85,6 +134,72 @@ _FFIX = (_FF, 11, "bold")
 
 
 # =============================================================================
+# SVInfoEntry normaliser
+#
+# Converts whatever arrives in ui_data["gps_sv_list"] into a uniform list of
+# plain dicts that _SatCanvas understands.
+#
+# Accepted input items:
+#   • SVInfoEntry C++ object exposed via pybind11
+#       attributes: gnss_name, svid, cno, used, quality, elev, azim, status_str
+#   • dict already using _SatCanvas keys (gnss_id / sv_id / ...)
+#   • dict using SVInfoEntry attribute names (gnss_name / svid / ...)
+#
+# Output dict keys (all always present):
+#   gnss_id   str   constellation name  e.g. "GPS"
+#   sv_id     int   satellite PRN / slot
+#   cno       int   dB-Hz
+#   used      bool  True = contributing to fix
+#   quality   int   0-7 UBX quality indicator
+#   elev      int   elevation degrees
+#   azim      int   azimuth degrees
+#   status    str   human-readable status string
+# =============================================================================
+
+def _normalize_sv_list(raw_list) -> list:
+    """
+    Accept a list of SVInfoEntry objects or dicts; return a list of plain dicts
+    with the keys _SatCanvas expects.  Silently skips items that cannot be
+    read.
+    """
+    out = []
+    for item in raw_list:
+        try:
+            if isinstance(item, dict):
+                # Already a dict — may use either naming convention.
+                # Prefer SVInfoEntry attribute names; fall back to _SatCanvas names.
+                out.append({
+                    "gnss_id": item.get("gnss_name",
+                               item.get("gnss_id", "?")),
+                    "sv_id":   item.get("svid",
+                               item.get("sv_id", 0)),
+                    "cno":     int(item.get("cno", 0)),
+                    "used":    bool(item.get("used", False)),
+                    "quality": item.get("quality", 0),
+                    "elev":    int(item.get("elev", 0)),
+                    "azim":    int(item.get("azim", 0)),
+                    "status":  item.get("status_str",
+                               item.get("status", "idle")),
+                })
+            else:
+                # Assume pybind11-wrapped SVInfoEntry object.
+                out.append({
+                    "gnss_id": item.gnss_name,
+                    "sv_id":   item.svid,
+                    "cno":     int(item.cno),
+                    "used":    bool(item.used),
+                    "quality": item.quality,
+                    "elev":    int(item.elev),
+                    "azim":    int(item.azim),
+                    "status":  item.status_str,
+                })
+        except Exception:
+            # Skip any entry that cannot be read rather than crashing the UI.
+            continue
+    return out
+
+
+# =============================================================================
 # Map canvas widget
 # =============================================================================
 
@@ -130,8 +245,8 @@ class _MapCanvas(tk.Frame):
             activebackground="#3a4555", activeforeground=_C["text"],
             cursor="hand2",
         )
-        tk.Button(ctrl, text="＋", command=self._zoom_in,          **btn_kw).pack(side="left", padx=(0, 2))
-        tk.Button(ctrl, text="－", command=self._zoom_out,         **btn_kw).pack(side="left", padx=(0, 2))
+        tk.Button(ctrl, text="＋", command=self._zoom_in,              **btn_kw).pack(side="left", padx=(0, 2))
+        tk.Button(ctrl, text="－", command=self._zoom_out,             **btn_kw).pack(side="left", padx=(0, 2))
         tk.Button(ctrl, text="⊙ Center", command=self._center_on_drone, **btn_kw).pack(side="left")
 
         self._zoom_lbl = tk.Label(
@@ -353,6 +468,18 @@ class _SatCanvas(tk.Frame):
     """
     Scrollable, canvas-drawn satellite signal-strength display.
     Mimics the Betaflight GPS signal strength panel.
+
+    Expects rows as plain dicts with keys:
+        gnss_id  str   constellation name
+        sv_id    int   PRN / slot
+        cno      int   dB-Hz (0 = no signal)
+        used     bool  True = in fix solution
+        quality  int   0-7 UBX quality indicator
+        elev     int   elevation degrees
+        azim     int   azimuth degrees
+        status   str   human-readable status
+
+    Use _normalize_sv_list() to convert SVInfoEntry objects before passing here.
     """
     _ROW_H   = 23
     _CNO_MAX = 55        # typical maximum C/N0 in dB-Hz
@@ -423,6 +550,10 @@ class _SatCanvas(tk.Frame):
         self._cv.yview_scroll(int(-event.delta / 120), "units")
 
     def update_satellites(self, sv_list: list):
+        """
+        Accept a list of already-normalised dicts (via _normalize_sv_list).
+        Empty list shows the "no data" placeholder.
+        """
         self._sv_data = sv_list or []
         self._redraw()
 
@@ -436,12 +567,13 @@ class _SatCanvas(tk.Frame):
             self._cv.create_text(
                 w // 2, 50,
                 text="No satellite data available\n"
-                     "(expose sv_list in DroneBackend to populate)",
+                     "(sv_list is empty — check GPS fix and BF Ports config)",
                 fill=_C["no_data"], font=(_FF, 9),
                 justify="center")
             self._cv.configure(scrollregion=(0, 0, w, 100))
             return
 
+        # Sort: used satellites first, then by descending signal strength
         rows = sorted(self._sv_data,
                       key=lambda s: (not s.get("used", False),
                                      -int(s.get("cno", 0))))
@@ -476,12 +608,12 @@ class _SatCanvas(tk.Frame):
             used    = bool(sv.get("used", False))
             bar_pct = min(cno / self._CNO_MAX, 1.0)
             bar_w   = int(bar_pct * self._BAR_MAX)
-            bar_col = (_C["sv_used"] if used
+            bar_col = (_C["sv_used"]   if used
                        else _C["sv_locked"] if cno > 12
                        else _C["sv_nodata"])
             track_h = 6
             by      = cy - track_h // 2
-            # track
+            # track background
             self._cv.create_rectangle(
                 x, by, x + self._BAR_MAX, by + track_h,
                 fill=_C["border"], outline="")
@@ -499,10 +631,19 @@ class _SatCanvas(tk.Frame):
             x += cols[3][1]
 
             # ── Used / unused badge ───────────────────────────────────────────
-            used_txt = "USED"   if used else "unused"
-            used_col = _C["sv_used"] if used else _C["no_data"]
-            self._cv.create_text(x, cy, text=used_txt, anchor="w",
-                                 fill=used_col, font=(_FF, 8, "bold"))
+            # Prefer the pre-computed status_str from the backend when available
+            status_str = sv.get("status", "")
+            if used:
+                badge_txt = "USED"
+                badge_col = _C["sv_used"]
+            elif status_str in ("tracked", "acquired", "searching"):
+                badge_txt = status_str
+                badge_col = _C["amber"] if status_str in ("tracked", "acquired") else _C["no_data"]
+            else:
+                badge_txt = "unused"
+                badge_col = _C["no_data"]
+            self._cv.create_text(x, cy, text=badge_txt, anchor="w",
+                                 fill=badge_col, font=(_FF, 8, "bold"))
             x += cols[4][1]
 
             # ── Quality ───────────────────────────────────────────────────────
@@ -514,9 +655,9 @@ class _SatCanvas(tk.Frame):
             qual_str = str(qual)[:14]
             if "fully" in qual_str.lower():
                 qcol = _C["green"]
-            elif "lock" in qual_str.lower() or "carrier" in qual_str.lower():
+            elif "carrier" in qual_str.lower() or "code lock" in qual_str.lower():
                 qcol = _C["amber"]
-            elif "code" in qual_str.lower():
+            elif "lock" in qual_str.lower():
                 qcol = _C["amber"]
             else:
                 qcol = _C["no_data"]
@@ -534,24 +675,13 @@ class GPSWidget(tk.Frame):
 
     update_gps(ui_data) must be called on every telemetry tick.
 
-    Expected ui_data keys (all optional):
-        (navigation)
-        gps_fix_type          int
-        gps_num_sat           int
-        gps_hdop              float   real HDOP (pre-divided)
-        gps_latitude          float   decimal degrees
-        gps_longitude         float   decimal degrees
-        gps_altitude_m        float   MSL metres
-        gps_ground_speed_cms  int     cm/s
-        gps_ground_course     int     decidegrees
-        gps_dist_to_home_m    float   metres
-        gps_bearing_to_home   int     degrees (−180…+180)
-        gps_heartbeat         int     toggles on each new GPS frame
-        gps_raw_valid         bool
-        gps_comp_valid        bool
-        gps_position_usable   bool
-        (satellite tab)
-        gps_sv_list           list[dict]  see _SatCanvas docstring
+    With the updated bindings.cpp, a single to_dict() call provides everything:
+
+        state = drone_link.get_latest_state()
+        gps_widget.update_gps(state.to_dict())
+
+    If using old bindings, manually add the three missing keys afterwards —
+    see the module docstring for details.
     """
 
     def __init__(self, parent, **kwargs):
@@ -607,7 +737,7 @@ class GPSWidget(tk.Frame):
         self._map_canvas.pack(fill="both", expand=True)
 
     # =========================================================================
-    # Navigation tab content  (same layout as the original GPSWidget)
+    # Navigation tab content
     # =========================================================================
 
     def _build_navigation(self, p):
@@ -816,7 +946,12 @@ class GPSWidget(tk.Frame):
     # =========================================================================
 
     def update_gps(self, ui_data: dict):
-        """Refresh all three tabs from the latest telemetry data dict."""
+        """
+        Refresh all three tabs from the latest telemetry data dict.
+
+        ui_data is typically the dict returned by DroneState.to_dict().
+        With updated bindings.cpp all required keys are present automatically.
+        """
         self._update_navigation(ui_data)
         self._update_satellites(ui_data)
         self._update_map(ui_data)
@@ -835,8 +970,15 @@ class GPSWidget(tk.Frame):
         alt_m      = float(ui_data.get("gps_altitude_m",  0.0))
         gs_cms     = ui_data.get("gps_ground_speed_cms",  0)
         course_dd  = ui_data.get("gps_ground_course",     0)
-        dist_m     = float(ui_data.get("gps_dist_to_home_m",  0.0))
-        brg        = int(ui_data.get("gps_bearing_to_home",   0))
+
+        # FIX: accept both the old key names (gps_dist_home_m / gps_bearing_home)
+        # from the original to_dict() and the correct names the widget expects
+        # (gps_dist_to_home_m / gps_bearing_to_home).  Updated bindings.cpp
+        # now exports both, but this fallback keeps things working with either.
+        dist_m     = float(ui_data.get("gps_dist_to_home_m",
+                           ui_data.get("gps_dist_home_m", 0.0)))
+        brg        = int(ui_data.get("gps_bearing_to_home",
+                         ui_data.get("gps_bearing_home", 0)))
         heartbeat  = ui_data.get("gps_heartbeat",         None)
 
         # Fix badge
@@ -925,7 +1067,17 @@ class GPSWidget(tk.Frame):
     # ── Satellite tab update ──────────────────────────────────────────────────
 
     def _update_satellites(self, ui_data: dict):
-        self._sat_canvas.update_satellites(ui_data.get("gps_sv_list", []))
+        """
+        Pull sv_list from ui_data, normalise SVInfoEntry objects → dicts,
+        then hand the result to _SatCanvas.
+
+        With updated bindings.cpp, "gps_sv_list" is present in to_dict()
+        automatically.  The key holds a list of SVInfoEntry pybind11 objects
+        which _normalize_sv_list() converts to plain dicts.
+        """
+        raw = ui_data.get("gps_sv_list", [])
+        normalised = _normalize_sv_list(raw)
+        self._sat_canvas.update_satellites(normalised)
 
     # ── Map tab update ────────────────────────────────────────────────────────
 
