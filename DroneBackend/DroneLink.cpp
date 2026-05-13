@@ -120,6 +120,11 @@ void DroneLink::startAccCalibration() {
     accCalRequested.store(true);
 }
 
+// -- MSP_NAV_STATUS (121) -----------------------------------------------------
+bool DroneLink::parseNavStatus(const std::vector<uint8_t>& buf, DroneState& s) {
+    return GPSNeoM10::parseNavStatus(buf, s.navStatus);
+}
+
 // =============================================================================
 // communicationLoop()
 //
@@ -259,6 +264,41 @@ void DroneLink::communicationLoop() {
             parseGPSComp(buf, pending);
         }
 
+        // -- 9. GPS Nav Status (MSP_NAV_STATUS 121) -----------------------------------
+        {
+            auto buf = sendMSP(MSP::NAV_STATUS);
+            parseNavStatus(buf, pending);
+        }
+
+        // -- 10. SV Info via UBX passthrough (polled at 1 Hz, not 100 Hz) -----------
+        {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - lastSvPollTime_).count();
+            if (elapsed >= 1000) {
+                lastSvPollTime_ = now;
+                auto ubxPoll = GPSNeoM10::buildNavSvInfoPoll();
+                auto mspFrame = GPSNeoM10::wrapUbxInMspPassthrough(ubxPoll);
+                // Write the passthrough frame directly
+                DWORD written = 0;
+                PurgeComm(hSerial, PURGE_RXCLEAR);
+                WriteFile(hSerial, mspFrame.data(),
+                    static_cast<DWORD>(mspFrame.size()), &written, NULL);
+                // Read the UBX response (variable length, needs bigger buffer)
+                auto ubxResp = readUbxResponse(200);
+                if (ubxResp.size() > 8) {
+                    // Strip the 6-byte UBX header to get the payload
+                    std::vector<uint8_t> payload(ubxResp.begin() + 6,
+                        ubxResp.end() - 2);  // -2 = checksum
+                    std::vector<SVInfoEntry> sv;
+                    if (GPSNeoM10::parseNavSvInfo(payload, sv)) {
+                        pending.svList = std::move(sv);
+                        pending.svInfoValid = true;
+                    }
+                }
+            }
+        }
+
         // -- Health tracking --------------------------------------------------
         if (anySuccess) {
             consecutiveFails = 0;
@@ -299,7 +339,7 @@ std::vector<uint8_t> DroneLink::sendMSP(uint8_t mspID) {
     if (!WriteFile(hSerial, req, sizeof(req), &written, NULL) || written != sizeof(req))
         return {};
 
-    constexpr size_t MAX_FRAME = 64;
+    constexpr size_t MAX_FRAME = 512;   // was 64 — UBX-NAV-SVINFO needs 400+
     uint8_t raw[MAX_FRAME];
     size_t  total = 0;
     int     payloadLen = -1;
@@ -327,6 +367,74 @@ std::vector<uint8_t> DroneLink::sendMSP(uint8_t mspID) {
 
     if (total < 6) return {};
     return std::vector<uint8_t>(raw, raw + total);
+}
+
+std::vector<uint8_t> DroneLink::readUbxResponse(int timeoutMs) {
+    std::vector<uint8_t> buf;
+    buf.reserve(512);
+    int     payloadLen = -1;
+    auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(timeoutMs);
+
+    while (buf.size() < 512) {
+        if (std::chrono::steady_clock::now() > deadline) break;
+        DWORD   rd = 0;
+        uint8_t b = 0;
+        if (!ReadFile(hSerial, &b, 1, &rd, NULL) || rd == 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(150));
+            continue;
+        }
+        buf.push_back(b);
+
+        // UBX length field is at bytes [4..5] (LE uint16)
+        if (buf.size() == 6)
+            payloadLen = static_cast<int>(buf[4]) | (static_cast<int>(buf[5]) << 8);
+
+        // Full UBX frame: 6 header + payload + 2 checksum
+        if (payloadLen >= 0 &&
+            buf.size() == static_cast<size_t>(payloadLen + 8))
+            break;
+    }
+    return buf;
+}
+
+GPSConfigResult DroneLink::applyGPSConfig(const GPSConfig& cfg) {
+    GPSConfigResult result;
+    if (!connected.load()) {
+        result.errorDetail = "Not connected";
+        return result;
+    }
+
+    auto sendUbx = [&](const std::vector<uint8_t>& ubx,
+        uint8_t cls, uint8_t id) -> bool {
+            auto frame = GPSNeoM10::wrapUbxInMspPassthrough(ubx);
+            DWORD written = 0;
+            PurgeComm(hSerial, PURGE_RXCLEAR);
+            if (!WriteFile(hSerial, frame.data(),
+                static_cast<DWORD>(frame.size()), &written, NULL))
+                return false;
+            auto resp = readUbxResponse(300);
+            return GPSNeoM10::parseAck(resp, cls, id);
+        };
+
+    result.gnssAck = sendUbx(GPSNeoM10::buildCfgGNSS(cfg.constellations), 0x06, 0x3E);
+    result.rateAck = sendUbx(GPSNeoM10::buildCfgRate(cfg.updateRateHz), 0x06, 0x08);
+    result.protocolAck = sendUbx(GPSNeoM10::buildCfgPrt(cfg.protocol), 0x06, 0x00);
+    // Nav5 (elevation mask + airborne model)
+    bool nav5Ok = sendUbx(GPSNeoM10::buildCfgNav5(cfg.elevationMaskDeg), 0x06, 0x24);
+    result.saveAck = sendUbx(GPSNeoM10::buildCfgCfg(), 0x06, 0x09);
+
+    result.overallOk = result.gnssAck && result.rateAck
+        && result.protocolAck && nav5Ok && result.saveAck;
+    if (!result.overallOk) {
+        result.errorDetail = "ACK failures:";
+        if (!result.gnssAck)     result.errorDetail += " CFG-GNSS";
+        if (!result.rateAck)     result.errorDetail += " CFG-RATE";
+        if (!result.protocolAck) result.errorDetail += " CFG-PRT";
+        if (!nav5Ok)             result.errorDetail += " CFG-NAV5";
+        if (!result.saveAck)     result.errorDetail += " CFG-CFG";
+    }
+    return result;
 }
 
 // =============================================================================

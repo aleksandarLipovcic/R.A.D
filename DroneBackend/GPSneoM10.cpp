@@ -126,6 +126,141 @@ bool GPSNeoM10::parseComp(const std::vector<uint8_t>& buf, GPSReading& out) {
 }
 
 // =============================================================================
+// buildNavSvInfoPoll() -- UBX-NAV-SVINFO (Class 0x01, ID 0x30)
+//
+// This is a poll-only frame (zero-length payload).
+// Send via MSP passthrough; read the variable-length UBX response back.
+// Response payload = 8 bytes header + numSV * 12 bytes per SV block.
+// =============================================================================
+std::vector<uint8_t> GPSNeoM10::buildNavSvInfoPoll() {
+    std::vector<uint8_t> frame = {
+        0xB5, 0x62,
+        0x01, 0x30,   // class NAV, id SVINFO
+        0x00, 0x00,   // zero payload = poll request
+    };
+    addUbxChecksum(frame);
+    return frame;
+}
+
+// =============================================================================
+// parseNavSvInfo() -- UBX-NAV-SVINFO response payload parser
+//
+// UBX-NAV-SVINFO payload layout:
+//   Bytes 0-3: iTOW (GPS time of week, ms)
+//   Byte  4:   numCh (number of channels = number of SV blocks following)
+//   Byte  5:   globalFlags
+//   Bytes 6-7: reserved
+//   Then numCh blocks of 12 bytes each:
+//     [0]  chn      -- tracking channel
+//     [1]  svid     -- satellite vehicle ID
+//     [2]  flags    -- bit0=svUsed, bit1=diffCorr, bit2=orbitAvail,
+//                      bit3=orbitEph, bit4=unhealthy, bit5=orbitAlm,
+//                      bit6=orbitAop, bit7=smoothed
+//     [3]  quality  -- 0=idle,1=searching,2=acquired,3=unusable,
+//                      4=code locked,5-7=code+carrier locked
+//     [4]  cno      -- carrier-to-noise density, dBHz
+//     [5]  elev     -- elevation, degrees (int8)
+//     [6-7] azim    -- azimuth, degrees (int16 LE)
+//     [8-11] prRes  -- pseudorange residual, cm (int32 LE)
+//
+// NOTE: ubxPayload is the raw UBX payload bytes (everything after the 6-byte
+// UBX header and before the 2-byte checksum). Minimum valid size = 8 bytes.
+// =============================================================================
+bool GPSNeoM10::parseNavSvInfo(const std::vector<uint8_t>& ubxPayload,
+    std::vector<SVInfoEntry>& out)
+{
+    if (ubxPayload.size() < 8) return false;
+
+    const uint8_t numCh = ubxPayload[4];
+    if (ubxPayload.size() < static_cast<size_t>(8 + numCh * 12)) return false;
+
+    out.clear();
+    out.reserve(numCh);
+
+    // gnssId is not directly in UBX-NAV-SVINFO; it must be inferred from svid
+    // ranges as the older NEO-M10 firmware doesn't include gnssId in SVINFO.
+    // SVID ranges per u-blox M10 Integration Manual s2.5:
+    //   1-32   = GPS
+    //   33-64  = SBAS (WAAS/EGNOS/etc.)
+    //   65-96  = GLONASS (slot 1-32 → svid 65-96)
+    //   120-158 = SBAS (alternative range)
+    //   159-163 = SBAS
+    //   193-202 = QZSS
+    //   211-246 = BeiDou
+    //   300-336 = Galileo (stored as 300+svid in some FW; or use gnssId block)
+    auto inferGnssId = [](uint8_t svid) -> uint8_t {
+        if (svid >= 1 && svid <= 32)  return 0;  // GPS
+        if (svid >= 33 && svid <= 64)  return 1;  // SBAS
+        if (svid >= 65 && svid <= 96)  return 6;  // GLONASS
+        if (svid >= 120 && svid <= 163) return 1;  // SBAS
+        if (svid >= 193 && svid <= 202) return 5;  // QZSS
+        if (svid >= 211 && svid <= 246) return 3;  // BeiDou
+        if (svid >= 301 && svid <= 336) return 2;  // Galileo
+        return 0xFF;  // unknown
+        };
+
+    auto gnssIdToName = [](uint8_t gnssId) -> std::string {
+        switch (gnssId) {
+        case 0: return "GPS";
+        case 1: return "SBAS";
+        case 2: return "Galileo";
+        case 3: return "BeiDou";
+        case 5: return "QZSS";
+        case 6: return "GLONASS";
+        default: return "Unknown";
+        }
+        };
+
+    auto qualityToStatus = [](uint8_t q, uint8_t flags) -> std::string {
+        if (flags & 0x01) return "used";       // svUsed bit
+        if (q >= 4)       return "tracked";
+        if (q >= 2)       return "acquired";
+        if (q == 1)       return "searching";
+        return "idle";
+        };
+
+    for (uint8_t i = 0; i < numCh; ++i) {
+        const size_t base = 8 + i * 12;
+        SVInfoEntry e;
+        e.chn = ubxPayload[base + 0];
+        e.svid = ubxPayload[base + 1];
+        e.flags = ubxPayload[base + 2];
+        e.quality = ubxPayload[base + 3];
+        e.cno = ubxPayload[base + 4];
+        e.elev = static_cast<int8_t>(ubxPayload[base + 5]);
+        e.azim = read16(ubxPayload, static_cast<int>(base + 6));
+        e.prRes = read32(ubxPayload, static_cast<int>(base + 8));
+        e.gnssId = inferGnssId(e.svid);
+        e.gnssName = gnssIdToName(e.gnssId);
+        e.statusStr = qualityToStatus(e.quality, e.flags);
+        e.used = (e.flags & 0x01) != 0;
+
+        // Filter out channels with no satellite assigned (svid=0 = empty slot)
+        if (e.svid != 0)
+            out.push_back(e);
+    }
+
+    return true;
+}
+
+// =============================================================================
+// parseNavStatus() -- MSP_NAV_STATUS (121)
+// =============================================================================
+bool GPSNeoM10::parseNavStatus(const std::vector<uint8_t>& buf, NavStatus& out) {
+    if (buf.size() < 13) return false;
+    if (buf[4] != 121)   return false;
+
+    out.fixType = buf[5];
+    out.gpsFlags = buf[6];
+    out.fixOk = (out.gpsFlags & 0x01) != 0;
+    out.dgpsUsed = (out.gpsFlags & 0x02) != 0;
+    out.mapFlags = buf[8];
+    out.hwStatus = buf[11];
+    out.valid = true;
+    return true;
+}
+
+// =============================================================================
 // buildCfgGNSS() -- UBX-CFG-GNSS (Class 0x06, ID 0x3E)
 //
 // Enables / disables individual GNSS constellations on the NEO-M10.

@@ -44,6 +44,7 @@ namespace MSP {
     constexpr uint8_t ATTITUDE = 108;  // fused roll / pitch / yaw (deg × 10)
     constexpr uint8_t ALTITUDE = 109;  // BMP280 fused altitude (cm) + vario (cm/s)
     constexpr uint8_t ANALOG = 110;  // battery voltage, mAh drawn, RSSI
+    constexpr uint8_t NAV_STATUS = 121;  // GPS nav engine status + fix flags
     constexpr uint8_t DEBUG = 254;  // 4 × int16_t debug values (mode-dependent)
 
     // ── Calibration — in messages (host → FC, fire-and-forget) ───────────────
@@ -140,6 +141,16 @@ struct DroneState {
     double   fcCycleMs = 0.0;   // from MSP_STATUS (101); 0 if STATUS not polled
     bool     linkHealthy = false;
     uint32_t packetCount = 0;
+
+    // -- GPS satellite list (UBX-NAV-SVINFO via MSP passthrough) -----------------
+    // Populated each time a UBX-NAV-SVINFO response is received.
+    // Empty when no fix or when svInfoValid is false.
+    // Poll rate is intentionally lower (1 Hz) to avoid flooding the passthrough.
+    std::vector<SVInfoEntry> svList;
+    bool                     svInfoValid = false;
+
+    // -- GPS nav engine status (MSP_NAV_STATUS 121) ------------------------------
+    NavStatus navStatus;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -175,6 +186,10 @@ public:
     // ── Tuning ────────────────────────────────────────────────────────────────
     void setPollIntervalMs(int ms) { pollIntervalMs.store(ms); }
 
+    // Applies a GPSConfig to the NEO-M10 via UBX passthrough.
+    // Returns per-step ACK status in GPSConfigResult.
+    GPSConfigResult applyGPSConfig(const GPSConfig& cfg);
+
 private:
     HANDLE            hSerial;
     std::atomic<bool> connected;
@@ -185,6 +200,12 @@ private:
     // Calibration request flags (set from Python thread, consumed by worker)
     std::atomic<bool> magCalRequested;
     std::atomic<bool> accCalRequested;
+
+    // SV info poll rate limiting (poll at 1 Hz, not 100 Hz)
+    std::chrono::steady_clock::time_point lastSvPollTime_;
+
+    // Variable-length UBX response reader (used for SVINFO passthrough)
+    std::vector<uint8_t> readUbxResponse(int timeoutMs = 150);
 
     // Calibration countdown state (worker-thread only, committed via commitState)
     bool                                  magCalActive_;
@@ -212,7 +233,7 @@ private:
     // GPS parsers — thin wrappers around GPSNeoM10 static methods
     bool parseGPSRaw(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseGPSComp(const std::vector<uint8_t>& buf, DroneState& s);
-
+    bool parseNavStatus(const std::vector<uint8_t>& buf, DroneState& s);
     void commitState(const DroneState& s);
 };
 

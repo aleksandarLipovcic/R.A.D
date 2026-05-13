@@ -160,6 +160,57 @@ struct GPSConfigResult {
 };
 
 // =============================================================================
+// SVInfoEntry
+//
+// One entry from UBX-NAV-SVINFO (Class 0x01, ID 0x30).
+// Mirrors the per-SV block in the UBX payload (12 bytes each).
+//
+// This is the data source for the Satellites tab columns:
+//   GNSS | SV | Signal | dBHz | Status | Quality
+//
+// gnssName / statusStr are helpers pre-computed in parseNavSvInfo()
+// so Python does not need to implement the ID-to-name mapping.
+// =============================================================================
+struct SVInfoEntry {
+    uint8_t  chn = 0;      // tracking channel (0-15)
+    uint8_t  svid = 0;      // satellite vehicle ID (PRN for GPS)
+    uint8_t  flags = 0;      // bitfield: bit0=svUsed, bit1=diffCorr, etc.
+    uint8_t  quality = 0;      // 0-7 UBX signal quality indicator
+    uint8_t  cno = 0;      // carrier-to-noise, dBHz (0-55)
+    int8_t   elev = 0;      // elevation, degrees (-90 to +90)
+    int16_t  azim = 0;      // azimuth, degrees (0 to 360)
+    int32_t  prRes = 0;      // pseudorange residual, cm
+    uint8_t  gnssId = 0;      // 0=GPS,1=SBAS,2=GAL,3=BDS,5=QZSS,6=GLO
+
+    // Pre-computed strings for direct use in Python UI
+    std::string gnssName;   // "GPS", "GLONASS", "Galileo", "BeiDou", "SBAS", "QZSS"
+    std::string statusStr;  // "used", "tracked", "searching", "idle"
+    bool        used = false;  // true when bit0 of flags is set
+};
+
+// =============================================================================
+// NavStatus  --  MSP_NAV_STATUS (121)
+//
+// Payload (7 bytes):
+//   [0]  GPS fix type (mirrors MSP_RAW_GPS fixType)
+//   [1]  GPS flags   (bit0 = GPS fix OK, bit1 = DGPS used, bit2 = WN valid,
+//                     bit3 = TOW valid, bit4 = headVeh valid)
+//   [2]  efh_status  (heading/course valid flags -- Betaflight internal)
+//   [3]  map_flags   (nav engine state)
+//   [4..5] int16  GPS heartbeat step  (internal)
+//   [6]  GPS HW status byte
+// =============================================================================
+struct NavStatus {
+    uint8_t  fixType = 0;
+    uint8_t  gpsFlags = 0;
+    bool     fixOk = false;   // gpsFlags bit0
+    bool     dgpsUsed = false;   // gpsFlags bit1
+    uint8_t  mapFlags = 0;
+    uint8_t  hwStatus = 0;
+    bool     valid = false;
+};
+
+// =============================================================================
 // GPSNeoM10
 //
 // Stateless parser + UBX frame builder class -- all methods are static.
@@ -228,6 +279,20 @@ public:
     // Requires BF Configurator -> Ports -> GPS UART -> Passthrough: ON.
     static std::vector<uint8_t> wrapUbxInMspPassthrough(
         const std::vector<uint8_t>& ubxFrame);
+
+    // -- UBX-NAV-SVINFO parser ---------------------------------------------------
+    // Parses the UBX-NAV-SVINFO response obtained via MSP passthrough.
+    // ubxPayload starts at byte 0 of the UBX payload (after header+length).
+    // Returns false if the payload is shorter than expected.
+    static bool parseNavSvInfo(const std::vector<uint8_t>& ubxPayload,
+        std::vector<SVInfoEntry>& out);
+
+    // -- MSP_NAV_STATUS (121) parser ---------------------------------------------
+    static bool parseNavStatus(const std::vector<uint8_t>& buf, NavStatus& out);
+
+    // -- UBX-NAV-SVINFO poll frame (to be wrapped in MSP passthrough) -----------
+    // Returns the UBX frame to send; caller wraps with wrapUbxInMspPassthrough().
+    static std::vector<uint8_t> buildNavSvInfoPoll();
 
 private:
     // Internal little-endian read helpers
