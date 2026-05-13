@@ -34,6 +34,20 @@
 //   MSP_ACC_CALIBRATION (205) — triggers accelerometer/gyro calibration.
 //   MSP_MAG_CALIBRATION (206) — triggers magnetometer calibration (30s window).
 //   Both are fire-and-forget: FC acks with an empty response frame.
+//
+// GPS SATELLITE DATA:
+//   Per-satellite data (GNSS | SV | Signal | dBHz | Status | Quality) is NOT
+//   available via standard MSP in Betaflight 4.5.x.  It is obtained via
+//   MSP_SET_PASSTHROUGH (0xF5) which puts BF into GPS UART passthrough mode.
+//   DroneLink uses this to poll UBX-NAV-SAT directly from the NEO-M10 every
+//   30 seconds.  The MSP loop is briefly interrupted (~1.5 s) for each poll.
+//   See step 10 in communicationLoop() for the full protocol sequence.
+//
+//   REQUIRED CONFIGURATION (one time in BF Configurator):
+//     Ports tab → GPS UART row → activate "Serial Rx" OR keep it as GPS function.
+//     The passthrough works as long as the GPS UART is assigned in Ports.
+//     Set gpsUartIndex_ to match: UART1=0, UART2=1, UART3=2, etc.
+//     F405 V3 ships with GPS on UART2 by default → gpsUartIndex_ = 1.
 // ─────────────────────────────────────────────────────────────────────────────
 namespace MSP {
     // ── Telemetry — out messages (FC → host) ─────────────────────────────────
@@ -50,6 +64,21 @@ namespace MSP {
     // ── Calibration — in messages (host → FC, fire-and-forget) ───────────────
     constexpr uint8_t ACC_CAL = 205;  // MSP_ACC_CALIBRATION — gyro + accel
     constexpr uint8_t MAG_CAL = 206;  // MSP_MAG_CALIBRATION — magnetometer
+
+    // ── GPS UART passthrough ──────────────────────────────────────────────────
+    // MSP_SET_PASSTHROUGH (245 = 0xF5)
+    // Payload: [serialPortIdentifier (1 byte)]
+    //   0 = UART1, 1 = UART2, 2 = UART3, etc.
+    // After sending this command, BF:
+    //   1. Sends an MSP ACK ($M> ...).
+    //   2. Enters raw passthrough mode: bytes on the MSP UART are forwarded
+    //      verbatim to the target UART, and vice versa.
+    //   3. MSP protocol processing is SUSPENDED until the host serial port
+    //      disconnects (USB virtual COM close) or BF is reset.
+    // IMPORTANT: the payload is ONE byte (UART index), NOT the UBX frame.
+    //   Wrapping UBX data as the MSP payload is WRONG — BF will interpret
+    //   0xB5 (the UBX preamble) as UART index 181, which doesn't exist.
+    constexpr uint8_t SET_PASSTHROUGH = 245;  // 0xF5
 
     // ── Battery (for reference — do NOT send as a telemetry request) ─────────
     // constexpr uint8_t BATTERY_STATE = 130;  // NOT RAW_MAG — battery data only
@@ -88,24 +117,10 @@ struct DroneState {
     bool    baroValid = false;
 
     // ── Magnetometer — QMC5883L via MSP_DEBUG (254) + debug_mode=MAG_CALIB ──
-    //
-    // PREREQUISITE (Betaflight CLI — one time):
-    //   set debug_mode = MAG_CALIB
-    //   save
-    //
-    // When set, MSP_DEBUG returns:
-    //   debug[0] = raw mag X (int16, ADC counts)
-    //   debug[1] = raw mag Y
-    //   debug[2] = raw mag Z
-    //   debug[3] = heading error / calibration quality
-    //
-    // magValid is false (and all values are 0) when:
-    //   a) debug_mode ≠ MAG_CALIB, OR
-    //   b) Magnetometer sensor is not detected/enabled in BF
     int16_t magX = 0;
     int16_t magY = 0;
     int16_t magZ = 0;
-    float   magHeadingDeg = 0.0f;   // tilt-uncorrected 2-D heading, 0–360°
+    float   magHeadingDeg = 0.0f;
     bool    magValid = false;
 
     // ── Magnetometer calibration state ───────────────────────────────────────
@@ -117,39 +132,21 @@ struct DroneState {
     int  accCalSecondsRemaining = 0;
 
     // ── GPS — NEO-M10 via MSP_RAW_GPS (106) + MSP_COMP_GPS (107) ────────────
-    // Populated when gps.rawValid / gps.compValid are true.
-    // All fields are already in SI-friendly units (see GPSNeoM10.h).
-    //
-    //   gps.fixType        — 0 = no fix, 1 = 2D, 2 = 3D
-    //   gps.numSat         — satellites used
-    //   gps.latitude       — decimal degrees (+ = N, − = S)
-    //   gps.longitude      — decimal degrees (+ = E, − = W)
-    //   gps.altitudeM      — MSL altitude, metres
-    //   gps.groundSpeedMs  — ground speed, cm/s  (÷100 → m/s)
-    //   gps.groundCourse   — ground course, decidegrees (0–3599)
-    //   gps.hdop           — HDOP × 100  (9999 = unknown; good fix < 200)
-    //   gps.distToHomM     — distance to home point, metres
-    //   gps.bearingToHome  — bearing to home, degrees (−180 … +180)
-    //   gps.gpsHeartbeat   — toggles each time FC receives a fresh GPS frame
-    //
-    // Requires: GPS enabled in BF Configurator → Configuration → Sensors
-    //           and a valid UART assigned to GPS in the Ports tab.
     GPSReading gps;
 
     // ── Diagnostics ──────────────────────────────────────────────────────────
     double   lastRttMs = 0.0;
-    double   fcCycleMs = 0.0;   // from MSP_STATUS (101); 0 if STATUS not polled
+    double   fcCycleMs = 0.0;
     bool     linkHealthy = false;
     uint32_t packetCount = 0;
 
-    // -- GPS satellite list (UBX-NAV-SVINFO via MSP passthrough) -----------------
-    // Populated each time a UBX-NAV-SVINFO response is received.
-    // Empty when no fix or when svInfoValid is false.
-    // Poll rate is intentionally lower (1 Hz) to avoid flooding the passthrough.
+    // ── GPS satellite list (UBX-NAV-SAT via BF GPS UART passthrough) ─────────
+    // Populated every 30 s via the MSP_SET_PASSTHROUGH → UBX-NAV-SAT cycle.
+    // Empty until the first successful passthrough poll completes.
     std::vector<SVInfoEntry> svList;
     bool                     svInfoValid = false;
 
-    // -- GPS nav engine status (MSP_NAV_STATUS 121) ------------------------------
+    // ── GPS nav engine status (MSP_NAV_STATUS 121) ────────────────────────────
     NavStatus navStatus;
 };
 
@@ -173,21 +170,22 @@ public:
     DroneState getLatestState();
 
     // ── Calibration triggers ─────────────────────────────────────────────────
-    // startMagCalibration()  — sends MSP_MAG_CALIBRATION (206) to FC and starts
-    //                          the 30-second countdown in DroneState.
-    //                          Rotate the drone on all axes during this window.
-    //
-    // startAccCalibration()  — sends MSP_ACC_CALIBRATION (205) to FC and starts
-    //                          the ~5-second countdown in DroneState.
-    //                          Keep the drone perfectly level and still.
     void startMagCalibration();
     void startAccCalibration();
 
     // ── Tuning ────────────────────────────────────────────────────────────────
     void setPollIntervalMs(int ms) { pollIntervalMs.store(ms); }
 
-    // Applies a GPSConfig to the NEO-M10 via UBX passthrough.
-    // Returns per-step ACK status in GPSConfigResult.
+    // ── GPS satellite passthrough configuration ───────────────────────────────
+    // Set the BF serial port index that the GPS module is assigned to.
+    // Match this to the UART shown in BF Configurator → Ports tab.
+    //   UART1 → index 0
+    //   UART2 → index 1  (F405 V3 default)
+    //   UART3 → index 2
+    // Default: 1 (UART2). Call before connect() if your FC uses a different UART.
+    void setGpsUartIndex(uint8_t idx) { gpsUartIndex_ = idx; }
+
+    // ── GPS config via UBX passthrough ────────────────────────────────────────
     GPSConfigResult applyGPSConfig(const GPSConfig& cfg);
 
 private:
@@ -197,11 +195,18 @@ private:
     std::atomic<bool> keepRunning;
     std::atomic<int>  pollIntervalMs;
 
+    // Saved for serial reconnects inside the passthrough cycle.
+    std::string portName_;
+
+    // GPS UART index for MSP_SET_PASSTHROUGH.
+    // Matches BF Configurator Ports tab: UART1=0, UART2=1, UART3=2, …
+    uint8_t gpsUartIndex_;
+
     // Calibration request flags (set from Python thread, consumed by worker)
     std::atomic<bool> magCalRequested;
     std::atomic<bool> accCalRequested;
 
-    // SV info poll rate limiting (poll at 1 Hz, not 100 Hz)
+    // SV info poll timestamp (satellite data is refreshed every 30 s)
     std::chrono::steady_clock::time_point lastSvPollTime_;
 
     // Variable-length UBX response reader (used for SVINFO passthrough)
@@ -219,6 +224,14 @@ private:
     // ── Worker ────────────────────────────────────────────────────────────────
     void communicationLoop();
 
+    // ── Serial port helpers ───────────────────────────────────────────────────
+    // Opens portName, configures DCB (115200 8N1, no flow control), and sets
+    // non-blocking read timeouts.  Used by both connect() and the passthrough
+    // reconnect cycle in step 10 of communicationLoop().
+    // Does NOT start the worker thread — that is connect()'s responsibility.
+    // Returns false if the port cannot be opened or configured.
+    bool setupSerialPort(const std::string& portName);
+
     // ── MSP transport ─────────────────────────────────────────────────────────
     std::vector<uint8_t> sendMSP(uint8_t mspID);
 
@@ -234,6 +247,7 @@ private:
     bool parseGPSRaw(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseGPSComp(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseNavStatus(const std::vector<uint8_t>& buf, DroneState& s);
+
     void commitState(const DroneState& s);
 };
 

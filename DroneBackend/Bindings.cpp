@@ -55,7 +55,8 @@ PYBIND11_MODULE(DroneBackend, m) {
     //
     // Registered BEFORE DroneState because DroneState holds
     // std::vector<SVInfoEntry> by value. pybind11 must know the type
-    // before it can build the return converter for def_readonly("sv_list").
+    // before it can build the return converter for def_readonly("sv_list")
+    // and before py::cast(sv) can be used inside the to_dict() lambda.
     // =========================================================================
     py::class_<SVInfoEntry>(m, "SVInfoEntry")
         .def_readonly("chn", &SVInfoEntry::chn,
@@ -209,6 +210,11 @@ PYBIND11_MODULE(DroneBackend, m) {
             "Seconds remaining in gyro/accel calibration window (5 -> 0).")
 
         // GPS -- NEO-M10 via MSP_RAW_GPS (106) + MSP_COMP_GPS (107)
+        // Returns the full GPSReading sub-object.
+        // Usage in Python:
+        //   state = link.get_latest_state()
+        //   if state.gps.position_usable:
+        //       print(state.gps.latitude, state.gps.longitude)
         .def_readonly("gps", &DroneState::gps,
             "GPSReading from NEO-M10. "
             "Check gps.raw_valid before position fields, "
@@ -216,6 +222,8 @@ PYBIND11_MODULE(DroneBackend, m) {
             "gps.position_usable before any navigation use.")
 
         // GPS satellite list (UBX-NAV-SVINFO via MSP passthrough, 1 Hz)
+        // Each element is an SVInfoEntry with gnss_name, svid, cno, elev,
+        // azim, status_str, used.  Empty until sv_info_valid becomes true.
         .def_readonly("sv_list", &DroneState::svList,
             "List of SVInfoEntry. Populated at 1 Hz via UBX-NAV-SVINFO passthrough. "
             "Each entry is one satellite: gnss_name, svid, cno, elev, azim, status_str, used.")
@@ -233,37 +241,69 @@ PYBIND11_MODULE(DroneBackend, m) {
         .def_readonly("link_healthy", &DroneState::linkHealthy)
         .def_readonly("packet_count", &DroneState::packetCount)
 
-        // Convenience dict -- all values pre-converted to useful units.
+        // ── Convenience dict ─────────────────────────────────────────────────
+        // All values pre-converted to useful units.
+        //
+        // GPS satellite list is built by iterating svList and calling
+        // py::cast() on each SVInfoEntry.  pybind11 cannot auto-convert
+        // std::vector<SVInfoEntry> inside a py::dict lambda, so we build
+        // a py::list explicitly.  SVInfoEntry must be registered above this
+        // class for py::cast() to resolve correctly.
+        //
+        // Key aliases for GPS widget compatibility
+        // -----------------------------------------
+        // The original bindings used gps_dist_home_m / gps_bearing_home.
+        // GPSWidget.py expects gps_dist_to_home_m / gps_bearing_to_home.
+        // Both sets are exported here so either naming convention works.
+        // gps_ground_speed_cms and gps_ground_course are also added here
+        // because GPSWidget._update_navigation() reads them directly from
+        // the dict (it does not read them via state.gps.*).
+        // ─────────────────────────────────────────────────────────────────────
         .def("to_dict", [](const DroneState& s) {
+
+        // Build the satellite list as a py::list of bound SVInfoEntry
+        // objects.  The lambda captures s by const-ref; py::cast wraps
+        // each C++ SVInfoEntry in the Python type registered above.
+        py::list sv_list;
+        for (const SVInfoEntry& sv : s.svList)
+            sv_list.append(py::cast(sv));
+
         return py::dict(
             // IMU
             "ax"_a = s.ax, "ay"_a = s.ay, "az"_a = s.az,
             "gx"_a = s.gx, "gy"_a = s.gy, "gz"_a = s.gz,
+
             // Attitude (pre-divided)
             "roll_deg"_a = s.roll / 10.0f,
             "pitch_deg"_a = s.pitch / 10.0f,
             "yaw_deg"_a = static_cast<float>(s.yaw),
+
             // Power
             "battery_v"_a = s.batteryVoltage,
             "rssi"_a = s.rssi,
+
             // Barometer
             "baro_altitude_m"_a = s.baroAltitudeCm * 0.01,
             "baro_altitude_ft"_a = s.baroAltitudeCm * 0.0328084,
             "baro_vario_mps"_a = s.baroVarioCmPerSec * 0.01,
             "baro_vario_fpm"_a = s.baroVarioCmPerSec * 1.9685,
             "baro_valid"_a = s.baroValid,
+
             // Magnetometer
             "mag_x"_a = s.magX,
             "mag_y"_a = s.magY,
             "mag_z"_a = s.magZ,
             "mag_heading_deg"_a = s.magHeadingDeg,
             "mag_valid"_a = s.magValid,
+
             // Mag calibration
             "mag_cal_active"_a = s.magCalActive,
             "mag_cal_seconds_remaining"_a = s.magCalSecondsRemaining,
+
             // Acc/Gyro calibration
             "acc_cal_active"_a = s.accCalActive,
             "acc_cal_seconds_remaining"_a = s.accCalSecondsRemaining,
+
             // GPS -- MSP_RAW_GPS (106)
             "gps_fix_type"_a = s.gps.fixType,
             "gps_num_sat"_a = s.gps.numSat,
@@ -278,16 +318,35 @@ PYBIND11_MODULE(DroneBackend, m) {
             "gps_hdop"_a = s.gps.hdop * 0.01,
             "gps_raw_valid"_a = s.gps.rawValid,
             "gps_position_usable"_a = s.gps.positionUsable,
+
+            // Ground speed / course also exported under the key names that
+            // GPSWidget._update_navigation() reads directly from the dict.
+            "gps_ground_speed_cms"_a = static_cast<int>(s.gps.groundSpeedMs),
+            "gps_ground_course"_a = static_cast<int>(s.gps.groundCourse),
+
             // GPS -- MSP_COMP_GPS (107)
+            // Exported under BOTH naming conventions:
+            //   gps_dist_home_m   / gps_dist_to_home_m   (old / new)
+            //   gps_bearing_home  / gps_bearing_to_home  (old / new)
             "gps_dist_home_m"_a = static_cast<double>(s.gps.distToHomM),
+            "gps_dist_to_home_m"_a = static_cast<double>(s.gps.distToHomM),
             "gps_dist_home_ft"_a = s.gps.distToHomM * 3.28084,
             "gps_bearing_home"_a = static_cast<int>(s.gps.bearingToHome),
+            "gps_bearing_to_home"_a = static_cast<int>(s.gps.bearingToHome),
             "gps_heartbeat"_a = s.gps.gpsHeartbeat,
             "gps_comp_valid"_a = s.gps.compValid,
-            // GPS -- UBX-NAV-SVINFO + MSP_NAV_STATUS
+
+            // GPS -- UBX-NAV-SVINFO (polled at 1 Hz via MSP passthrough)
+            // gps_sv_list is a py::list of SVInfoEntry objects.
+            // GPSWidget._update_satellites() calls _normalize_sv_list()
+            // which accepts SVInfoEntry objects directly.
+            "gps_sv_list"_a = sv_list,
             "gps_sv_info_valid"_a = s.svInfoValid,
+
+            // GPS -- MSP_NAV_STATUS (121)
             "gps_nav_fix_ok"_a = s.navStatus.fixOk,
             "gps_nav_dgps"_a = s.navStatus.dgpsUsed,
+
             // Diagnostics
             "rtt_ms"_a = s.lastRttMs,
             "fc_cycle_ms"_a = s.fcCycleMs,
@@ -322,9 +381,10 @@ PYBIND11_MODULE(DroneBackend, m) {
             "Monitor state.acc_cal_active and state.acc_cal_seconds_remaining.")
         .def("apply_gps_config", &DroneLink::applyGPSConfig,
             py::arg("config"),
-            "Send UBX CFG-GNSS/RATE/PRT/NAV5/CFG frames to the NEO-M10 via passthrough.\n"
-            "Returns GPSConfigResult with per-step ACK status.\n"
-            "Requires BF Configurator -> Ports -> GPS UART -> Passthrough: ON.");
+            "Send UBX CFG-GNSS/RATE/PRT/NAV5/CFG frames to the NEO-M10 via\n"
+            "MSP GPS passthrough.  Returns GPSConfigResult with per-step ACK\n"
+            "status.  Requires BF Configurator -> Ports -> GPS UART ->\n"
+            "Passthrough: ON.");
 
     // =========================================================================
     // IMUSensor
