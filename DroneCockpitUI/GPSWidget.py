@@ -1,556 +1,938 @@
 """
 GPSWidget.py
+============
+Aviation-grade GPS navigation widget — three tabbed views:
 
-Aviation-style GPS navigation display widget for Project R.A.D GCS.
+  [Navigation]  Classic numeric readout (lat/lon, alt, speed, track, home)
+  [Satellites]  Per-satellite signal-strength bars (Betaflight-style)
+  [Map]         Live OpenStreetMap tile map with drone position marker
 
-Displays data from MSP_RAW_GPS (106) and MSP_COMP_GPS (107) following
-ICAO Annex 10 / DO-229E conventions:
+All three tabs are updated on every call to update_gps(ui_data).
 
-  - Fix quality: NO FIX / 2D FIX / 3D FIX with colour coding
-  - Satellite count
-  - HDOP quality bar (colour-graded: green < 1.0, yellow < 2.0, red >= 2.0)
-  - Latitude / Longitude in Degrees, Decimal-Minutes (DDM) — standard for
-    aviation charts and the format used on VFR sectionals
-  - Altitude MSL in feet (aviation standard) and metres
-  - Ground speed in knots (kt) — standard aviation unit — and km/h
-  - Ground track (COG) with a small compass-rose needle
-  - Distance to home in metres / nautical miles
-  - Bearing to home drawn as a pointer on a miniature compass arc
-  - GPS heartbeat blink indicator — confirms fresh data is arriving
-  - Position-usable gate indicator — warns when fix does not meet integrity
-    thresholds (fixType>=2, numSat>=4, HDOP<5.0)
+Map notes
+---------
+• Tiles are fetched from tile.openstreetmap.org in daemon threads and
+  cached in memory.  The GCS machine needs internet access.
+• Pan with left-click drag.  Zoom with scroll wheel or +/- buttons.
+• "⊙ Center" snaps the view back to the drone.
+• If the GPS has no fix the map shows a "Waiting for GPS fix" overlay.
 
-Usage:
-    widget = GPSWidget(parent_frame)
-    widget.grid(row=2, column=0, columnspan=2, sticky="ew", ...)
-    widget.update_gps(ui_data)   # called every tick from DroneCockpitApp
-
-ui_data keys consumed (all provided by DroneCockpitApp._update_loop):
-    gps_fix_type          int    0/1/2
-    gps_num_sat           int
-    gps_latitude          float  decimal degrees
-    gps_longitude         float  decimal degrees
-    gps_altitude_m        float  metres MSL
-    gps_ground_speed_cms  int    cm/s
-    gps_ground_course     int    decidegrees (0-3599)
-    gps_hdop              float  already divided by 100 (real HDOP value)
-    gps_dist_to_home_m    float  metres
-    gps_bearing_to_home   int    degrees (-180 to +180)
-    gps_heartbeat         int    toggles 0/1
-    gps_raw_valid         bool
-    gps_comp_valid        bool
-    gps_position_usable   bool
+Satellite tab notes
+-------------------
+• Populated when ui_data["gps_sv_list"] is a non-empty list.
+• Each item must be a dict with keys:
+      gnss_id (str)   e.g. "GPS", "GLONASS", "BeiDou", "SBAS"
+      sv_id   (int)   satellite PRN / slot number
+      cno     (int)   carrier-to-noise ratio in dB-Hz  (0 = no signal)
+      used    (bool)  contributing to the current fix
+      quality (int 0-7 or str)  0=idle … 7=fully locked
+• If the list is empty a "No satellite data — upgrade backend" hint is shown.
 """
 
-import math
 import tkinter as tk
 from tkinter import ttk
+import math
+import threading
+import queue
+import urllib.request
+import base64
+
+
+# ── Unit conversion constants ─────────────────────────────────────────────────
+_CMS_TO_KT  = 0.019438
+_CMS_TO_KMH = 0.036
+_M_TO_FT    = 3.28084
+
+# ── Colour palette ────────────────────────────────────────────────────────────
+_C = {
+    "bg":           "#1a1e24",
+    "frame_bg":     "#21262e",
+    "border":       "#2e3540",
+    "text":         "#d8dde6",
+    "label":        "#5a6370",
+    "unit":         "#7a8898",
+    "green":        "#39e07a",
+    "amber":        "#f0b429",
+    "red":          "#f04040",
+    "cyan":         "#29c7e0",
+    "compass_bg":   "#151920",
+    "compass_rim":  "#3a4555",
+    "track_needle": "#39e07a",
+    "home_arrow":   "#29c7e0",
+    "no_data":      "#3a4555",
+    "hb_on":        "#39e07a",
+    "hb_off":       "#2e3540",
+    # satellite colours
+    "sv_row_even":  "#1a1e24",
+    "sv_row_odd":   "#1f242c",
+    "sv_used":      "#39e07a",
+    "sv_locked":    "#f0b429",
+    "sv_nodata":    "#3a4555",
+    # map colours
+    "map_bg":       "#2a3040",
+    "map_btn":      "#2e3540",
+    "map_marker":   "#f0b429",
+    "map_home":     "#29c7e0",
+    "map_acc_ring": "#39e07a",
+}
+
+_FF   = "Courier New"
+_FL   = (_FF,  8, "bold")
+_FV   = (_FF, 13, "bold")
+_FVS  = (_FF, 10, "bold")
+_FU   = (_FF,  8)
+_FFIX = (_FF, 11, "bold")
+
 
 # =============================================================================
-# Colour palette — matches the dark-instrument aesthetic used elsewhere
-# =============================================================================
-BG          = "#1a1a2e"   # deep navy — widget background
-BG_PANEL    = "#16213e"   # slightly darker panel sections
-BG_CELL     = "#0f3460"   # individual data cells
-BORDER      = "#e94560"   # accent border / active highlight (red-accent)
-TEXT_HI     = "#eaeaea"   # primary text
-TEXT_DIM    = "#8892a4"   # secondary / label text
-TEXT_UNIT   = "#5a7a9a"   # unit suffix text
-
-# Fix-type colours
-COL_NO_FIX  = "#e94560"   # red
-COL_2D      = "#f5a623"   # amber
-COL_3D      = "#00d084"   # green
-
-# HDOP quality colours
-COL_HDOP_GOOD = "#00d084"
-COL_HDOP_MED  = "#f5a623"
-COL_HDOP_BAD  = "#e94560"
-
-# Heartbeat colours
-COL_HB_ON   = "#00d084"
-COL_HB_OFF  = "#1e3050"
-
-FONT_MONO   = ("Courier New", 10, "bold")
-FONT_LABEL  = ("Courier New",  8)
-FONT_VALUE  = ("Courier New", 11, "bold")
-FONT_BIG    = ("Courier New", 13, "bold")
-FONT_SMALL  = ("Courier New",  8)
-FONT_TITLE  = ("Courier New",  9, "bold")
-
-
-# =============================================================================
-# Helpers
+# Map canvas widget
 # =============================================================================
 
-def _cms_to_kt(cms: float) -> float:
-    """cm/s -> knots (1 kt = 51.4444 cm/s)"""
-    return cms / 51.4444
-
-def _cms_to_kmh(cms: float) -> float:
-    return cms * 0.036
-
-def _m_to_ft(m: float) -> float:
-    return m * 3.28084
-
-def _m_to_nm(m: float) -> float:
-    """metres -> nautical miles"""
-    return m / 1852.0
-
-def _decimal_to_ddm(deg: float, is_lat: bool) -> str:
+class _MapCanvas(tk.Frame):
     """
-    Convert decimal degrees to Degrees Decimal-Minutes string.
-    e.g.  45.234567  ->  "45° 14.074' N"
-    Standard format on VFR aviation charts.
+    Lightweight OSM tile map.
+    Tiles are 256×256 PNG from tile.openstreetmap.org, fetched in daemon
+    threads and cached as tk.PhotoImage objects (kept alive in a dict).
     """
-    hemi_pos = "N" if is_lat else "E"
-    hemi_neg = "S" if is_lat else "W"
-    hemi = hemi_pos if deg >= 0 else hemi_neg
-    deg  = abs(deg)
-    d    = int(deg)
-    m    = (deg - d) * 60.0
-    return f"{d:02d}\u00b0 {m:06.3f}' {hemi}"
+    TILE_SIZE = 256
+    _OSM_URL  = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+    _UA       = "DroneCockpitGCS/1.0 (github educational project)"
 
-def _hdop_colour(hdop: float) -> str:
-    if hdop < 1.0:
-        return COL_HDOP_GOOD
-    if hdop < 2.0:
-        return COL_HDOP_MED
-    return COL_HDOP_BAD
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, bg=_C["bg"], **kwargs)
+        self._zoom        = 15
+        self._center_lat  = 44.77    # sensible default until first fix
+        self._center_lon  = 17.21
+        self._drone_lat   = None
+        self._drone_lon   = None
+        self._fix_valid   = False
+        self._auto_center = True     # follow drone until user pans
 
-def _fix_colour(fix_type: int) -> str:
-    if fix_type == 2: return COL_3D
-    if fix_type == 1: return COL_2D
-    return COL_NO_FIX
+        self._tile_img    = {}       # {(z,x,y): PhotoImage}  keep refs!
+        self._tile_queue  = queue.Queue()
+        self._tile_pend   = set()
 
-def _fix_label(fix_type: int) -> str:
-    return {0: "NO FIX", 1: "2D FIX", 2: "3D FIX"}.get(fix_type, "NO FIX")
+        self._pan_last    = None
+
+        self._build()
+        self._poll_tiles()
+
+    # ── Build UI ──────────────────────────────────────────────────────────────
+
+    def _build(self):
+        ctrl = tk.Frame(self, bg=_C["bg"])
+        ctrl.pack(side="top", fill="x", padx=2, pady=2)
+
+        btn_kw = dict(
+            bg=_C["map_btn"], fg=_C["text"],
+            relief="flat", padx=6, pady=2,
+            font=(_FF, 9, "bold"),
+            activebackground="#3a4555", activeforeground=_C["text"],
+            cursor="hand2",
+        )
+        tk.Button(ctrl, text="＋", command=self._zoom_in,          **btn_kw).pack(side="left", padx=(0, 2))
+        tk.Button(ctrl, text="－", command=self._zoom_out,         **btn_kw).pack(side="left", padx=(0, 2))
+        tk.Button(ctrl, text="⊙ Center", command=self._center_on_drone, **btn_kw).pack(side="left")
+
+        self._zoom_lbl = tk.Label(
+            ctrl, text=f"z{self._zoom}",
+            fg=_C["label"], bg=_C["bg"], font=_FL)
+        self._zoom_lbl.pack(side="right", padx=4)
+
+        self._cv = tk.Canvas(self, bg=_C["map_bg"],
+                             highlightthickness=0, cursor="fleur")
+        self._cv.pack(fill="both", expand=True)
+
+        self._cv.bind("<Configure>",       self._on_resize)
+        self._cv.bind("<ButtonPress-1>",   self._on_pan_start)
+        self._cv.bind("<B1-Motion>",       self._on_pan)
+        self._cv.bind("<ButtonRelease-1>", self._on_pan_end)
+        self._cv.bind("<MouseWheel>",      self._on_scroll)
+        self._cv.bind("<Button-4>",        lambda e: self._zoom_in())   # Linux
+        self._cv.bind("<Button-5>",        lambda e: self._zoom_out())  # Linux
+
+        # Overlay text (shown when no fix)
+        self._overlay = self._cv.create_text(
+            10, 10, anchor="nw",
+            text="Waiting for GPS fix…",
+            fill=_C["amber"], font=(_FF, 10))
+
+    # ── Tile math ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _deg2tile_f(lat, lon, zoom):
+        """Return fractional tile coordinates for lat/lon at zoom."""
+        n     = 2 ** zoom
+        x_f   = (lon + 180.0) / 360.0 * n
+        lat_r = math.radians(lat)
+        y_f   = (1.0 - math.asinh(math.tan(lat_r)) / math.pi) / 2.0 * n
+        return x_f, y_f
+
+    def _center_tile_f(self):
+        return self._deg2tile_f(self._center_lat, self._center_lon, self._zoom)
+
+    def _latlon_to_canvas(self, lat, lon):
+        """Map lat/lon to canvas pixel coordinates."""
+        w  = self._cv.winfo_width()  or 400
+        h  = self._cv.winfo_height() or 300
+        cx, cy = self._center_tile_f()
+        xf, yf = self._deg2tile_f(lat, lon, self._zoom)
+        px = w / 2 + (xf - cx) * self.TILE_SIZE
+        py = h / 2 + (yf - cy) * self.TILE_SIZE
+        return px, py
+
+    # ── Tile fetching ─────────────────────────────────────────────────────────
+
+    def _request_tile(self, z, x, y):
+        key = (z, x, y)
+        if key in self._tile_img or key in self._tile_pend:
+            return
+        self._tile_pend.add(key)
+        threading.Thread(
+            target=self._fetch_tile, args=(z, x, y), daemon=True
+        ).start()
+
+    def _fetch_tile(self, z, x, y):
+        key = (z, x, y)
+        url = self._OSM_URL.format(z=z, x=x, y=y)
+        try:
+            req  = urllib.request.Request(url, headers={"User-Agent": self._UA})
+            data = urllib.request.urlopen(req, timeout=8).read()
+            self._tile_queue.put((key, base64.b64encode(data).decode()))
+        except Exception:
+            self._tile_queue.put((key, None))
+        finally:
+            self._tile_pend.discard(key)
+
+    def _poll_tiles(self):
+        """Drain the tile queue and redraw if any new tiles arrived."""
+        changed = False
+        try:
+            while True:
+                key, b64 = self._tile_queue.get_nowait()
+                if b64:
+                    # PhotoImage must be created on the main thread
+                    self._tile_img[key] = tk.PhotoImage(data=b64)
+                    changed = True
+        except queue.Empty:
+            pass
+        if changed:
+            self._redraw()
+        self.after(250, self._poll_tiles)
+
+    # ── Drawing ───────────────────────────────────────────────────────────────
+
+    def _redraw(self):
+        if not self.winfo_ismapped():
+            return
+        w = self._cv.winfo_width()
+        h = self._cv.winfo_height()
+        if w < 4 or h < 4:
+            return
+
+        self._cv.delete("tile", "marker")
+
+        n    = 2 ** self._zoom
+        cx_f, cy_f = self._center_tile_f()
+        cx_ti = int(cx_f)
+        cy_ti = int(cy_f)
+
+        tiles_x = w // self.TILE_SIZE + 3
+        tiles_y = h // self.TILE_SIZE + 3
+
+        for dx in range(-tiles_x // 2 - 1, tiles_x // 2 + 2):
+            for dy in range(-tiles_y // 2 - 1, tiles_y // 2 + 2):
+                tx = (cx_ti + dx) % n
+                ty = cy_ti + dy
+                if ty < 0 or ty >= n:
+                    continue
+                px = w / 2 + (cx_ti + dx - cx_f) * self.TILE_SIZE
+                py = h / 2 + (cy_ti + dy - cy_f) * self.TILE_SIZE
+                key = (self._zoom, tx, ty)
+                if key in self._tile_img:
+                    self._cv.create_image(px, py, anchor="nw",
+                                          image=self._tile_img[key],
+                                          tags="tile")
+                else:
+                    self._cv.create_rectangle(
+                        px, py,
+                        px + self.TILE_SIZE, py + self.TILE_SIZE,
+                        fill="#2a3040", outline="#3a4555", tags="tile")
+                    self._request_tile(self._zoom, tx, ty)
+
+        # Drone marker
+        if self._fix_valid and self._drone_lat is not None:
+            mx, my = self._latlon_to_canvas(self._drone_lat, self._drone_lon)
+            r = 8
+            self._cv.create_oval(mx - r, my - r, mx + r, my + r,
+                                 fill=_C["map_marker"], outline="#ffffff",
+                                 width=1.5, tags="marker")
+            self._cv.create_line(mx, my - r, mx, my - r - 12,
+                                 fill="#ffffff", width=2,
+                                 arrow="last", arrowshape=(6, 8, 3),
+                                 tags="marker")
+
+        # Overlay
+        if self._fix_valid:
+            self._cv.itemconfig(self._overlay, state="hidden")
+        else:
+            self._cv.itemconfig(self._overlay,
+                                text="Waiting for GPS fix…", state="normal")
+            self._cv.tag_raise(self._overlay)
+
+    # ── Event handlers ────────────────────────────────────────────────────────
+
+    def _on_resize(self, _event):
+        self._redraw()
+
+    def _on_pan_start(self, event):
+        self._pan_last    = (event.x, event.y)
+        self._auto_center = False
+
+    def _on_pan(self, event):
+        if self._pan_last is None:
+            return
+        dx = event.x - self._pan_last[0]
+        dy = event.y - self._pan_last[1]
+        self._pan_last = (event.x, event.y)
+        n      = 2 ** self._zoom
+        cx_f, cy_f = self._center_tile_f()
+        new_xf = cx_f - dx / self.TILE_SIZE
+        new_yf = cy_f - dy / self.TILE_SIZE
+        self._center_lon = new_xf / n * 360.0 - 180.0
+        self._center_lat = math.degrees(
+            math.atan(math.sinh(math.pi * (1.0 - 2.0 * new_yf / n))))
+        self._redraw()
+
+    def _on_pan_end(self, _event):
+        self._pan_last = None
+
+    def _on_scroll(self, event):
+        if event.delta > 0:
+            self._zoom_in()
+        else:
+            self._zoom_out()
+
+    def _zoom_in(self):
+        if self._zoom < 19:
+            self._zoom += 1
+            self._zoom_lbl.config(text=f"z{self._zoom}")
+            self._redraw()
+
+    def _zoom_out(self):
+        if self._zoom > 2:
+            self._zoom -= 1
+            self._zoom_lbl.config(text=f"z{self._zoom}")
+            self._redraw()
+
+    def _center_on_drone(self):
+        if self._drone_lat is not None:
+            self._center_lat = self._drone_lat
+            self._center_lon = self._drone_lon
+        self._auto_center = True
+        self._redraw()
+
+    # ── Public update ─────────────────────────────────────────────────────────
+
+    def update_position(self, lat: float, lon: float, fix_valid: bool):
+        self._fix_valid = fix_valid
+        if fix_valid and lat != 0.0:
+            self._drone_lat = lat
+            self._drone_lon = lon
+            if self._auto_center:
+                self._center_lat = lat
+                self._center_lon = lon
+        self._redraw()
 
 
 # =============================================================================
-# GPSWidget
+# Satellite signal canvas widget
+# =============================================================================
+
+class _SatCanvas(tk.Frame):
+    """
+    Scrollable, canvas-drawn satellite signal-strength display.
+    Mimics the Betaflight GPS signal strength panel.
+    """
+    _ROW_H   = 23
+    _CNO_MAX = 55        # typical maximum C/N0 in dB-Hz
+    _BAR_MAX = 88        # pixel width of the full-scale signal bar
+
+    # GNSS constellation short-name colours
+    _GNSS_COLOR = {
+        "GPS":     "#39e07a",
+        "GLONASS": "#f0b429",
+        "BeiDou":  "#29c7e0",
+        "Galileo": "#cc88ff",
+        "SBAS":    "#aaaaaa",
+        "QZSS":    "#ff8844",
+    }
+
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, bg=_C["bg"], **kwargs)
+        self._sv_data = []
+        self._build()
+
+    def _build(self):
+        # Fixed header row
+        hdr = tk.Canvas(self, bg=_C["frame_bg"], height=18,
+                        highlightthickness=0)
+        hdr.pack(fill="x")
+        self._header_cv = hdr
+        self._draw_header(hdr)
+
+        # Scrollable body
+        body = tk.Frame(self, bg=_C["bg"])
+        body.pack(fill="both", expand=True)
+
+        self._cv = tk.Canvas(body, bg=_C["bg"], highlightthickness=0)
+        sb = ttk.Scrollbar(body, orient="vertical",
+                           command=self._cv.yview)
+        self._cv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self._cv.pack(side="left", fill="both", expand=True)
+
+        self._cv.bind("<Configure>",  lambda _e: self._redraw())
+        self._cv.bind("<MouseWheel>", self._on_scroll)
+        self._cv.bind("<Button-4>",   lambda _e: self._cv.yview_scroll(-1, "units"))
+        self._cv.bind("<Button-5>",   lambda _e: self._cv.yview_scroll( 1, "units"))
+
+    def _draw_header(self, cv):
+        cv.delete("all")
+        w = cv.winfo_width() or 360
+        col_fg = _C["label"]
+        font   = (_FF, 7, "bold")
+        x = 6
+        for label, width in self._columns():
+            cv.create_text(x, 9, text=label, anchor="w",
+                           fill=col_fg, font=font)
+            x += width
+
+    @staticmethod
+    def _columns():
+        return [
+            ("GNSS",   62),
+            ("SV",     32),
+            ("Signal", 96),
+            ("dBHz",   38),
+            ("Status", 60),
+            ("Quality",80),
+        ]
+
+    def _on_scroll(self, event):
+        self._cv.yview_scroll(int(-event.delta / 120), "units")
+
+    def update_satellites(self, sv_list: list):
+        self._sv_data = sv_list or []
+        self._redraw()
+
+    def _redraw(self):
+        self._cv.delete("all")
+        self._draw_header(self._header_cv)
+
+        w = max(self._cv.winfo_width(), 360)
+
+        if not self._sv_data:
+            self._cv.create_text(
+                w // 2, 50,
+                text="No satellite data available\n"
+                     "(expose sv_list in DroneBackend to populate)",
+                fill=_C["no_data"], font=(_FF, 9),
+                justify="center")
+            self._cv.configure(scrollregion=(0, 0, w, 100))
+            return
+
+        rows = sorted(self._sv_data,
+                      key=lambda s: (not s.get("used", False),
+                                     -int(s.get("cno", 0))))
+        total_h = len(rows) * self._ROW_H + 2
+        self._cv.configure(scrollregion=(0, 0, w, total_h))
+
+        cols = self._columns()
+
+        for i, sv in enumerate(rows):
+            y      = i * self._ROW_H
+            row_bg = _C["sv_row_odd"] if i % 2 else _C["sv_row_even"]
+            self._cv.create_rectangle(0, y, w, y + self._ROW_H,
+                                      fill=row_bg, outline="")
+
+            x = 6
+            cy = y + self._ROW_H // 2
+
+            # ── GNSS constellation ────────────────────────────────────────────
+            gnss  = str(sv.get("gnss_id", "?"))[:8]
+            gcol  = self._GNSS_COLOR.get(gnss, _C["text"])
+            self._cv.create_text(x, cy, text=gnss, anchor="w",
+                                 fill=gcol, font=(_FF, 8, "bold"))
+            x += cols[0][1]
+
+            # ── SV ID ─────────────────────────────────────────────────────────
+            self._cv.create_text(x, cy, text=str(sv.get("sv_id", "--")),
+                                 anchor="w", fill=_C["text"], font=(_FF, 9))
+            x += cols[1][1]
+
+            # ── Signal bar ────────────────────────────────────────────────────
+            cno     = int(sv.get("cno", 0))
+            used    = bool(sv.get("used", False))
+            bar_pct = min(cno / self._CNO_MAX, 1.0)
+            bar_w   = int(bar_pct * self._BAR_MAX)
+            bar_col = (_C["sv_used"] if used
+                       else _C["sv_locked"] if cno > 12
+                       else _C["sv_nodata"])
+            track_h = 6
+            by      = cy - track_h // 2
+            # track
+            self._cv.create_rectangle(
+                x, by, x + self._BAR_MAX, by + track_h,
+                fill=_C["border"], outline="")
+            # fill
+            if bar_w > 0:
+                self._cv.create_rectangle(
+                    x, by, x + bar_w, by + track_h,
+                    fill=bar_col, outline="")
+            x += cols[2][1]
+
+            # ── CNO value ─────────────────────────────────────────────────────
+            cno_txt = f"{cno:2d}" if cno > 0 else "--"
+            self._cv.create_text(x, cy, text=cno_txt, anchor="w",
+                                 fill=_C["text"], font=(_FF, 9))
+            x += cols[3][1]
+
+            # ── Used / unused badge ───────────────────────────────────────────
+            used_txt = "USED"   if used else "unused"
+            used_col = _C["sv_used"] if used else _C["no_data"]
+            self._cv.create_text(x, cy, text=used_txt, anchor="w",
+                                 fill=used_col, font=(_FF, 8, "bold"))
+            x += cols[4][1]
+
+            # ── Quality ───────────────────────────────────────────────────────
+            qual = sv.get("quality", 0)
+            if isinstance(qual, int):
+                _Q = ["idle", "searching", "acquired", "detected",
+                      "code lock", "carrier lock", "fully locked", "fully locked"]
+                qual = _Q[min(qual, 7)]
+            qual_str = str(qual)[:14]
+            if "fully" in qual_str.lower():
+                qcol = _C["green"]
+            elif "lock" in qual_str.lower() or "carrier" in qual_str.lower():
+                qcol = _C["amber"]
+            elif "code" in qual_str.lower():
+                qcol = _C["amber"]
+            else:
+                qcol = _C["no_data"]
+            self._cv.create_text(x, cy, text=qual_str, anchor="w",
+                                 fill=qcol, font=(_FF, 8))
+
+
+# =============================================================================
+# Main GPS widget (Notebook with three tabs)
 # =============================================================================
 
 class GPSWidget(tk.Frame):
     """
-    Aviation-grade GPS display widget.
+    Self-contained GPS widget with three tabbed views.
 
-    Laid out as a two-row instrument panel:
-      Row 0: Fix status bar (full width)
-      Row 1: Left block  — coordinates + altitude + speed + track
-             Right block — home vector (distance + bearing compass arc)
+    update_gps(ui_data) must be called on every telemetry tick.
+
+    Expected ui_data keys (all optional):
+        (navigation)
+        gps_fix_type          int
+        gps_num_sat           int
+        gps_hdop              float   real HDOP (pre-divided)
+        gps_latitude          float   decimal degrees
+        gps_longitude         float   decimal degrees
+        gps_altitude_m        float   MSL metres
+        gps_ground_speed_cms  int     cm/s
+        gps_ground_course     int     decidegrees
+        gps_dist_to_home_m    float   metres
+        gps_bearing_to_home   int     degrees (−180…+180)
+        gps_heartbeat         int     toggles on each new GPS frame
+        gps_raw_valid         bool
+        gps_comp_valid        bool
+        gps_position_usable   bool
+        (satellite tab)
+        gps_sv_list           list[dict]  see _SatCanvas docstring
     """
 
     def __init__(self, parent, **kwargs):
-        super().__init__(parent, bg=BG, bd=1, relief="solid", **kwargs)
-        self.configure(highlightbackground=BORDER, highlightthickness=1)
-
-        self._prev_heartbeat = -1   # sentinel — first tick always blinks
-
+        super().__init__(parent, bg=_C["bg"], **kwargs)
+        self._prev_heartbeat = None
+        self._hb_state       = False
         self._build_ui()
 
     # =========================================================================
-    # UI construction
+    # Build UI
     # =========================================================================
 
     def _build_ui(self):
-        # ----- Title bar -----------------------------------------------------
-        title_row = tk.Frame(self, bg=BORDER)
-        title_row.pack(fill="x", side="top")
+        style = ttk.Style()
+        style.configure("GPS.TLabelframe",
+                        background=_C["bg"], bordercolor=_C["border"])
+        style.configure("GPS.TLabelframe.Label",
+                        background=_C["bg"], foreground=_C["label"],
+                        font=(_FF, 9, "bold"))
+        style.configure("GPSNB.TNotebook",
+                        background=_C["bg"], borderwidth=0)
+        style.configure("GPSNB.TNotebook.Tab",
+                        background=_C["frame_bg"],
+                        foreground=_C["label"],
+                        font=(_FF, 8, "bold"),
+                        padding=(8, 3))
+        style.map("GPSNB.TNotebook.Tab",
+                  background=[("selected", _C["border"])],
+                  foreground=[("selected", _C["text"])])
 
-        tk.Label(
-            title_row,
-            text="  GPS NAV  \u2014  NEO-M10",
-            bg=BORDER, fg="#ffffff",
-            font=FONT_TITLE, anchor="w",
-        ).pack(side="left", padx=6, pady=2)
+        outer = ttk.LabelFrame(self, text="GPS Navigation",
+                               style="GPS.TLabelframe")
+        outer.pack(fill="both", expand=True, padx=2, pady=2)
 
-        # Heartbeat indicator (right side of title bar)
-        self._hb_canvas = tk.Canvas(
-            title_row, width=12, height=12,
-            bg=BORDER, highlightthickness=0
-        )
-        self._hb_canvas.pack(side="right", padx=8, pady=2)
-        self._hb_dot = self._hb_canvas.create_oval(
-            1, 1, 11, 11, fill=COL_HB_OFF, outline=""
-        )
+        nb = ttk.Notebook(outer, style="GPSNB.TNotebook")
+        nb.pack(fill="both", expand=True, padx=4, pady=(2, 4))
 
-        # ----- Fix status row ------------------------------------------------
-        status_row = tk.Frame(self, bg=BG_PANEL)
-        status_row.pack(fill="x", side="top", pady=(0, 1))
+        # ── Tab 1: Navigation ─────────────────────────────────────────────────
+        nav_frame = tk.Frame(nb, bg=_C["bg"])
+        nb.add(nav_frame, text=" Navigation ")
+        self._build_navigation(nav_frame)
 
-        # Fix type label
-        self._fix_label = tk.Label(
-            status_row,
-            text="NO FIX",
-            bg=BG_PANEL, fg=COL_NO_FIX,
-            font=("Courier New", 11, "bold"),
-            width=7, anchor="center",
-        )
-        self._fix_label.pack(side="left", padx=(8, 0), pady=3)
+        # ── Tab 2: Satellites ─────────────────────────────────────────────────
+        sat_frame = tk.Frame(nb, bg=_C["bg"])
+        nb.add(sat_frame, text=" Satellites ")
+        self._sat_canvas = _SatCanvas(sat_frame)
+        self._sat_canvas.pack(fill="both", expand=True)
 
-        tk.Label(status_row, text="|", bg=BG_PANEL,
-                 fg=TEXT_DIM, font=FONT_LABEL).pack(side="left", padx=4)
+        # ── Tab 3: Map ────────────────────────────────────────────────────────
+        map_frame = tk.Frame(nb, bg=_C["bg"])
+        nb.add(map_frame, text=" Map ")
+        self._map_canvas = _MapCanvas(map_frame)
+        self._map_canvas.pack(fill="both", expand=True)
 
-        # Satellite count
-        tk.Label(status_row, text="SAT", bg=BG_PANEL,
-                 fg=TEXT_DIM, font=FONT_LABEL).pack(side="left")
-        self._sat_label = tk.Label(
-            status_row, text="--",
-            bg=BG_PANEL, fg=TEXT_HI,
-            font=FONT_MONO, width=3, anchor="w",
-        )
-        self._sat_label.pack(side="left", padx=(2, 8))
+    # =========================================================================
+    # Navigation tab content  (same layout as the original GPSWidget)
+    # =========================================================================
+
+    def _build_navigation(self, p):
+        c = tk.Frame(p, bg=_C["bg"])
+        c.pack(fill="both", expand=True, padx=6, pady=4)
+
+        self._build_fix_row(c)
+        self._sep(c)
+        self._build_position(c)
+        self._sep(c)
+        self._build_altitude(c)
+        self._sep(c)
+        self._build_ground_vector(c)
+        self._sep(c)
+        self._build_home(c)
+
+    def _sep(self, parent):
+        tk.Frame(parent, bg=_C["border"], height=1).pack(fill="x", pady=3)
+
+    # ── Fix status row ────────────────────────────────────────────────────────
+
+    def _build_fix_row(self, p):
+        row = tk.Frame(p, bg=_C["bg"])
+        row.pack(fill="x", pady=(2, 0))
+
+        self._fix_lbl = tk.Label(
+            row, text="NO FIX", fg=_C["red"], bg=_C["frame_bg"],
+            font=_FFIX, width=7, anchor="center",
+            relief="flat", padx=4, pady=2)
+        self._fix_lbl.pack(side="left")
+
+        sat_f = tk.Frame(row, bg=_C["bg"])
+        sat_f.pack(side="left", padx=(10, 0))
+        tk.Label(sat_f, text="SAT", fg=_C["label"], bg=_C["bg"],
+                 font=_FL).pack(side="left")
+        self._sat_lbl = tk.Label(sat_f, text=" --",
+                                 fg=_C["no_data"], bg=_C["bg"],
+                                 font=_FVS, width=3)
+        self._sat_lbl.pack(side="left")
+
+        hdop_f = tk.Frame(row, bg=_C["bg"])
+        hdop_f.pack(side="left", padx=(10, 0))
+        tk.Label(hdop_f, text="HDOP", fg=_C["label"], bg=_C["bg"],
+                 font=_FL).pack(side="left")
+        self._hdop_lbl = tk.Label(hdop_f, text=" -.--",
+                                  fg=_C["no_data"], bg=_C["bg"],
+                                  font=_FVS, width=5)
+        self._hdop_lbl.pack(side="left")
+
+        self._hb_cv = tk.Canvas(row, width=12, height=12,
+                                bg=_C["bg"], highlightthickness=0)
+        self._hb_cv.pack(side="right", padx=(0, 4))
+        self._hb_dot = self._hb_cv.create_oval(
+            1, 1, 11, 11, fill=_C["hb_off"], outline="")
+
+    # ── Position ──────────────────────────────────────────────────────────────
+
+    def _build_position(self, p):
+        tk.Label(p, text="POSITION", fg=_C["label"], bg=_C["bg"],
+                 font=_FL).pack(anchor="w")
+        lat_r = tk.Frame(p, bg=_C["bg"])
+        lat_r.pack(fill="x")
+        tk.Label(lat_r, text="LAT", fg=_C["label"], bg=_C["bg"],
+                 font=_FL, width=4, anchor="w").pack(side="left")
+        self._lat_lbl = tk.Label(lat_r, text="---.---------- -",
+                                 fg=_C["no_data"], bg=_C["bg"], font=_FV)
+        self._lat_lbl.pack(side="left")
+
+        lon_r = tk.Frame(p, bg=_C["bg"])
+        lon_r.pack(fill="x")
+        tk.Label(lon_r, text="LON", fg=_C["label"], bg=_C["bg"],
+                 font=_FL, width=4, anchor="w").pack(side="left")
+        self._lon_lbl = tk.Label(lon_r, text="---.---------- -",
+                                 fg=_C["no_data"], bg=_C["bg"], font=_FV)
+        self._lon_lbl.pack(side="left")
+
+    # ── Altitude ──────────────────────────────────────────────────────────────
+
+    def _build_altitude(self, p):
+        tk.Label(p, text="ALTITUDE MSL", fg=_C["label"], bg=_C["bg"],
+                 font=_FL).pack(anchor="w")
+        alt_r = tk.Frame(p, bg=_C["bg"])
+        alt_r.pack(fill="x")
+        self._alt_ft_lbl = tk.Label(alt_r, text="------ ft",
+                                    fg=_C["no_data"], bg=_C["bg"], font=_FV)
+        self._alt_ft_lbl.pack(side="left")
+        self._alt_m_lbl = tk.Label(alt_r, text="(------ m)",
+                                   fg=_C["unit"], bg=_C["bg"], font=_FVS)
+        self._alt_m_lbl.pack(side="left", padx=(8, 0))
+
+    # ── Ground vector ─────────────────────────────────────────────────────────
+
+    def _build_ground_vector(self, p):
+        tk.Label(p, text="GROUND VECTOR", fg=_C["label"], bg=_C["bg"],
+                 font=_FL).pack(anchor="w")
+        inner = tk.Frame(p, bg=_C["bg"])
+        inner.pack(fill="x")
+        left = tk.Frame(inner, bg=_C["bg"])
+        left.pack(side="left", anchor="n")
+
+        gs_kt_r = tk.Frame(left, bg=_C["bg"])
+        gs_kt_r.pack(anchor="w")
+        tk.Label(gs_kt_r, text="GS", fg=_C["label"], bg=_C["bg"],
+                 font=_FL, width=3, anchor="w").pack(side="left")
+        self._gs_kt_lbl = tk.Label(gs_kt_r, text="---.- kt",
+                                   fg=_C["no_data"], bg=_C["bg"], font=_FV)
+        self._gs_kt_lbl.pack(side="left")
+
+        gs_km_r = tk.Frame(left, bg=_C["bg"])
+        gs_km_r.pack(anchor="w")
+        tk.Label(gs_km_r, text="  ", fg=_C["label"], bg=_C["bg"],
+                 font=_FL, width=3, anchor="w").pack(side="left")
+        self._gs_km_lbl = tk.Label(gs_km_r, text="(--- km/h)",
+                                   fg=_C["unit"], bg=_C["bg"], font=_FVS)
+        self._gs_km_lbl.pack(side="left")
+
+        trk_r = tk.Frame(left, bg=_C["bg"])
+        trk_r.pack(anchor="w", pady=(4, 0))
+        tk.Label(trk_r, text="TRK", fg=_C["label"], bg=_C["bg"],
+                 font=_FL, width=3, anchor="w").pack(side="left")
+        self._trk_lbl = tk.Label(trk_r, text="---.-°",
+                                 fg=_C["no_data"], bg=_C["bg"], font=_FV)
+        self._trk_lbl.pack(side="left")
+
+        self._trk_cv = tk.Canvas(inner, width=68, height=68,
+                                 bg=_C["compass_bg"], highlightthickness=1,
+                                 highlightbackground=_C["compass_rim"])
+        self._trk_cv.pack(side="right", padx=(8, 0))
+        self._draw_rose(self._trk_cv, 34, 34, 28, cardinals=True)
+        self._trk_needle = self._trk_cv.create_line(
+            34, 34, 34, 10, fill=_C["track_needle"],
+            width=2, arrow="last", arrowshape=(7, 9, 3))
+
+    # ── Home ──────────────────────────────────────────────────────────────────
+
+    def _build_home(self, p):
+        tk.Label(p, text="HOME POINT", fg=_C["label"], bg=_C["bg"],
+                 font=_FL).pack(anchor="w")
+        inner = tk.Frame(p, bg=_C["bg"])
+        inner.pack(fill="x", pady=(0, 2))
+        left = tk.Frame(inner, bg=_C["bg"])
+        left.pack(side="left", anchor="n")
+
+        dist_r = tk.Frame(left, bg=_C["bg"])
+        dist_r.pack(anchor="w")
+        tk.Label(dist_r, text="DIST", fg=_C["label"], bg=_C["bg"],
+                 font=_FL, width=4, anchor="w").pack(side="left")
+        self._dist_lbl = tk.Label(dist_r, text="------ m",
+                                  fg=_C["no_data"], bg=_C["bg"], font=_FV)
+        self._dist_lbl.pack(side="left")
+
+        brg_r = tk.Frame(left, bg=_C["bg"])
+        brg_r.pack(anchor="w")
+        tk.Label(brg_r, text="BRG", fg=_C["label"], bg=_C["bg"],
+                 font=_FL, width=4, anchor="w").pack(side="left")
+        self._brg_lbl = tk.Label(brg_r, text="---°",
+                                 fg=_C["no_data"], bg=_C["bg"], font=_FV)
+        self._brg_lbl.pack(side="left")
+
+        self._home_cv = tk.Canvas(inner, width=68, height=68,
+                                  bg=_C["compass_bg"], highlightthickness=1,
+                                  highlightbackground=_C["compass_rim"])
+        self._home_cv.pack(side="right", padx=(8, 0))
+        self._draw_rose(self._home_cv, 34, 34, 28, cardinals=False)
+        self._home_arrow = self._home_cv.create_line(
+            34, 34, 34, 10, fill=_C["home_arrow"],
+            width=2, arrow="last", arrowshape=(7, 9, 3))
+
+    # =========================================================================
+    # Canvas helpers
+    # =========================================================================
+
+    def _draw_rose(self, cv, cx, cy, r, cardinals=True):
+        cv.create_oval(cx - r, cy - r, cx + r, cy + r,
+                       outline=_C["compass_rim"], width=1)
+        cv.create_oval(cx - 2, cy - 2, cx + 2, cy + 2,
+                       fill=_C["compass_rim"], outline="")
+        for deg in range(0, 360, 45):
+            rad = math.radians(deg - 90)
+            r1  = r - 5
+            cv.create_line(
+                cx + math.cos(rad) * r1, cy + math.sin(rad) * r1,
+                cx + math.cos(rad) * r,  cy + math.sin(rad) * r,
+                fill=_C["compass_rim"], width=1)
+        cv.create_line(cx, cy - r + 5, cx, cy - r,
+                       fill=_C["amber"], width=2)
+        if cardinals:
+            r_lbl = r - 11
+            for lbl, deg in (("N", 0), ("E", 90), ("S", 180), ("W", 270)):
+                rad = math.radians(deg - 90)
+                cv.create_text(
+                    cx + math.cos(rad) * r_lbl,
+                    cy + math.sin(rad) * r_lbl,
+                    text=lbl, fill=_C["label"], font=(_FF, 6))
+
+    def _point_needle(self, cv, needle_id, cx, cy, r, angle_deg):
+        rad   = math.radians(angle_deg - 90)
+        tip_r = r - 4
+        cv.coords(needle_id,
+                  cx, cy,
+                  cx + math.cos(rad) * tip_r,
+                  cy + math.sin(rad) * tip_r)
+
+    # =========================================================================
+    # Public update method
+    # =========================================================================
+
+    def update_gps(self, ui_data: dict):
+        """Refresh all three tabs from the latest telemetry data dict."""
+        self._update_navigation(ui_data)
+        self._update_satellites(ui_data)
+        self._update_map(ui_data)
+
+    # ── Navigation tab update ─────────────────────────────────────────────────
+
+    def _update_navigation(self, ui_data: dict):
+        raw_valid  = ui_data.get("gps_raw_valid",        False)
+        comp_valid = ui_data.get("gps_comp_valid",       False)
+        pos_usable = ui_data.get("gps_position_usable",  False)
+        fix_type   = ui_data.get("gps_fix_type",          0)
+        num_sat    = ui_data.get("gps_num_sat",           0)
+        hdop       = ui_data.get("gps_hdop",              99.0)
+        lat        = ui_data.get("gps_latitude",          0.0)
+        lon        = ui_data.get("gps_longitude",         0.0)
+        alt_m      = float(ui_data.get("gps_altitude_m",  0.0))
+        gs_cms     = ui_data.get("gps_ground_speed_cms",  0)
+        course_dd  = ui_data.get("gps_ground_course",     0)
+        dist_m     = float(ui_data.get("gps_dist_to_home_m",  0.0))
+        brg        = int(ui_data.get("gps_bearing_to_home",   0))
+        heartbeat  = ui_data.get("gps_heartbeat",         None)
+
+        # Fix badge
+        if raw_valid and fix_type >= 2:
+            self._fix_lbl.config(text="3D FIX", fg=_C["green"])
+        elif raw_valid and fix_type == 1:
+            self._fix_lbl.config(text="2D FIX", fg=_C["amber"])
+        else:
+            self._fix_lbl.config(text="NO FIX", fg=_C["red"])
+
+        # Satellites
+        if raw_valid:
+            self._sat_lbl.config(
+                text=f"{num_sat:3d}",
+                fg=_C["green"] if num_sat >= 6 else _C["amber"])
+        else:
+            self._sat_lbl.config(text=" --", fg=_C["no_data"])
 
         # HDOP
-        tk.Label(status_row, text="HDOP", bg=BG_PANEL,
-                 fg=TEXT_DIM, font=FONT_LABEL).pack(side="left")
-        self._hdop_label = tk.Label(
-            status_row, text="-.--",
-            bg=BG_PANEL, fg=TEXT_HI,
-            font=FONT_MONO, width=5, anchor="w",
-        )
-        self._hdop_label.pack(side="left", padx=(2, 4))
-
-        # HDOP quality bar (10 segments × 6 px = 60 px)
-        self._hdop_bar = tk.Canvas(
-            status_row, width=62, height=10,
-            bg=BG_PANEL, highlightthickness=0
-        )
-        self._hdop_bar.pack(side="left", padx=(0, 8))
-        self._hdop_segs = []
-        for i in range(10):
-            seg = self._hdop_bar.create_rectangle(
-                i * 6 + 1, 1, i * 6 + 5, 9,
-                fill="#1e3050", outline=""
-            )
-            self._hdop_segs.append(seg)
-
-        # Position usable warning
-        self._usable_label = tk.Label(
-            status_row, text="POS UNUSABLE",
-            bg=BG_PANEL, fg=COL_NO_FIX,
-            font=("Courier New", 8, "bold"),
-        )
-        self._usable_label.pack(side="right", padx=8)
-
-        # ----- Main data area ------------------------------------------------
-        data_row = tk.Frame(self, bg=BG)
-        data_row.pack(fill="both", expand=True, side="top",
-                      padx=6, pady=(2, 6))
-
-        # Left block: coordinates / altitude / speed / track
-        left = tk.Frame(data_row, bg=BG)
-        left.pack(side="left", fill="both", expand=True)
-
-        self._coord_frame = self._make_section(left, "POSITION")
-        self._coord_frame.pack(fill="x", pady=(0, 4))
-
-        self._lat_val  = self._add_data_row(self._coord_frame, "LAT", "\u2014")
-        self._lon_val  = self._add_data_row(self._coord_frame, "LON", "\u2014")
-        self._alt_val  = self._add_data_row(self._coord_frame, "ALT", "\u2014")
-
-        self._nav_frame = self._make_section(left, "NAVIGATION")
-        self._nav_frame.pack(fill="x")
-
-        self._spd_val  = self._add_data_row(self._nav_frame, "GS",  "\u2014")
-        self._trk_val  = self._add_data_row(self._nav_frame, "TRK", "\u2014")
-
-        # Right block: home vector + bearing compass
-        right = tk.Frame(data_row, bg=BG)
-        right.pack(side="right", fill="y", padx=(8, 0))
-
-        self._home_frame = self._make_section(right, "HOME VECTOR")
-        self._home_frame.pack(fill="x", pady=(0, 4))
-
-        self._dist_val = self._add_data_row(self._home_frame, "DIST", "\u2014")
-        self._brg_val  = self._add_data_row(self._home_frame, "BRG",  "\u2014")
-
-        # Miniature bearing compass arc
-        self._compass = tk.Canvas(
-            right, width=90, height=90,
-            bg=BG, highlightthickness=0
-        )
-        self._compass.pack(pady=(2, 0))
-        self._draw_compass_rose()
-
-    # =========================================================================
-    # UI helpers
-    # =========================================================================
-
-    def _make_section(self, parent, title: str) -> tk.Frame:
-        frame = tk.Frame(parent, bg=BG_CELL,
-                         highlightbackground="#1e3060",
-                         highlightthickness=1)
-        tk.Label(
-            frame, text=f" {title} ",
-            bg=BG_CELL, fg=TEXT_DIM,
-            font=FONT_SMALL, anchor="w",
-        ).pack(fill="x", side="top", padx=2, pady=(2, 0))
-        return frame
-
-    def _add_data_row(self, parent: tk.Frame, label: str, initial: str):
-        """
-        Add a label + value row inside a section frame.
-        Returns the value Label so the caller can update it.
-        """
-        row = tk.Frame(parent, bg=BG_CELL)
-        row.pack(fill="x", padx=4, pady=1)
-
-        tk.Label(
-            row, text=f"{label:<4}",
-            bg=BG_CELL, fg=TEXT_DIM,
-            font=FONT_LABEL, anchor="w", width=4,
-        ).pack(side="left")
-
-        val = tk.Label(
-            row, text=initial,
-            bg=BG_CELL, fg=TEXT_HI,
-            font=FONT_MONO, anchor="w",
-        )
-        val.pack(side="left", padx=(4, 0))
-        return val
-
-    # =========================================================================
-    # Compass rose
-    # =========================================================================
-
-    def _draw_compass_rose(self):
-        """Draw static compass markings; bearing needle is updated each tick."""
-        cx, cy, r = 45, 45, 38
-        c = self._compass
-
-        # Outer ring
-        c.create_oval(cx - r, cy - r, cx + r, cy + r,
-                      outline=TEXT_DIM, width=1)
-
-        # Cardinal tick marks + labels
-        cardinals = {0: "N", 90: "E", 180: "S", 270: "W"}
-        for deg in range(0, 360, 30):
-            rad  = math.radians(deg - 90)
-            inner = r - (6 if deg % 90 == 0 else 3)
-            x1 = cx + inner * math.cos(rad)
-            y1 = cy + inner * math.sin(rad)
-            x2 = cx + r     * math.cos(rad)
-            y2 = cy + r     * math.sin(rad)
-            c.create_line(x1, y1, x2, y2,
-                          fill=TEXT_DIM if deg % 90 != 0 else TEXT_HI,
-                          width=1)
-            if deg in cardinals:
-                lx = cx + (r - 14) * math.cos(rad)
-                ly = cy + (r - 14) * math.sin(rad)
-                c.create_text(lx, ly, text=cardinals[deg],
-                              fill=TEXT_HI, font=FONT_SMALL)
-
-        # Centre dot
-        c.create_oval(cx - 3, cy - 3, cx + 3, cy + 3,
-                      fill=TEXT_DIM, outline="")
-
-        # Placeholder needle (home bearing pointer) — updated each tick
-        self._needle = c.create_line(
-            cx, cy,
-            cx, cy - r + 8,
-            fill=BG, width=2, arrow="last",
-        )
-
-        # Track needle (COG) — updated each tick
-        self._track_needle = c.create_line(
-            cx, cy,
-            cx, cy - r + 14,
-            fill=BG, width=2,
-        )
-
-    def _update_compass(self, bearing_deg: int, track_deg: float,
-                        comp_valid: bool, raw_valid: bool):
-        """
-        Update the bearing needle (home direction) and track needle (COG).
-
-        bearing_deg : bearing to home (-180 to +180), degrees
-        track_deg   : ground track (COG), 0-360 degrees
-        """
-        cx, cy, r = 45, 45, 38
-        c = self._compass
-
-        # --- Home bearing pointer (red) ---
-        if comp_valid:
-            rad = math.radians(bearing_deg - 90)
-            ex  = cx + (r - 8) * math.cos(rad)
-            ey  = cy + (r - 8) * math.sin(rad)
-            c.coords(self._needle, cx, cy, ex, ey)
-            c.itemconfig(self._needle, fill=COL_NO_FIX)
+        if raw_valid and hdop < 99.0:
+            hcol = (_C["green"] if hdop < 1.0 else
+                    _C["amber"] if hdop < 2.0 else _C["red"])
+            self._hdop_lbl.config(text=f"{hdop:5.2f}", fg=hcol)
         else:
-            c.coords(self._needle, cx, cy, cx, cy)
-            c.itemconfig(self._needle, fill=BG)
+            self._hdop_lbl.config(text=" -.--", fg=_C["no_data"])
 
-        # --- Ground track pointer (green) ---
-        if raw_valid:
-            rad = math.radians(track_deg - 90)
-            ex  = cx + (r - 14) * math.cos(rad)
-            ey  = cy + (r - 14) * math.sin(rad)
-            c.coords(self._track_needle, cx, cy, ex, ey)
-            c.itemconfig(self._track_needle, fill=COL_3D)
-        else:
-            c.coords(self._track_needle, cx, cy, cx, cy)
-            c.itemconfig(self._track_needle, fill=BG)
-
-    # =========================================================================
-    # HDOP quality bar
-    # =========================================================================
-
-    def _update_hdop_bar(self, hdop: float):
-        """
-        Fill the HDOP bar proportionally.
-        Bar represents HDOP 0.0 - 5.0 (= 10 segments of 0.5 each).
-        Colour: green (good) -> amber -> red (poor).
-        """
-        # Clamp to 0-5 range for display; 9999 (unknown) shown as empty
-        if hdop >= 99:
-            filled = 0
-            colour = COL_HDOP_BAD
-        else:
-            clamped = min(hdop, 5.0)
-            filled  = round(clamped / 0.5)   # 0-10 segments
-            colour  = _hdop_colour(hdop)
-
-        for i, seg in enumerate(self._hdop_segs):
-            self._hdop_bar.itemconfig(
-                seg,
-                fill=colour if i < filled else "#1e3050"
-            )
-
-    # =========================================================================
-    # Public update method — called every tick from DroneCockpitApp
-    # =========================================================================
-
-    def update_gps(self, d: dict):
-        """
-        Refresh all GPS display elements from the ui_data dict.
-        Designed to be called at 50 Hz; all operations are O(1).
-        """
-        raw_valid  = d.get("gps_raw_valid",       False)
-        comp_valid = d.get("gps_comp_valid",       False)
-        pos_usable = d.get("gps_position_usable",  False)
-        fix_type   = d.get("gps_fix_type",         0)
-        num_sat    = d.get("gps_num_sat",          0)
-        hdop       = d.get("gps_hdop",             99.0)   # real HDOP value
-        lat        = d.get("gps_latitude",         0.0)
-        lon        = d.get("gps_longitude",        0.0)
-        alt_m      = d.get("gps_altitude_m",       0.0)
-        spd_cms    = d.get("gps_ground_speed_cms", 0)
-        course     = d.get("gps_ground_course",    0)      # decidegrees
-        dist_m     = d.get("gps_dist_to_home_m",   0.0)
-        bearing    = d.get("gps_bearing_to_home",  0)
-        heartbeat  = d.get("gps_heartbeat",        0)
-
-        # -- Heartbeat indicator ----------------------------------------------
-        if heartbeat != self._prev_heartbeat:
-            self._hb_canvas.itemconfig(self._hb_dot, fill=COL_HB_ON)
+        # Heartbeat blink
+        if heartbeat is not None and heartbeat != self._prev_heartbeat:
+            self._hb_state       = not self._hb_state
             self._prev_heartbeat = heartbeat
-        else:
-            self._hb_canvas.itemconfig(self._hb_dot, fill=COL_HB_OFF)
+        self._hb_cv.itemconfig(
+            self._hb_dot,
+            fill=_C["hb_on"] if self._hb_state else _C["hb_off"])
 
-        # -- Fix status -------------------------------------------------------
-        col = _fix_colour(fix_type)
-        self._fix_label.config(text=_fix_label(fix_type), fg=col)
-
-        # -- Satellite count --------------------------------------------------
-        self._sat_label.config(
-            text=str(num_sat) if raw_valid else "--",
-            fg=TEXT_HI if num_sat >= 4 else COL_2D,
-        )
-
-        # -- HDOP -------------------------------------------------------------
-        if raw_valid and hdop < 99:
-            self._hdop_label.config(
-                text=f"{hdop:.2f}",
-                fg=_hdop_colour(hdop),
-            )
-            self._update_hdop_bar(hdop)
-        else:
-            self._hdop_label.config(text="-.--", fg=TEXT_DIM)
-            self._update_hdop_bar(99)
-
-        # -- Position usable gate ---------------------------------------------
-        if pos_usable:
-            self._usable_label.config(text="POS OK", fg=COL_3D)
-        elif raw_valid:
-            self._usable_label.config(text="POS DEGRADED", fg=COL_2D)
-        else:
-            self._usable_label.config(text="POS UNUSABLE", fg=COL_NO_FIX)
-
-        # -- Coordinates ------------------------------------------------------
-        if pos_usable:
-            self._lat_val.config(
-                text=_decimal_to_ddm(lat, is_lat=True),
-                fg=TEXT_HI,
-            )
-            self._lon_val.config(
-                text=_decimal_to_ddm(lon, is_lat=False),
-                fg=TEXT_HI,
-            )
-        else:
-            self._lat_val.config(text="\u2014 \u00b0 \u2014 -  -", fg=TEXT_DIM)
-            self._lon_val.config(text="\u2014 \u00b0 \u2014 -  -", fg=TEXT_DIM)
-
-        # -- Altitude (feet primary, metres secondary) ------------------------
-        # Aviation standard: altitude in feet MSL.
+        # Position
         if raw_valid and fix_type >= 1:
-            alt_ft = _m_to_ft(alt_m)
-            self._alt_val.config(
-                text=f"{alt_ft:,.0f} ft  ({alt_m:.0f} m)",
-                fg=TEXT_HI,
-            )
+            lat_ch = "N" if lat >= 0 else "S"
+            lon_ch = "E" if lon >= 0 else "W"
+            col    = _C["text"] if pos_usable else _C["amber"]
+            self._lat_lbl.config(text=f"{abs(lat):10.6f} {lat_ch}", fg=col)
+            self._lon_lbl.config(text=f"{abs(lon):10.6f} {lon_ch}", fg=col)
         else:
-            self._alt_val.config(text="\u2014  ft", fg=TEXT_DIM)
+            self._lat_lbl.config(text="---.---------- -", fg=_C["no_data"])
+            self._lon_lbl.config(text="---.---------- -", fg=_C["no_data"])
 
-        # -- Ground speed (knots primary, km/h secondary) --------------------
-        # Knots is the standard aviation unit for airspeed and groundspeed.
+        # Altitude
+        if raw_valid and fix_type >= 2:
+            alt_ft = alt_m * _M_TO_FT
+            self._alt_ft_lbl.config(text=f"{alt_ft:7.0f} ft", fg=_C["text"])
+            self._alt_m_lbl.config( text=f"({alt_m:6.0f} m)",  fg=_C["unit"])
+        else:
+            self._alt_ft_lbl.config(text="------ ft",  fg=_C["no_data"])
+            self._alt_m_lbl.config( text="(------ m)", fg=_C["unit"])
+
+        # Ground speed
         if raw_valid:
-            kt  = _cms_to_kt(spd_cms)
-            kmh = _cms_to_kmh(spd_cms)
-            self._spd_val.config(
-                text=f"{kt:5.1f} kt  ({kmh:.0f} km/h)",
-                fg=TEXT_HI,
-            )
+            gs_kt  = gs_cms * _CMS_TO_KT
+            gs_kmh = gs_cms * _CMS_TO_KMH
+            self._gs_kt_lbl.config(text=f"{gs_kt:5.1f} kt",      fg=_C["text"])
+            self._gs_km_lbl.config(text=f"({gs_kmh:5.1f} km/h)", fg=_C["unit"])
         else:
-            self._spd_val.config(text="\u2014  kt", fg=TEXT_DIM)
+            self._gs_kt_lbl.config(text="---.- kt",   fg=_C["no_data"])
+            self._gs_km_lbl.config(text="(--- km/h)", fg=_C["unit"])
 
-        # -- Ground track (COG) -----------------------------------------------
+        # Ground track
         if raw_valid:
-            trk_deg = course * 0.1   # decidegrees -> degrees
-            self._trk_val.config(
-                text=f"{trk_deg:05.1f}\u00b0 T",
-                fg=TEXT_HI,
-            )
+            trk = (course_dd / 10.0) % 360.0
+            self._trk_lbl.config(text=f"{trk:05.1f}°", fg=_C["text"])
+            self._point_needle(self._trk_cv, self._trk_needle, 34, 34, 28, trk)
         else:
-            self._trk_val.config(text="\u2014\u00b0  T", fg=TEXT_DIM)
-            trk_deg = 0.0
+            self._trk_lbl.config(text="---.-°", fg=_C["no_data"])
+            self._point_needle(self._trk_cv, self._trk_needle, 34, 34, 28, 0)
 
-        # -- Distance to home -------------------------------------------------
+        # Home
         if comp_valid:
-            nm = _m_to_nm(dist_m)
-            self._dist_val.config(
-                text=f"{dist_m:.0f} m  ({nm:.3f} NM)",
-                fg=TEXT_HI,
-            )
+            brg360 = (brg + 360) % 360
+            self._dist_lbl.config(text=f"{int(dist_m):6d} m", fg=_C["cyan"])
+            self._brg_lbl.config( text=f"{brg360:03d}°",       fg=_C["cyan"])
+            self._point_needle(self._home_cv, self._home_arrow,
+                               34, 34, 28, brg360)
         else:
-            self._dist_val.config(text="\u2014  m", fg=TEXT_DIM)
+            self._dist_lbl.config(text="------ m", fg=_C["no_data"])
+            self._brg_lbl.config( text="---°",     fg=_C["no_data"])
+            self._point_needle(self._home_cv, self._home_arrow, 34, 34, 28, 0)
 
-        # -- Bearing to home --------------------------------------------------
-        if comp_valid:
-            # Convert -180..+180 to 0..360 for display
-            brg360 = bearing % 360
-            self._brg_val.config(
-                text=f"{brg360:03d}\u00b0 M",
-                fg=TEXT_HI,
-            )
-        else:
-            self._brg_val.config(text="\u2014\u00b0  M", fg=TEXT_DIM)
+    # ── Satellite tab update ──────────────────────────────────────────────────
 
-        # -- Compass rose needles ---------------------------------------------
-        self._update_compass(
-            bearing_deg=bearing,
-            track_deg=trk_deg if raw_valid else 0.0,
-            comp_valid=comp_valid,
-            raw_valid=raw_valid,
-        )
+    def _update_satellites(self, ui_data: dict):
+        self._sat_canvas.update_satellites(ui_data.get("gps_sv_list", []))
+
+    # ── Map tab update ────────────────────────────────────────────────────────
+
+    def _update_map(self, ui_data: dict):
+        raw_valid  = ui_data.get("gps_raw_valid",       False)
+        fix_type   = ui_data.get("gps_fix_type",         0)
+        lat        = ui_data.get("gps_latitude",         0.0)
+        lon        = ui_data.get("gps_longitude",        0.0)
+        fix_valid  = raw_valid and fix_type >= 2
+        self._map_canvas.update_position(lat, lon, fix_valid)
