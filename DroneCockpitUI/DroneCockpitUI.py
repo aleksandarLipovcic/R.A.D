@@ -313,6 +313,7 @@ class DroneCockpitApp:
                        bg="#0f1428", fg="#c0d0f0",
                        activebackground="#1e3060",
                        activeforeground="#ffffff",
+                       selectcolor="#ffffff",
                        font=("Consolas", 10), bd=1, relief="solid")
         for name, label in _PANEL_LABELS.items():
             menu.add_checkbutton(

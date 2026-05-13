@@ -1,61 +1,62 @@
+"""
+BaroWidget.py  — Aviation PFD-style Altitude Tape + VSI
+========================================================
+FULLY RESPONSIVE with correct aviation proportions:
+
+  ┌─────────────────────────┬──────┐
+  │                         │ V/S  │
+  │   ALTITUDE TAPE  (~75%) │ (25%)│
+  │                         │      │
+  └─────────────────────────┴──────┘
+
+The VSI has a FIXED minimum width and a MAXIMUM cap so it never
+dominates.  The altitude tape takes everything that's left.
+Both canvases bind <Configure> and redraw from actual pixel sizes —
+nothing is hardcoded.
+
+Key proportions (tape canvas):
+  SPINE  at 92% of tape width   (vertical scale line, right side)
+  MAJ_L  at 84%                 (major tick start)
+  MIN_L  at 89%                 (minor tick start)
+  TIP_X  at 76%                 (pentagon pointer tip)
+  SHLDR  at 66%                 (pentagon shoulder)
+  BOX_L  at  3%                 (left wall of readout box)
+
+VSI canvas:
+  Fixed width = clamp(W_total * 0.22, 44, 80) px
+  Axis at 40% of VSI width; labels to the right of axis
+"""
+
 import tkinter as tk
 import time
 import collections
 
 
 class BaroWidget(tk.Frame):
-    """
-    Aviation PFD-style Altitude Tape + Vertical Speed Indicator (VSI).
 
-    TAPE LAYOUT — box LEFT, tip points RIGHT ► into spine on RIGHT
-    ─────────────────────────────────────────────────────────────────────────
-      x=0  BOX_L  SHOULDER  TIP_X  MIN_L  MAJ_L  SPINE_X   x=W
-        │    │       │        ►      │      │        │
-        │    ├───────┘        │      │      ├────────┤  +390
-        │    │ +161.0  tip►───┤      ├──────┤        │  (spine)
-        │    ├───────┐        │      │      ├────────┤  +380
+    # ── Scale / units ─────────────────────────────────────────────────────────
+    PX_PER_M_BASE = 6.0
+    REF_H         = 340.0
+    LABEL_STEP    = 10
+    TICK_STEP     =  5
 
-    VARIO NOTE
-    ──────────
-    Betaflight's MSP_ALTITUDE varioCmPerSec field is often zero or near-zero
-    because the FC's internal vario estimator is tuned for stabilisation, not
-    for a readable climb-rate display.  We therefore compute our own vario by
-    differentiating altitude over a short rolling window (VARIO_WINDOW_S) and
-    applying a simple exponential smoothing filter (VARIO_ALPHA).
+    # ── Tape proportions (fraction of TAPE canvas width) ──────────────────────
+    _P_SPINE   = 0.92
+    _P_MAJ_L   = 0.84
+    _P_MIN_L   = 0.89
+    _P_TIP_X   = 0.76
+    _P_SHLDR   = 0.66
+    _P_BOX_L   = 0.03
 
-    The FC vario is accepted only as a fallback when we have fewer than
-    MIN_SAMPLES_FOR_DERIVED samples in the window.
+    # ── VSI sizing ────────────────────────────────────────────────────────────
+    VSI_MIN_W  = 44    # pixels minimum
+    VSI_MAX_W  = 80    # pixels maximum — prevents the giant-dot problem
+    VSI_FRAC   = 0.22  # preferred fraction of total widget width
 
-    ALTITUDE THRESHOLDS (drone operational envelope):
-      Green   0 – 800 m
-      Amber 800 – 1000 m
-      Red   > 1000 m
-    """
-
-    # ── Canvas geometry ───────────────────────────────────────────────────────
-    TAPE_W   = 160
-    VSI_W    =  60
-    TAPE_H   = 340
-
-    PX_PER_M   = 6.0
-    LABEL_STEP = 10
-    TICK_STEP  =  5
-
-    # ── Tape x-coordinate layout ──────────────────────────────────────────────
-    SPINE_X  = 150
-    MAJ_L    = 138
-    MIN_L    = 143
-    TIP_X    = 130
-    SHOULDER = 120
-    BOX_L    =   5
-
-    # ── Vario derivation parameters ───────────────────────────────────────────
-    # Rolling window of (timestamp, altitude_m) samples used to compute dh/dt.
-    # A 2-second window smooths noise without lagging too much.
-    VARIO_WINDOW_S       = 2.0    # seconds of history to keep
-    VARIO_ALPHA          = 0.25   # EMA smoothing  (lower = smoother, more lag)
-    MIN_SAMPLES_FOR_DERIVED = 3   # need at least this many samples before
-                                  # we trust the derived value over FC vario
+    # ── Vario derivation ──────────────────────────────────────────────────────
+    VARIO_WINDOW_S          = 2.0
+    VARIO_ALPHA             = 0.25
+    MIN_SAMPLES_FOR_DERIVED = 3
 
     # ── Warning thresholds ────────────────────────────────────────────────────
     WARN_ALT_M  =  800.0
@@ -66,7 +67,7 @@ class BaroWidget(tk.Frame):
 
     # ── Anti-flicker gates ────────────────────────────────────────────────────
     ALT_THR   = 0.05
-    VARIO_THR = 0.02   # tighter than before since derived vario is smoother
+    VARIO_THR = 0.02
 
     # ── Cockpit palette ───────────────────────────────────────────────────────
     C_BG      = "#0d0d1a"
@@ -88,8 +89,9 @@ class BaroWidget(tk.Frame):
 
     def __init__(self, parent):
         super().__init__(parent, bg=self.C_FRAME)
+
         self._alt_m     = 0.0
-        self._vario_mps = 0.0   # smoothed derived vario
+        self._vario_mps = 0.0
         self._valid     = False
         self._qnh_ref_m = 0.0
 
@@ -97,47 +99,52 @@ class BaroWidget(tk.Frame):
         self._last_vario = None
         self._last_valid = None
 
-        # ── Vario derivation state ─────────────────────────────────────────────
-        # deque of (time_s, alt_m) — automatically discards old samples
         self._alt_history: collections.deque = collections.deque()
-        self._vario_ema   = 0.0   # exponential moving average of raw dh/dt
+        self._vario_ema   = 0.0
+
+        self._tape_redraw_id = None
+        self._vsi_redraw_id  = None
 
         self._build_ui()
 
     # ── Construction ──────────────────────────────────────────────────────────
 
     def _build_ui(self):
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        # Row 0 — header
         hdr = tk.Frame(self, bg=self.C_FRAME)
-        hdr.pack(side="top", fill="x", padx=4, pady=(5, 2))
+        hdr.grid(row=0, column=0, sticky="ew", padx=4, pady=(5, 2))
         tk.Label(
             hdr, text="ALTITUDE / VSI",
             bg=self.C_FRAME, fg=self.C_DIM,
             font=("Consolas", 9, "bold")
         ).pack(side="left")
 
-        cv_row = tk.Frame(self, bg=self.C_FRAME)
-        cv_row.pack(side="top", padx=4)
+        # Row 1 — canvas area managed by place() inside _cv_outer
+        self._cv_outer = tk.Frame(self, bg=self.C_FRAME)
+        self._cv_outer.grid(row=1, column=0, sticky="nsew", padx=4)
 
         self._tape_cv = tk.Canvas(
-            cv_row,
-            width=self.TAPE_W, height=self.TAPE_H,
-            bg=self.C_BG,
-            highlightthickness=1,
-            highlightbackground=self.C_SPINE
+            self._cv_outer, bg=self.C_BG,
+            highlightthickness=1, highlightbackground=self.C_SPINE,
         )
-        self._tape_cv.pack(side="left")
-
         self._vsi_cv = tk.Canvas(
-            cv_row,
-            width=self.VSI_W, height=self.TAPE_H,
-            bg=self.C_BG,
-            highlightthickness=1,
-            highlightbackground=self.C_SPINE
+            self._cv_outer, bg=self.C_BG,
+            highlightthickness=1, highlightbackground=self.C_SPINE,
         )
-        self._vsi_cv.pack(side="left", padx=(3, 0))
 
+        self._tape_cv.place(x=0, y=0, relheight=1.0)
+        self._vsi_cv.place(relheight=1.0)
+
+        self._cv_outer.bind("<Configure>", self._on_outer_configure)
+        self._tape_cv.bind("<Configure>",  lambda e: self._schedule_redraw("tape"))
+        self._vsi_cv.bind("<Configure>",   lambda e: self._schedule_redraw("vsi"))
+
+        # Row 2 — ft / AGL labels
         imp_row = tk.Frame(self, bg=self.C_FRAME)
-        imp_row.pack(side="top", fill="x", padx=6, pady=(6, 0))
+        imp_row.grid(row=2, column=0, sticky="ew", padx=6, pady=(6, 0))
 
         self._ft_lbl = tk.Label(
             imp_row, text="--- ft",
@@ -153,12 +160,14 @@ class BaroWidget(tk.Frame):
         )
         self._agl_lbl.pack(side="right")
 
-        tk.Frame(self, bg=self.C_SEP, height=1).pack(
-            side="top", fill="x", padx=4, pady=(5, 3)
+        # Row 3 — separator
+        tk.Frame(self, bg=self.C_SEP, height=1).grid(
+            row=3, column=0, sticky="ew", padx=4, pady=(5, 3)
         )
 
+        # Row 4 — QNH
         qnh_row = tk.Frame(self, bg=self.C_FRAME)
-        qnh_row.pack(side="top", fill="x", padx=6, pady=(0, 6))
+        qnh_row.grid(row=4, column=0, sticky="ew", padx=6, pady=(0, 6))
 
         self._qnh_lbl = tk.Label(
             qnh_row, text="QNH ref: not set",
@@ -177,8 +186,31 @@ class BaroWidget(tk.Frame):
         )
         self._qnh_btn.pack(side="right")
 
-        self._draw_tape()
-        self._draw_vsi()
+    # ── Canvas layout — enforces VSI width cap ────────────────────────────────
+
+    def _on_outer_configure(self, event):
+        total_w = event.width
+        gap     = 3
+
+        vsi_w = int(total_w * self.VSI_FRAC)
+        vsi_w = max(self.VSI_MIN_W, min(self.VSI_MAX_W, vsi_w))
+
+        tape_w = max(60, total_w - vsi_w - gap)
+
+        self._tape_cv.place(x=0,            y=0, width=tape_w, relheight=1.0)
+        self._vsi_cv.place( x=tape_w + gap, y=0, width=vsi_w,  relheight=1.0)
+
+    # ── Debounced redraws ─────────────────────────────────────────────────────
+
+    def _schedule_redraw(self, which: str):
+        if which == "tape":
+            if self._tape_redraw_id:
+                self._tape_cv.after_cancel(self._tape_redraw_id)
+            self._tape_redraw_id = self._tape_cv.after(12, self._draw_tape)
+        else:
+            if self._vsi_redraw_id:
+                self._vsi_cv.after_cancel(self._vsi_redraw_id)
+            self._vsi_redraw_id = self._vsi_cv.after(12, self._draw_vsi)
 
     # ── QNH ──────────────────────────────────────────────────────────────────
 
@@ -200,51 +232,28 @@ class BaroWidget(tk.Frame):
     # ── Vario derivation ──────────────────────────────────────────────────────
 
     def _update_vario(self, alt_m: float, fc_vario_mps: float) -> float:
-        """
-        Compute a smoothed vertical speed from the altitude history.
-
-        Algorithm:
-          1. Push (now, alt_m) onto a rolling deque.
-          2. Evict samples older than VARIO_WINDOW_S.
-          3. If we have enough samples, estimate dh/dt by linear regression
-             over the window (least-squares slope = Σ(t·h) / Σ(t²) after
-             mean-centring).  This is more robust than a simple endpoint diff.
-          4. Apply exponential smoothing to suppress noise.
-          5. Fall back to the FC-supplied vario until the window fills up.
-
-        Returns the smoothed vario in m/s.
-        """
         now = time.monotonic()
         self._alt_history.append((now, alt_m))
 
-        # Evict old samples
         cutoff = now - self.VARIO_WINDOW_S
         while self._alt_history and self._alt_history[0][0] < cutoff:
             self._alt_history.popleft()
 
         n = len(self._alt_history)
-
         if n < self.MIN_SAMPLES_FOR_DERIVED:
-            # Not enough data yet — trust the FC value and seed the EMA
             self._vario_ema = fc_vario_mps
             return fc_vario_mps
 
-        # ── Linear regression slope (dh/dt) over the window ──────────────────
-        times = [s[0] for s in self._alt_history]
-        alts  = [s[1] for s in self._alt_history]
-
+        times  = [s[0] for s in self._alt_history]
+        alts   = [s[1] for s in self._alt_history]
         t_mean = sum(times) / n
         h_mean = sum(alts)  / n
+        num    = sum((t - t_mean) * (h - h_mean) for t, h in zip(times, alts))
+        den    = sum((t - t_mean) ** 2            for t in times)
+        raw    = (num / den) if den > 1e-9 else 0.0
 
-        num = sum((t - t_mean) * (h - h_mean) for t, h in zip(times, alts))
-        den = sum((t - t_mean) ** 2            for t      in times)
-
-        raw_vario = (num / den) if den > 1e-9 else 0.0
-
-        # ── Exponential moving average ────────────────────────────────────────
-        self._vario_ema = (self.VARIO_ALPHA * raw_vario
+        self._vario_ema = (self.VARIO_ALPHA * raw
                            + (1.0 - self.VARIO_ALPHA) * self._vario_ema)
-
         return self._vario_ema
 
     # ── Altitude tape ─────────────────────────────────────────────────────────
@@ -252,124 +261,143 @@ class BaroWidget(tk.Frame):
     def _draw_tape(self):
         cv = self._tape_cv
         cv.delete("all")
-        W, H = self.TAPE_W, self.TAPE_H
-        cy   = H // 2
+
+        W = cv.winfo_width()
+        H = cv.winfo_height()
+        if W < 20 or H < 20:
+            return
+
+        cy = H // 2
+
+        spine_x = int(W * self._P_SPINE)
+        maj_l   = int(W * self._P_MAJ_L)
+        min_l   = int(W * self._P_MIN_L)
+        tip_x   = int(W * self._P_TIP_X)
+        shldr   = int(W * self._P_SHLDR)
+        box_l   = max(2, int(W * self._P_BOX_L))
+        lbl_cx  = (box_l + shldr) // 2
+
+        ppm     = self.PX_PER_M_BASE * (H / self.REF_H)
+        ppm     = max(2.0, min(18.0, ppm))
+        font_sz = max(7, min(11, int(W * 0.072)))
 
         if not self._valid:
-            cv.create_text(
-                W // 2, H // 2, text="NO\nSIG",
-                fill=self.C_CRIT, font=("Consolas", 12, "bold"),
-                justify="center"
-            )
+            cv.create_text(W // 2, H // 2, text="NO\nSIG",
+                           fill=self.C_CRIT,
+                           font=("Consolas", font_sz + 1, "bold"),
+                           justify="center")
             return
 
         alt  = self._alt_m
-        ppm  = self.PX_PER_M
         half = H / (2.0 * ppm)
-
         raw_lo = int(alt - half) - self.LABEL_STEP
         lo = raw_lo - (raw_lo % self.TICK_STEP)
         hi = int(alt + half) + self.LABEL_STEP
 
-        # ── 1. Spine — right side ──────────────────────────────────────────────
-        cv.create_line(
-            self.SPINE_X, 0, self.SPINE_X, H,
-            fill=self.C_SPINE, width=2
-        )
+        # Spine
+        cv.create_line(spine_x, 0, spine_x, H, fill=self.C_SPINE, width=2)
 
-        # ── 2. Ticks + scale numbers ───────────────────────────────────────────
-        bh       = 14
-        label_cx = (self.BOX_L + self.SHOULDER) // 2
+        # Ticks + labels
+        bh = max(10, int(H * 0.040))
 
         for a in range(lo, hi + 1, self.TICK_STEP):
             y = cy - (a - alt) * ppm
             if y < 2 or y > H - 2:
                 continue
-
             behind_box = abs(y - cy) < bh + 2
-
             if a % self.LABEL_STEP == 0:
-                cv.create_line(
-                    self.MAJ_L, y, self.SPINE_X, y,
-                    fill=self.C_SPINE, width=2
-                )
+                cv.create_line(maj_l, y, spine_x, y,
+                               fill=self.C_SPINE, width=2)
                 if not behind_box:
-                    cv.create_text(
-                        label_cx, y,
-                        text=f"{a:+d}",
-                        fill=self.C_LABEL,
-                        font=("Consolas", 10, "bold"),
-                        anchor="center"
-                    )
+                    cv.create_text(lbl_cx, y, text=f"{a:+d}",
+                                   fill=self.C_LABEL,
+                                   font=("Consolas", font_sz, "bold"),
+                                   anchor="center")
             else:
-                cv.create_line(
-                    self.MIN_L, y, self.SPINE_X, y,
-                    fill=self.C_MIN, width=1
-                )
+                cv.create_line(min_l, y, spine_x, y,
+                               fill=self.C_MIN, width=1)
 
-        # ── 3. Pentagon altitude box ───────────────────────────────────────────
+        # Pentagon readout box
         box_col = self._alt_color(alt)
-
-        A = (self.TIP_X,    cy)
-        B = (self.SHOULDER, cy - bh)
-        C = (self.BOX_L,    cy - bh)
-        D = (self.BOX_L,    cy + bh)
-        E = (self.SHOULDER, cy + bh)
-
-        pts = [A[0],A[1], B[0],B[1], C[0],C[1], D[0],D[1], E[0],E[1]]
-        cv.create_polygon(pts, fill=self.C_BOX_BG, outline=box_col, width=2)
-
-        text_cx = (self.BOX_L + self.SHOULDER) // 2
-        cv.create_text(
-            text_cx, cy,
-            text=f"{alt:+.1f}",
-            fill=box_col,
-            font=("Consolas", 11, "bold"),
-            anchor="center"
-        )
+        A = (tip_x, cy);       B = (shldr, cy - bh)
+        C = (box_l, cy - bh);  D = (box_l, cy + bh);  E = (shldr, cy + bh)
+        cv.create_polygon([A[0],A[1], B[0],B[1], C[0],C[1], D[0],D[1], E[0],E[1]],
+                          fill=self.C_BOX_BG, outline=box_col, width=2)
+        cv.create_text((box_l + shldr) // 2, cy,
+                       text=f"{alt:+.1f}",
+                       fill=box_col,
+                       font=("Consolas", font_sz, "bold"),
+                       anchor="center")
 
     # ── VSI ───────────────────────────────────────────────────────────────────
 
     def _draw_vsi(self):
         cv = self._vsi_cv
         cv.delete("all")
-        W, H  = self.VSI_W, self.TAPE_H
+
+        W = cv.winfo_width()
+        H = cv.winfo_height()
+        if W < 10 or H < 10:
+            return
+
         cy    = H // 2
         MAX   = self.VSI_MAX_MPS
-        ax    = W // 2
 
-        scale_h = (H - 30) // 2
+        # Because VSI_MAX_W caps the canvas at 80 px, everything here
+        # is sized to look right at 44–80 px wide.
+        ax      = max(6, int(W * 0.40))
+        pad_t   = max(8,  int(H * 0.04))
+        pad_b   = max(14, int(H * 0.06))
+        scale_h = max(10, (H - pad_t - pad_b) // 2)
+
+        font_sz   = max(6, min(8, int(W * 0.14)))
+        tick_half = max(3, int(W * 0.12))
 
         def v2y(v: float) -> int:
             return cy - int((v / MAX) * scale_h)
 
-        cv.create_line(ax, 12, ax, H - 18, fill=self.C_SPINE, width=1)
+        # Centre axis line
+        cv.create_line(ax, pad_t, ax, H - pad_b,
+                       fill=self.C_SPINE, width=1)
 
+        # Tick marks + labels every 2 m/s
         for v in range(2, int(MAX) + 1, 2):
             for sign in (1, -1):
                 y = v2y(sign * v)
-                cv.create_line(ax - 8, y, ax + 8, y, fill=self.C_LABEL, width=1)
-                cv.create_text(
-                    ax + 12, y, text=str(v),
-                    fill=self.C_LABEL, font=("Consolas", 9, "bold"), anchor="w"
-                )
+                cv.create_line(ax - tick_half, y, ax + tick_half, y,
+                               fill=self.C_LABEL, width=1)
+                lbl_x = ax + tick_half + 2
+                if lbl_x + font_sz * 2 <= W - 1:
+                    cv.create_text(lbl_x, y, text=str(v),
+                                   fill=self.C_LABEL,
+                                   font=("Consolas", font_sz, "bold"),
+                                   anchor="w")
 
-        cv.create_line(ax - 10, cy, ax + 10, cy, fill=self.C_LABEL, width=2)
-        cv.create_text(
-            ax + 12, cy, text="0",
-            fill=self.C_LABEL, font=("Consolas", 9, "bold"), anchor="w"
-        )
+        # Zero mark
+        cv.create_line(ax - tick_half - 2, cy, ax + tick_half + 2, cy,
+                       fill=self.C_LABEL, width=2)
+        lbl_x = ax + tick_half + 2
+        if lbl_x + font_sz * 2 <= W - 1:
+            cv.create_text(lbl_x, cy, text="0",
+                           fill=self.C_LABEL,
+                           font=("Consolas", font_sz, "bold"),
+                           anchor="w")
 
-        cv.create_text(ax, 6,     text="▲", fill=self.C_DIM, font=("Consolas", 8))
-        cv.create_text(ax, H - 6, text="▼", fill=self.C_DIM, font=("Consolas", 8))
-        cv.create_text(ax, 4,     text="V/S", fill=self.C_DIM,
-                       font=("Consolas", 7, "bold"), anchor="n")
+        # "V/S" label + arrows
+        cv.create_text(ax, 2, text="V/S",
+                       fill=self.C_DIM,
+                       font=("Consolas", max(5, font_sz - 1), "bold"),
+                       anchor="n")
+        cv.create_text(ax, pad_t - 1, text="▲",
+                       fill=self.C_DIM, font=("Consolas", font_sz), anchor="s")
+        cv.create_text(ax, H - pad_b + 1, text="▼",
+                       fill=self.C_DIM, font=("Consolas", font_sz), anchor="n")
 
         if not self._valid:
-            cv.create_text(
-                ax, H // 2, text="NO\nSIG",
-                fill=self.C_CRIT, font=("Consolas", 8, "bold"), justify="center"
-            )
+            cv.create_text(ax, cy, text="--",
+                           fill=self.C_CRIT,
+                           font=("Consolas", font_sz, "bold"),
+                           anchor="center")
             return
 
         vario    = max(-MAX, min(MAX, self._vario_mps))
@@ -378,30 +406,25 @@ class BaroWidget(tk.Frame):
                     self.C_WARN if abs(vario) >= self.WARN_VARIO else
                     self.C_SAFE)
 
-        cv.create_line(ax, cy, ax, needle_y,
-                       fill=color, width=5, capstyle=tk.ROUND)
-        cv.create_oval(
-            ax - 5, needle_y - 5, ax + 5, needle_y + 5,
-            fill=color, outline=""
-        )
-        cv.create_text(
-            ax, H - 8, text=f"{vario:+.1f}",
-            fill=color, font=("Consolas", 8, "bold"), anchor="s"
-        )
+        # Needle width and dot radius: hard-capped small values
+        needle_w = max(2, min(4,  int(W * 0.07)))
+        dot_r    = max(3, min(6,  int(W * 0.10)))
 
-    # ── Public update (called from main.py at 50 Hz) ──────────────────────────
+        cv.create_line(ax, cy, ax, needle_y,
+                       fill=color, width=needle_w, capstyle=tk.ROUND)
+        cv.create_oval(ax - dot_r, needle_y - dot_r,
+                       ax + dot_r, needle_y + dot_r,
+                       fill=color, outline="")
+
+        # Numeric readout at bottom
+        cv.create_text(ax, H - 2, text=f"{vario:+.1f}",
+                       fill=color,
+                       font=("Consolas", font_sz, "bold"),
+                       anchor="s")
+
+    # ── Public update ─────────────────────────────────────────────────────────
 
     def update_baro(self, data: dict):
-        """
-        Keys expected in data:
-            baro_altitude_cm       int   FC-fused altitude above home, cm
-            baro_vario_cm_per_sec  int   vertical speed from FC, cm/s
-                                         (used only as fallback seed)
-            baro_valid             bool  True when MSP_ALTITUDE decoded OK
-
-        Vario is derived internally from the altitude history rather than
-        relying on the FC value, which Betaflight often reports as zero.
-        """
         valid    = data.get("baro_valid", False)
         alt_cm   = int(data.get("baro_altitude_cm",      0)) if valid else 0
         vario_cm = int(data.get("baro_vario_cm_per_sec", 0)) if valid else 0
@@ -409,20 +432,16 @@ class BaroWidget(tk.Frame):
         new_alt      = alt_cm   * self.CM_TO_M
         fc_vario_mps = vario_cm * self.CM_TO_M
 
-        # Derive vario from altitude history (ignores FC value unless warming up)
         if valid:
             new_vario = self._update_vario(new_alt, fc_vario_mps)
         else:
-            # Invalid signal — reset history so we start fresh on reconnect
             self._alt_history.clear()
             self._vario_ema = 0.0
             new_vario = 0.0
 
-        alt_dirty   = (self._last_alt   is None or
-                       abs(new_alt   - self._last_alt)   > self.ALT_THR)
-        vario_dirty = (self._last_vario is None or
-                       abs(new_vario - self._last_vario) > self.VARIO_THR)
-        valid_dirty = (self._last_valid != valid)
+        alt_dirty   = self._last_alt   is None or abs(new_alt   - self._last_alt)   > self.ALT_THR
+        vario_dirty = self._last_vario is None or abs(new_vario - self._last_vario) > self.VARIO_THR
+        valid_dirty = self._last_valid != valid
 
         self._alt_m     = new_alt
         self._vario_mps = new_vario
