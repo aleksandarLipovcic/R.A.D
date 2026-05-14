@@ -1,361 +1,182 @@
 #pragma once
-#include <cstdint>
 #include <vector>
 #include <string>
+#include <cstdint>
+#include <cmath>
 
 // =============================================================================
-// GPSReading
-//
-// Populated by GPSNeoM10::parseRaw() and GPSNeoM10::parseComp().
-//
-// Two MSP commands feed this struct:
-//   MSP_RAW_GPS  (106) -- fix, satellites, lat/lon, alt, speed, ground course
-//   MSP_COMP_GPS (107) -- distance-to-home, bearing-to-home, GPS heartbeat
-//
-// All fields are in SI-friendly units; raw protocol units are converted
-// inside the parser so callers never need to know the wire format.
+// GPS enums — used by GPSConfig
 // =============================================================================
-struct GPSReading {
-    // -- From MSP_RAW_GPS (106) -----------------------------------------------
-    uint8_t  fixType = 0;       // 0 = no fix, 1 = 2D, 2 = 3D
-    uint8_t  numSat = 0;       // satellites used in solution
-    double   latitude = 0.0;     // decimal degrees  (+ = N, - = S)
-    double   longitude = 0.0;     // decimal degrees  (+ = E, - = W)
-    uint16_t altitudeM = 0;       // MSL altitude, metres
-    uint16_t groundSpeedMs = 0;       // ground speed, cm/s  -> divide by 100 for m/s
-    uint16_t groundCourse = 0;       // ground course, decidegrees (0-3599)
-    uint16_t hdop = 9999;    // HDOP x100; 9999 = unknown; good fix < 200
 
-    // -- From MSP_COMP_GPS (107) ----------------------------------------------
-    uint16_t distToHomM = 0;       // distance to home point, metres
-    int16_t  bearingToHome = 0;       // bearing to home, degrees (-180 to +180)
-    uint8_t  gpsHeartbeat = 0;       // toggles each time FC gets a fresh GPS frame
-
-    // -- Validity flags -------------------------------------------------------
-    bool rawValid = false;   // true after first successful MSP_RAW_GPS parse
-    bool compValid = false;   // true after first successful MSP_COMP_GPS parse
-
-    // -- Position usability gate (DO-229E / ICAO Annex 10) -------------------
-    // true only when ALL three conditions are met simultaneously:
-    //   1. fixType >= 2  -- 3D fix
-    //   2. numSat  >= 4  -- minimum constellation for a valid 3D solution
-    //   3. hdop    < 500 -- HDOP < 5.0 (x100 wire format)
-    //
-    // Always gate coordinate display and navigation decisions on this flag,
-    // not on rawValid alone. rawValid is set on any parseable frame; this
-    // flag is set only when the fix meets minimum integrity thresholds.
-    //
-    // Note: this GCS is a monitoring tool, NOT a certified navigation system.
-    bool positionUsable = false;
+enum GPSConstellationFlags : uint32_t {
+    GNSS_GPS = (1 << 0),
+    GNSS_SBAS = (1 << 1),
+    GNSS_GALILEO = (1 << 2),
+    GNSS_BEIDOU = (1 << 3),
+    GNSS_QZSS = (1 << 4),
+    GNSS_GLONASS = (1 << 5),
+    GNSS_DEFAULT = GNSS_GPS | GNSS_GALILEO | GNSS_GLONASS,
+    GNSS_DUAL = GNSS_GPS | GNSS_GLONASS,
+    GNSS_TRIPLE = GNSS_GPS | GNSS_GALILEO | GNSS_GLONASS,
+    GNSS_ALL = GNSS_GPS | GNSS_SBAS | GNSS_GALILEO |
+    GNSS_BEIDOU | GNSS_QZSS | GNSS_GLONASS,
 };
 
-// =============================================================================
-// GPSConstellationFlags
-//
-// Bitmask selecting which GNSS constellations the NEO-M10 should use.
-// These map directly to u-blox UBX-CFG-GNSS gnssId values.
-//
-// NEO-M10 supports simultaneous use of GPS + up to 2 other constellations
-// depending on firmware revision. Enabling too many may cause the receiver to
-// silently ignore the extras -- always check numSat after applying config.
-//
-// BITMASK NOTE: QZSS uses bit 4 (1<<4 = 0x10) in this bitmask, which maps
-// to u-blox gnssId 5. The bit position and gnssId are intentionally different;
-// the mapping table in buildCfgGNSS() translates between them.
-// =============================================================================
-enum GPSConstellationFlags : uint8_t {
-    GNSS_GPS = (1 << 0),   // u-blox gnssId 0 -- GPS L1 C/A
-    GNSS_SBAS = (1 << 1),   // u-blox gnssId 1 -- SBAS (WAAS/EGNOS/etc.)
-    GNSS_GALILEO = (1 << 2),   // u-blox gnssId 2 -- Galileo E1
-    GNSS_BEIDOU = (1 << 3),   // u-blox gnssId 3 -- BeiDou B1
-    GNSS_QZSS = (1 << 4),   // u-blox gnssId 5 -- QZSS (Japan only); bit != gnssId
-    GNSS_GLONASS = (1 << 5),   // u-blox gnssId 6 -- GLONASS L1
-
-    // Convenience presets
-    GNSS_DEFAULT = GNSS_GPS | GNSS_SBAS,
-    GNSS_DUAL = GNSS_GPS | GNSS_SBAS | GNSS_GALILEO,
-    GNSS_TRIPLE = GNSS_GPS | GNSS_SBAS | GNSS_GALILEO | GNSS_GLONASS,
-    GNSS_ALL = 0x3F
-};
+enum class GPSUpdateRate { RATE_1HZ, RATE_2HZ, RATE_5HZ, RATE_10HZ };
+enum class GPSProtocol { UBLOX, NMEA, MSP };
 
 // =============================================================================
-// GPSProtocol
-//
-// Output protocol emitted by the NEO-M10 on its UART.
-// For Betaflight 4.5.x the recommended setting is UBLOX (UBX binary) as it
-// gives the richest data at lowest bandwidth.
-//
-// IMPORTANT: This enum is defined here (in GPSNeoM10.h) only.
-// DroneLink.h includes this file, so do NOT redefine GPSProtocol there.
-// =============================================================================
-enum class GPSProtocol : uint8_t {
-    UBLOX = 0,   // UBX binary (recommended for Betaflight; richest data)
-    NMEA = 1,   // ASCII NMEA 0183 sentences
-    MSP = 2    // MSP GPS input (legacy; only for injection, not NEO-M10)
-};
-
-// =============================================================================
-// GPSUpdateRate
-//
-// Navigation solution rate in Hz. The NEO-M10 supports 1-10 Hz in single-
-// constellation mode; multi-constellation reduces the max rate.
-//
-// UBX-CFG-RATE measRate field is in milliseconds (e.g. 100 ms = 10 Hz).
-// =============================================================================
-enum class GPSUpdateRate : uint16_t {
-    RATE_1HZ = 1,    //  1 Hz -- 1000 ms
-    RATE_2HZ = 2,    //  2 Hz --  500 ms -- general GCS telemetry
-    RATE_5HZ = 5,    //  5 Hz --  200 ms -- recommended for UAV navigation
-    RATE_10HZ = 10     // 10 Hz --  100 ms -- max for single-constellation GPS
-};
-
-// =============================================================================
-// GPSConfig
-//
-// Aggregates all run-time configurable parameters for the NEO-M10 receiver.
-// Passed to DroneLink::applyGPSConfig() which serialises each field into the
-// correct UBX frame(s) and sends them via MSP GPS passthrough.
-//
-// IMPORTANT: This struct is defined here (in GPSNeoM10.h) only.
-// DroneLink.h includes this file, so do NOT redefine GPSConfig there.
+// GPSConfig — passed to DroneLink::applyGPSConfig()
 // =============================================================================
 struct GPSConfig {
-    // Constellation selection (bitmask of GPSConstellationFlags)
-    // Default: GNSS_DEFAULT (GPS + SBAS) -- safe for any region.
-    uint8_t constellations = GPSConstellationFlags::GNSS_DEFAULT;
-
-    // Target navigation solution rate.
-    GPSUpdateRate updateRateHz = GPSUpdateRate::RATE_5HZ;
-
-    // Protocol the NEO-M10 emits on its UART to the F405.
-    // Must match the gps_provider setting in Betaflight (UBLOX or NMEA).
-    GPSProtocol protocol = GPSProtocol::UBLOX;
-
-    // Enable SBAS correction (WAAS / EGNOS / MSAS / GAGAN).
-    // Only relevant if GNSS_SBAS is set in constellations.
-    bool sbasEnabled = true;
-
-    // Satellites below this elevation (degrees above horizon) are excluded.
-    // 5 deg is u-blox default; 10-15 deg is recommended in obstructed areas.
-    uint8_t elevationMaskDeg = 5;
-
-    // Minimum signal strength (dBHz). Reserved for future UBX-CFG-GNSS
-    // signal quality block implementation -- NOT currently sent to receiver.
-    uint8_t signalMaskDbHz = 6;
+    uint32_t      constellations = GNSS_DEFAULT;
+    GPSUpdateRate updateRateHz = GPSUpdateRate::RATE_1HZ;
+    GPSProtocol   protocol = GPSProtocol::UBLOX;
+    bool          sbasEnabled = false;
+    int           elevationMaskDeg = 5;
+    int           signalMaskDbHz = 0;
 };
 
-// =============================================================================
-// GPSConfigResult
-//
-// Returned by DroneLink::applyGPSConfig() so Python can show per-step status.
-// =============================================================================
 struct GPSConfigResult {
-    bool gnssAck = false;   // UBX-CFG-GNSS constellation config accepted
-    bool rateAck = false;   // UBX-CFG-RATE update rate accepted
-    bool protocolAck = false;   // UBX-CFG-PRT protocol change accepted
-    bool saveAck = false;   // UBX-CFG-CFG BBR/flash save accepted
-    bool overallOk = false;   // true only when all four acks received
-
-    std::string errorDetail;    // human-readable failure reason (empty = success)
+    bool        gnssAck = false;
+    bool        rateAck = false;
+    bool        protocolAck = false;
+    bool        saveAck = false;
+    bool        overallOk = false;
+    std::string errorDetail;
 };
 
 // =============================================================================
-// SVInfoEntry
-//
-// One satellite channel entry, usable from both data sources:
-//
-//   SOURCE A (primary): MSP_GPS_SV_INFO (cmd 164)
-//     Polled directly in the main communicationLoop() every SV_POLL_TICKS.
-//     Always available when GPS is assigned in BF Ports tab.
-//     Provides: gnssId, svid, quality, cno, gnssName, statusStr, used, flags.
-//     Does NOT provide: elev, azim, prRes (left as 0).
-//
-//   SOURCE B (fallback): UBX-NAV-SAT (0x01/0x35) via MSP passthrough
-//     Only reachable when gps_auto_config=OFF in Betaflight CLI.
-//     With gps_auto_config=ON (the default) the GPS UART is locked by BF
-//     and passthrough returns 0 bytes -- this source is permanently dead
-//     on standard Betaflight 4.5.x setups.
-//     Provides all fields including elev, azim, prRes.
-//
-// Fields populated by both sources are marked [A+B].
-// Fields populated by source B only are marked [B only] -- will be 0 for MSP.
-//
-// The Python GPSWidget reads: gnss_name, svid, cno, status_str, used,
-// quality, gnss_id, elev, azim.  All are populated by source A except
-// elev and azim which remain 0 and should be hidden in the UI when
-// sv_source == "MSP".
+// GPSReading — populated by parseRaw() + parseComp()
 // =============================================================================
-struct SVInfoEntry {
-    uint8_t  chn = 0;      // [A+B] channel index (SV index for MSP, track ch for UBX)
-    uint8_t  svid = 0;      // [A+B] satellite vehicle ID (PRN for GPS)
-    uint8_t  flags = 0;      // [A+B] lower byte: bits[0:2]=quality, bit[3]=svUsed
-    uint8_t  quality = 0;      // [A+B] 0-7 UBX signal quality indicator
-    uint8_t  cno = 0;      // [A+B] carrier-to-noise, dBHz (0-55)
-    int8_t   elev = 0;      // [B only] elevation, degrees (-90 to +90); 0 for MSP
-    int16_t  azim = 0;      // [B only] azimuth, degrees (0-360); 0 for MSP
-    int32_t  prRes = 0;      // [B only] pseudorange residual, cm; 0 for MSP
-    uint8_t  gnssId = 0;      // [A+B] 0=GPS,1=SBAS,2=GAL,3=BDS,5=QZSS,6=GLO
+struct GPSReading {
+    // MSP_RAW_GPS (106)
+    uint8_t  fixType = 0;    // 0=nofix 1=deadreck 2=2D 3=3D 4=gps+dr 5=time
+    uint8_t  numSat = 0;
+    double   latitude = 0.0;  // decimal degrees
+    double   longitude = 0.0;
+    float    altitudeM = 0.0f; // metres MSL
+    uint16_t groundSpeedMs = 0;    // cm/s
+    uint16_t groundCourse = 0;    // decidegrees (0-3599)
+    uint16_t hdop = 9999; // x100; 9999 = unknown
 
-    // Pre-computed strings for direct use in Python UI
-    std::string gnssName;   // [A+B] "GPS", "GLONASS", "Galileo", "BeiDou", "SBAS", "QZSS"
-    std::string statusStr;  // [A+B] "used", "tracked", "searching", "idle"
-    bool        used = false;  // [A+B] true when satellite contributes to fix
+    // MSP_COMP_GPS (107)
+    uint16_t distToHomM = 0;    // metres
+    int16_t  bearingToHome = 0;    // degrees -180..+180
+    uint8_t  gpsHeartbeat = 0;    // toggles 0↔1 on each fresh frame
+
+    // Validity flags
+    bool rawValid = false;
+    bool compValid = false;
+    bool positionUsable = false;   // fixType>=2 && numSat>=4 && hdop<500
 };
 
 // =============================================================================
-// NavStatus  --  MSP_NAV_STATUS (121)
-//
-// Payload (7 bytes):
-//   [0]  GPS fix type (mirrors MSP_RAW_GPS fixType)
-//   [1]  GPS flags   (bit0 = GPS fix OK, bit1 = DGPS used, bit2 = WN valid,
-//                     bit3 = TOW valid, bit4 = headVeh valid)
-//   [2]  efh_status  (heading/course valid flags -- Betaflight internal)
-//   [3]  map_flags   (nav engine state)
-//   [4..5] int16  GPS heartbeat step  (internal)
-//   [6]  GPS HW status byte
+// NavStatus — MSP_NAV_STATUS (121)
 // =============================================================================
 struct NavStatus {
-    uint8_t  fixType = 0;
-    uint8_t  gpsFlags = 0;
-    bool     fixOk = false;   // gpsFlags bit0
-    bool     dgpsUsed = false;   // gpsFlags bit1
-    uint8_t  mapFlags = 0;
-    uint8_t  hwStatus = 0;
-    bool     valid = false;
+    uint8_t fixType = 0;
+    uint8_t gpsFlags = 0;
+    bool    fixOk = false;
+    bool    dgpsUsed = false;
+    uint8_t mapFlags = 0;
+    uint8_t hwStatus = 0;
+    bool    valid = false;
 };
 
 // =============================================================================
-// GPSNeoM10
+// SVInfoEntry — one satellite channel
 //
-// Stateless parser + UBX frame builder class -- all methods are static.
-// Mirrors the BaroBMP280 interface so DroneLink can call it uniformly.
+// Populated by GPSNeoM10::parseMspSvInfo() from MSP_GPS_SV_INFO (cmd 164).
 //
-// Parser methods:
-//   parseRaw()       -- MSP_RAW_GPS      (106) -> GPSReading
-//   parseComp()      -- MSP_COMP_GPS     (107) -> GPSReading
-//   parseMspSvInfo() -- MSP_GPS_SV_INFO  (164) -> vector<SVInfoEntry>  ← PRIMARY
-//   parseNavSvInfo() -- UBX-NAV-SAT payload    -> vector<SVInfoEntry>  ← FALLBACK ONLY
+// Confirmed payload layout (v6 probe, XFlight F405 V3 / BF 4.5.3 / NEO-M10):
+//   Byte 0       : numCh = 0x20 (32 channels)
+//   Per channel (4 bytes):
+//     [0] chn    : channel byte — upper nibble = GNSS ID (when numCh > 16)
+//                                 lower nibble = channel index
+//     [1] svid   : satellite vehicle ID
+//     [2] quality: signal quality 0-7 (matches UBX qualityInd)
+//     [3] cno    : carrier-to-noise dBHz (0 = not tracked)
 //
-// UBX frame builder methods (returns raw bytes ready to write to serial):
-//   buildCfgGNSS()  -- UBX-CFG-GNSS  constellation enable/disable
-//   buildCfgRate()  -- UBX-CFG-RATE  navigation solution rate
-//   buildCfgPrt()   -- UBX-CFG-PRT   UART protocol (UBX / NMEA)
-//   buildCfgNav5()  -- UBX-CFG-NAV5  elevation mask + dynamic model
-//   buildCfgCfg()   -- UBX-CFG-CFG   save config to BBR and flash
-//
-// UBX ACK parser:
-//   parseAck()      -- checks if buf contains UBX-ACK-ACK for a given class/id
-//
-// MSP passthrough helper:
-//   wrapUbxInMspPassthrough() -- wraps a UBX frame in MSP_PASSTHROUGH (245)
-//
-// UBX framing reference: u-blox M10 Integration Manual, Section 3.5
-//   Preamble: 0xB5 0x62
-//   Class (1 byte), ID (1 byte), Length LE uint16, Payload, CK_A, CK_B
-//   CK_A/CK_B: 8-bit Fletcher checksum over Class + ID + Length + Payload.
+// Fields not available in MSP mode (always 0): elev, azim, prRes.
+// Python UI should check sv_source == "MSP" and hide Elev/Azim columns.
+// =============================================================================
+struct SVInfoEntry {
+    uint8_t     chn = 0;    // channel index (lower nibble when numCh>16)
+    uint8_t     svid = 0;    // satellite vehicle ID / PRN
+    uint8_t     flags = 0;    // packed: bits[0:2]=quality, bit[3]=used
+    uint8_t     quality = 0;    // 0-7 UBX qualityInd
+    uint8_t     cno = 0;    // dBHz signal strength
+    int8_t      elev = 0;    // degrees (-90..+90) — 0 in MSP mode
+    int16_t     azim = 0;    // degrees (0..360)   — 0 in MSP mode
+    int16_t     prRes = 0;    // pseudorange residual — 0 in MSP mode
+    uint8_t     gnssId = 0;    // 0=GPS 1=SBAS 2=Galileo 3=BeiDou 5=QZSS 6=GLONASS
+    std::string gnssName;         // "GPS", "GLONASS", "Galileo", etc.
+    std::string statusStr;        // "used", "tracked", "acquired", "searching", "idle"
+    bool        used = false; // true when quality >= 4
+};
+
+// =============================================================================
+// GPSNeoM10 — static parser / builder namespace
 // =============================================================================
 class GPSNeoM10 {
 public:
-    // -- MSP frame parsers ----------------------------------------------------
+    // ── MSP parsers ──────────────────────────────────────────────────────────
+
+    // MSP_RAW_GPS (cmd 106) — 18-byte payload
     static bool parseRaw(const std::vector<uint8_t>& buf, GPSReading& out);
+
+    // MSP_COMP_GPS (cmd 107) — 5-byte payload
     static bool parseComp(const std::vector<uint8_t>& buf, GPSReading& out);
 
-    // ── MSP_GPS_SV_INFO (cmd 164) parser  ────────────────────────────────────
-    //
-    // PRIMARY satellite data source. Called every SV_POLL_TICKS in the main
-    // communicationLoop() via a direct sendMSP(164) call -- no passthrough,
-    // no port close/reopen, no 30 s delay.
-    //
-    // Payload layout (confirmed 129 bytes for NEO-M10 with 32 channels):
-    //
-    //   Byte 0        numCh   -- number of channels (0x20 = 32 for M10)
-    //   Bytes 1..end  numCh × 4 bytes per channel:
-    //     [0] chn     -- channel byte:
-    //                    when numCh > 16: upper nibble = GNSS id, lower nibble = ch index
-    //                    when numCh ≤ 16: full byte = channel index, GNSS inferred from svid
-    //     [1] svid    -- satellite vehicle ID
-    //     [2] quality -- signal quality 0-7 (same scale as UBX qualityInd)
-    //     [3] cno     -- carrier-to-noise dBHz
-    //
-    // GNSS id nibble values (upper nibble of chn when numCh > 16):
-    //   0=GPS, 1=SBAS, 2=Galileo, 3=BeiDou, 5=QZSS, 6=GLONASS
-    //
-    // Fields NOT available in cmd 164 (left as 0 in SVInfoEntry):
-    //   elev, azim, prRes
-    //
-    // Returns false only on a malformed/empty payload.
-    // Channels where both svid==0 and cno==0 are skipped (unused slots).
-    static bool parseMspSvInfo(const std::vector<uint8_t>& buf,
-        std::vector<SVInfoEntry>& out);
-
-    // -- UBX config frame builders --------------------------------------------
-
-    // UBX-CFG-GNSS (Class 0x06, ID 0x3E)
-    // Enables/disables GNSS systems. GPS is always forced on.
-    static std::vector<uint8_t> buildCfgGNSS(uint8_t constellationFlags);
-
-    // UBX-CFG-RATE (Class 0x06, ID 0x08)
-    // navRate is always 1. timeRef: 0 = UTC, 1 = GPS time.
-    static std::vector<uint8_t> buildCfgRate(GPSUpdateRate rateHz,
-        uint16_t timeRef = 1);
-
-    // UBX-CFG-PRT (Class 0x06, ID 0x00) -- UART1 port config
-    // Baud rate is fixed at 115200 to match Betaflight GPS serial config.
-    static std::vector<uint8_t> buildCfgPrt(GPSProtocol protocol);
-
-    // UBX-CFG-NAV5 (Class 0x06, ID 0x24)
-    // dynModel is always 8 (Airborne <4g) -- REQUIRED for UAV applications.
-    // Using any other dynamic model causes position errors at UAV speeds.
-    static std::vector<uint8_t> buildCfgNav5(uint8_t elevMaskDeg);
-
-    // UBX-CFG-CFG (Class 0x06, ID 0x09)
-    // Saves config to BBR and flash.
-    static std::vector<uint8_t> buildCfgCfg();
-
-    // -- UBX ACK parser -------------------------------------------------------
-    // Returns true if buf contains UBX-ACK-ACK (0x05 0x01) for msgClass/msgId.
-    static bool parseAck(const std::vector<uint8_t>& buf,
-        uint8_t msgClass, uint8_t msgId);
-
-    // -- MSP passthrough helper -----------------------------------------------
-    // Wraps a raw UBX frame inside MSP_PASSTHROUGH (245) so it can be sent
-    // to Betaflight which forwards it to the GPS UART transparently.
-    // Only used by applyGPSConfig() for UBX configuration writes.
-    // NOT used for satellite polling (use parseMspSvInfo instead).
-    static std::vector<uint8_t> wrapUbxInMspPassthrough(
-        const std::vector<uint8_t>& ubxFrame);
-
-    // -- UBX-NAV-SAT parser (FALLBACK -- passthrough path only) ---------------
-    //
-    // Parses the payload of a UBX-NAV-SAT (0x01/0x35) response obtained via
-    // MSP_SET_PASSTHROUGH. This path is BLOCKED on standard BF 4.5.x setups
-    // with gps_auto_config=ON because the GPS UART is locked by Betaflight.
-    //
-    // Only reachable when gps_auto_config=OFF in the BF CLI.
-    // With the NEO-M10 on this project: probe confirmed 0 bytes returned
-    // on all 6 UART indices -- do not attempt to use this path for sv polling.
-    //
-    // Kept for applyGPSConfig() and future hardware where passthrough works.
-    static bool parseNavSvInfo(const std::vector<uint8_t>& ubxPayload,
-        std::vector<SVInfoEntry>& out);
-
-    // -- MSP_NAV_STATUS (121) parser ---------------------------------------------
+    // MSP_NAV_STATUS (cmd 121)
     static bool parseNavStatus(const std::vector<uint8_t>& buf, NavStatus& out);
 
-    // -- UBX-NAV-SAT poll frame (used ONLY by applyGPSConfig / UBX path) ------
-    // Named buildNavSvInfoPoll() to match the existing header declaration.
-    // Do NOT call this for satellite polling -- use sendMSP(164) instead.
+    // ── MSP_GPS_SV_INFO (cmd 164) ─────────────────────────────────────────────
+    //
+    // PRIMARY satellite data path.  No passthrough required.
+    // Called from DroneLink::pollSatellitesMSP() every SV_POLL_TICKS.
+    //
+    // Confirmed format (NEO-M10, BF 4.5.3):
+    //   buf[0..4] = MSP header ($M> payLen cmd)
+    //   buf[5]    = numCh (32 = 0x20 for M10)
+    //   buf[6..6+numCh*4-1] = channel records (4 bytes each)
+    //   buf[last] = checksum
+    //
+    // GNSS ID encoding (numCh > 16):
+    //   chn byte = (gnss_id << 4) | channel_index
+    //   gnss_id : 0=GPS 1=SBAS 2=Galileo 3=BeiDou 5=QZSS 6=GLONASS
+    //
+    // Returns true and fills svList on success.
+    // Returns false (leaves svList unchanged) on any parse failure.
+    static bool parseMspSvInfo(const std::vector<uint8_t>& buf,
+        std::vector<SVInfoEntry>& svList);
+
+    // ── UBX parsers (used by applyGPSConfig / legacy passthrough) ────────────
+
+    // UBX-NAV-SAT response parser (passthrough path, kept for applyGPSConfig)
+    static bool parseNavSvInfo(const std::vector<uint8_t>& ubxPayload,
+        std::vector<SVInfoEntry>& svList);
+
+    // UBX ACK/NAK check
+    static bool parseAck(const std::vector<uint8_t>& frame,
+        uint8_t expectedCls, uint8_t expectedId);
+
+    // ── UBX frame builders (for applyGPSConfig) ───────────────────────────────
     static std::vector<uint8_t> buildNavSvInfoPoll();
+    static std::vector<uint8_t> buildCfgGNSS(uint32_t constellationMask);
+    static std::vector<uint8_t> buildCfgRate(GPSUpdateRate rate);
+    static std::vector<uint8_t> buildCfgPrt(GPSProtocol protocol);
+    static std::vector<uint8_t> buildCfgNav5(int elevationMaskDeg);
+    static std::vector<uint8_t> buildCfgCfg();
 
 private:
-    // Internal little-endian read helpers
-    static int16_t  read16(const std::vector<uint8_t>& b, int i);
-    static uint16_t read16u(const std::vector<uint8_t>& b, int i);
-    static int32_t  read32(const std::vector<uint8_t>& b, int i);
+    // UBX checksum (Fletcher over bytes cls..payload end)
+    static void ubxChecksum(std::vector<uint8_t>& frame);
 
-    // Fletcher-8 checksum over Class + ID + Length + Payload (UBX spec s3.4)
-    static void addUbxChecksum(std::vector<uint8_t>& frame);
+    // GNSS ID → name string
+    static const char* gnssName(uint8_t gnssId);
 
-    // Shared GNSS id -> name lookup used by both parseMspSvInfo and parseNavSvInfo
-    static std::string gnssIdToName(uint8_t gnssId);
+    // Quality index → status string
+    static const char* qualityStatus(uint8_t quality);
 };

@@ -540,15 +540,30 @@ class DroneCockpitApp:
             if gps is not None:
                 gps_hdop_raw  = getattr(gps, "hdop", 9999)
                 gps_hdop_real = gps_hdop_raw / 100.0 if gps_hdop_raw != 9999 else 99.0
-                sv_list_raw   = getattr(gps, "sv_list", None) or []
+
+                # ── FIX: sv_list lives on state, NOT on state.gps ────────────
+                # state.gps is a GPSReading (fix/lat/lon/speed).
+                # state.sv_list is the satellite list from MSP cmd 164.
+                # Reading it from gps always returned empty; now read from state.
+                sv_list_raw = list(state.sv_list) if state.sv_info_valid else []
+
+                # Build normalised dicts matching _normalize_sv_list() expectations.
+                # Key fix: use sv.gnss_name (string) not sv.gnss_id (int) so that
+                # _SatCanvas._GNSS_COLOR lookup works ("GPS" not 0).
                 sv_list = [
-                    {"gnss_id": getattr(sv, "gnss_id", "?"),
-                     "sv_id":   getattr(sv, "sv_id",   0),
-                     "cno":     getattr(sv, "cno",     0),
-                     "used":    getattr(sv, "used",    False),
-                     "quality": getattr(sv, "quality", 0)}
+                    {
+                        "gnss_id": getattr(sv, "gnss_name",  "?"),
+                        "sv_id":   getattr(sv, "svid",        0),
+                        "cno":     getattr(sv, "cno",         0),
+                        "used":    getattr(sv, "used",        False),
+                        "quality": getattr(sv, "quality",     0),
+                        "status":  getattr(sv, "status_str",  "idle"),
+                        "elev":    getattr(sv, "elev",        0),
+                        "azim":    getattr(sv, "azim",        0),
+                    }
                     for sv in sv_list_raw
                 ]
+
                 gps_data = {
                     "gps_fix_type":         getattr(gps, "fix_type",         0),
                     "gps_num_sat":          getattr(gps, "num_sat",           0),
@@ -565,6 +580,8 @@ class DroneCockpitApp:
                     "gps_comp_valid":       getattr(gps, "comp_valid",        False),
                     "gps_position_usable":  getattr(gps, "position_usable",   False),
                     "gps_sv_list":          sv_list,
+                    "gps_sv_info_valid":    state.sv_info_valid,
+                    "gps_sv_source":        state.sv_source,
                 }
             else:
                 gps_data = {
@@ -574,7 +591,10 @@ class DroneCockpitApp:
                     "gps_ground_course": 0, "gps_dist_to_home_m": 0.0,
                     "gps_bearing_to_home": 0, "gps_heartbeat": None,
                     "gps_raw_valid": False, "gps_comp_valid": False,
-                    "gps_position_usable": False, "gps_sv_list": [],
+                    "gps_position_usable": False,
+                    "gps_sv_list": [],
+                    "gps_sv_info_valid": False,
+                    "gps_sv_source": "",
                 }
 
             ui_data = {
