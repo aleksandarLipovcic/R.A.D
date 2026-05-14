@@ -32,9 +32,10 @@ Satellite tab notes
       azim       (int)   azimuth degrees 0-360
       status_str (str)   "used", "tracked", "acquired", "searching", "idle"
 
-  _normalize_sv_list() converts SVInfoEntry objects (or already-correct dicts)
-  into the internal dict format used by _SatCanvas.  Pass either form via
-  ui_data["gps_sv_list"].
+  _normalize_sv_list() accepts SVInfoEntry objects, raw dicts using
+  SVInfoEntry attribute names (gnss_name/svid/status_str), OR already-
+  converted dicts using widget keys (gnss_id/sv_id/status).
+  Pass any of these forms via ui_data["gps_sv_list"].
 
 How to feed this widget from your main loop
 -------------------------------------------
@@ -116,8 +117,9 @@ _FFIX = (_FF, 11, "bold")
 # Accepted input items:
 #   • SVInfoEntry C++ object exposed via pybind11
 #       attributes: gnss_name, svid, cno, used, quality, elev, azim, status_str
-#   • dict already using _SatCanvas keys (gnss_id / sv_id / ...)
-#   • dict using SVInfoEntry attribute names (gnss_name / svid / ...)
+#   • dict using SVInfoEntry attribute names (gnss_name / svid / status_str)
+#   • dict already using widget keys (gnss_id / sv_id / status)
+#     — produced by main.py's pre-conversion loop
 #
 # Output dict keys (all always present):
 #   gnss_id   str   constellation name  e.g. "GPS"
@@ -132,28 +134,38 @@ _FFIX = (_FF, 11, "bold")
 
 def _normalize_sv_list(raw_list) -> list:
     """
-    Accept a list of SVInfoEntry objects or dicts; return a list of plain dicts
-    with the keys _SatCanvas expects.  Silently skips items that cannot be
-    read.
+    Accept a list of SVInfoEntry objects or dicts (either naming convention);
+    return a list of plain dicts with the keys _SatCanvas expects.
+    Silently skips items that cannot be read.
+
+    Key resolution order for dicts (first match wins):
+      gnss_id  ← "gnss_id"  (widget key, set by main.py pre-conversion)
+               ← "gnss_name" (SVInfoEntry attribute name)
+      sv_id    ← "sv_id"    (widget key)
+               ← "svid"     (SVInfoEntry attribute name)
+      status   ← "status"   (widget key)
+               ← "status_str" (SVInfoEntry attribute name)
     """
     out = []
     for item in raw_list:
         try:
             if isinstance(item, dict):
-                # Already a dict — may use either naming convention.
-                # Prefer SVInfoEntry attribute names; fall back to _SatCanvas names.
+                # Resolve each field trying widget key first, then SVInfoEntry
+                # attribute name, so both dict formats are handled correctly.
+                gnss_id = item.get("gnss_id") or item.get("gnss_name", "?")
+                sv_id   = item.get("sv_id")
+                if sv_id is None:
+                    sv_id = item.get("svid", 0)
+                status  = item.get("status") or item.get("status_str", "idle")
                 out.append({
-                    "gnss_id": item.get("gnss_name",
-                               item.get("gnss_id", "?")),
-                    "sv_id":   item.get("svid",
-                               item.get("sv_id", 0)),
+                    "gnss_id": gnss_id,
+                    "sv_id":   sv_id,
                     "cno":     int(item.get("cno", 0)),
                     "used":    bool(item.get("used", False)),
                     "quality": item.get("quality", 0),
                     "elev":    int(item.get("elev", 0)),
                     "azim":    int(item.get("azim", 0)),
-                    "status":  item.get("status_str",
-                               item.get("status", "idle")),
+                    "status":  status,
                 })
             else:
                 # Assume pybind11-wrapped SVInfoEntry object.
@@ -579,7 +591,12 @@ class _SatCanvas(tk.Frame):
 
             # ── Signal bar ────────────────────────────────────────────────────
             cno     = int(sv.get("cno", 0))
-            used    = bool(sv.get("used", False))
+            # FIX: only treat a satellite as truly "used" if it also has a
+            # non-zero signal reading.  The backend occasionally sends used=True
+            # with cno=0 for satellites that are in the nav solution by inertia
+            # but currently have no measurable signal — showing them as green
+            # USED with a full-quality badge was misleading.
+            used    = bool(sv.get("used", False)) and cno > 0
             bar_pct = min(cno / self._CNO_MAX, 1.0)
             bar_w   = int(bar_pct * self._BAR_MAX)
             bar_col = (_C["sv_used"]   if used
@@ -604,12 +621,23 @@ class _SatCanvas(tk.Frame):
                                  fill=_C["text"], font=(_FF, 9))
             x += cols[3][1]
 
-            # ── Used / unused badge ───────────────────────────────────────────
-            # Prefer the pre-computed status_str from the backend when available
+            # ── Status badge ──────────────────────────────────────────────────
+            # FIX: use the locally-corrected `used` flag (cno > 0 guard applied
+            # above) rather than the raw backend value, so the badge stays
+            # consistent with the signal bar colour.
             status_str = sv.get("status", "")
             if used:
                 badge_txt = "USED"
                 badge_col = _C["sv_used"]
+            elif cno == 0:
+                # No signal at all — show raw status from backend if available,
+                # otherwise fall back to "no sig"
+                if status_str in ("tracked", "acquired", "searching", "idle"):
+                    badge_txt = status_str
+                    badge_col = _C["no_data"]
+                else:
+                    badge_txt = "no sig"
+                    badge_col = _C["no_data"]
             elif status_str in ("tracked", "acquired", "searching"):
                 badge_txt = status_str
                 badge_col = _C["amber"] if status_str in ("tracked", "acquired") else _C["no_data"]
@@ -621,20 +649,30 @@ class _SatCanvas(tk.Frame):
             x += cols[4][1]
 
             # ── Quality ───────────────────────────────────────────────────────
+            # FIX: if cno == 0 the satellite has no real signal; clamp the
+            # displayed quality to "no signal" so we don't show "fully locked"
+            # for a satellite the receiver can't actually hear right now.
             qual = sv.get("quality", 0)
-            if isinstance(qual, int):
-                _Q = ["idle", "searching", "acquired", "detected",
-                      "code lock", "carrier lock", "fully locked", "fully locked"]
-                qual = _Q[min(qual, 7)]
-            qual_str = str(qual)[:14]
-            if "fully" in qual_str.lower():
-                qcol = _C["green"]
-            elif "carrier" in qual_str.lower() or "code lock" in qual_str.lower():
-                qcol = _C["amber"]
-            elif "lock" in qual_str.lower():
-                qcol = _C["amber"]
+            if cno == 0:
+                qual_str = "no signal"
+                qcol     = _C["no_data"]
             else:
-                qcol = _C["no_data"]
+                if isinstance(qual, int):
+                    _Q = ["idle", "searching", "acquired", "detected",
+                          "code lock", "carrier lock", "fully locked", "fully locked"]
+                    qual_str = _Q[min(qual, 7)]
+                else:
+                    qual_str = str(qual)[:14]
+
+                if "fully" in qual_str.lower():
+                    qcol = _C["green"]
+                elif "carrier" in qual_str.lower() or "code" in qual_str.lower():
+                    qcol = _C["amber"]
+                elif "lock" in qual_str.lower():
+                    qcol = _C["amber"]
+                else:
+                    qcol = _C["no_data"]
+
             self._cv.create_text(x, cy, text=qual_str, anchor="w",
                                  fill=qcol, font=(_FF, 8))
 
@@ -668,8 +706,8 @@ class GPSWidget(tk.Frame):
         gps_position_usable   bool
 
         (satellite tab)
-        gps_sv_list           list    SVInfoEntry objects OR normalised dicts
-                                      (both accepted; see _normalize_sv_list)
+        gps_sv_list           list    SVInfoEntry objects OR dicts in either
+                                      naming convention (both accepted).
 
     Minimum main-loop snippet
     -------------------------
@@ -1058,10 +1096,17 @@ class GPSWidget(tk.Frame):
 
     def _update_satellites(self, ui_data: dict):
         """
-        Pull sv_list from ui_data, normalise SVInfoEntry objects → dicts,
-        then hand the result to _SatCanvas.
+        Pull sv_list from ui_data, normalise SVInfoEntry objects or raw dicts
+        into the internal dict format, then hand the result to _SatCanvas.
+
+        Accepts:
+          • list of SVInfoEntry pybind11 objects (direct from state.sv_list)
+          • list of dicts using SVInfoEntry attribute names (gnss_name/svid/…)
+          • list of dicts using widget keys (gnss_id/sv_id/…) as produced by
+            main.py's pre-conversion loop — all three forms are handled by
+            _normalize_sv_list() without double-conversion issues.
         """
-        raw = ui_data.get("gps_sv_list", [])
+        raw        = ui_data.get("gps_sv_list", [])
         normalised = _normalize_sv_list(raw)
         self._sat_canvas.update_satellites(normalised)
 

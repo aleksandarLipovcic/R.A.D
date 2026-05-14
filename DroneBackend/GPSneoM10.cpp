@@ -14,9 +14,9 @@ static inline int16_t  i16le(const uint8_t* p) {
 }
 static inline uint32_t u32le(const uint8_t* p) {
     return static_cast<uint32_t>(p[0])
-         | (static_cast<uint32_t>(p[1]) <<  8)
-         | (static_cast<uint32_t>(p[2]) << 16)
-         | (static_cast<uint32_t>(p[3]) << 24);
+        | (static_cast<uint32_t>(p[1]) << 8)
+        | (static_cast<uint32_t>(p[2]) << 16)
+        | (static_cast<uint32_t>(p[3]) << 24);
 }
 static inline int32_t  i32le(const uint8_t* p) {
     return static_cast<int32_t>(u32le(p));
@@ -26,8 +26,8 @@ static inline int32_t  i32le(const uint8_t* p) {
 // Returns pointer to the first payload byte, or nullptr on failure.
 // minPayload is the minimum number of payload bytes required.
 static const uint8_t* mspPayload(const std::vector<uint8_t>& buf,
-                                  uint8_t  expectedCmd,
-                                  size_t   minPayload)
+    uint8_t  expectedCmd,
+    size_t   minPayload)
 {
     // Frame: $M> payLen cmd [payload...] csum
     if (buf.size() < 6)             return nullptr;
@@ -47,29 +47,29 @@ static const uint8_t* mspPayload(const std::vector<uint8_t>& buf,
 
 const char* GPSNeoM10::gnssName(uint8_t gnssId) {
     switch (gnssId) {
-        case 0: return "GPS";
-        case 1: return "SBAS";
-        case 2: return "Galileo";
-        case 3: return "BeiDou";
-        case 4: return "IMES";
-        case 5: return "QZSS";
-        case 6: return "GLONASS";
-        default: return "Unknown";
+    case 0: return "GPS";
+    case 1: return "SBAS";
+    case 2: return "Galileo";
+    case 3: return "BeiDou";
+    case 4: return "IMES";
+    case 5: return "QZSS";
+    case 6: return "GLONASS";
+    default: return "Unknown";
     }
 }
 
 const char* GPSNeoM10::qualityStatus(uint8_t quality) {
     // Mirrors BF Configurator GPS Signal Strength panel labels
     switch (quality) {
-        case 0: return "idle";
-        case 1: return "searching";
-        case 2: return "acquired";
-        case 3: return "unusable";
-        case 4: return "locked";
-        case 5:
-        case 6:
-        case 7: return "fully locked";
-        default: return "unknown";
+    case 0: return "idle";
+    case 1: return "searching";
+    case 2: return "acquired";
+    case 3: return "unusable";
+    case 4: return "locked";
+    case 5:
+    case 6:
+    case 7: return "fully locked";
+    default: return "unknown";
     }
 }
 
@@ -90,19 +90,19 @@ bool GPSNeoM10::parseRaw(const std::vector<uint8_t>& buf, GPSReading& out) {
     const uint8_t* p = mspPayload(buf, 106, 16);
     if (!p) return false;
 
-    out.fixType      = p[0];
-    out.numSat       = p[1];
-    out.latitude     = i32le(p + 2)  / 1e7;
-    out.longitude    = i32le(p + 6)  / 1e7;
-    out.altitudeM    = static_cast<float>(u16le(p + 10)) / 100.0f;
-    out.groundSpeedMs= u16le(p + 12);
+    out.fixType = p[0];
+    out.numSat = p[1];
+    out.latitude = i32le(p + 2) / 1e7;
+    out.longitude = i32le(p + 6) / 1e7;
+    out.altitudeM = static_cast<float>(u16le(p + 10)) / 100.0f;
+    out.groundSpeedMs = u16le(p + 12);
     out.groundCourse = u16le(p + 14);
-    out.hdop         = (buf[3] >= 18) ? u16le(p + 16) : 9999;
+    out.hdop = (buf[3] >= 18) ? u16le(p + 16) : 9999;
 
-    out.rawValid     = true;
+    out.rawValid = true;
     out.positionUsable = (out.fixType >= 2)
-                      && (out.numSat  >= 4)
-                      && (out.hdop    < 500);   // HDOP < 5.00
+        && (out.numSat >= 4)
+        && (out.hdop < 500);   // HDOP < 5.00
     return true;
 }
 
@@ -117,10 +117,10 @@ bool GPSNeoM10::parseComp(const std::vector<uint8_t>& buf, GPSReading& out) {
     const uint8_t* p = mspPayload(buf, 107, 5);
     if (!p) return false;
 
-    out.distToHomM    = u16le(p);
+    out.distToHomM = u16le(p);
     out.bearingToHome = i16le(p + 2);
-    out.gpsHeartbeat  = p[4];
-    out.compValid     = true;
+    out.gpsHeartbeat = p[4];
+    out.compValid = true;
     return true;
 }
 
@@ -136,65 +136,62 @@ bool GPSNeoM10::parseNavStatus(const std::vector<uint8_t>& buf, NavStatus& out) 
     const uint8_t* p = mspPayload(buf, 121, 4);
     if (!p) return false;
 
-    out.fixType  = p[0];
+    out.fixType = p[0];
     out.gpsFlags = p[1];
-    out.fixOk    = (p[1] & 0x01) != 0;
+    out.fixOk = (p[1] & 0x01) != 0;
     out.dgpsUsed = (p[1] & 0x02) != 0;
     out.mapFlags = p[2];
     out.hwStatus = p[3];
-    out.valid    = true;
+    out.valid = true;
     return true;
 }
 
 // =============================================================================
 // parseMspSvInfo()  —  MSP_GPS_SV_INFO (cmd 164)   ← PRIMARY SATELLITE PATH
 //
-// Confirmed payload from v6 probe (XFlight F405 V3 / BF 4.5.3 / NEO-M10):
-//   Total: 129 bytes  =  1 (numCh) + 32 × 4 (channel records) + 2 (MSP frame)
+// Confirmed payload layout from live probe (XFlight F405 V3 / BF 4.5.3 / NEO-M10):
 //
-// MSP frame structure (buf):
-//   buf[0]  '$'
-//   buf[1]  'M'
-//   buf[2]  '>'
-//   buf[3]  payLen  = 1 + numCh*4   (129 - 2 header/csum bytes = 128, but
-//                                    payLen = buf[3] = 0x80 = 128 for 32 ch)
+//   buf[3]  payLen  =  1 + numCh * 4
+//           For 32 channels (NEO-M10): payLen = 129 (0x81)
 //   buf[4]  cmd     = 164
 //   buf[5]  numCh   = 32 (0x20) for NEO-M10
-//   buf[6..129-1]   channel records, 4 bytes each
-//   buf[last]       checksum
+//   buf[6+] channel records, 4 bytes each
 //
-// Channel record layout (4 bytes):
-//   [0] chn     upper nibble = GNSS ID  (only when numCh > 16)
-//               lower nibble = channel index
-//   [1] svid    satellite vehicle ID
-//   [2] quality signal quality 0-7 (UBX qualityInd)
-//   [3] cno     carrier-to-noise dBHz (0 = not tracking)
+//   Channel record (4 bytes):
+//     rec[0]  chn      uint8
+//                      bits[7:4] = gnssId    (when numCh > 16)
+//                      bits[3:0] = chnIdx
+//     rec[1]  svid     uint8   satellite vehicle ID / PRN
+//     rec[2]  packed   uint8   PACKED BYTE — confirmed from debug values 0x11, 0x1C:
+//                                bits[7:4] = gnssId  (GNSS system ID 0-6)
+//                                bits[3:0] = quality (UBX qualityInd 0-7)
+//                              Example: 0x1C → gnssId=1 (SBAS), quality=4 (locked)
+//                              Example: 0x11 → gnssId=1 (SBAS), quality=1 (searching)
+//     rec[3]  cno      uint8   carrier-to-noise density, dBHz (0 = not tracked)
 //
-// GNSS IDs (upper nibble of chn when numCh > 16):
-//   0 = GPS      (PRN  1-32)
-//   1 = SBAS     (PRN 120-158)
-//   2 = Galileo  (PRN  1-36)
-//   3 = BeiDou   (PRN  1-37)
-//   5 = QZSS     (PRN  1-10)
-//   6 = GLONASS  (PRN  1-24, 255=unknown)
+//   elev and azim are NOT present in this 4-byte record; always 0 in MSP mode.
+//   prRes is also not present; always 0.
 //
-// Status mapping (matches BF Configurator GPS Signal Strength panel):
-//   quality 0         → "idle"        (channel allocated, no signal)
-//   quality 1         → "searching"   (signal acquisition in progress)
-//   quality 2         → "acquired"    (signal acquired, no lock)
-//   quality 3         → "unusable"    (signal present but unusable)
-//   quality 4         → "locked"      (code lock)
-//   quality 5,6,7     → "fully locked"(code + carrier lock)
-//   "used"            → quality >= 4  (contributes to fix)
-//   "tracked"         → cno > 0       (visible but not used)
+// "used" flag: BF MSP_GPS_SV_INFO has no separate svUsed bit.
+//   quality >= 4 means the satellite contributes to the fix (BF convention).
+//
+// GNSS IDs (from rec[2] upper nibble, confirmed matches rec[0] upper nibble):
+//   0 = GPS      1 = SBAS    2 = Galileo  3 = BeiDou
+//   4 = IMES     5 = QZSS    6 = GLONASS
+//
+// Quality / status mapping (matches BF Configurator GPS Signal Strength labels):
+//   quality 0  → "idle"          quality 4  → "locked"  (used)
+//   quality 1  → "searching"     quality 5  → "fully locked"  (used)
+//   quality 2  → "acquired"      quality 6  → "fully locked"  (used)
+//   quality 3  → "unusable"      quality 7  → "fully locked"  (used)
 // =============================================================================
 bool GPSNeoM10::parseMspSvInfo(const std::vector<uint8_t>& buf,
-                                std::vector<SVInfoEntry>&   svList)
+    std::vector<SVInfoEntry>& svList)
 {
     // ── Validate MSP frame ────────────────────────────────────────────────────
-    if (buf.size() < 8) return false;           // too short for any valid frame
+    if (buf.size() < 8) return false;
     if (buf[0] != '$' || buf[1] != 'M' || buf[2] != '>') return false;
-    if (buf[4] != 164) return false;            // wrong command
+    if (buf[4] != 164) return false;
 
     uint8_t payLen = buf[3];
     if (buf.size() < static_cast<size_t>(6 + payLen)) return false;
@@ -206,63 +203,67 @@ bool GPSNeoM10::parseMspSvInfo(const std::vector<uint8_t>& buf,
         return true;    // valid response, just no channels yet
     }
 
-    // payLen should be 1 + numCh*4
-    if (payLen < static_cast<uint8_t>(1 + numCh * 4)) return false;
+    // ── Validate stride: 4 bytes per channel + 1 byte numCh header ───────────
+    // payLen = 1 + numCh * 4  →  129 for 32 channels on NEO-M10 / BF 4.5.3.
+    // Use size_t arithmetic to avoid uint8_t overflow for large numCh values.
+    if (static_cast<size_t>(payLen) < 1u + static_cast<size_t>(numCh) * 4u)
+        return false;
 
-    // For M10 (32 channels), GNSS ID is packed in the upper nibble of chn.
-    // For older modules (<=16 channels), the whole byte is the channel index
-    // and we assume GPS.
-    const bool gnssInHighNibble = (numCh > 16);
+    // GNSS ID is encoded in the upper nibble of rec[2] (the packed quality byte).
+    // rec[0] upper nibble also carries gnssId and can be used for cross-check,
+    // but rec[2] is authoritative since it was confirmed from live debug values.
+    // For legacy modules with numCh <= 16 the upper nibble of rec[0] is not
+    // reliably the GNSS ID; in that case we fall back to gnssId = 0 (GPS).
+    const bool hasGnssId = (numCh > 16);
 
     // ── Parse channels ────────────────────────────────────────────────────────
     std::vector<SVInfoEntry> result;
     result.reserve(numCh);
 
-    const uint8_t* base = buf.data() + 6;   // first channel record
+    const uint8_t* base = buf.data() + 6;   // buf[6] = first channel record
 
     for (uint8_t i = 0; i < numCh; ++i) {
-        const uint8_t* rec = base + i * 4;
+        const uint8_t* rec = base + i * 4;  // 4 bytes per record
 
         uint8_t chnByte = rec[0];
-        uint8_t svid    = rec[1];
-        uint8_t quality = rec[2];
-        uint8_t cno     = rec[3];
+        uint8_t svid = rec[1];
+        uint8_t packed = rec[2];  // bits[7:4]=gnssId, bits[3:0]=qualityInd
+        uint8_t cno = rec[3];
 
-        uint8_t gnssId;
-        uint8_t chnIdx;
-        if (gnssInHighNibble) {
-            gnssId = (chnByte >> 4) & 0x0F;
-            chnIdx =  chnByte       & 0x0F;
-        } else {
-            gnssId = 0;
-            chnIdx = chnByte;
-        }
+        // Unpack rec[2] — confirmed from debug output (quality=0x11 → gnss=1,qual=1)
+        uint8_t gnssId = hasGnssId ? ((packed >> 4) & 0x0F) : 0;
+        uint8_t quality = (packed) & 0x0F;
+
+        // chn index from lower nibble of rec[0] when gnss is in upper nibble
+        uint8_t chnIdx = hasGnssId ? (chnByte & 0x0F) : chnByte;
 
         SVInfoEntry sv;
-        sv.chn      = chnIdx;
-        sv.svid     = svid;
-        sv.quality  = quality;
-        sv.cno      = cno;
-        sv.gnssId   = gnssId;
+        sv.chn = chnIdx;
+        sv.svid = svid;
+        sv.quality = quality;          // correctly unpacked 0-7
+        sv.cno = cno;
+        sv.elev = 0;                // not in 4-byte record
+        sv.azim = 0;
+        sv.prRes = 0;
+        sv.gnssId = gnssId;
         sv.gnssName = gnssName(gnssId);
-        sv.used     = (quality >= 4);
-        sv.elev     = 0;    // not available via MSP cmd 164
-        sv.azim     = 0;
-        sv.prRes    = 0;
 
-        // Pack flags byte matching UBX convention so legacy code that reads
-        // sv.flags still works: bits[0:2] = quality, bit[3] = used
+        // quality >= 4 → satellite contributes to the fix (BF convention)
+        sv.used = (quality >= 4);
+
+        // Pack flags byte for UBX-compatible legacy code: bits[0:2]=quality, bit[3]=used
         sv.flags = (quality & 0x07) | (sv.used ? 0x08 : 0x00);
 
-        // Status string — matches BF Configurator GPS Signal Strength labels
+        // Status string — matches BF Configurator GPS Signal Strength panel labels
         if (sv.used) {
             sv.statusStr = "used";
-        } else if (cno > 0) {
-            sv.statusStr = "tracked";
-        } else {
-            // Distinguish "searching" from truly idle channels
-            sv.statusStr = (quality == 1 || quality == 2) ? qualityStatus(quality)
-                                                           : "idle";
+        }
+        else if (cno > 0) {
+            sv.statusStr = qualityStatus(quality);
+        }
+        else {
+            sv.statusStr = (quality == 1 || quality == 2)
+                ? qualityStatus(quality) : "idle";
         }
 
         result.push_back(std::move(sv));
@@ -293,7 +294,7 @@ bool GPSNeoM10::parseMspSvInfo(const std::vector<uint8_t>& buf,
 //     [8..11] flags  uint32  bits[0:2]=qualityInd, bit[3]=svUsed
 // =============================================================================
 bool GPSNeoM10::parseNavSvInfo(const std::vector<uint8_t>& ubxPayload,
-                                std::vector<SVInfoEntry>&   svList)
+    std::vector<SVInfoEntry>& svList)
 {
     if (ubxPayload.size() < 8) return false;
 
@@ -306,34 +307,36 @@ bool GPSNeoM10::parseNavSvInfo(const std::vector<uint8_t>& ubxPayload,
     for (uint8_t i = 0; i < numSvs; ++i) {
         const uint8_t* sv = ubxPayload.data() + 8 + i * 12;
 
-        uint8_t  gnssId  = sv[0];
-        uint8_t  svid    = sv[1];
-        uint8_t  cno     = sv[2];
-        int8_t   elev    = static_cast<int8_t>(sv[3]);
-        int16_t  azim    = i16le(sv + 4);
-        int16_t  prRes   = i16le(sv + 6);
-        uint32_t flags   = u32le(sv + 8);
+        uint8_t  gnssId = sv[0];
+        uint8_t  svid = sv[1];
+        uint8_t  cno = sv[2];
+        int8_t   elev = static_cast<int8_t>(sv[3]);
+        int16_t  azim = i16le(sv + 4);
+        int16_t  prRes = i16le(sv + 6);
+        uint32_t flags = u32le(sv + 8);
         uint8_t  quality = flags & 0x07;
-        bool     used    = (flags & 0x08) != 0;
+        bool     used = (flags & 0x08) != 0;
 
         SVInfoEntry e;
-        e.chn      = i;
-        e.svid     = svid;
-        e.quality  = quality;
-        e.cno      = cno;
-        e.elev     = elev;
-        e.azim     = azim;
-        e.prRes    = prRes;
-        e.gnssId   = gnssId;
+        e.chn = i;
+        e.svid = svid;
+        e.quality = quality;
+        e.cno = cno;
+        e.elev = elev;
+        e.azim = azim;
+        e.prRes = prRes;
+        e.gnssId = gnssId;
         e.gnssName = gnssName(gnssId);
-        e.used     = used;
-        e.flags    = static_cast<uint8_t>((quality & 0x07) | (used ? 0x08 : 0x00));
+        e.used = used;
+        e.flags = static_cast<uint8_t>((quality & 0x07) | (used ? 0x08 : 0x00));
 
         if (used) {
             e.statusStr = "used";
-        } else if (cno > 0) {
-            e.statusStr = "tracked";
-        } else {
+        }
+        else if (cno > 0) {
+            e.statusStr = qualityStatus(quality);
+        }
+        else {
             e.statusStr = qualityStatus(quality);
         }
 
@@ -348,7 +351,7 @@ bool GPSNeoM10::parseNavSvInfo(const std::vector<uint8_t>& ubxPayload,
 // parseAck()  —  UBX-ACK-ACK / UBX-ACK-NAK
 // =============================================================================
 bool GPSNeoM10::parseAck(const std::vector<uint8_t>& frame,
-                          uint8_t expectedCls, uint8_t expectedId)
+    uint8_t expectedCls, uint8_t expectedId)
 {
     // UBX frame: 0xB5 0x62 cls id payLen_lo payLen_hi [payload] ckA ckB
     if (frame.size() < 10) return false;
@@ -397,12 +400,12 @@ std::vector<uint8_t> GPSNeoM10::buildCfgGNSS(uint32_t mask) {
     // flags bit0 = enable
     struct Block { uint8_t id, res, max, rsv; uint8_t en; uint8_t f1, f2, f3; };
     const Block blocks[] = {
-        { 0, 8, 16, 0, (mask & GNSS_GPS)     ? 1u : 0u, 0x01, 0x00, 0x01 }, // GPS
-        { 1, 1,  3, 0, (mask & GNSS_SBAS)    ? 1u : 0u, 0x01, 0x00, 0x01 }, // SBAS
+        { 0, 8, 16, 0, (mask & GNSS_GPS) ? 1u : 0u, 0x01, 0x00, 0x01 }, // GPS
+        { 1, 1,  3, 0, (mask & GNSS_SBAS) ? 1u : 0u, 0x01, 0x00, 0x01 }, // SBAS
         { 2, 4,  8, 0, (mask & GNSS_GALILEO) ? 1u : 0u, 0x01, 0x00, 0x01 }, // Galileo
-        { 3, 8, 16, 0, (mask & GNSS_BEIDOU)  ? 1u : 0u, 0x01, 0x00, 0x01 }, // BeiDou
+        { 3, 8, 16, 0, (mask & GNSS_BEIDOU) ? 1u : 0u, 0x01, 0x00, 0x01 }, // BeiDou
         { 4, 0,  8, 0, 0,                                0x03, 0x00, 0x01 }, // IMES (off)
-        { 5, 0,  3, 0, (mask & GNSS_QZSS)    ? 1u : 0u, 0x05, 0x00, 0x01 }, // QZSS
+        { 5, 0,  3, 0, (mask & GNSS_QZSS) ? 1u : 0u, 0x05, 0x00, 0x01 }, // QZSS
         { 6, 8, 14, 0, (mask & GNSS_GLONASS) ? 1u : 0u, 0x01, 0x00, 0x01 }, // GLONASS
     };
 
@@ -441,10 +444,10 @@ std::vector<uint8_t> GPSNeoM10::buildCfgGNSS(uint32_t mask) {
 std::vector<uint8_t> GPSNeoM10::buildCfgRate(GPSUpdateRate rate) {
     uint16_t measRateMs;
     switch (rate) {
-        case GPSUpdateRate::RATE_2HZ:  measRateMs = 500;  break;
-        case GPSUpdateRate::RATE_5HZ:  measRateMs = 200;  break;
-        case GPSUpdateRate::RATE_10HZ: measRateMs = 100;  break;
-        default:                       measRateMs = 1000; break;  // 1 Hz
+    case GPSUpdateRate::RATE_2HZ:  measRateMs = 500;  break;
+    case GPSUpdateRate::RATE_5HZ:  measRateMs = 200;  break;
+    case GPSUpdateRate::RATE_10HZ: measRateMs = 100;  break;
+    default:                       measRateMs = 1000; break;  // 1 Hz
     }
     std::vector<uint8_t> f = {
         0xB5, 0x62, 0x06, 0x08, 0x06, 0x00,

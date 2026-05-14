@@ -89,27 +89,34 @@ struct NavStatus {
 //
 // Populated by GPSNeoM10::parseMspSvInfo() from MSP_GPS_SV_INFO (cmd 164).
 //
-// Confirmed payload layout (v6 probe, XFlight F405 V3 / BF 4.5.3 / NEO-M10):
-//   Byte 0       : numCh = 0x20 (32 channels)
-//   Per channel (4 bytes):
-//     [0] chn    : channel byte — upper nibble = GNSS ID (when numCh > 16)
-//                                 lower nibble = channel index
-//     [1] svid   : satellite vehicle ID
-//     [2] quality: signal quality 0-7 (matches UBX qualityInd)
-//     [3] cno    : carrier-to-noise dBHz (0 = not tracked)
+// Confirmed payload layout (XFlight F405 V3 / BF 4.5.3 / NEO-M10):
+//   buf[5]    : numCh = 0x20 (32 channels for NEO-M10)
+//   buf[6..]  : channel records, 4 bytes each:
+//     rec[0]  chn    : bits[7:4] = GNSS ID (when numCh > 16)
+//                      bits[3:0] = channel index
+//     rec[1]  svid   : satellite vehicle ID / PRN
+//     rec[2]  packed : PACKED BYTE — confirmed from live debug (values 0x11, 0x1C):
+//                        bits[7:4] = gnssId   (GNSS system 0-6)
+//                        bits[3:0] = quality  (UBX qualityInd 0-7)
+//     rec[3]  cno    : carrier-to-noise dBHz (0 = not tracked)
 //
-// Fields not available in MSP mode (always 0): elev, azim, prRes.
-// Python UI should check sv_source == "MSP" and hide Elev/Azim columns.
+//   payLen = 1 + numCh * 4  →  1 + 32*4 = 129 bytes for NEO-M10
+//
+// "used" flag: BF MSP_GPS_SV_INFO has no separate svUsed bit.
+//   quality >= 4 means the satellite contributes to the fix (BF convention).
+//
+// elev, azim and prRes are always 0 — not present in the 4-byte record.
+// Python UI should hide Elev/Azim columns when sv_source == "MSP".
 // =============================================================================
 struct SVInfoEntry {
     uint8_t     chn = 0;    // channel index (lower nibble when numCh>16)
     uint8_t     svid = 0;    // satellite vehicle ID / PRN
     uint8_t     flags = 0;    // packed: bits[0:2]=quality, bit[3]=used
-    uint8_t     quality = 0;    // 0-7 UBX qualityInd
+    uint8_t     quality = 0;    // 0-7 UBX qualityInd (unpacked from rec[2] lower nibble)
     uint8_t     cno = 0;    // dBHz signal strength
-    int8_t      elev = 0;    // degrees (-90..+90) — 0 in MSP mode
-    int16_t     azim = 0;    // degrees (0..360)   — 0 in MSP mode
-    int16_t     prRes = 0;    // pseudorange residual — 0 in MSP mode
+    int8_t      elev = 0;    // always 0 — not present in 4-byte MSP record
+    int16_t     azim = 0;    // always 0 — not present in 4-byte MSP record
+    int16_t     prRes = 0;    // always 0 — not present in MSP cmd 164
     uint8_t     gnssId = 0;    // 0=GPS 1=SBAS 2=Galileo 3=BeiDou 5=QZSS 6=GLONASS
     std::string gnssName;         // "GPS", "GLONASS", "Galileo", etc.
     std::string statusStr;        // "used", "tracked", "acquired", "searching", "idle"
@@ -139,13 +146,19 @@ public:
     //
     // Confirmed format (NEO-M10, BF 4.5.3):
     //   buf[0..4] = MSP header ($M> payLen cmd)
-    //   buf[5]    = numCh (32 = 0x20 for M10)
+    //   buf[5]    = numCh (32 = 0x20 for NEO-M10)
     //   buf[6..6+numCh*4-1] = channel records (4 bytes each)
     //   buf[last] = checksum
+    //   payLen    = 1 + numCh * 4  (129 for 32 channels)
     //
-    // GNSS ID encoding (numCh > 16):
-    //   chn byte = (gnss_id << 4) | channel_index
-    //   gnss_id : 0=GPS 1=SBAS 2=Galileo 3=BeiDou 5=QZSS 6=GLONASS
+    // Channel record layout (4 bytes):
+    //   [0] chn    : bits[7:4]=gnssId (when numCh>16), bits[3:0]=chnIdx
+    //   [1] svid   : satellite vehicle ID
+    //   [2] packed : bits[7:4]=gnssId, bits[3:0]=qualityInd 0-7  ← PACKED
+    //   [3] cno    : carrier-to-noise dBHz
+    //
+    // GNSS ID encoding (rec[2] upper nibble, confirmed from live debug):
+    //   0=GPS  1=SBAS  2=Galileo  3=BeiDou  5=QZSS  6=GLONASS
     //
     // Returns true and fills svList on success.
     // Returns false (leaves svList unchanged) on any parse failure.
