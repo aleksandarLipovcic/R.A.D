@@ -34,6 +34,25 @@ int32_t GPSNeoM10::read32(const std::vector<uint8_t>& b, int i) {
 }
 
 // =============================================================================
+// gnssIdToName()  [private static]
+//
+// Shared by parseMspSvInfo() and parseNavSvInfo() so the mapping is defined
+// exactly once. u-blox gnssId values match UBX-NAV-SAT and the GNSS nibble
+// packed into the chn byte of MSP_GPS_SV_INFO (cmd 164) for M10 modules.
+// =============================================================================
+std::string GPSNeoM10::gnssIdToName(uint8_t gnssId) {
+    switch (gnssId) {
+    case 0:  return "GPS";
+    case 1:  return "SBAS";
+    case 2:  return "Galileo";
+    case 3:  return "BeiDou";
+    case 5:  return "QZSS";
+    case 6:  return "GLONASS";
+    default: return "Unknown";
+    }
+}
+
+// =============================================================================
 // addUbxChecksum()
 //
 // Appends CK_A and CK_B (Fletcher-8) to a UBX frame.
@@ -126,6 +145,129 @@ bool GPSNeoM10::parseComp(const std::vector<uint8_t>& buf, GPSReading& out) {
 }
 
 // =============================================================================
+// parseMspSvInfo() -- MSP_GPS_SV_INFO (command ID 164 / 0xA4)
+//
+// PRIMARY satellite data source for this project. Polled directly in the
+// main communicationLoop() -- no passthrough, no port cycle, always available.
+//
+// Confirmed working by sv_baud_probe.py:
+//   cmd 164 (MSP_GPS_SV_INFO) -> 129 bytes  [20 00 02 1F ...]
+//
+// MSP frame layout (full frame including header):
+//   [0..2]  '$' 'M' '>'    MSP response preamble
+//   [3]     payloadLen      number of payload bytes  (0x81 = 129 for M10)
+//   [4]     0xA4            command ID 164
+//   [5]     numCh           number of channels (0x20 = 32 for M10)
+//   [6..]   numCh × 4 bytes per channel (see below)
+//   [last]  checksum
+//
+// Per-channel block (4 bytes):
+//   [0] chn     channel byte
+//               When numCh > 16 (M10 reports 32):
+//                 upper nibble = GNSS id  (0=GPS,1=SBAS,2=Galileo,3=BDS,5=QZSS,6=GLO)
+//                 lower nibble = channel index within that constellation
+//               When numCh ≤ 16 (legacy 16-ch modules):
+//                 full byte = channel index, gnssId inferred from svid range
+//   [1] svid    satellite vehicle ID
+//   [2] quality signal quality 0-7 (same encoding as UBX qualityInd):
+//                 0=no signal, 1=searching, 2=acquired, 3=unusable,
+//                 4=code locked, 5/6/7=code+carrier locked (fully locked)
+//   [3] cno     carrier-to-noise density, dBHz (0-55)
+//
+// Fields NOT available in cmd 164 (set to 0 in SVInfoEntry):
+//   elev, azim, prRes
+//
+// The Python GPSWidget should hide the Elev/Azim columns when
+// sv_source == "MSP" (see DroneLink.h sv_source field comment).
+//
+// Channels where svid==0 AND cno==0 are unused receiver slots -- skipped.
+// =============================================================================
+bool GPSNeoM10::parseMspSvInfo(const std::vector<uint8_t>& buf,
+    std::vector<SVInfoEntry>& out)
+{
+    // Minimum frame: preamble(3) + len(1) + cmd(1) + numCh(1) + checksum(1) = 7
+    if (buf.size() < 7)  return false;
+    if (buf[4] != 164)   return false;
+
+    const uint8_t numCh = buf[5];
+    if (numCh == 0)      return false;
+
+    // Verify frame is large enough for all channels + checksum
+    const size_t expectedMin = 6u + static_cast<size_t>(numCh) * 4u + 1u;
+    if (buf.size() < expectedMin) return false;
+
+    // M10 reports 32 channels: GNSS id is in the upper nibble of the chn byte.
+    // Legacy 16-ch modules pack the full channel index into the chn byte.
+    const bool gnssInHighNibble = (numCh > 16);
+
+    out.clear();
+    out.reserve(numCh);
+
+    for (uint8_t i = 0; i < numCh; ++i) {
+        const size_t base = 6u + static_cast<size_t>(i) * 4u;
+
+        const uint8_t chnByte = buf[base + 0];
+        const uint8_t svid = buf[base + 1];
+        const uint8_t quality = buf[base + 2];
+        const uint8_t cno = buf[base + 3];
+
+        // Skip unused receiver channel slots
+        if (svid == 0 && cno == 0) continue;
+
+        SVInfoEntry e;
+
+        if (gnssInHighNibble) {
+            e.gnssId = (chnByte >> 4) & 0x0Fu;
+            e.chn = chnByte & 0x0Fu;
+        }
+        else {
+            // Legacy path: infer GNSS from svid range (GPS only module)
+            e.gnssId = 0;
+            e.chn = chnByte;
+        }
+
+        e.svid = svid;
+        e.quality = quality;
+        e.cno = cno;
+
+        // elev, azim, prRes not available via MSP cmd 164 -- remain 0
+        e.elev = 0;
+        e.azim = 0;
+        e.prRes = 0;
+
+        // Reconstruct flags byte to match the SVInfoEntry convention used by
+        // the UBX path: bits[0:2] = qualityInd, bit[3] = svUsed.
+        // This lets Python code treat both sources identically.
+        e.used = (quality >= 4);
+        e.flags = static_cast<uint8_t>(
+            (quality & 0x07u) | (e.used ? 0x08u : 0x00u));
+
+        e.gnssName = gnssIdToName(e.gnssId);
+
+        // Status string matches BF Configurator terminology
+        if (e.used) {
+            e.statusStr = "used";
+        }
+        else if (quality >= 4) {
+            e.statusStr = "tracked";    // code locked but not chosen for fix
+        }
+        else if (quality >= 2) {
+            e.statusStr = "acquired";
+        }
+        else if (quality == 1) {
+            e.statusStr = "searching";
+        }
+        else {
+            e.statusStr = "idle";
+        }
+
+        out.push_back(e);
+    }
+
+    return !out.empty();
+}
+
+// =============================================================================
 // buildNavSvInfoPoll() -- UBX-NAV-SAT (Class 0x01, ID 0x35)
 //
 // NOTE ON HARDWARE COMPATIBILITY
@@ -133,7 +275,7 @@ bool GPSNeoM10::parseComp(const std::vector<uint8_t>& buf, GPSReading& out) {
 // The u-blox NEO-M10 (and the broader M10/HPG firmware platform) does NOT
 // implement UBX-NAV-SVINFO (Class 0x01, ID 0x30).  That message was deprecated
 // in u-blox generation 9 and is absent from HPG firmware entirely.  Polling
-// 0x30 on a NEO-M10 produces no response — which is why the satellite list
+// 0x30 on a NEO-M10 produces no response -- which is why the satellite list
 // was always empty.
 //
 // The correct replacement is UBX-NAV-SAT (Class 0x01, ID 0x35), available on
@@ -142,23 +284,13 @@ bool GPSNeoM10::parseComp(const std::vector<uint8_t>& buf, GPSReading& out) {
 // This function is named buildNavSvInfoPoll() to match its declaration in the
 // header; the underlying UBX message ID has been updated to 0x35 accordingly.
 //
-// NAV-SAT response layout:
-//   Header (8 bytes): iTOW(4), version(1), numSvs(1), reserved(2)
-//   Per-SV blocks: numSvs × 12 bytes
-//     [0]  gnssId  uint8   GNSS system (0=GPS,1=SBAS,2=GAL,3=BDS,5=QZSS,6=GLO)
-//     [1]  svId    uint8   satellite vehicle identifier
-//     [2]  cno     uint8   carrier-to-noise density, dBHz
-//     [3]  elev    int8    elevation, degrees (-90 to +90)
-//     [4]  azim    int16   azimuth, degrees (0-360), little-endian
-//     [6]  prRes   int16   pseudorange residual x0.1 m, little-endian
-//     [8]  flags   uint32  little-endian bitfield:
-//                            bits[0:2] qualityInd  (0=no sig .. 7=carrier locked)
-//                            bit[3]    svUsed      (1 = contributes to fix)
-//                            bits[4:5] health      (0=unknown,1=OK,2=unhealthy)
-//                            bit[6]    diffCorr
-//                            bit[7]    smoothed
-//                            bits[8:10] orbitSource
-//                            ...
+// NOTE ON REACHABILITY
+// ────────────────────
+// With gps_auto_config=ON (BF 4.5.x default) the GPS UART is locked by BF.
+// sv_baud_probe.py confirmed 0 bytes returned on all 6 UART indices.
+// This poll frame is therefore only useful when applyGPSConfig() is called
+// and the caller knows passthrough will work (gps_auto_config=OFF).
+// For satellite polling use MSP cmd 164 (parseMspSvInfo) instead.
 // =============================================================================
 std::vector<uint8_t> GPSNeoM10::buildNavSvInfoPoll() {
     std::vector<uint8_t> frame = {
@@ -173,29 +305,25 @@ std::vector<uint8_t> GPSNeoM10::buildNavSvInfoPoll() {
 // =============================================================================
 // parseNavSvInfo() -- UBX-NAV-SAT response payload parser
 //
-// Parses the payload of a UBX-NAV-SAT (0x01/0x35) response.
-//
-// IMPORTANT DIFFERENCES FROM UBX-NAV-SVINFO (the old message this replaces):
-//
-//   Field         SVINFO offset    NAV-SAT offset    Notes
-//   ──────────    ────────────     ──────────────    ──────────────────────────
-//   SV count      [4] numCh        [5] numSvs         Different byte position!
-//   gnssId        inferred         [0] direct         NAV-SAT is authoritative
-//   svId          [1]              [1]                same
-//   cno           [4]              [2]                different position
-//   elev          [5]              [3]                different position
-//   azim          [6..7] int16     [4..5] int16       same type, shifted
-//   prRes         [8..11] int32    [6..7] int16       NAV-SAT is int16 x0.1m
-//   flags byte    [2]              flags32 bits 0-7   flags is uint32 in NAV-SAT
-//   quality byte  [3]              flags32 bits 0-2   embedded in flags
-//   svUsed        flags bit 0      flags32 bit 3      bit position differs
-//
-// The function name is kept as parseNavSvInfo() to match the header declaration
-// and avoid cascading renames in DroneLink.cpp and bindings.cpp.
+// FALLBACK PATH -- only reachable when gps_auto_config=OFF.
+// On this project (BF 4.5.x, gps_auto_config=ON) this function is never
+// reached during normal operation. It is kept for:
+//   - applyGPSConfig() verification
+//   - Future hardware where passthrough is available
 //
 // ubxPayload: raw UBX payload bytes starting after the 6-byte UBX header
 //             and ending before the 2-byte checksum.
 //             Minimum valid size = 8 bytes (header only, numSvs=0).
+//
+// NAV-SAT header: iTOW(4) + version(1) + numSvs(1) + reserved(2) = 8 bytes
+// Per-SV block (12 bytes):
+//   [0]  gnssId  uint8
+//   [1]  svId    uint8
+//   [2]  cno     uint8
+//   [3]  elev    int8
+//   [4]  azim    int16 LE
+//   [6]  prRes   int16 LE  (0.1 m units)
+//   [8]  flags   uint32 LE (bits[0:2]=qualityInd, bit[3]=svUsed)
 // =============================================================================
 bool GPSNeoM10::parseNavSvInfo(const std::vector<uint8_t>& ubxPayload,
     std::vector<SVInfoEntry>& out)
@@ -213,61 +341,35 @@ bool GPSNeoM10::parseNavSvInfo(const std::vector<uint8_t>& ubxPayload,
     out.clear();
     out.reserve(numSvs);
 
-    // NAV-SAT provides gnssId directly in each SV block — no svId range
-    // inference is needed.
-    auto gnssIdToName = [](uint8_t gnssId) -> std::string {
-        switch (gnssId) {
-        case 0:  return "GPS";
-        case 1:  return "SBAS";
-        case 2:  return "Galileo";
-        case 3:  return "BeiDou";
-        case 5:  return "QZSS";
-        case 6:  return "GLONASS";
-        default: return "Unknown";
-        }
-        };
-
     for (uint8_t i = 0; i < numSvs; ++i) {
         const size_t base = 8u + static_cast<size_t>(i) * 12u;
 
         SVInfoEntry e;
 
-        // ── NAV-SAT per-SV block layout ───────────────────────────────────
-        e.gnssId = ubxPayload[base + 0];                             // uint8
-        e.svid = ubxPayload[base + 1];                             // uint8
-        e.cno = ubxPayload[base + 2];                             // uint8, dBHz
-        e.elev = static_cast<int8_t>(ubxPayload[base + 3]);        // int8,  deg
-        e.azim = read16(ubxPayload, static_cast<int>(base + 4));   // int16, deg
-        // prRes: int16 at [6..7], units = 0.1 m  (int32 in old SVINFO)
+        e.gnssId = ubxPayload[base + 0];
+        e.svid = ubxPayload[base + 1];
+        e.cno = ubxPayload[base + 2];
+        e.elev = static_cast<int8_t>(ubxPayload[base + 3]);
+        e.azim = read16(ubxPayload, static_cast<int>(base + 4));
         e.prRes = static_cast<int32_t>(
             read16(ubxPayload, static_cast<int>(base + 6)));
 
-        // flags: uint32 at [8..11]
         const uint32_t flags32 =
             static_cast<uint32_t>(ubxPayload[base + 8]) |
             (static_cast<uint32_t>(ubxPayload[base + 9]) << 8) |
             (static_cast<uint32_t>(ubxPayload[base + 10]) << 16) |
             (static_cast<uint32_t>(ubxPayload[base + 11]) << 24);
 
-        const uint8_t qualityInd = static_cast<uint8_t>(flags32 & 0x07u);  // bits 0-2
-        const bool    svUsed = (flags32 & 0x08u) != 0u;                 // bit 3
+        const uint8_t qualityInd = static_cast<uint8_t>(flags32 & 0x07u);
+        const bool    svUsed = (flags32 & 0x08u) != 0u;
 
-        // Store raw flags lower byte for compatibility with SVInfoEntry.flags
         e.flags = static_cast<uint8_t>(flags32 & 0xFFu);
         e.quality = qualityInd;
         e.used = svUsed;
-        // NAV-SAT has no tracking-channel field; use the SV index as a proxy
         e.chn = i;
 
         e.gnssName = gnssIdToName(e.gnssId);
 
-        // qualityInd values (u-blox M10 HPG Integration Manual, s2.x):
-        //   0 = no signal
-        //   1 = searching
-        //   2 = signal acquired
-        //   3 = signal detected but unusable
-        //   4 = code locked and time synchronized
-        //   5..7 = code + carrier locked (full tracking)
         if (svUsed) {
             e.statusStr = "used";
         }
@@ -284,8 +386,6 @@ bool GPSNeoM10::parseNavSvInfo(const std::vector<uint8_t>& ubxPayload,
             e.statusStr = "idle";
         }
 
-        // Include only SVs with a valid satellite identifier.
-        // svId == 0 means an unused receiver channel slot.
         if (e.svid != 0)
             out.push_back(e);
     }
@@ -312,48 +412,27 @@ bool GPSNeoM10::parseNavStatus(const std::vector<uint8_t>& buf, NavStatus& out) 
 
 // =============================================================================
 // buildCfgGNSS() -- UBX-CFG-GNSS (Class 0x06, ID 0x3E)
-//
-// Enables / disables individual GNSS constellations on the NEO-M10.
-//
-// GPS is mandatory -- if GNSS_GPS is missing from constellationFlags it is
-// forced on here. A receiver without GPS would not provide ICAO-compatible
-// position data.
-//
-// NEO-M10 channel budget (firmware >= HPG 1.00):
-//   15 total tracking channels. Only valid combos:
-//   GPS+GAL, GPS+GLO, GPS+BDS -- not all four simultaneously.
-//
-// GNSS block layout (8 bytes per constellation):
-//   gnssId    uint8   u-blox constellation ID
-//   resTrkCh  uint8   reserved tracking channels (minimum)
-//   maxTrkCh  uint8   max tracking channels when enabled
-//   reserved  uint8   0x00
-//   flags     uint32  LE; bit 0 = enable, bits[24:16] = sigCfgMask (L1=0x01)
 // =============================================================================
 std::vector<uint8_t> GPSNeoM10::buildCfgGNSS(uint8_t constellationFlags) {
-    // GPS is mandatory
     constellationFlags |= GPSConstellationFlags::GNSS_GPS;
 
     struct ConstellEntry {
-        uint8_t flag;        // GPSConstellationFlags bit
-        uint8_t gnssId;      // u-blox UBX gnssId (differs from flag for QZSS)
+        uint8_t flag;
+        uint8_t gnssId;
         uint8_t resTrkCh;
         uint8_t maxTrkCh;
-        uint8_t sigCfgMask;  // bits[24:16] of flags word; L1 = 0x01
+        uint8_t sigCfgMask;
     };
 
-    // NEO-M10 channel allocation per u-blox M10 Integration Manual s3.13.
-    // QZSS: gnssId=5, not 4 -- the gap is intentional in the u-blox spec.
     const ConstellEntry table[] = {
-        { GNSS_GPS,     0, 8,  15, 0x01 },   // GPS L1 C/A
-        { GNSS_SBAS,    1, 1,   3, 0x01 },   // SBAS (WAAS/EGNOS)
-        { GNSS_GALILEO, 2, 4,   8, 0x01 },   // Galileo E1
-        { GNSS_BEIDOU,  3, 8,  15, 0x01 },   // BeiDou B1
-        { GNSS_QZSS,    5, 0,   3, 0x01 },   // QZSS L1 C/A (Japan regional)
-        { GNSS_GLONASS, 6, 8,  15, 0x01 },   // GLONASS L1 OF
+        { GNSS_GPS,     0, 8,  15, 0x01 },
+        { GNSS_SBAS,    1, 1,   3, 0x01 },
+        { GNSS_GALILEO, 2, 4,   8, 0x01 },
+        { GNSS_BEIDOU,  3, 8,  15, 0x01 },
+        { GNSS_QZSS,    5, 0,   3, 0x01 },
+        { GNSS_GLONASS, 6, 8,  15, 0x01 },
     };
 
-    // FIX: explicit cast to uint8_t avoids MSVC C4244 narrowing warning.
     const uint8_t  numBlocks = static_cast<uint8_t>(sizeof(table) / sizeof(table[0]));
     const uint8_t  msgVer = 0x00;
     const uint8_t  numTrkCh = 15;
@@ -362,21 +441,15 @@ std::vector<uint8_t> GPSNeoM10::buildCfgGNSS(uint8_t constellationFlags) {
     std::vector<uint8_t> frame;
     frame.reserve(6u + payloadLen + 2u);
 
-    // UBX preamble + frame header
-    frame.push_back(0xB5);
-    frame.push_back(0x62);
-    frame.push_back(0x06);   // class: CFG
-    frame.push_back(0x3E);   // id:    CFG-GNSS
+    frame.push_back(0xB5); frame.push_back(0x62);
+    frame.push_back(0x06); frame.push_back(0x3E);
     frame.push_back(static_cast<uint8_t>(payloadLen & 0xFF));
     frame.push_back(static_cast<uint8_t>(payloadLen >> 8));
-
-    // CFG-GNSS payload header (4 bytes)
     frame.push_back(msgVer);
-    frame.push_back(0x00);       // numTrkChHw = 0 (auto)
+    frame.push_back(0x00);
     frame.push_back(numTrkCh);
     frame.push_back(numBlocks);
 
-    // One 8-byte block per constellation
     for (const auto& e : table) {
         bool     enabled = (constellationFlags & e.flag) != 0;
         uint32_t flags32 = (enabled ? 0x00000001u : 0x00000000u)
@@ -385,7 +458,7 @@ std::vector<uint8_t> GPSNeoM10::buildCfgGNSS(uint8_t constellationFlags) {
         frame.push_back(e.gnssId);
         frame.push_back(e.resTrkCh);
         frame.push_back(enabled ? e.maxTrkCh : static_cast<uint8_t>(0));
-        frame.push_back(0x00);   // reserved1
+        frame.push_back(0x00);
         frame.push_back(static_cast<uint8_t>(flags32 & 0xFF));
         frame.push_back(static_cast<uint8_t>((flags32 >> 8) & 0xFF));
         frame.push_back(static_cast<uint8_t>((flags32 >> 16) & 0xFF));
@@ -398,11 +471,6 @@ std::vector<uint8_t> GPSNeoM10::buildCfgGNSS(uint8_t constellationFlags) {
 
 // =============================================================================
 // buildCfgRate() -- UBX-CFG-RATE (Class 0x06, ID 0x08)
-//
-// Payload (6 bytes):
-//   measRate  uint16 LE   measurement period in milliseconds
-//   navRate   uint16 LE   number of measurements per nav solution (always 1)
-//   timeRef   uint16 LE   0 = UTC, 1 = GPS time
 // =============================================================================
 std::vector<uint8_t> GPSNeoM10::buildCfgRate(GPSUpdateRate rateHz,
     uint16_t timeRef) {
@@ -411,12 +479,10 @@ std::vector<uint8_t> GPSNeoM10::buildCfgRate(GPSUpdateRate rateHz,
     uint16_t measMs = static_cast<uint16_t>(1000u / hz);
 
     std::vector<uint8_t> frame = {
-        0xB5, 0x62,
-        0x06, 0x08,
-        0x06, 0x00,
+        0xB5, 0x62, 0x06, 0x08, 0x06, 0x00,
         static_cast<uint8_t>(measMs & 0xFF),
         static_cast<uint8_t>((measMs >> 8) & 0xFF),
-        0x01, 0x00,   // navRate = 1
+        0x01, 0x00,
         static_cast<uint8_t>(timeRef & 0xFF),
         static_cast<uint8_t>((timeRef >> 8) & 0xFF),
     };
@@ -425,35 +491,20 @@ std::vector<uint8_t> GPSNeoM10::buildCfgRate(GPSUpdateRate rateHz,
 }
 
 // =============================================================================
-// buildCfgPrt() -- UBX-CFG-PRT (Class 0x06, ID 0x00) -- UART1 port
-//
-// Payload (20 bytes):
-//   portID       uint8   0x01 = UART1
-//   reserved1    uint8   0x00
-//   txReady      uint16  0x0000 (disabled)
-//   mode         uint32  8N1, no parity (0x000008D0)
-//   baudRate     uint32  115200 = 0x0001C200
-//   inProtoMask  uint16  0x0001 = UBX in (always; needed for config commands)
-//   outProtoMask uint16  0x0001 = UBX, 0x0002 = NMEA
-//   flags        uint16  0x0000
-//   reserved2    uint16  0x0000
+// buildCfgPrt() -- UBX-CFG-PRT (Class 0x06, ID 0x00)
 // =============================================================================
 std::vector<uint8_t> GPSNeoM10::buildCfgPrt(GPSProtocol protocol) {
-    uint16_t outProto = 0x0001u;   // default: UBX only
+    uint16_t outProto = 0x0001u;
     if (protocol == GPSProtocol::NMEA)
-        outProto = 0x0002u;        // NMEA only
+        outProto = 0x0002u;
 
     const uint32_t baud = 115200u;
-    const uint32_t mode = 0x000008D0u;   // 8N1, no flow control
+    const uint32_t mode = 0x000008D0u;
     const uint16_t inProto = 0x0001u;
 
     std::vector<uint8_t> frame = {
-        0xB5, 0x62,
-        0x06, 0x00,
-        0x14, 0x00,   // length = 20
-        0x01,         // portID = UART1
-        0x00,
-        0x00, 0x00,   // txReady disabled
+        0xB5, 0x62, 0x06, 0x00, 0x14, 0x00,
+        0x01, 0x00, 0x00, 0x00,
         static_cast<uint8_t>(mode & 0xFF),
         static_cast<uint8_t>((mode >> 8) & 0xFF),
         static_cast<uint8_t>((mode >> 16) & 0xFF),
@@ -466,8 +517,7 @@ std::vector<uint8_t> GPSNeoM10::buildCfgPrt(GPSProtocol protocol) {
         static_cast<uint8_t>((inProto >> 8) & 0xFF),
         static_cast<uint8_t>(outProto & 0xFF),
         static_cast<uint8_t>((outProto >> 8) & 0xFF),
-        0x00, 0x00,   // flags
-        0x00, 0x00,   // reserved2
+        0x00, 0x00, 0x00, 0x00,
     };
     addUbxChecksum(frame);
     return frame;
@@ -475,44 +525,26 @@ std::vector<uint8_t> GPSNeoM10::buildCfgPrt(GPSProtocol protocol) {
 
 // =============================================================================
 // buildCfgNav5() -- UBX-CFG-NAV5 (Class 0x06, ID 0x24)
-//
-// CRITICAL: dynModel = 8 (Airborne <4g) is MANDATORY for UAV applications.
-// This removes the speed cap and 50 000 m altitude cap that consumer models
-// impose. Using model 0 (Portable) or 4 (Automotive) causes incorrect
-// positions at speeds above ~27 m/s or altitudes above 9000 m.
-//
-// mask = 0x0005: apply dynModel (bit 0) + elevation mask (bit 2).
-// Payload is 36 bytes; unused fields are zero-filled.
 // =============================================================================
 std::vector<uint8_t> GPSNeoM10::buildCfgNav5(uint8_t elevMaskDeg) {
     const uint16_t mask = 0x0005u;
-    const uint8_t  dynModel = 8u;    // Airborne <4g -- MANDATORY for UAV
-    const uint8_t  fixMode = 3u;    // auto 2D/3D
+    const uint8_t  dynModel = 8u;
+    const uint8_t  fixMode = 3u;
 
     std::vector<uint8_t> frame = {
-        0xB5, 0x62,
-        0x06, 0x24,
-        0x24, 0x00,   // length = 36
+        0xB5, 0x62, 0x06, 0x24, 0x24, 0x00,
         static_cast<uint8_t>(mask & 0xFF),
         static_cast<uint8_t>((mask >> 8) & 0xFF),
-        dynModel,
-        fixMode,
-        0x00, 0x00, 0x00, 0x00,   // fixedAlt     (unused; fixMode=3)
-        0x00, 0x00, 0x00, 0x00,   // fixedAltVar  (unused)
-        elevMaskDeg,
-        0x00,                      // drLimit
-        0x00, 0x00,                // pDop
-        0x00, 0x00,                // tDop
-        0x00, 0x00,                // pAcc
-        0x00, 0x00,                // tAcc
-        0x00,                      // staticHoldThresh
-        0x00,                      // dgnssTimeout
-        0x00,                      // cnoThreshNumSVs
-        0x00,                      // cnoThresh (see GPSConfig::signalMaskDbHz note)
-        0x00, 0x00,                // reserved1
-        0x00, 0x00,                // staticHoldDist
-        0x00,                      // utcStandard (auto)
-        0x00, 0x00, 0x00,          // reserved2[3]
+        dynModel, fixMode,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        elevMaskDeg, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
     };
     addUbxChecksum(frame);
     return frame;
@@ -520,23 +552,14 @@ std::vector<uint8_t> GPSNeoM10::buildCfgNav5(uint8_t elevMaskDeg) {
 
 // =============================================================================
 // buildCfgCfg() -- UBX-CFG-CFG (Class 0x06, ID 0x09)
-//
-// Saves current config to BBR and flash.
-// Payload (13 bytes):
-//   clearMask   uint32  0x00000000 -- do not erase
-//   saveMask    uint32  0x0000061F -- save IO ports, messages, INF, nav, rxm
-//   loadMask    uint32  0x00000000 -- do not load
-//   deviceMask  uint8   0x07       -- BBR + Flash + EEPROM
 // =============================================================================
 std::vector<uint8_t> GPSNeoM10::buildCfgCfg() {
     std::vector<uint8_t> frame = {
-        0xB5, 0x62,
-        0x06, 0x09,
-        0x0D, 0x00,   // length = 13
-        0x00, 0x00, 0x00, 0x00,   // clearMask = 0
-        0x1F, 0x06, 0x00, 0x00,   // saveMask  = 0x0000061F (LE)
-        0x00, 0x00, 0x00, 0x00,   // loadMask  = 0
-        0x07,                      // deviceMask: BBR + Flash + EEPROM
+        0xB5, 0x62, 0x06, 0x09, 0x0D, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x1F, 0x06, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x07,
     };
     addUbxChecksum(frame);
     return frame;
@@ -544,23 +567,14 @@ std::vector<uint8_t> GPSNeoM10::buildCfgCfg() {
 
 // =============================================================================
 // parseAck() -- UBX-ACK-ACK (Class 0x05, ID 0x01)
-//
-// Frame layout (10 bytes):
-//   [0..1]  0xB5 0x62  preamble
-//   [2]     0x05       class ACK
-//   [3]     0x01       id ACK-ACK (0x00 = ACK-NAK = rejected)
-//   [4..5]  0x02 0x00  payload length = 2
-//   [6]     clsID      class of the acknowledged message
-//   [7]     msgID      id    of the acknowledged message
-//   [8..9]  CK_A CK_B
 // =============================================================================
 bool GPSNeoM10::parseAck(const std::vector<uint8_t>& buf,
     uint8_t msgClass, uint8_t msgId) {
     if (buf.size() < 10)    return false;
     if (buf[0] != 0xB5)     return false;
     if (buf[1] != 0x62)     return false;
-    if (buf[2] != 0x05)     return false;   // class ACK
-    if (buf[3] != 0x01)     return false;   // id ACK-ACK (not NAK=0x00)
+    if (buf[2] != 0x05)     return false;
+    if (buf[3] != 0x01)     return false;
     if (buf[6] != msgClass) return false;
     if (buf[7] != msgId)    return false;
     return true;
@@ -568,18 +582,11 @@ bool GPSNeoM10::parseAck(const std::vector<uint8_t>& buf,
 
 // =============================================================================
 // wrapUbxInMspPassthrough()
-//
-// MSP_PASSTHROUGH (ID 0xF5 = 245) frame layout:
-//   '$' 'M' '<'  payloadLen  0xF5  <UBX frame bytes>  checksum
-//
-// checksum = XOR of payloadLen ^ 0xF5 ^ all UBX bytes.
-//
-// Prerequisite: BF Configurator -> Ports -> GPS UART -> Passthrough: ON.
 // =============================================================================
 std::vector<uint8_t> GPSNeoM10::wrapUbxInMspPassthrough(
     const std::vector<uint8_t>& ubxFrame)
 {
-    if (ubxFrame.size() > 255) return {};   // MSP payload length is 1 byte
+    if (ubxFrame.size() > 255) return {};
 
     const auto    payloadLen = static_cast<uint8_t>(ubxFrame.size());
     const uint8_t MSP_PASSTHROUGH = 0xF5u;

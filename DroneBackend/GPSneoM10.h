@@ -162,30 +162,44 @@ struct GPSConfigResult {
 // =============================================================================
 // SVInfoEntry
 //
-// One entry from UBX-NAV-SVINFO (Class 0x01, ID 0x30).
-// Mirrors the per-SV block in the UBX payload (12 bytes each).
+// One satellite channel entry, usable from both data sources:
 //
-// This is the data source for the Satellites tab columns:
-//   GNSS | SV | Signal | dBHz | Status | Quality
+//   SOURCE A (primary): MSP_GPS_SV_INFO (cmd 164)
+//     Polled directly in the main communicationLoop() every SV_POLL_TICKS.
+//     Always available when GPS is assigned in BF Ports tab.
+//     Provides: gnssId, svid, quality, cno, gnssName, statusStr, used, flags.
+//     Does NOT provide: elev, azim, prRes (left as 0).
 //
-// gnssName / statusStr are helpers pre-computed in parseNavSvInfo()
-// so Python does not need to implement the ID-to-name mapping.
+//   SOURCE B (fallback): UBX-NAV-SAT (0x01/0x35) via MSP passthrough
+//     Only reachable when gps_auto_config=OFF in Betaflight CLI.
+//     With gps_auto_config=ON (the default) the GPS UART is locked by BF
+//     and passthrough returns 0 bytes -- this source is permanently dead
+//     on standard Betaflight 4.5.x setups.
+//     Provides all fields including elev, azim, prRes.
+//
+// Fields populated by both sources are marked [A+B].
+// Fields populated by source B only are marked [B only] -- will be 0 for MSP.
+//
+// The Python GPSWidget reads: gnss_name, svid, cno, status_str, used,
+// quality, gnss_id, elev, azim.  All are populated by source A except
+// elev and azim which remain 0 and should be hidden in the UI when
+// sv_source == "MSP".
 // =============================================================================
 struct SVInfoEntry {
-    uint8_t  chn = 0;      // tracking channel (0-15)
-    uint8_t  svid = 0;      // satellite vehicle ID (PRN for GPS)
-    uint8_t  flags = 0;      // bitfield: bit0=svUsed, bit1=diffCorr, etc.
-    uint8_t  quality = 0;      // 0-7 UBX signal quality indicator
-    uint8_t  cno = 0;      // carrier-to-noise, dBHz (0-55)
-    int8_t   elev = 0;      // elevation, degrees (-90 to +90)
-    int16_t  azim = 0;      // azimuth, degrees (0 to 360)
-    int32_t  prRes = 0;      // pseudorange residual, cm
-    uint8_t  gnssId = 0;      // 0=GPS,1=SBAS,2=GAL,3=BDS,5=QZSS,6=GLO
+    uint8_t  chn = 0;      // [A+B] channel index (SV index for MSP, track ch for UBX)
+    uint8_t  svid = 0;      // [A+B] satellite vehicle ID (PRN for GPS)
+    uint8_t  flags = 0;      // [A+B] lower byte: bits[0:2]=quality, bit[3]=svUsed
+    uint8_t  quality = 0;      // [A+B] 0-7 UBX signal quality indicator
+    uint8_t  cno = 0;      // [A+B] carrier-to-noise, dBHz (0-55)
+    int8_t   elev = 0;      // [B only] elevation, degrees (-90 to +90); 0 for MSP
+    int16_t  azim = 0;      // [B only] azimuth, degrees (0-360); 0 for MSP
+    int32_t  prRes = 0;      // [B only] pseudorange residual, cm; 0 for MSP
+    uint8_t  gnssId = 0;      // [A+B] 0=GPS,1=SBAS,2=GAL,3=BDS,5=QZSS,6=GLO
 
     // Pre-computed strings for direct use in Python UI
-    std::string gnssName;   // "GPS", "GLONASS", "Galileo", "BeiDou", "SBAS", "QZSS"
-    std::string statusStr;  // "used", "tracked", "searching", "idle"
-    bool        used = false;  // true when bit0 of flags is set
+    std::string gnssName;   // [A+B] "GPS", "GLONASS", "Galileo", "BeiDou", "SBAS", "QZSS"
+    std::string statusStr;  // [A+B] "used", "tracked", "searching", "idle"
+    bool        used = false;  // [A+B] true when satellite contributes to fix
 };
 
 // =============================================================================
@@ -217,8 +231,10 @@ struct NavStatus {
 // Mirrors the BaroBMP280 interface so DroneLink can call it uniformly.
 //
 // Parser methods:
-//   parseRaw()  -- MSP_RAW_GPS  (106) -> GPSReading
-//   parseComp() -- MSP_COMP_GPS (107) -> GPSReading
+//   parseRaw()       -- MSP_RAW_GPS      (106) -> GPSReading
+//   parseComp()      -- MSP_COMP_GPS     (107) -> GPSReading
+//   parseMspSvInfo() -- MSP_GPS_SV_INFO  (164) -> vector<SVInfoEntry>  ← PRIMARY
+//   parseNavSvInfo() -- UBX-NAV-SAT payload    -> vector<SVInfoEntry>  ← FALLBACK ONLY
 //
 // UBX frame builder methods (returns raw bytes ready to write to serial):
 //   buildCfgGNSS()  -- UBX-CFG-GNSS  constellation enable/disable
@@ -243,6 +259,34 @@ public:
     // -- MSP frame parsers ----------------------------------------------------
     static bool parseRaw(const std::vector<uint8_t>& buf, GPSReading& out);
     static bool parseComp(const std::vector<uint8_t>& buf, GPSReading& out);
+
+    // ── MSP_GPS_SV_INFO (cmd 164) parser  ────────────────────────────────────
+    //
+    // PRIMARY satellite data source. Called every SV_POLL_TICKS in the main
+    // communicationLoop() via a direct sendMSP(164) call -- no passthrough,
+    // no port close/reopen, no 30 s delay.
+    //
+    // Payload layout (confirmed 129 bytes for NEO-M10 with 32 channels):
+    //
+    //   Byte 0        numCh   -- number of channels (0x20 = 32 for M10)
+    //   Bytes 1..end  numCh × 4 bytes per channel:
+    //     [0] chn     -- channel byte:
+    //                    when numCh > 16: upper nibble = GNSS id, lower nibble = ch index
+    //                    when numCh ≤ 16: full byte = channel index, GNSS inferred from svid
+    //     [1] svid    -- satellite vehicle ID
+    //     [2] quality -- signal quality 0-7 (same scale as UBX qualityInd)
+    //     [3] cno     -- carrier-to-noise dBHz
+    //
+    // GNSS id nibble values (upper nibble of chn when numCh > 16):
+    //   0=GPS, 1=SBAS, 2=Galileo, 3=BeiDou, 5=QZSS, 6=GLONASS
+    //
+    // Fields NOT available in cmd 164 (left as 0 in SVInfoEntry):
+    //   elev, azim, prRes
+    //
+    // Returns false only on a malformed/empty payload.
+    // Channels where both svid==0 and cno==0 are skipped (unused slots).
+    static bool parseMspSvInfo(const std::vector<uint8_t>& buf,
+        std::vector<SVInfoEntry>& out);
 
     // -- UBX config frame builders --------------------------------------------
 
@@ -273,25 +317,34 @@ public:
     static bool parseAck(const std::vector<uint8_t>& buf,
         uint8_t msgClass, uint8_t msgId);
 
-    // -- MSP GPS passthrough helper -------------------------------------------
+    // -- MSP passthrough helper -----------------------------------------------
     // Wraps a raw UBX frame inside MSP_PASSTHROUGH (245) so it can be sent
     // to Betaflight which forwards it to the GPS UART transparently.
-    // Requires BF Configurator -> Ports -> GPS UART -> Passthrough: ON.
+    // Only used by applyGPSConfig() for UBX configuration writes.
+    // NOT used for satellite polling (use parseMspSvInfo instead).
     static std::vector<uint8_t> wrapUbxInMspPassthrough(
         const std::vector<uint8_t>& ubxFrame);
 
-    // -- UBX-NAV-SVINFO parser ---------------------------------------------------
-    // Parses the UBX-NAV-SVINFO response obtained via MSP passthrough.
-    // ubxPayload starts at byte 0 of the UBX payload (after header+length).
-    // Returns false if the payload is shorter than expected.
+    // -- UBX-NAV-SAT parser (FALLBACK -- passthrough path only) ---------------
+    //
+    // Parses the payload of a UBX-NAV-SAT (0x01/0x35) response obtained via
+    // MSP_SET_PASSTHROUGH. This path is BLOCKED on standard BF 4.5.x setups
+    // with gps_auto_config=ON because the GPS UART is locked by Betaflight.
+    //
+    // Only reachable when gps_auto_config=OFF in the BF CLI.
+    // With the NEO-M10 on this project: probe confirmed 0 bytes returned
+    // on all 6 UART indices -- do not attempt to use this path for sv polling.
+    //
+    // Kept for applyGPSConfig() and future hardware where passthrough works.
     static bool parseNavSvInfo(const std::vector<uint8_t>& ubxPayload,
         std::vector<SVInfoEntry>& out);
 
     // -- MSP_NAV_STATUS (121) parser ---------------------------------------------
     static bool parseNavStatus(const std::vector<uint8_t>& buf, NavStatus& out);
 
-    // -- UBX-NAV-SVINFO poll frame (to be wrapped in MSP passthrough) -----------
-    // Returns the UBX frame to send; caller wraps with wrapUbxInMspPassthrough().
+    // -- UBX-NAV-SAT poll frame (used ONLY by applyGPSConfig / UBX path) ------
+    // Named buildNavSvInfoPoll() to match the existing header declaration.
+    // Do NOT call this for satellite polling -- use sendMSP(164) instead.
     static std::vector<uint8_t> buildNavSvInfoPoll();
 
 private:
@@ -302,4 +355,7 @@ private:
 
     // Fletcher-8 checksum over Class + ID + Length + Payload (UBX spec s3.4)
     static void addUbxChecksum(std::vector<uint8_t>& frame);
+
+    // Shared GNSS id -> name lookup used by both parseMspSvInfo and parseNavSvInfo
+    static std::string gnssIdToName(uint8_t gnssId);
 };

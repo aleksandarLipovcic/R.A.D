@@ -21,6 +21,7 @@ namespace MSP {
     constexpr uint8_t ALTITUDE = 109;
     constexpr uint8_t ANALOG = 110;
     constexpr uint8_t NAV_STATUS = 121;
+    constexpr uint8_t GPS_SV_INFO = 164;   // MSP_GPS_SV_INFO -- satellite list
     constexpr uint8_t DEBUG = 254;
     constexpr uint8_t ACC_CAL = 205;
     constexpr uint8_t MAG_CAL = 206;
@@ -84,11 +85,24 @@ static constexpr int MAG_CAL_DURATION_S = 30;
 static constexpr int ACC_CAL_DURATION_S = 5;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SV poll interval — 30 s between satellite list refreshes.
-// The passthrough cycle closes and reopens the serial port (~300–600 ms),
-// briefly interrupting MSP.  30 s spacing keeps the impact negligible.
+// SV poll cadence
+//
+// SV_POLL_TICKS — how many communicationLoop() iterations between satellite
+// list refreshes via MSP_GPS_SV_INFO (cmd 164).
+//
+// At POLL_INTERVAL_MS = 10 ms (100 Hz loop):
+//   100 ticks = ~1 s refresh  (recommended: matches BF Configurator rate)
+//   500 ticks = ~5 s refresh
+//
+// Unlike the old UBX passthrough approach, MSP cmd 164 is a normal MSP query
+// that takes ~1-2 ms and does NOT close or reopen the serial port.
+// There is no penalty for polling frequently.
+//
+// The old SV_POLL_INTERVAL_S (30 s) was necessary because the passthrough
+// cycle required a port close/reopen cycle (~300-600 ms of link interruption).
+// That constraint is gone -- MSP cmd 164 is fire-and-forget.
 // ─────────────────────────────────────────────────────────────────────────────
-static constexpr int SV_POLL_INTERVAL_S = 30;
+static constexpr int SV_POLL_TICKS = 100;   // ~1 s at 100 Hz poll rate
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DroneState — written exclusively by the worker thread,
@@ -128,10 +142,24 @@ struct DroneState {
     // ── GPS — NEO-M10 via MSP_RAW_GPS (106) + MSP_COMP_GPS (107) ─────────────
     GPSReading gps;
 
-    // ── Satellite list — UBX-NAV-SAT via passthrough, every SV_POLL_INTERVAL_S
-    // Empty until sv_info_valid = true (~30 s after connect).
+    // ── Satellite list — MSP_GPS_SV_INFO (cmd 164), polled every SV_POLL_TICKS
+    //
+    // Populated every ~1 s (SV_POLL_TICKS iterations at 100 Hz).
+    // Uses a direct MSP query — no passthrough, no port cycle.
+    // sv_info_valid becomes true on the first successful parse (~1 s after
+    // connect, as opposed to the old 30 s passthrough delay).
+    //
+    // sv_source identifies which data path filled the list:
+    //   "MSP"  — MSP_GPS_SV_INFO cmd 164 (primary, always available)
+    //   "UBX"  — UBX-NAV-SAT passthrough (fallback, only if passthrough works)
+    //   ""     — not yet populated
+    //
+    // Fields available in MSP mode: gnss_name, svid, cno, quality, status_str,
+    //   used, gnss_id, flags, chn.
+    // Fields always 0 in MSP mode (not in cmd 164 payload): elev, azim, prRes.
     std::vector<SVInfoEntry> svList;
     bool                     svInfoValid = false;
+    std::string              svSource;      // "MSP" or "UBX"
 
     // ── GPS nav engine status — MSP_NAV_STATUS (121) ──────────────────────────
     NavStatus navStatus;
@@ -167,7 +195,8 @@ public:
     void startAccCalibration();
 
     // ── GPS UART index for MSP_SET_PASSTHROUGH ────────────────────────────────
-    // Must match the UART your GPS is on in BF Configurator → Ports tab.
+    // Only used by applyGPSConfig() (UBX config writes).
+    // NOT used for satellite polling (MSP cmd 164 needs no UART index).
     //   UART1 → 0   ← GPS confirmed on UART1 for this project
     //   UART2 → 1
     //   UART3 → 2
@@ -189,16 +218,18 @@ private:
 
     std::string portName_;          // saved for reopen after passthrough cycle
 
-    // GPS UART index sent in the MSP_SET_PASSTHROUGH payload.
-    // 0 = UART1 — confirmed GPS location for this project.
+    // GPS UART index — only used by applyGPSConfig() passthrough sessions.
+    // MSP cmd 164 satellite polling does NOT use this.
     uint8_t gpsUartIndex_ = 0;
 
     // Calibration request flags (set from Python thread, consumed by worker)
     std::atomic<bool> magCalRequested;
     std::atomic<bool> accCalRequested;
 
-    // SV poll scheduling
-    std::chrono::steady_clock::time_point lastSvPollTime_;
+    // SV poll tick counter — incremented every communicationLoop() iteration.
+    // When it reaches SV_POLL_TICKS the satellite list is refreshed and
+    // the counter resets to 0.  No time-based scheduling needed.
+    int svPollTickCounter_ = 0;
 
     // Calibration countdown state (worker-thread only, committed via commitState)
     bool                                  magCalActive_;
@@ -213,17 +244,20 @@ private:
     void communicationLoop();
 
     // ── Serial port helpers ───────────────────────────────────────────────────
-    // openSerialPort() opens portName at MSP_BAUD (57600), 8N1, no flow control,
-    // non-blocking COMMTIMEOUTS.  Does NOT start the worker thread.
     bool openSerialPort(const std::string& portName);
     void closeSerialPort();
 
     // ── MSP transport ─────────────────────────────────────────────────────────
     std::vector<uint8_t> sendMSP(uint8_t mspID);
 
-    // ── UBX passthrough cycle ─────────────────────────────────────────────────
-    // pollSatellites() runs the full open→passthrough→poll→reopen cycle and
-    // writes the updated svList into 'pending' on success.
+    // ── Satellite list — MSP path (primary) ───────────────────────────────────
+    // Sends MSP_GPS_SV_INFO (cmd 164) and parses the response directly.
+    // No passthrough, no port cycle.  Called every SV_POLL_TICKS iterations.
+    bool pollSatellitesMSP(DroneState& pending);
+
+    // ── UBX passthrough cycle (kept for applyGPSConfig only) ─────────────────
+    // pollSatellites() is no longer called from communicationLoop().
+    // It is retained so applyGPSConfig() can reuse readUbxResponse().
     void pollSatellites(DroneState& pending);
 
     // readUbxResponse() synchronises on the 0xB5 0x62 preamble and returns
@@ -240,6 +274,7 @@ private:
     bool parseGPSRaw(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseGPSComp(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseNavStatus(const std::vector<uint8_t>& buf, DroneState& s);
+    bool parseMspSvInfo(const std::vector<uint8_t>& buf, DroneState& s);
     void commitState(const DroneState& s);
 };
 

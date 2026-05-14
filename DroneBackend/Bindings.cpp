@@ -12,9 +12,6 @@ PYBIND11_MODULE(DroneBackend, m) {
 
     // =========================================================================
     // GPSReading
-    //
-    // Must be registered BEFORE DroneState because DroneState holds one by
-    // value. Gate all display/navigation code on raw_valid / comp_valid.
     // =========================================================================
     py::class_<GPSReading>(m, "GPSReading")
         .def_readonly("fix_type", &GPSReading::fixType,
@@ -50,28 +47,38 @@ PYBIND11_MODULE(DroneBackend, m) {
     // =========================================================================
     // SVInfoEntry
     //
-    // Registered BEFORE DroneState because DroneState holds
-    // std::vector<SVInfoEntry> by value. pybind11 must know the type
-    // before it can build the return converter for def_readonly("sv_list")
-    // and before py::cast(sv) can be used inside the to_dict() lambda.
+    // Populated by MSP_GPS_SV_INFO (cmd 164) via GPSNeoM10::parseMspSvInfo().
+    //
+    // Fields always populated (MSP and UBX sources):
+    //   gnss_name, svid, cno, quality, status_str, used, gnss_id, flags, chn
+    //
+    // Fields that are 0 when sv_source == "MSP" (not in cmd 164 payload):
+    //   elev, azim, prRes
+    //
+    // Python UI should check state.sv_source before showing Elev/Azim columns:
+    //   if state.sv_source == "MSP":
+    //       hide elev/azim columns in the satellite table
     // =========================================================================
     py::class_<SVInfoEntry>(m, "SVInfoEntry")
         .def_readonly("chn", &SVInfoEntry::chn,
-            "Tracking channel number (0-15). NAV-SAT uses SV index as proxy.")
+            "Channel index. For MSP source: SV index (0-31). "
+            "For UBX source: receiver tracking channel.")
         .def_readonly("svid", &SVInfoEntry::svid,
             "Satellite vehicle ID (PRN for GPS, slot for GLONASS).")
         .def_readonly("flags", &SVInfoEntry::flags,
-            "Lower byte of the UBX-NAV-SAT flags32 word. "
-            "bits[0:2]=qualityInd, bit[3]=svUsed, bit[4:5]=health.")
+            "Packed flags byte: bits[0:2]=quality, bit[3]=svUsed. "
+            "Same encoding for both MSP and UBX sources.")
         .def_readonly("quality", &SVInfoEntry::quality,
             "UBX qualityInd 0-7: 0=no sig,1=searching,2=acquired,3=unusable,"
             "4=code locked,5-7=code+carrier locked.")
         .def_readonly("cno", &SVInfoEntry::cno,
             "Carrier-to-noise density, dBHz. 0-55.")
         .def_readonly("elev", &SVInfoEntry::elev,
-            "Elevation above horizon, degrees (-90 to +90).")
+            "Elevation above horizon, degrees (-90 to +90). "
+            "Always 0 when sv_source == 'MSP' (not available in cmd 164).")
         .def_readonly("azim", &SVInfoEntry::azim,
-            "Azimuth, degrees (0-360).")
+            "Azimuth, degrees (0-360). "
+            "Always 0 when sv_source == 'MSP' (not available in cmd 164).")
         .def_readonly("gnss_id", &SVInfoEntry::gnssId,
             "GNSS system ID: 0=GPS,1=SBAS,2=Galileo,3=BeiDou,5=QZSS,6=GLONASS.")
         .def_readonly("gnss_name", &SVInfoEntry::gnssName,
@@ -189,15 +196,10 @@ PYBIND11_MODULE(DroneBackend, m) {
         .def_readonly("mag_valid", &DroneState::magValid,
             "True when mag X/Y/Z are non-zero.")
 
-        .def_readonly("mag_cal_active", &DroneState::magCalActive,
-            "True while FC is in magnetometer calibration mode (30 s window).")
-        .def_readonly("mag_cal_seconds_remaining", &DroneState::magCalSecondsRemaining,
-            "Seconds remaining in mag calibration window (30 -> 0).")
-
-        .def_readonly("acc_cal_active", &DroneState::accCalActive,
-            "True while FC is performing gyro/accel calibration (~5 s).")
-        .def_readonly("acc_cal_seconds_remaining", &DroneState::accCalSecondsRemaining,
-            "Seconds remaining in gyro/accel calibration window (5 -> 0).")
+        .def_readonly("mag_cal_active", &DroneState::magCalActive)
+        .def_readonly("mag_cal_seconds_remaining", &DroneState::magCalSecondsRemaining)
+        .def_readonly("acc_cal_active", &DroneState::accCalActive)
+        .def_readonly("acc_cal_seconds_remaining", &DroneState::accCalSecondsRemaining)
 
         .def_readonly("gps", &DroneState::gps,
             "GPSReading from NEO-M10. "
@@ -206,19 +208,19 @@ PYBIND11_MODULE(DroneBackend, m) {
             "gps.position_usable before any navigation use.")
 
         // ── Satellite list ────────────────────────────────────────────────────
-        // Populated every 30 s via the MSP_SET_PASSTHROUGH → UBX-NAV-SAT cycle.
-        // Each element is an SVInfoEntry with: gnss_name, svid, cno, elev,
-        // azim, status_str, used, quality, gnss_id, flags, chn.
-        // Empty until sv_info_valid becomes True (~30 s after connect).
-        //
-        // The 30 s poll interval is intentional: the passthrough cycle
-        // requires closing and reopening the serial port to exit BF's
-        // passthrough mode, which briefly interrupts MSP telemetry (~300 ms).
+        // Populated every ~1 s via MSP_GPS_SV_INFO (cmd 164).
+        // No passthrough, no port cycle. sv_info_valid becomes true within
+        // the first second of connect().
         .def_readonly("sv_list", &DroneState::svList,
-            "List of SVInfoEntry. Populated every 30 s via UBX-NAV-SAT passthrough. "
-            "Each entry: gnss_name, svid, cno, elev, azim, status_str, used.")
+            "List of SVInfoEntry. Updated every ~1 s via MSP cmd 164. "
+            "Fields gnss_name/svid/cno/quality/status_str/used/gnss_id are "
+            "always populated. elev/azim are 0 (not available via MSP).")
         .def_readonly("sv_info_valid", &DroneState::svInfoValid,
-            "True when sv_list has been populated at least once.")
+            "True when sv_list has been populated at least once (~1 s after connect).")
+        .def_readonly("sv_source", &DroneState::svSource,
+            "'MSP' when populated via cmd 164 (normal). "
+            "'UBX' when populated via passthrough (only if gps_auto_config=OFF). "
+            "Check this before showing elev/azim columns in the satellite table.")
 
         .def_readonly("nav_status", &DroneState::navStatus,
             "NavStatus from MSP_NAV_STATUS (121). fix_ok is the authoritative fix flag.")
@@ -232,14 +234,11 @@ PYBIND11_MODULE(DroneBackend, m) {
         // ── to_dict() ─────────────────────────────────────────────────────────
         // Convenience snapshot with all values pre-converted to useful units.
         //
-        // sv_list is built as a py::list of SVInfoEntry objects so that
-        // GPSWidget._normalize_sv_list() can read .gnss_name / .svid / etc.
-        // directly from the C++ objects without a separate conversion step.
-        //
-        // Both old and new key names are included for GPS home fields so
-        // existing Python code using either convention continues to work:
-        //   gps_dist_home_m  == gps_dist_to_home_m
-        //   gps_bearing_home == gps_bearing_to_home
+        // gps_sv_list  : py::list of SVInfoEntry objects — read .gnss_name,
+        //                .svid, .cno, etc. directly (no extra conversion step).
+        // gps_sv_source: "MSP" in normal operation. Python UI should hide the
+        //                Elev/Azim columns in the satellite table when this is "MSP"
+        //                since those fields are 0 (not available in cmd 164).
         .def("to_dict", [](const DroneState& s) {
 
         py::list sv_list;
@@ -274,11 +273,9 @@ PYBIND11_MODULE(DroneBackend, m) {
             "mag_heading_deg"_a = s.magHeadingDeg,
             "mag_valid"_a = s.magValid,
 
-            // Mag calibration
+            // Calibration
             "mag_cal_active"_a = s.magCalActive,
             "mag_cal_seconds_remaining"_a = s.magCalSecondsRemaining,
-
-            // Acc/Gyro calibration
             "acc_cal_active"_a = s.accCalActive,
             "acc_cal_seconds_remaining"_a = s.accCalSecondsRemaining,
 
@@ -310,9 +307,10 @@ PYBIND11_MODULE(DroneBackend, m) {
             "gps_heartbeat"_a = s.gps.gpsHeartbeat,
             "gps_comp_valid"_a = s.gps.compValid,
 
-            // GPS -- UBX-NAV-SAT satellite list (every 30 s via passthrough)
+            // GPS -- satellite list (MSP cmd 164, every ~1 s)
             "gps_sv_list"_a = sv_list,
             "gps_sv_info_valid"_a = s.svInfoValid,
+            "gps_sv_source"_a = s.svSource,   // "MSP" or "UBX"
 
             // GPS -- MSP_NAV_STATUS (121)
             "gps_nav_fix_ok"_a = s.navStatus.fixOk,
@@ -342,25 +340,12 @@ PYBIND11_MODULE(DroneBackend, m) {
         .def("set_poll_interval_ms", &DroneLink::setPollIntervalMs,
             py::arg("ms"),
             "Tune background thread cadence (default 10 ms = 100 Hz).")
-
-        // ── NEW: GPS UART index for the passthrough cycle ─────────────────────
-        // Must match the UART your NEO-M10 is assigned to in BF Configurator
-        // Ports tab.  Call this BEFORE connect().
-        //
-        //   UART1 → index 0
-        //   UART2 → index 1   ← F405 V3 default; this is also DroneLink default
-        //   UART3 → index 2
-        //
-        // Example:
-        //   link = DroneBackend.DroneLink()
-        //   link.set_gps_uart_index(1)   # UART2 — F405 V3
-        //   link.connect("COM5")
         .def("set_gps_uart_index", &DroneLink::setGpsUartIndex,
             py::arg("index"),
-            "Set the BF serial port index for the GPS UART passthrough.\n"
+            "Set the BF serial port index used by applyGPSConfig() passthrough.\n"
             "UART1=0, UART2=1 (F405 V3 default), UART3=2.\n"
+            "Has no effect on satellite polling (uses MSP cmd 164, no UART index needed).\n"
             "Must be called before connect().")
-
         .def("start_mag_calibration", &DroneLink::startMagCalibration,
             "Send MSP_MAG_CALIBRATION (206) to the FC.\n"
             "FC enters calibration mode for 30 s. Rotate drone on all axes.\n"
