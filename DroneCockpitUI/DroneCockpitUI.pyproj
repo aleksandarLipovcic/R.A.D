@@ -41,6 +41,12 @@
     <Compile Include="MagWidget.py">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="TestScripts\sv_baud_probe.py">
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="TestScripts\sv_passthrough_test.py">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="Setup_Project.py">
       <SubType>Code</SubType>
     </Compile>
@@ -51,6 +57,9 @@
       <Project>{9baff06c-9db1-499e-80eb-7d2681e22b08}</Project>
       <Private>True</Private>
     </ProjectReference>
+  </ItemGroup>
+  <ItemGroup>
+    <Folder Include="TestScripts\" />
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
   <!-- Uncomment the CoreCompile target to enable the Build command in
