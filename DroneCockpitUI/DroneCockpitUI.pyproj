@@ -41,6 +41,9 @@
     <Compile Include="MagWidget.py">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="TestScripts\gps_sv_reader.py">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="TestScripts\sv_baud_probe.py">
       <SubType>Code</SubType>
     </Compile>
