@@ -19,19 +19,27 @@ Layout philosophy
 
 Aviation HUD overlay layout (map mode)
 ---------------------------------------
-  ┌─[FIX badge] [SAT ##] [HDOP #.##] [●]────────────[+][−][⊙ Ctr][SAT]─┐
+  ┌─[FIX badge] [SAT ##] [HDOP #.##] ────────────────[+][−][⊙ Ctr][SAT]─┐
   │                                                                       │
   │   ┌─ top-left ────────────────┐                                       │
   │   │  LAT  44.770029 N         │                                       │
   │   │  LON  17.210185 E         │                                       │
   │   │  ALT  6 ft  (2 m)        │                                       │
   │   └───────────────────────────┘                                       │
-  │                                    ┌─ bottom-right ─────────────────┐ │
-  │                                    │ GS  1.2 kt  (2.3 km/h)        │ │
-  │                                    │ TRK 323.2°  [compass rose]     │ │
-  │                                    │ DIST 0 m  BRG 000° [rose]     │ │
-  │                                    └────────────────────────────────┘ │
+  │                                                                       │
+  │   ┌─ bottom-left ─────────────────────────────────────────────┐       │
+  │   │ GS  1.2 kt  (2.3 km/h)   TRK 323.2°   DIST 0 m  BRG 000°│       │
+  │   │  [TRK compass rose]              [HOME compass rose]       │       │
+  │   └───────────────────────────────────────────────────────────┘       │
   └───────────────────────────────────────────────────────────────────────┘
+
+CHANGES vs original
+-------------------
+  1. Bottom HUD panel moved to BOTTOM-LEFT (mirrors position panel above it).
+  2. Compass roses for TRK and HOME are drawn inside that bottom-left panel.
+  3. HUD overlay fonts enlarged for ~70 cm reading distance:
+       _FHL  7 → 11 pt   (HUD micro-label)
+       _FHD 11 → 15 pt   (HUD primary value)
 
 All update_gps(ui_data) keys are identical to the original widget.
 """
@@ -60,7 +68,7 @@ _C = {
     "bg":           "#0d1117",
     "frame_bg":     "#141920",
     "border":       "#1e2730",
-    "hud_bg":       "#0a0e14cc",   # semi-transparent (used as stipple workaround)
+    "hud_bg":       "#0a0e14cc",
     # text
     "text":         "#e8edf4",
     "label":        "#6b7885",
@@ -92,15 +100,17 @@ _C = {
     "sv_nodata":    "#2a3545",
 }
 
-# Fonts — Courier New keeps the avionics mono feel; sizes bumped for legibility
+# ── Fonts ───────────────────────────────────────────────────────────────────
+# Courier New keeps the avionics mono feel.
+# _FHL / _FHD enlarged so text is legible from ~70 cm viewing distance.
 _FF  = "Courier New"
-_FL  = (_FF,  8, "bold")   # micro label
-_FLM = (_FF,  9, "bold")   # label medium
-_FV  = (_FF, 14, "bold")   # primary value
-_FVS = (_FF, 11, "bold")   # secondary value
+_FL  = (_FF,  8, "bold")   # micro label (nav panel)
+_FLM = (_FF,  9, "bold")   # label medium (nav panel)
+_FV  = (_FF, 14, "bold")   # primary value (nav panel)
+_FVS = (_FF, 11, "bold")   # secondary value (nav panel)
 _FU  = (_FF,  9)           # unit
-_FHD = (_FF, 11, "bold")   # HUD overlay data
-_FHL = (_FF,  7, "bold")   # HUD overlay micro-label
+_FHD = (_FF, 15, "bold")   # HUD overlay data  ← was 11, now 15
+_FHL = (_FF, 11, "bold")   # HUD overlay label ← was  7, now 11
 
 # ── Quality tables (Betaflight 4.5.3) ───────────────────────────────────────
 _QUALITY_LABEL = [
@@ -114,7 +124,7 @@ _QUALITY_COLOR = [
 
 
 # =============================================================================
-# SVInfoEntry normaliser  (unchanged from original)
+# SVInfoEntry normaliser
 # =============================================================================
 
 def _normalize_sv_list(raw_list) -> list:
@@ -154,7 +164,7 @@ def _normalize_sv_list(raw_list) -> list:
 
 
 # =============================================================================
-# Satellite panel  (scrollable canvas — standalone Frame, no Notebook)
+# Satellite panel
 # =============================================================================
 
 class _SatPanel(tk.Frame):
@@ -192,7 +202,6 @@ class _SatPanel(tk.Frame):
         self._build()
 
     def _build(self):
-        # Header
         hdr = tk.Frame(self, bg=_C["border"], height=1)
         hdr.pack(fill="x")
 
@@ -202,7 +211,6 @@ class _SatPanel(tk.Frame):
                  fg=_C["label"], bg=_C["frame_bg"],
                  font=(_FF, 8, "bold")).pack(side="left")
 
-        # Column header
         col_hdr = tk.Canvas(self, bg=_C["frame_bg"], height=16,
                             highlightthickness=0)
         col_hdr.pack(fill="x", padx=4)
@@ -212,7 +220,6 @@ class _SatPanel(tk.Frame):
         sep = tk.Frame(self, bg=_C["border"], height=1)
         sep.pack(fill="x")
 
-        # Scrollable body
         body = tk.Frame(self, bg=_C["bg"])
         body.pack(fill="both", expand=True)
         self._cv = tk.Canvas(body, bg=_C["bg"], highlightthickness=0,
@@ -279,7 +286,6 @@ class _SatPanel(tk.Frame):
             quality = min(int(sv.get("quality", 0)), 7)
             used    = bool(sv.get("used", False)) and cno > 0
 
-            # GNSS
             gnss_raw = str(sv.get("gnss_id", "?"))
             gnss_key = self._GNSS_ALIASES.get(gnss_raw.lower(), gnss_raw)
             gcol     = self._GNSS_COLOR.get(gnss_key, self._GNSS_COLOR["Unknown"])
@@ -287,12 +293,10 @@ class _SatPanel(tk.Frame):
                                  fill=gcol, font=(_FF, 8, "bold"))
             x += cols[0][1]
 
-            # SV
             self._cv.create_text(x, cy, text=str(sv.get("sv_id", "--")),
                                  anchor="w", fill=_C["text"], font=(_FF, 8))
             x += cols[1][1]
 
-            # Bar
             bar_w  = int(min(cno / self._CNO_MAX, 1.0) * self._BAR_MAX)
             bar_col = (_C["sv_used"] if used else
                        _C["sv_locked"] if cno > 0 else _C["sv_nodata"])
@@ -305,7 +309,6 @@ class _SatPanel(tk.Frame):
                                           fill=bar_col, outline="")
             x += cols[2][1]
 
-            # dBHz
             self._cv.create_text(
                 x, cy,
                 text=f"{cno:2d}" if cno > 0 else "--",
@@ -314,7 +317,6 @@ class _SatPanel(tk.Frame):
                 font=(_FF, 8))
             x += cols[3][1]
 
-            # Status badge
             if used:
                 b_txt, b_col = "USED", _C["sv_used"]
             elif cno > 0 and quality >= 4:
@@ -329,7 +331,6 @@ class _SatPanel(tk.Frame):
                                  fill=b_col, font=(_FF, 8, "bold"))
             x += cols[4][1]
 
-            # Quality
             if cno == 0:
                 q_str = "search" if quality in (1, 2) else "idle"
                 q_col = _C["dim"]
@@ -347,12 +348,17 @@ class _SatPanel(tk.Frame):
 class _MapCanvas(tk.Frame):
     """
     OSM tile map with aviation HUD overlay.
-    Nav data panels are drawn directly on the canvas over the tiles so the
-    pilot always sees both the map and the flight data simultaneously.
+
+    HUD layout (all panels on the LEFT side so the right is unobstructed):
+      • TOP-LEFT    — fix status, lat/lon, altitude
+      • BOTTOM-LEFT — ground speed, track, home dist/bearing + compass roses
     """
     TILE_SIZE = 256
     _OSM_URL  = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
     _UA       = "DroneCockpitGCS/1.0 (github educational project)"
+
+    # Compass rose radius in the HUD bottom panel
+    _ROSE_R = 38
 
     def __init__(self, parent, **kwargs):
         super().__init__(parent, bg=_C["bg"], **kwargs)
@@ -364,12 +370,11 @@ class _MapCanvas(tk.Frame):
         self._fix_valid   = False
         self._auto_center = True
 
-        self._tile_img  = {}
+        self._tile_img   = {}
         self._tile_queue = queue.Queue()
         self._tile_pend  = set()
         self._pan_last   = None
 
-        # Nav data cache for HUD
         self._hud = {}
 
         self._build()
@@ -378,7 +383,6 @@ class _MapCanvas(tk.Frame):
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build(self):
-        # Toolbar
         bar = tk.Frame(self, bg=_C["frame_bg"])
         bar.pack(side="top", fill="x")
 
@@ -389,16 +393,15 @@ class _MapCanvas(tk.Frame):
             activebackground="#2a3545", activeforeground=_C["text"],
             cursor="hand2",
         )
-        tk.Button(bar, text="＋", command=self._zoom_in,               **btn_kw).pack(side="left", padx=(2, 1))
-        tk.Button(bar, text="－", command=self._zoom_out,              **btn_kw).pack(side="left", padx=(0, 1))
-        tk.Button(bar, text="⊙ CTR", command=self._center_on_drone,   **btn_kw).pack(side="left", padx=(0, 2))
+        tk.Button(bar, text="＋",    command=self._zoom_in,           **btn_kw).pack(side="left", padx=(2, 1))
+        tk.Button(bar, text="－",    command=self._zoom_out,          **btn_kw).pack(side="left", padx=(0, 1))
+        tk.Button(bar, text="⊙ CTR", command=self._center_on_drone,  **btn_kw).pack(side="left", padx=(0, 2))
 
         self._zoom_lbl = tk.Label(bar, text=f"z{self._zoom}",
                                   fg=_C["label"], bg=_C["frame_bg"],
                                   font=(_FF, 8))
         self._zoom_lbl.pack(side="left", padx=4)
 
-        # Map canvas
         self._cv = tk.Canvas(self, bg=_C["map_bg"],
                              highlightthickness=0, cursor="fleur")
         self._cv.pack(fill="both", expand=True)
@@ -415,10 +418,10 @@ class _MapCanvas(tk.Frame):
 
     @staticmethod
     def _deg2tile_f(lat, lon, zoom):
-        n   = 2 ** zoom
-        xf  = (lon + 180.0) / 360.0 * n
-        lr  = math.radians(lat)
-        yf  = (1.0 - math.asinh(math.tan(lr)) / math.pi) / 2.0 * n
+        n  = 2 ** zoom
+        xf = (lon + 180.0) / 360.0 * n
+        lr = math.radians(lat)
+        yf = (1.0 - math.asinh(math.tan(lr)) / math.pi) / 2.0 * n
         return xf, yf
 
     def _center_tile_f(self):
@@ -467,7 +470,7 @@ class _MapCanvas(tk.Frame):
             self._redraw()
         self.after(250, self._poll_tiles)
 
-    # ── Redraw: tiles + HUD overlay ───────────────────────────────────────────
+    # ── Redraw ────────────────────────────────────────────────────────────────
 
     def _redraw(self):
         if not self.winfo_ismapped():
@@ -476,7 +479,6 @@ class _MapCanvas(tk.Frame):
         h = self._cv.winfo_height()
         if w < 4 or h < 4:
             return
-
         self._cv.delete("all")
         self._draw_tiles(w, h)
         self._draw_marker(w, h)
@@ -510,20 +512,16 @@ class _MapCanvas(tk.Frame):
 
     def _draw_marker(self, w, h):
         if not (self._fix_valid and self._drone_lat is not None):
-            # No-fix overlay
             self._cv.create_text(w // 2, h // 2,
                 text="NO GPS FIX", fill=_C["red"],
                 font=(_FF, 13, "bold"))
             return
         mx, my = self._latlon_to_canvas(self._drone_lat, self._drone_lon)
         r = 9
-        # Accuracy ring
         self._cv.create_oval(mx - r*2, my - r*2, mx + r*2, my + r*2,
                              outline=_C["green"], width=1, dash=(3, 4))
-        # Position dot
         self._cv.create_oval(mx - r, my - r, mx + r, my + r,
                              fill=_C["map_marker"], outline="#ffffff", width=1.5)
-        # Track vector (uses hud track angle)
         trk = self._hud.get("trk", 0)
         rad = math.radians(trk - 90)
         vlen = 24
@@ -533,12 +531,13 @@ class _MapCanvas(tk.Frame):
                              fill=_C["green"], width=2,
                              arrow="last", arrowshape=(7, 9, 3))
 
-    # ── HUD overlay panels ────────────────────────────────────────────────────
+    # ── HUD helpers ───────────────────────────────────────────────────────────
 
     def _hud_box(self, x, y, w_px, h_px, anchor="nw"):
         """Draw a semi-transparent HUD box; return (x0, y0) top-left."""
-        # Tkinter canvas has no real transparency; use a dark stipple rectangle
-        if anchor == "se":
+        if anchor == "sw":
+            x0, y0 = x, y - h_px
+        elif anchor == "se":
             x0, y0 = x - w_px, y - h_px
         elif anchor == "ne":
             x0, y0 = x - w_px, y
@@ -546,34 +545,73 @@ class _MapCanvas(tk.Frame):
             x0, y0 = x, y
         self._cv.create_rectangle(
             x0, y0, x0 + w_px, y0 + h_px,
-            fill="#080c14", outline="#1e2a38",
-            stipple="gray75",
-        )
-        # Opaque overlay for text readability (non-stippled, slightly smaller)
+            fill="#080c14", outline="#1e2a38", stipple="gray75")
         self._cv.create_rectangle(
             x0 + 1, y0 + 1, x0 + w_px - 1, y0 + h_px - 1,
-            fill="#0a0e14", outline="",
-        )
+            fill="#0a0e14", outline="")
         return x0, y0
+
+    def _draw_hud_rose(self, cx, cy, r, label, angle_deg, needle_col):
+        """Draw a compass rose on the map canvas at (cx, cy)."""
+        cv = self._cv
+        cv.create_oval(cx - r, cy - r, cx + r, cy + r,
+                       outline=_C["compass_rim"], width=1)
+        cv.create_oval(cx - 2, cy - 2, cx + 2, cy + 2,
+                       fill=_C["compass_rim"], outline="")
+        # Tick marks every 45°
+        for deg in range(0, 360, 45):
+            rad = math.radians(deg - 90)
+            r1  = r - 6
+            cv.create_line(cx + math.cos(rad) * r1, cy + math.sin(rad) * r1,
+                           cx + math.cos(rad) * r,  cy + math.sin(rad) * r,
+                           fill=_C["compass_rim"], width=1)
+        # North tick (amber)
+        cv.create_line(cx, cy - r + 5, cx, cy - r,
+                       fill=_C["amber"], width=2)
+        # Cardinal labels
+        for lbl, deg in (("N", 0), ("E", 90), ("S", 180), ("W", 270)):
+            rad = math.radians(deg - 90)
+            rl  = r - 13
+            cv.create_text(cx + math.cos(rad) * rl,
+                           cy + math.sin(rad) * rl,
+                           text=lbl, fill=_C["label"],
+                           font=(_FF, 8, "bold"))
+        # Needle
+        if angle_deg is not None:
+            rad = math.radians(angle_deg - 90)
+            tip = r - 6
+            cv.create_line(cx, cy,
+                           cx + math.cos(rad) * tip,
+                           cy + math.sin(rad) * tip,
+                           fill=needle_col, width=2,
+                           arrow="last", arrowshape=(7, 9, 3))
+        # Label below rose
+        cv.create_text(cx, cy + r + 10, text=label,
+                       fill=_C["label"], font=(_FF, 9, "bold"))
+
+    # ── HUD overlay panels ────────────────────────────────────────────────────
 
     def _draw_hud(self, w, h):
         d = self._hud
         if not d:
             return
 
-        # ── TOP-LEFT: position + altitude ────────────────────────────────────
-        pad  = 6
-        box_w, box_h = 220, 74
-        bx, by = self._hud_box(pad, pad, box_w, box_h)
+        pad = 6
 
-        raw_valid  = d.get("raw_valid", False)
-        fix_type   = d.get("fix_type", 0)
+        # ─────────────────────────────────────────────────────────────────────
+        # TOP-LEFT panel: fix status + position + altitude
+        # ─────────────────────────────────────────────────────────────────────
+        tl_w, tl_h = 290, 90
+        bx, by = self._hud_box(pad, pad, tl_w, tl_h, anchor="nw")
+
+        raw_valid  = d.get("raw_valid",  False)
+        fix_type   = d.get("fix_type",   0)
         pos_usable = d.get("pos_usable", False)
-        lat        = d.get("lat", 0.0)
-        lon        = d.get("lon", 0.0)
-        alt_m      = d.get("alt_m", 0.0)
+        lat        = d.get("lat",    0.0)
+        lon        = d.get("lon",    0.0)
+        alt_m      = d.get("alt_m",  0.0)
         num_sat    = d.get("num_sat", 0)
-        hdop       = d.get("hdop", 99.0)
+        hdop       = d.get("hdop",   99.0)
 
         # Fix status pill
         if raw_valid and fix_type >= 2:
@@ -584,26 +622,24 @@ class _MapCanvas(tk.Frame):
             fix_txt, fix_col = "NO FIX", _C["red"]
 
         tx = bx + 6
-        self._cv.create_text(tx, by + 11, text=fix_txt, anchor="w",
-                             fill=fix_col, font=(_FF, 10, "bold"))
+        self._cv.create_text(tx, by + 13, text=fix_txt, anchor="w",
+                             fill=fix_col, font=(_FF, 13, "bold"))
 
-        # SAT / HDOP
         sat_col  = (_C["green"] if (raw_valid and num_sat >= 6)
                     else _C["amber"] if raw_valid else _C["dim"])
         hdop_col = (_C["green"] if hdop < 1.0
                     else _C["amber"] if hdop < 2.0 else _C["red"])
-        self._cv.create_text(tx + 65, by + 11,
+        self._cv.create_text(tx + 76, by + 13,
                              text=f"SAT {num_sat:2d}" if raw_valid else "SAT --",
                              anchor="w", fill=sat_col, font=_FHL)
-        self._cv.create_text(tx + 115, by + 11,
+        self._cv.create_text(tx + 150, by + 13,
                              text=f"HDOP {hdop:.2f}" if raw_valid else "HDOP --",
                              anchor="w", fill=hdop_col, font=_FHL)
 
-        # Separator
-        self._cv.create_line(bx + 2, by + 18, bx + box_w - 2, by + 18,
+        self._cv.create_line(bx + 2, by + 22, bx + tl_w - 2, by + 22,
                              fill=_C["border"])
 
-        # Lat/Lon
+        # Lat / Lon
         if raw_valid and fix_type >= 1:
             col = _C["text"] if pos_usable else _C["amber"]
             lat_str = f"{abs(lat):10.6f} {'N' if lat >= 0 else 'S'}"
@@ -613,20 +649,20 @@ class _MapCanvas(tk.Frame):
             lat_str = "---.---------- -"
             lon_str = "---.---------- -"
 
-        row_y = by + 30
-        self._cv.create_text(tx, row_y, text="LAT", anchor="w",
+        row_y = by + 36
+        self._cv.create_text(tx,      row_y, text="LAT", anchor="w",
                              fill=_C["label"], font=_FHL)
-        self._cv.create_text(tx + 26, row_y, text=lat_str, anchor="w",
+        self._cv.create_text(tx + 34, row_y, text=lat_str, anchor="w",
                              fill=col, font=_FHD)
 
+        row_y += 22
+        self._cv.create_text(tx,      row_y, text="LON", anchor="w",
+                             fill=_C["label"], font=_FHL)
+        self._cv.create_text(tx + 34, row_y, text=lon_str, anchor="w",
+                             fill=col, font=_FHD)
+
+        # Altitude (in the top-left box, last line)
         row_y += 18
-        self._cv.create_text(tx, row_y, text="LON", anchor="w",
-                             fill=_C["label"], font=_FHL)
-        self._cv.create_text(tx + 26, row_y, text=lon_str, anchor="w",
-                             fill=col, font=_FHD)
-
-        # Altitude
-        row_y += 16
         if raw_valid and fix_type >= 2:
             alt_str = f"ALT  {alt_m * _M_TO_FT:6.0f} ft  ({alt_m:.0f} m)"
             a_col   = _C["cyan"]
@@ -636,18 +672,40 @@ class _MapCanvas(tk.Frame):
         self._cv.create_text(tx, row_y, text=alt_str, anchor="w",
                              fill=a_col, font=_FHL)
 
-        # ── BOTTOM-RIGHT: speed + track + home ───────────────────────────────
-        br_w, br_h = 200, 110
-        rx, ry = self._hud_box(w - pad, h - pad, br_w, br_h, anchor="se")
+        # ─────────────────────────────────────────────────────────────────────
+        # BOTTOM-LEFT panel: speed + track + home dist/bearing + compass roses
+        #
+        # Layout inside the box:
+        #   Row 1: GS value
+        #   Row 2: TRK value   |  DIST value
+        #   Row 3: separator
+        #   Row 4: [TRK rose]  [HOME rose]   (side by side)
+        # ─────────────────────────────────────────────────────────────────────
+        rose_r    = self._ROSE_R
+        rose_diam = rose_r * 2
+        label_gap = 14           # space below rose for label text
+        row_text_h = 20          # height per text row
+        inner_pad  = 8
 
-        gs_cms   = d.get("gs_cms", 0)
-        trk      = d.get("trk", 0.0)
-        dist_m   = d.get("dist_m", 0.0)
-        brg      = d.get("brg", 0)
-        comp_v   = d.get("comp_valid", False)
+        # Box height: 3 text rows + separator + roses + label + margins
+        bl_h = (row_text_h * 3 + 6          # text rows + separator
+                + rose_diam + label_gap      # roses
+                + inner_pad * 2)             # top/bottom padding
+        # Box width: two roses side by side with gap
+        rose_gap = 20
+        bl_w = max(340, rose_diam * 2 + rose_gap + inner_pad * 2 + 20)
 
-        tx2 = rx + 6
-        cy2 = ry + 12
+        # Anchor: bottom-left corner of canvas
+        bx2, by2 = self._hud_box(pad, h - pad, bl_w, bl_h, anchor="sw")
+
+        gs_cms = d.get("gs_cms", 0)
+        trk    = d.get("trk",    0.0)
+        dist_m = d.get("dist_m", 0.0)
+        brg    = d.get("brg",    0)
+        comp_v = d.get("comp_valid", False)
+
+        tx2 = bx2 + inner_pad
+        cy2 = by2 + inner_pad + row_text_h // 2
 
         # Ground speed
         if raw_valid:
@@ -658,91 +716,70 @@ class _MapCanvas(tk.Frame):
                 fill=_C["text"], font=_FHL)
         else:
             self._cv.create_text(tx2, cy2, anchor="w",
-                text="GS  ---.- kt",
-                fill=_C["dim"], font=_FHL)
+                text="GS  ---.- kt", fill=_C["dim"], font=_FHL)
 
-        cy2 += 14
-        # Track
+        cy2 += row_text_h
+
+        # Track  (left column)
         if raw_valid:
             self._cv.create_text(tx2, cy2, anchor="w",
-                text=f"TRK {trk:05.1f}°",
+                text=f"TRK  {trk:05.1f}°",
                 fill=_C["green"], font=_FHL)
         else:
             self._cv.create_text(tx2, cy2, anchor="w",
-                text="TRK ---.-°", fill=_C["dim"], font=_FHL)
+                text="TRK  ---.-°", fill=_C["dim"], font=_FHL)
 
-        cy2 += 8
-        self._cv.create_line(rx + 2, cy2, rx + br_w - 2, cy2,
-                             fill=_C["border"])
-        cy2 += 8
-
-        # Home dist / bearing
+        # Home DIST  (right column — starts halfway across the box)
+        mid_x = bx2 + bl_w // 2
         if comp_v:
-            self._cv.create_text(tx2, cy2, anchor="w",
+            self._cv.create_text(mid_x, cy2, anchor="w",
                 text=f"DIST  {int(dist_m):5d} m",
                 fill=_C["cyan"], font=_FHL)
-            cy2 += 14
-            self._cv.create_text(tx2, cy2, anchor="w",
-                text=f"BRG   {(brg+360)%360:03d}°",
+        else:
+            self._cv.create_text(mid_x, cy2, anchor="w",
+                text="DIST  ------ m", fill=_C["dim"], font=_FHL)
+
+        cy2 += row_text_h
+
+        # Home BRG  (right column)
+        if comp_v:
+            self._cv.create_text(mid_x, cy2, anchor="w",
+                text=f"BRG   {(brg + 360) % 360:03d}°",
                 fill=_C["cyan"], font=_FHL)
         else:
-            self._cv.create_text(tx2, cy2, anchor="w",
-                text="DIST  ------ m",
-                fill=_C["dim"], font=_FHL)
-            cy2 += 14
-            self._cv.create_text(tx2, cy2, anchor="w",
-                text="BRG   ---°",
-                fill=_C["dim"], font=_FHL)
+            self._cv.create_text(mid_x, cy2, anchor="w",
+                text="BRG   ---°", fill=_C["dim"], font=_FHL)
 
-        cy2 += 10
-        self._cv.create_line(rx + 2, cy2, rx + br_w - 2, cy2,
+        cy2 += row_text_h // 2
+
+        # Separator line
+        self._cv.create_line(bx2 + 2, cy2, bx2 + bl_w - 2, cy2,
                              fill=_C["border"])
-        cy2 += 8
 
-        # Mini compass roses (track + home) side by side
-        rose_r = 24
-        rose_gap = 10
-        rose_cx1 = rx + rose_r + 6
-        rose_cx2 = rx + rose_r * 2 + rose_gap + rose_r + 6
+        cy2 += 6
+
+        # ── Compass roses ─────────────────────────────────────────────────────
         rose_cy  = cy2 + rose_r + 2
+        # Centre the two roses within the box
+        total_rose_w = rose_diam + rose_gap + rose_diam
+        rose_x_start = bx2 + (bl_w - total_rose_w) // 2 + rose_r
 
-        if rose_cy + rose_r + 4 < ry + br_h:
-            # Track rose
-            self._draw_hud_rose(rose_cx1, rose_cy, rose_r, "TRK",
-                                trk if raw_valid else None, _C["track_needle"])
-            # Home bearing rose
-            self._draw_hud_rose(rose_cx2, rose_cy, rose_r, "HOME",
-                                (brg + 360) % 360 if comp_v else None,
-                                _C["home_arrow"])
+        rose_cx1 = rose_x_start                      # TRK rose centre
+        rose_cx2 = rose_x_start + rose_diam + rose_gap  # HOME rose centre
 
-    def _draw_hud_rose(self, cx, cy, r, label, angle_deg, needle_col):
-        self._cv.create_oval(cx - r, cy - r, cx + r, cy + r,
-                             outline=_C["compass_rim"], width=1)
-        self._cv.create_oval(cx - 2, cy - 2, cx + 2, cy + 2,
-                             fill=_C["compass_rim"], outline="")
-        # North tick
-        self._cv.create_line(cx, cy - r + 3, cx, cy - r,
-                             fill=_C["amber"], width=2)
-        # Cardinal labels
-        for lbl, deg in (("N", 0), ("E", 90), ("S", 180), ("W", 270)):
-            rad = math.radians(deg - 90)
-            rl  = r - 9
-            self._cv.create_text(cx + math.cos(rad) * rl,
-                                 cy + math.sin(rad) * rl,
-                                 text=lbl, fill=_C["label"],
-                                 font=(_FF, 5))
-        # Needle
-        if angle_deg is not None:
-            rad = math.radians(angle_deg - 90)
-            tip = r - 5
-            self._cv.create_line(cx, cy,
-                                 cx + math.cos(rad) * tip,
-                                 cy + math.sin(rad) * tip,
-                                 fill=needle_col, width=2,
-                                 arrow="last", arrowshape=(5, 7, 2))
-        # Label below
-        self._cv.create_text(cx, cy + r + 6, text=label,
-                             fill=_C["label"], font=(_FF, 6, "bold"))
+        # Track rose (green needle)
+        self._draw_hud_rose(
+            rose_cx1, rose_cy, rose_r,
+            "TRK",
+            trk if raw_valid else None,
+            _C["track_needle"])
+
+        # Home bearing rose (cyan needle)
+        self._draw_hud_rose(
+            rose_cx2, rose_cy, rose_r,
+            "HOME",
+            (brg + 360) % 360 if comp_v else None,
+            _C["home_arrow"])
 
     # ── Event handlers ────────────────────────────────────────────────────────
 
@@ -750,7 +787,7 @@ class _MapCanvas(tk.Frame):
     def _on_pan_end(self, _): self._pan_last = None
 
     def _on_pan_start(self, event):
-        self._pan_last = (event.x, event.y)
+        self._pan_last    = (event.x, event.y)
         self._auto_center = False
 
     def _on_pan(self, event):
@@ -806,7 +843,6 @@ class _MapCanvas(tk.Frame):
         self._redraw()
 
     def update_hud(self, d: dict):
-        """Cache nav data dict; redraws the HUD overlay."""
         self._hud = d
         self._redraw()
 
@@ -840,7 +876,6 @@ class _NavPanel(tk.Frame):
         c = tk.Frame(self, bg=_C["bg"])
         c.pack(fill="both", expand=True, padx=8, pady=4)
 
-        # Fix row
         fix_row = tk.Frame(c, bg=_C["bg"])
         fix_row.pack(fill="x", pady=(2, 0))
         self._fix_lbl = tk.Label(fix_row, text="NO FIX",
@@ -868,7 +903,6 @@ class _NavPanel(tk.Frame):
 
         self._sep()
 
-        # Position
         tk.Label(c, text="POSITION", fg=_C["label"], bg=_C["bg"],
                  font=_FL).pack(anchor="w")
         self._lrow(c, "LAT", "_lat_lbl", "---.---------- -")
@@ -876,7 +910,6 @@ class _NavPanel(tk.Frame):
 
         self._sep()
 
-        # Altitude
         tk.Label(c, text="ALTITUDE MSL", fg=_C["label"], bg=_C["bg"],
                  font=_FL).pack(anchor="w")
         alt_r = tk.Frame(c, bg=_C["bg"])
@@ -890,7 +923,6 @@ class _NavPanel(tk.Frame):
 
         self._sep()
 
-        # Ground vector
         tk.Label(c, text="GROUND VECTOR", fg=_C["label"], bg=_C["bg"],
                  font=_FL).pack(anchor="w")
         inner = tk.Frame(c, bg=_C["bg"])
@@ -912,7 +944,6 @@ class _NavPanel(tk.Frame):
 
         self._sep()
 
-        # Home
         tk.Label(c, text="HOME POINT", fg=_C["label"], bg=_C["bg"],
                  font=_FL).pack(anchor="w")
         inner2 = tk.Frame(c, bg=_C["bg"])
@@ -961,22 +992,21 @@ class _NavPanel(tk.Frame):
     # ── Public update ─────────────────────────────────────────────────────────
 
     def update(self, d: dict):
-        raw_valid  = d.get("raw_valid", False)
+        raw_valid  = d.get("raw_valid",  False)
         comp_valid = d.get("comp_valid", False)
         pos_usable = d.get("pos_usable", False)
-        fix_type   = d.get("fix_type", 0)
-        num_sat    = d.get("num_sat", 0)
-        hdop       = d.get("hdop", 99.0)
-        lat        = d.get("lat", 0.0)
-        lon        = d.get("lon", 0.0)
-        alt_m      = d.get("alt_m", 0.0)
-        gs_cms     = d.get("gs_cms", 0)
-        trk        = d.get("trk", 0.0)
-        dist_m     = d.get("dist_m", 0.0)
-        brg        = d.get("brg", 0)
-        heartbeat  = d.get("heartbeat", None)
+        fix_type   = d.get("fix_type",   0)
+        num_sat    = d.get("num_sat",    0)
+        hdop       = d.get("hdop",       99.0)
+        lat        = d.get("lat",        0.0)
+        lon        = d.get("lon",        0.0)
+        alt_m      = d.get("alt_m",      0.0)
+        gs_cms     = d.get("gs_cms",     0)
+        trk        = d.get("trk",        0.0)
+        dist_m     = d.get("dist_m",     0.0)
+        brg        = d.get("brg",        0)
+        heartbeat  = d.get("heartbeat",  None)
 
-        # Fix badge
         if raw_valid and fix_type >= 2:
             self._fix_lbl.config(text="3D FIX", fg=_C["green"])
         elif raw_valid and fix_type == 1:
@@ -984,13 +1014,11 @@ class _NavPanel(tk.Frame):
         else:
             self._fix_lbl.config(text="NO FIX", fg=_C["red"])
 
-        # SAT
         self._sat_lbl.config(
             text=f"{num_sat:3d}" if raw_valid else " --",
             fg=_C["green"] if (raw_valid and num_sat >= 6)
                else _C["amber"] if raw_valid else _C["dim"])
 
-        # HDOP
         if raw_valid and hdop < 99.0:
             hcol = (_C["green"] if hdop < 1.0
                     else _C["amber"] if hdop < 2.0 else _C["red"])
@@ -998,14 +1026,12 @@ class _NavPanel(tk.Frame):
         else:
             self._hdop_lbl.config(text=" -.--", fg=_C["dim"])
 
-        # Heartbeat blink
         if heartbeat is not None and heartbeat != self._prev_heartbeat:
             self._hb_state       = not self._hb_state
             self._prev_heartbeat = heartbeat
         self._hb_cv.itemconfig(self._hb_dot,
                                fill=_C["hb_on"] if self._hb_state else _C["hb_off"])
 
-        # Position
         if raw_valid and fix_type >= 1:
             col = _C["text"] if pos_usable else _C["amber"]
             self._lat_lbl.config(
@@ -1016,7 +1042,6 @@ class _NavPanel(tk.Frame):
             self._lat_lbl.config(text="---.---------- -", fg=_C["dim"])
             self._lon_lbl.config(text="---.---------- -", fg=_C["dim"])
 
-        # Altitude
         if raw_valid and fix_type >= 2:
             self._alt_ft_lbl.config(text=f"{alt_m * _M_TO_FT:7.0f} ft", fg=_C["text"])
             self._alt_m_lbl.config( text=f"({alt_m:6.0f} m)",             fg=_C["unit"])
@@ -1024,7 +1049,6 @@ class _NavPanel(tk.Frame):
             self._alt_ft_lbl.config(text="------ ft",  fg=_C["dim"])
             self._alt_m_lbl.config( text="(------ m)", fg=_C["unit"])
 
-        # Ground speed
         if raw_valid:
             self._gs_kt_lbl.config(text=f"{gs_cms * _CMS_TO_KT:5.1f} kt",      fg=_C["text"])
             self._gs_km_lbl.config(text=f"({gs_cms * _CMS_TO_KMH:5.1f} km/h)", fg=_C["unit"])
@@ -1032,7 +1056,6 @@ class _NavPanel(tk.Frame):
             self._gs_kt_lbl.config(text="---.- kt",   fg=_C["dim"])
             self._gs_km_lbl.config(text="(--- km/h)", fg=_C["dim"])
 
-        # Track
         if raw_valid:
             self._trk_lbl.config(text=f"{trk:05.1f}°", fg=_C["text"])
             self._point_needle(self._trk_cv, self._trk_needle, 34, 34, 28, trk)
@@ -1040,7 +1063,6 @@ class _NavPanel(tk.Frame):
             self._trk_lbl.config(text="---.-°", fg=_C["dim"])
             self._point_needle(self._trk_cv, self._trk_needle, 34, 34, 28, 0)
 
-        # Home
         if comp_valid:
             brg360 = (brg + 360) % 360
             self._dist_lbl.config(text=f"{int(dist_m):6d} m", fg=_C["cyan"])
@@ -1080,9 +1102,9 @@ class GPSWidget(tk.Frame):
     def __init__(self, parent, **kwargs):
         super().__init__(parent, bg=_C["bg"], **kwargs)
         self._sat_open     = False
-        self._map_mode     = True        # current layout mode
+        self._map_mode     = True
         self._last_ui_data = {}
-        self._sat_toplevel = None        # used only in nav-mode fallback
+        self._sat_toplevel = None
 
         self._build_ui()
         self.bind("<Configure>", self._on_configure)
@@ -1092,7 +1114,6 @@ class GPSWidget(tk.Frame):
     # =========================================================================
 
     def _build_ui(self):
-        # ── Title / header bar ───────────────────────────────────────────────
         self._hdr = tk.Frame(self, bg=_C["frame_bg"], height=26)
         self._hdr.pack(fill="x")
         self._hdr.pack_propagate(False)
@@ -1112,7 +1133,6 @@ class GPSWidget(tk.Frame):
         )
         self._sat_btn.pack(side="right", padx=6, pady=3)
 
-        # Heartbeat indicator in header
         self._hb_cv  = tk.Canvas(self._hdr, width=10, height=10,
                                  bg=_C["frame_bg"], highlightthickness=0)
         self._hb_cv.pack(side="right", padx=(0, 4))
@@ -1121,31 +1141,23 @@ class GPSWidget(tk.Frame):
         self._prev_heartbeat = None
         self._hb_state       = False
 
-        # Thin separator
         tk.Frame(self, bg=_C["border"], height=1).pack(fill="x")
 
-        # ── Content area ─────────────────────────────────────────────────────
         self._content = tk.Frame(self, bg=_C["bg"])
         self._content.pack(fill="both", expand=True)
 
         self._build_map_layout()
         self._build_nav_layout()
 
-        # Initial layout — start in map mode
         self._apply_map_mode()
 
     def _build_map_layout(self):
-        """Map + optional side satellite panel."""
-        self._map_frame = tk.Frame(self._content, bg=_C["bg"])
-
+        self._map_frame  = tk.Frame(self._content, bg=_C["bg"])
         self._map_canvas = _MapCanvas(self._map_frame)
         self._map_canvas.pack(side="left", fill="both", expand=True)
-
-        self._sat_panel = _SatPanel(self._map_frame)
-        # not packed initially
+        self._sat_panel  = _SatPanel(self._map_frame)
 
     def _build_nav_layout(self):
-        """Compact nav panel (fallback for small widget sizes)."""
         self._nav_frame = tk.Frame(self._content, bg=_C["bg"])
         self._nav_panel = _NavPanel(self._nav_frame)
         self._nav_panel.pack(fill="both", expand=True)
@@ -1158,7 +1170,6 @@ class GPSWidget(tk.Frame):
         self._map_mode = True
         self._nav_frame.pack_forget()
         self._map_frame.pack(fill="both", expand=True)
-        # Restore sat panel visibility
         if self._sat_open:
             self._sat_panel.pack(side="right", fill="y")
         self._sat_btn.config(state="normal")
@@ -1172,14 +1183,13 @@ class GPSWidget(tk.Frame):
 
     def _on_configure(self, event):
         w = event.width
-        h = event.height - 27   # subtract header bar
+        h = event.height - 27
         want_map = (w >= MIN_MAP_W and h >= MIN_MAP_H)
         if want_map != self._map_mode:
             if want_map:
                 self._apply_map_mode()
             else:
                 self._apply_nav_mode()
-            # Re-push last known data into new layout
             if self._last_ui_data:
                 self._push_data(self._last_ui_data)
 
@@ -1203,7 +1213,6 @@ class GPSWidget(tk.Frame):
                 self._close_sat_toplevel()
 
     def _open_sat_toplevel(self):
-        """In nav-mode, satellites float in a Toplevel window."""
         if self._sat_toplevel and self._sat_toplevel.winfo_exists():
             return
         tl = tk.Toplevel(self)
@@ -1218,7 +1227,6 @@ class GPSWidget(tk.Frame):
         self._sat_toplevel_panel = panel
         self._sat_toplevel       = tl
 
-        # Push latest data
         if self._last_ui_data:
             raw  = self._last_ui_data.get("gps_sv_list", [])
             norm = _normalize_sv_list(raw)
@@ -1256,7 +1264,6 @@ class GPSWidget(tk.Frame):
         heartbeat  = ui_data.get("gps_heartbeat",         None)
         trk        = (course_dd / 10.0) % 360.0
 
-        # Common nav dict shared by all sub-widgets
         nav = dict(
             raw_valid=raw_valid, comp_valid=comp_valid,
             pos_usable=pos_usable, fix_type=fix_type,
@@ -1267,7 +1274,7 @@ class GPSWidget(tk.Frame):
             heartbeat=heartbeat,
         )
 
-        # Heartbeat in header (shared across both modes)
+        # Heartbeat in header
         if heartbeat is not None and heartbeat != self._prev_heartbeat:
             self._hb_state       = not self._hb_state
             self._prev_heartbeat = heartbeat
@@ -1281,7 +1288,6 @@ class GPSWidget(tk.Frame):
         else:
             self._nav_panel.update(nav)
 
-        # Satellite panel (in-frame or floating toplevel)
         raw_sv = ui_data.get("gps_sv_list", [])
         norm   = _normalize_sv_list(raw_sv)
         self._sat_panel.update_satellites(norm)
