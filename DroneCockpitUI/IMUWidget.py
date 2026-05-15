@@ -314,9 +314,13 @@ class IMUWidget(tk.Frame):
         frm.grid(row=row, column=0, sticky="nsew", padx=4, pady=1)
         for i, w in enumerate([2, 1, 1, 1]):
             frm.columnconfigure(i, weight=w)
-        frm.rowconfigure(0, weight=1)
-        frm.rowconfigure(1, weight=1)
-        frm.rowconfigure(2, weight=1)
+
+        # Rows 0, 2, 4 = data rows (equal stretch); rows 1, 3 = 1px separators
+        frm.rowconfigure(0, weight=1, minsize=0)
+        frm.rowconfigure(1, weight=0, minsize=1)
+        frm.rowconfigure(2, weight=1, minsize=0)
+        frm.rowconfigure(3, weight=0, minsize=1)
+        frm.rowconfigure(4, weight=1, minsize=0)
 
         axes = {}
         for i, (key, label) in enumerate([
@@ -324,25 +328,25 @@ class IMUWidget(tk.Frame):
             ("pitch", "PITCH"),
             ("yaw",   "YAW"),
         ]):
+            actual_row = i * 2   # 0, 2, 4
+
             if i > 0:
                 tk.Frame(frm, bg=self.C_SEP, height=1).grid(
-                    row=i * 2 - 1, column=0, columnspan=4, sticky="ew")
-
-            actual_row = i * 2  # interleave separators
+                    row=actual_row - 1, column=0, columnspan=4, sticky="ew")
 
             tk.Label(
                 frm, text=label,
                 font=("Consolas", font_size - 1, "bold"),
                 fg=self.C_AXIS_FG, bg=self.C_GRID_BG,
                 padx=6, anchor="w",
-            ).grid(row=actual_row, column=0, sticky="ew", padx=1, pady=2)
+            ).grid(row=actual_row, column=0, sticky="nsew", padx=1, pady=2)
 
             rot = self._make_cell(frm, font_size)
             acc = self._make_cell(frm, font_size)
             ang = self._make_cell(frm, font_size)
-            rot.grid(row=actual_row, column=1, sticky="ew", padx=1, pady=2)
-            acc.grid(row=actual_row, column=2, sticky="ew", padx=1, pady=2)
-            ang.grid(row=actual_row, column=3, sticky="ew", padx=1, pady=2)
+            rot.grid(row=actual_row, column=1, sticky="nsew", padx=1, pady=2)
+            acc.grid(row=actual_row, column=2, sticky="nsew", padx=1, pady=2)
+            ang.grid(row=actual_row, column=3, sticky="nsew", padx=1, pady=2)
             axes[key] = {"rot": rot, "acc": acc, "ang": ang}
 
         self._tier_widgets["axes"] = axes
