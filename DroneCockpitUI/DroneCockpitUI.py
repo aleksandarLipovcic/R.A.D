@@ -220,9 +220,12 @@ class DroneCockpitApp:
         self._last_mag_heading = 0.0
         self._last_mag_valid   = False
 
-        # Debug: suppress repeated sv diagnostic prints after the first N frames
+        # ── SV diagnostics ────────────────────────────────────────────────────
+        # Prints all satellite entries for the first _sv_debug_limit frames
+        # after each connection, then goes silent.  Reset to 0 on reconnect
+        # so you always get a fresh diagnostic on each new link.
         self._sv_debug_frames = 0
-        self._sv_debug_limit  = 5   # print diagnostics for first 5 frames only
+        self._sv_debug_limit  = 10  # print diagnostics for first 10 frames
 
         self._locked_ref = [False]
         self._vis_vars: dict[str, tk.BooleanVar] = {}
@@ -494,6 +497,7 @@ class DroneCockpitApp:
         if self.hub.connect(port):
             self.status_label.config(
                 text=f"Status: Connected — {port}", fg="#00ff88")
+            self._sv_debug_frames = 0   # reset SV diagnostics on each new connection
             self._schedule_update()
         else:
             self.status_label.config(
@@ -545,17 +549,16 @@ class DroneCockpitApp:
                 gps_hdop_raw  = getattr(gps, "hdop", 9999)
                 gps_hdop_real = gps_hdop_raw / 100.0 if gps_hdop_raw != 9999 else 99.0
 
-                # ── FIX 1: Always read sv_list — do NOT gate on sv_info_valid.
+                # Always read sv_list — do NOT gate on sv_info_valid.
                 # sv_info_valid being False was silently swallowing all satellite
                 # data even when Betaflight reported full constellation info.
-                # We still pass sv_info_valid through so the widget can use it
-                # for display context if needed, but we never skip building the
-                # satellite list because of it.
-                sv_list_raw    = list(state.sv_list)
-                sv_info_valid  = getattr(state, "sv_info_valid", False)
-                sv_source      = getattr(state, "sv_source", "")
+                sv_list_raw   = list(state.sv_list)
+                sv_info_valid = getattr(state, "sv_info_valid", False)
+                sv_source     = getattr(state, "sv_source", "")
 
-                # ── Diagnostic: print sv details for first N frames ───────────
+                # ── SV diagnostics: all entries, first _sv_debug_limit frames ─
+                # Prints gnss_name so you can verify the C++ gnssId fix is
+                # working (should show GPS / BeiDou / Galileo / SBAS, not all SBAS).
                 if self._sv_debug_frames < self._sv_debug_limit:
                     self._sv_debug_frames += 1
                     print(
@@ -564,14 +567,14 @@ class DroneCockpitApp:
                         f"  sv_source={sv_source!r}"
                         f"  sv_count={len(sv_list_raw)}"
                     )
-                    for sv in sv_list_raw[:5]:  # first 5 entries only
+                    for sv in sv_list_raw:   # all entries — verify constellation mix
                         print(
-                            f"         gnss_name={getattr(sv,'gnss_name','?')}"
-                            f"  svid={getattr(sv,'svid','?')}"
-                            f"  cno={getattr(sv,'cno','?')}"
-                            f"  used={getattr(sv,'used','?')}"
-                            f"  quality={getattr(sv,'quality','?')}"
-                            f"  status_str={getattr(sv,'status_str','?')}"
+                            f"         gnss_name={getattr(sv, 'gnss_name',  '?'):8s}"
+                            f"  svid={getattr(sv, 'svid',       0):3d}"
+                            f"  cno={getattr(sv, 'cno',        0):3d}"
+                            f"  used={getattr(sv, 'used',      False)!s:5s}"
+                            f"  quality={getattr(sv, 'quality', 0)}"
+                            f"  status={getattr(sv, 'status_str', 'idle')}"
                         )
 
                 # Build normalised dicts for GPSWidget._normalize_sv_list().
@@ -591,9 +594,7 @@ class DroneCockpitApp:
                     for sv in sv_list_raw
                 ]
 
-                # ── FIX 2: heartbeat attribute name was "gps_heartbeat"
-                # (double-prefixed) — the actual attribute on gps is "heartbeat".
-                # Try both names so it works regardless of backend version.
+                # heartbeat: try both attribute names for backwards compatibility
                 heartbeat = getattr(gps, "heartbeat",
                             getattr(gps, "gps_heartbeat", None))
 
@@ -608,7 +609,7 @@ class DroneCockpitApp:
                     "gps_ground_course":    getattr(gps, "ground_course",     0),
                     "gps_dist_to_home_m":   float(getattr(gps, "dist_to_home_m", 0)),
                     "gps_bearing_to_home":  getattr(gps, "bearing_to_home",   0),
-                    "gps_heartbeat":        heartbeat,          # FIX 2 applied
+                    "gps_heartbeat":        heartbeat,
                     "gps_raw_valid":        getattr(gps, "raw_valid",         False),
                     "gps_comp_valid":       getattr(gps, "comp_valid",        False),
                     "gps_position_usable":  getattr(gps, "position_usable",   False),
