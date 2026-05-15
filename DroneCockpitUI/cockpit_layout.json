@@ -1,18 +1,18 @@
 {
   "geometry": "1536x793+-26+34",
-  "locked": false,
+  "locked": true,
   "panels": {
     "imu": {
       "x": 29,
       "y": 3,
-      "w": 460,
-      "h": 318,
+      "w": 469,
+      "h": 254,
       "visible": true
     },
     "mag": {
-      "x": 16,
-      "y": 368,
-      "w": 474,
+      "x": 20,
+      "y": 260,
+      "w": 477,
       "h": 340,
       "visible": true
     },
@@ -31,9 +31,9 @@
       "visible": true
     },
     "gps": {
-      "x": 490,
-      "y": 3,
-      "w": 690,
+      "x": 498,
+      "y": 2,
+      "w": 684,
       "h": 717,
       "visible": true
     }
