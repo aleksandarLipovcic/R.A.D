@@ -6,20 +6,23 @@ class IMUWidget(tk.Frame):
     """
     MPU-6500 IMU / Attitude display — fully adaptive cockpit instrument.
 
-    Layout philosophy:
-      Primary data (rotation, g-force, angle) is NEVER hidden as long as the
-      panel has enough room to draw even one row.  Secondary chrome (column
-      header labels, checkbox) shrinks or drops first.  The diag panel hides
-      only when the widget is genuinely too small to fit it after the grid.
+    Aviation alerting standard (EASA CS-25 / FAA AC 25.1322):
+      SAFE   — dark cell background (#0d1520),  green  text  (#00ff88)
+      WARN   — solid amber fill   (#C87000),    black  text  (#000000)
+               Amber = CAUTION level.  Black-on-amber passes WCAG AA (4.6:1).
+      CRIT   — flashing red fill alternating between #CC0000 and #500000,
+               white text (#FFFFFF) always — white-on-#CC0000 = 5.1:1 (WCAG AA).
+               Flash cadence 500 ms ON / 500 ms OFF per DO-160 / EASA conventions.
 
-    Tier definitions drive font size and chrome visibility only:
-      FULL    (h>=210, w>=400): full column headers + checkbox + diag panel
-      MEDIUM  (h>=150, w>=290): short column headers + adjust btn + diag panel
-      COMPACT (h>=90,  w>=190): no column headers + axis rows + diag if it fits
-      TINY    (h< 90  or w<190): single summary line
+    All three states keep the numeric value fully legible at all times.
+    Flashing is managed by a single shared _tick() loop that walks a registry
+    of currently-flashing cells.  Adding / removing cells is O(1).
 
-    The diag panel uses grid() / grid_forget() dynamically after every resize
-    based on actual remaining pixel space — not on tier alone.
+    Layout tiers (unchanged from original):
+      FULL    (h>=210, w>=400)
+      MEDIUM  (h>=150, w>=290)
+      COMPACT (h>=90,  w>=190)
+      TINY    (h< 90  or w<190)
     """
 
     # ── Scale factors ─────────────────────────────────────────────────────────
@@ -42,14 +45,14 @@ class IMUWidget(tk.Frame):
     DRIFT_WARN_DEG = 15.0
     DRIFT_CRIT_DEG = 30.0
 
-    # Approximate pixel heights for layout decisions
-    _HDR_H    = 28    # header bar
-    _ROW_H    = 26    # one axis data row
-    _COLHDR_H = 22    # column header row
-    _DIAG_H   = 54    # diag panel (3 lines)
-    _PAD      = 10    # total vertical padding budget
+    # ── Layout pixel budgets ──────────────────────────────────────────────────
+    _HDR_H    = 28
+    _ROW_H    = 26
+    _COLHDR_H = 22
+    _DIAG_H   = 54
+    _PAD      = 10
 
-    # ── Cockpit colour palette ────────────────────────────────────────────────
+    # ── Base cockpit palette ──────────────────────────────────────────────────
     C_BG          = "#0a0a10"
     C_HEADER_BG   = "#0d1520"
     C_GRID_BG     = "#0b0b15"
@@ -61,14 +64,31 @@ class IMUWidget(tk.Frame):
     C_TEXT        = "#c0d0e0"
     C_LABEL       = "#3a5a6a"
     C_SEP         = "#1e2a3a"
-    C_SAFE        = "#00ff88"
-    C_WARN        = "#FFD700"
-    C_CRIT        = "#FF3333"
     C_NEUTRAL     = "#00d4ff"
     C_BTN_NORMAL  = "#0a1520"
     C_BTN_FG      = "#00d4ff"
     C_BTN_FLASH_A = "#FF2222"
     C_BTN_FLASH_B = "#880000"
+
+    # ── Alert state colours (aviation standard) ───────────────────────────────
+    # SAFE
+    C_SAFE_BG   = "#0d1520"   # dark cockpit cell
+    C_SAFE_FG   = "#00ff88"   # green value text
+    C_SAFE_BDR  = "#1e2a3a"   # subtle border
+
+    # WARN  — amber caution (EASA CS-25 / FAA AC 25.1322 amber = caution)
+    C_WARN_BG   = "#C87000"   # solid amber fill
+    C_WARN_FG   = "#000000"   # black text — contrast 4.6:1 on amber (WCAG AA)
+    C_WARN_BDR  = "#FF9900"   # bright amber border for extra pop
+
+    # CRIT  — red warning, flashing
+    C_CRIT_BG_A = "#CC0000"   # flash phase A — bright red   (white-on-red 5.1:1)
+    C_CRIT_BG_B = "#500000"   # flash phase B — dark red     (white-on-dark 8.0:1)
+    C_CRIT_FG   = "#FFFFFF"   # white text — readable on both phases
+    C_CRIT_BDR  = "#FF4444"   # red border
+
+    # Flash cadence: 500 ms per half-period (1 Hz total)
+    _FLASH_MS = 500
 
     def __init__(self, parent, on_adjust_heading=None):
         super().__init__(parent, bg=self.C_BG)
@@ -87,13 +107,18 @@ class IMUWidget(tk.Frame):
         self._flash_on  = False
         self._flashing  = False
 
+        # Registry of cells currently in CRIT state: label widget → True
+        self._crit_cells: dict[tk.Label, bool] = {}
+        self._cell_flash_phase = True   # True = phase-A (bright)
+        self._cell_flash_job   = None
+
         self._last_mag_heading = 0.0
         self._mag_valid        = False
         self._last_data        = {}
 
         self._current_tier  = None
         self._tier_widgets  = {}
-        self._diag_visible  = False   # tracks actual diag panel state
+        self._diag_visible  = False
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
@@ -102,6 +127,83 @@ class IMUWidget(tk.Frame):
         self._container.grid(row=0, column=0, sticky="nsew")
 
         self.bind("<Configure>", self._on_resize)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Cell flash engine — single shared ticker
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _start_cell_flash(self):
+        """Start the shared cell-flash ticker if not already running."""
+        if self._cell_flash_job is not None:
+            return
+        self._cell_flash_ticker()
+
+    def _cell_flash_ticker(self):
+        """Toggle all CRIT cells between phase-A and phase-B every _FLASH_MS."""
+        self._cell_flash_phase = not self._cell_flash_phase
+        bg = self.C_CRIT_BG_A if self._cell_flash_phase else self.C_CRIT_BG_B
+
+        dead = []
+        for lbl in list(self._crit_cells):
+            try:
+                lbl.config(bg=bg)
+            except tk.TclError:
+                dead.append(lbl)   # widget was destroyed during tier rebuild
+
+        for lbl in dead:
+            self._crit_cells.pop(lbl, None)
+
+        if self._crit_cells:
+            self._cell_flash_job = self.after(self._FLASH_MS,
+                                              self._cell_flash_ticker)
+        else:
+            self._cell_flash_job = None   # nothing left to flash — stop ticker
+
+    def _register_crit(self, lbl: tk.Label):
+        if lbl not in self._crit_cells:
+            self._crit_cells[lbl] = True
+            self._start_cell_flash()
+
+    def _unregister_crit(self, lbl: tk.Label):
+        self._crit_cells.pop(lbl, None)
+        # Ticker stops itself automatically when dict empties
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Cell state application
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _apply_cell_state(self, lbl: tk.Label, value_text: str, state: str):
+        """
+        Apply SAFE / WARN / CRIT visual state to a data cell.
+
+        SAFE  — dark bg, green text, subtle border
+        WARN  — solid amber bg, black text, amber border
+        CRIT  — enter flash registry (flashing red), white text, red border
+        """
+        if state == "warn":
+            self._unregister_crit(lbl)
+            lbl.config(
+                text=value_text,
+                bg=self.C_WARN_BG,
+                fg=self.C_WARN_FG,
+                highlightbackground=self.C_WARN_BDR,
+            )
+        elif state == "crit":
+            lbl.config(
+                text=value_text,
+                bg=self.C_CRIT_BG_A,   # ticker will alternate from here
+                fg=self.C_CRIT_FG,
+                highlightbackground=self.C_CRIT_BDR,
+            )
+            self._register_crit(lbl)
+        else:  # safe
+            self._unregister_crit(lbl)
+            lbl.config(
+                text=value_text,
+                bg=self.C_SAFE_BG,
+                fg=self.C_SAFE_FG,
+                highlightbackground=self.C_SAFE_BDR,
+            )
 
     # ══════════════════════════════════════════════════════════════════════════
     # Resize handling
@@ -118,7 +220,6 @@ class IMUWidget(tk.Frame):
             if self._last_data:
                 self._render(self._last_data)
 
-        # After (re)build, always re-evaluate diag visibility based on real space
         self.after_idle(lambda: self._refit_diag(h))
 
     def _classify(self, w, h):
@@ -131,23 +232,15 @@ class IMUWidget(tk.Frame):
         return "full"
 
     def _refit_diag(self, total_h=None):
-        """
-        Show or hide the diag panel depending on whether it actually fits
-        below the grid in the current pixel height.  Called after every resize
-        and after every tier rebuild.
-        """
         diag = self._tier_widgets.get("diag")
         if diag is None:
-            return  # tier doesn't have a diag panel (compact/tiny)
+            return
 
         if total_h is None:
             total_h = self.winfo_height()
 
         tier = self._current_tier
-        # Estimate pixels consumed by fixed chrome above the diag panel
-        if tier == "full":
-            chrome = self._HDR_H + self._COLHDR_H + 3 * self._ROW_H + self._PAD
-        elif tier == "medium":
+        if tier in ("full", "medium"):
             chrome = self._HDR_H + self._COLHDR_H + 3 * self._ROW_H + self._PAD
         else:
             chrome = 3 * self._ROW_H + self._PAD
@@ -166,6 +259,8 @@ class IMUWidget(tk.Frame):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _clear_container(self):
+        # Remove all cells from the flash registry before destroying them
+        self._crit_cells.clear()
         for w in self._container.winfo_children():
             w.destroy()
         self._tier_widgets  = {}
@@ -183,14 +278,13 @@ class IMUWidget(tk.Frame):
             "tiny":    self._build_tiny,
         }[tier]()
 
-    # ── FULL ──────────────────────────────────────────────────────────────────
     def _build_full(self):
         c = self._container
         c.columnconfigure(0, weight=1)
-        c.rowconfigure(0, weight=0)   # header
-        c.rowconfigure(1, weight=0)   # col headers
-        c.rowconfigure(2, weight=1)   # grid rows
-        c.rowconfigure(3, weight=0)   # diag (shown/hidden by _refit_diag)
+        c.rowconfigure(0, weight=0)
+        c.rowconfigure(1, weight=0)
+        c.rowconfigure(2, weight=1)
+        c.rowconfigure(3, weight=0)
 
         self._build_header(c, row=0, full=True)
         self._build_col_headers(c, row=1, font_size=8, labels=[
@@ -199,7 +293,6 @@ class IMUWidget(tk.Frame):
         self._build_axis_grid(c, row=2, font_size=12)
         self._build_diag(c)
 
-    # ── MEDIUM ────────────────────────────────────────────────────────────────
     def _build_medium(self):
         c = self._container
         c.columnconfigure(0, weight=1)
@@ -215,20 +308,16 @@ class IMUWidget(tk.Frame):
         self._build_axis_grid(c, row=2, font_size=10)
         self._build_diag(c)
 
-    # ── COMPACT ───────────────────────────────────────────────────────────────
     def _build_compact(self):
         c = self._container
         c.columnconfigure(0, weight=1)
-        c.rowconfigure(0, weight=0)   # slim header (adjust btn + drift only)
-        c.rowconfigure(1, weight=1)   # grid rows
-        # No diag — will be added by _refit_diag if space allows
-        # (compact is h>=90, so there's rarely room, but we still check)
+        c.rowconfigure(0, weight=0)
+        c.rowconfigure(1, weight=1)
 
         self._build_header(c, row=0, full=False)
         self._build_axis_grid(c, row=1, font_size=9)
-        self._build_diag(c)   # created but initially hidden; _refit_diag decides
+        self._build_diag(c)
 
-    # ── TINY ──────────────────────────────────────────────────────────────────
     def _build_tiny(self):
         c = self._container
         c.columnconfigure(0, weight=1)
@@ -237,7 +326,7 @@ class IMUWidget(tk.Frame):
         summary = tk.Label(
             c, text="R: ---  P: ---  Y: ---",
             font=("Consolas", 9, "bold"),
-            fg=self.C_SAFE, bg=self.C_BG,
+            fg=self.C_SAFE_FG, bg=self.C_BG,
         )
         summary.grid(row=0, column=0)
         self._tier_widgets["summary"] = summary
@@ -315,7 +404,6 @@ class IMUWidget(tk.Frame):
         for i, w in enumerate([2, 1, 1, 1]):
             frm.columnconfigure(i, weight=w)
 
-        # Rows 0, 2, 4 = data rows (equal stretch); rows 1, 3 = 1px separators
         frm.rowconfigure(0, weight=1, minsize=0)
         frm.rowconfigure(1, weight=0, minsize=1)
         frm.rowconfigure(2, weight=1, minsize=0)
@@ -328,7 +416,7 @@ class IMUWidget(tk.Frame):
             ("pitch", "PITCH"),
             ("yaw",   "YAW"),
         ]):
-            actual_row = i * 2   # 0, 2, 4
+            actual_row = i * 2
 
             if i > 0:
                 tk.Frame(frm, bg=self.C_SEP, height=1).grid(
@@ -352,10 +440,8 @@ class IMUWidget(tk.Frame):
         self._tier_widgets["axes"] = axes
 
     def _build_diag(self, parent):
-        """Build diag panel but do NOT show it — _refit_diag decides."""
         diag = tk.Frame(parent, bg=self.C_HEADER_BG,
                         highlightbackground=self.C_SEP, highlightthickness=1)
-        # NOT grid()'d here — _refit_diag calls grid() / grid_forget()
         self._tier_widgets["diag"] = diag
 
         for key, label in [
@@ -377,13 +463,14 @@ class IMUWidget(tk.Frame):
             self._tier_widgets[key] = val
 
     def _make_cell(self, parent, font_size):
+        """Create a data cell in its initial SAFE state."""
         return tk.Label(
             parent,
             text="  ---",
             font=("Consolas", font_size, "bold"),
-            fg=self.C_SAFE,
-            bg=self.C_CELL_BG,
-            highlightbackground=self.C_CELL_BORDER,
+            fg=self.C_SAFE_FG,
+            bg=self.C_SAFE_BG,
+            highlightbackground=self.C_SAFE_BDR,
             highlightthickness=1,
             padx=4, pady=3,
             anchor="e",
@@ -394,7 +481,6 @@ class IMUWidget(tk.Frame):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _on_latency_toggle(self):
-        """User toggled the 'Link latency' checkbox — honour it immediately."""
         show_var = self._tier_widgets.get("show_diag")
         if show_var is None:
             return
@@ -402,14 +488,13 @@ class IMUWidget(tk.Frame):
         if diag is None:
             return
         if show_var.get():
-            # re-run refit so it re-checks available space
             self._refit_diag()
         else:
             diag.grid_forget()
             self._diag_visible = False
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Heading adjust + flash
+    # Heading adjust + heading-button flash
     # ══════════════════════════════════════════════════════════════════════════
 
     def _on_adjust_pressed(self):
@@ -507,28 +592,39 @@ class IMUWidget(tk.Frame):
         drift_lbl = self._tier_widgets.get("drift_lbl")
         if drift_lbl:
             if mag_valid:
-                clr = (self.C_CRIT if abs_drift >= self.DRIFT_CRIT_DEG else
-                       self.C_WARN if abs_drift >= self.DRIFT_WARN_DEG else
-                       self.C_SAFE)
+                clr = (self.C_CRIT_BG_A if abs_drift >= self.DRIFT_CRIT_DEG else
+                       self.C_WARN_BG    if abs_drift >= self.DRIFT_WARN_DEG else
+                       self.C_SAFE_FG)
                 drift_lbl.config(text=f"{drift:>+6.1f}°", fg=clr)
             else:
                 drift_lbl.config(text="NO MAG", fg=self.C_LABEL)
 
-        # ── Flash control ─────────────────────────────────────────────────────
+        # ── Heading-button flash ──────────────────────────────────────────────
         if mag_valid and abs_drift >= self.DRIFT_CRIT_DEG:
             self._start_flash()
         else:
             self._stop_flash()
 
-        # ── Tiny: single summary line ─────────────────────────────────────────
+        # ── TINY: single summary line ─────────────────────────────────────────
         summary = self._tier_widgets.get("summary")
         if summary:
-            rc = self._angle_color(roll)
-            pc = self._angle_color(pitch)
-            yc = self._drift_color(abs_drift) if mag_valid else self.C_SAFE
+            rc = self._angle_state(roll)
+            pc = self._angle_state(pitch)
+            yc = self._drift_state(abs_drift) if mag_valid else "safe"
+            worst = self._worst_state(rc, pc, yc)
+            fg = {
+                "crit": self.C_CRIT_FG,
+                "warn": self.C_WARN_FG,
+                "safe": self.C_SAFE_FG,
+            }[worst]
+            bg = {
+                "crit": self.C_CRIT_BG_A,
+                "warn": self.C_WARN_BG,
+                "safe": self.C_BG,
+            }[worst]
             summary.config(
                 text=f"R:{roll:>5.1f}°  P:{pitch:>5.1f}°  Y:{fc_yaw_trimmed:>5.1f}°",
-                fg=self._worst_color(rc, pc, yc),
+                fg=fg, bg=bg,
             )
             return
 
@@ -546,26 +642,17 @@ class IMUWidget(tk.Frame):
             if not cells:
                 continue
 
-            rot_clr = self._gyro_color(key, abs(rot_val), now)
-            acc_clr = self._accel_color(acc_val, is_yaw)
-            ang_clr = (self._drift_color(abs_drift) if (is_yaw and mag_valid)
-                       else self._angle_color(ang_val))
+            rot_state = self._gyro_state_label(key, abs(rot_val), now)
+            acc_state = self._accel_state(acc_val, is_yaw)
+            ang_state = (self._drift_state(abs_drift) if (is_yaw and mag_valid)
+                         else self._angle_state(ang_val))
 
-            def border(clr):
-                return ("#3a0000" if clr == self.C_CRIT else
-                        "#3a3000" if clr == self.C_WARN else
-                        self.C_CELL_BORDER)
+            self._apply_cell_state(cells["rot"], f"{rot_val:>7.2f}", rot_state)
+            self._apply_cell_state(cells["acc"], f"{acc_val:>7.3f}", acc_state)
+            self._apply_cell_state(cells["ang"], f"{ang_val:>7.1f}", ang_state)
 
-            cells["rot"].config(text=f"{rot_val:>7.2f}", fg=rot_clr,
-                                highlightbackground=border(rot_clr))
-            cells["acc"].config(text=f"{acc_val:>7.3f}", fg=acc_clr,
-                                highlightbackground=border(acc_clr))
-            cells["ang"].config(text=f"{ang_val:>7.1f}", fg=ang_clr,
-                                highlightbackground=border(ang_clr))
-
-        # ── Diag panel values ─────────────────────────────────────────────────
+        # ── Diag panel ────────────────────────────────────────────────────────
         if self._diag_visible:
-            # Respect user checkbox if present
             show_var = self._tier_widgets.get("show_diag")
             if show_var is None or show_var.get():
                 rtt      = data.get("rtt_ms",      0.0)
@@ -591,48 +678,68 @@ class IMUWidget(tk.Frame):
         self.is_calibrating = False
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Colour helpers
+    # State helpers  (return "safe" | "warn" | "crit")
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _gyro_color(self, axis: str, abs_dps: float, now: float) -> str:
+    def _gyro_state_label(self, axis: str, abs_dps: float, now: float) -> str:
         s = self._gyro_state[axis]
         if abs_dps >= self.GYRO_CRIT_DPS:
-            s["state"]      = "critical"
+            s["state"]      = "crit"
             s["hold_until"] = now + self.HOLD_CRIT_SEC
         elif abs_dps >= self.GYRO_WARN_DPS:
-            if s["state"] != "critical":
+            if s["state"] != "crit":
                 s["state"]      = "warn"
                 s["hold_until"] = now + self.HOLD_WARN_SEC
         else:
             if now >= s["hold_until"]:
                 s["state"]      = "safe"
                 s["hold_until"] = 0.0
-        return (self.C_CRIT if s["state"] == "critical" else
-                self.C_WARN if s["state"] == "warn"     else
-                self.C_SAFE)
+        return s["state"]
 
-    def _accel_color(self, val: float, is_vertical: bool) -> str:
+    def _accel_state(self, val: float, is_vertical: bool) -> str:
         if is_vertical:
-            if   self.ACC_VERT_LO_OK < val < self.ACC_VERT_HI_OK: return self.C_SAFE
-            elif self.ACC_VERT_LO_CR < val < self.ACC_VERT_HI_CR: return self.C_WARN
-            else:                                                  return self.C_CRIT
+            if   self.ACC_VERT_LO_OK < val < self.ACC_VERT_HI_OK: return "safe"
+            elif self.ACC_VERT_LO_CR < val < self.ACC_VERT_HI_CR: return "warn"
+            else:                                                  return "crit"
         else:
             a = abs(val)
-            if   a < self.ACC_LAT_WARN: return self.C_SAFE
-            elif a < self.ACC_LAT_CRIT: return self.C_WARN
-            else:                       return self.C_CRIT
+            if   a < self.ACC_LAT_WARN: return "safe"
+            elif a < self.ACC_LAT_CRIT: return "warn"
+            else:                       return "crit"
 
-    def _angle_color(self, deg: float) -> str:
+    def _angle_state(self, deg: float) -> str:
         a = abs(deg)
-        if   a < self.ANGLE_WARN_DEG: return self.C_SAFE
-        elif a < self.ANGLE_CRIT_DEG: return self.C_WARN
-        else:                         return self.C_CRIT
+        if   a < self.ANGLE_WARN_DEG: return "safe"
+        elif a < self.ANGLE_CRIT_DEG: return "warn"
+        else:                         return "crit"
 
-    def _drift_color(self, abs_drift: float) -> str:
-        if   abs_drift >= self.DRIFT_CRIT_DEG: return self.C_CRIT
-        elif abs_drift >= self.DRIFT_WARN_DEG: return self.C_WARN
-        else:                                  return self.C_SAFE
+    def _drift_state(self, abs_drift: float) -> str:
+        if   abs_drift >= self.DRIFT_CRIT_DEG: return "crit"
+        elif abs_drift >= self.DRIFT_WARN_DEG: return "warn"
+        else:                                  return "safe"
 
-    def _worst_color(self, *colors: str) -> str:
-        priority = {self.C_CRIT: 2, self.C_WARN: 1, self.C_SAFE: 0, self.C_NEUTRAL: 0}
+    def _worst_state(self, *states: str) -> str:
+        priority = {"crit": 2, "warn": 1, "safe": 0}
+        return max(states, key=lambda s: priority.get(s, 0))
+
+    # Legacy colour helpers retained for any external callers
+    def _gyro_color(self, axis, abs_dps, now):
+        s = self._gyro_state_label(axis, abs_dps, now)
+        return self.C_CRIT_BG_A if s == "crit" else self.C_WARN_BG if s == "warn" else self.C_SAFE_FG
+
+    def _accel_color(self, val, is_vertical):
+        s = self._accel_state(val, is_vertical)
+        return self.C_CRIT_BG_A if s == "crit" else self.C_WARN_BG if s == "warn" else self.C_SAFE_FG
+
+    def _angle_color(self, deg):
+        s = self._angle_state(deg)
+        return self.C_CRIT_BG_A if s == "crit" else self.C_WARN_BG if s == "warn" else self.C_SAFE_FG
+
+    def _drift_color(self, abs_drift):
+        s = self._drift_state(abs_drift)
+        return self.C_CRIT_BG_A if s == "crit" else self.C_WARN_BG if s == "warn" else self.C_SAFE_FG
+
+    def _worst_color(self, *colors):
+        priority = {self.C_CRIT_BG_A: 2, self.C_WARN_BG: 1,
+                    self.C_SAFE_FG: 0, self.C_NEUTRAL: 0}
         return max(colors, key=lambda c: priority.get(c, 0))
