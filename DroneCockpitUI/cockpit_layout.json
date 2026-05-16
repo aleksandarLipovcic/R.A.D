@@ -1,40 +1,40 @@
 {
   "geometry": "1536x793+-26+34",
-  "locked": false,
+  "locked": true,
   "panels": {
     "imu": {
-      "x": 10,
-      "y": 10,
-      "w": 460,
-      "h": 260,
-      "visible": false
+      "x": 1125,
+      "y": 471,
+      "w": 405,
+      "h": 273,
+      "visible": true
     },
     "mag": {
-      "x": 10,
-      "y": 280,
+      "x": -9,
+      "y": 433,
       "w": 460,
-      "h": 210,
-      "visible": false
+      "h": 313,
+      "visible": true
     },
     "adi": {
-      "x": 58,
-      "y": 28,
+      "x": 0,
+      "y": 1,
       "w": 450,
       "h": 430,
       "visible": true
     },
     "baro": {
-      "x": 940,
-      "y": 10,
+      "x": 1310,
+      "y": 1,
       "w": 220,
-      "h": 430,
-      "visible": false
+      "h": 469,
+      "visible": true
     },
     "gps": {
-      "x": 516,
-      "y": 2,
-      "w": 523,
-      "h": 455,
+      "x": 447,
+      "y": 3,
+      "w": 680,
+      "h": 743,
       "visible": true
     }
   }

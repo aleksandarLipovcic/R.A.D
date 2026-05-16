@@ -529,16 +529,33 @@ class _MapCanvas(tk.Frame):
             return
         mx, my = self._latlon_to_canvas(self._drone_lat, self._drone_lon)
         r = 9
+
+        # 1. Dark shadow halo — punches through any map tile colour
+        self._cv.create_oval(mx - r - 4, my - r - 4, mx + r + 4, my + r + 4,
+                             fill="#000000", outline="", stipple="gray50")
+
+        # 2. Outer dashed range ring (cyan, slightly heavier)
         self._cv.create_oval(mx - r*2, my - r*2, mx + r*2, my + r*2,
-                             outline=_C["green"], width=1, dash=(3, 4))
+                             outline=_C["cyan"], width=1.5, dash=(3, 4))
+
+        # 3. Solid black backing disc — guarantees contrast for the dot itself
+        self._cv.create_oval(mx - r - 1, my - r - 1, mx + r + 1, my + r + 1,
+                             fill="#000000", outline="")
+
+        # 4. Main marker — magenta is perceptually opposite to OSM's greens/yellows
         self._cv.create_oval(mx - r, my - r, mx + r, my + r,
-                             fill=_C["map_marker"], outline="#ffffff", width=1.5)
-        trk = self._hud.get("trk", 0)
-        rad = math.radians(trk - 90)
-        vlen = 24
-        self._cv.create_line(mx, my,
-                             mx + math.cos(rad) * vlen,
-                             my + math.sin(rad) * vlen,
+                             fill=_C["magenta"], outline="#ffffff", width=2)
+
+        # 5. Track arrow — white shadow then green on top for legibility
+        trk  = self._hud.get("trk", 0)
+        rad  = math.radians(trk - 90)
+        vlen = 26
+        tip_x = mx + math.cos(rad) * vlen
+        tip_y = my + math.sin(rad) * vlen
+        self._cv.create_line(mx, my, tip_x, tip_y,
+                             fill="#000000", width=4,
+                             arrow="last", arrowshape=(8, 10, 4))
+        self._cv.create_line(mx, my, tip_x, tip_y,
                              fill=_C["green"], width=2,
                              arrow="last", arrowshape=(7, 9, 3))
 
@@ -1013,22 +1030,20 @@ class _MapCanvas(tk.Frame):
     def _set_center_for_drone(self, lat, lon, w, h):
         """
         Compute _center_lat/_center_lon so the drone's tile position lands at
-        eff_center_y (centre of the visible strip above HUD) rather than h/2.
+        eff_center_y — the centre of the visible map strip above the HUD.
 
-        The tile-space offset is:
-            y_tile_offset = hud_h / 2 / TILE_SIZE
-        Adding this to the drone's tile y gives the tile-space "centre" that
-        makes _latlon_to_canvas return (_, eff_cy) for the drone.
+        _latlon_to_canvas uses eff_center_y = (h - hud_h) / 2 as its Y origin,
+        so when cy_f == drone_yf the drone pixel Y is:
+            eff_center_y + (drone_yf - drone_yf) * TILE_SIZE == eff_center_y  ✓
+
+        No tile-space offset is needed; adding one was the source of the
+        above-centre positioning bug.
         """
-        hud_h         = self._hud_height(w, h)
-        y_tile_offset = hud_h / 2.0 / self.TILE_SIZE
-
         drone_xf, drone_yf = self._deg2tile_f(lat, lon, self._zoom)
-        center_yf           = drone_yf + y_tile_offset
         n                   = 2 ** self._zoom
         self._center_lon    = drone_xf / n * 360.0 - 180.0
         self._center_lat    = math.degrees(
-            math.atan(math.sinh(math.pi * (1.0 - 2.0 * center_yf / n))))
+            math.atan(math.sinh(math.pi * (1.0 - 2.0 * drone_yf / n))))
 
     def _center_on_drone(self):
         if self._drone_lat is not None:
