@@ -2,23 +2,18 @@
 GPSWidget.py  —  Aviation-grade GPS Navigation Widget
 =====================================================
 
-FIXES applied (v6):
-  1. SAT panel — intelligent placement in MAP mode:
-     • If widget_width − SAT_PANEL_W ≥ MIN_MAP_W the panel packs inline to
-       the right of the map (as before).
-     • Otherwise it opens as a floating Toplevel positioned near the widget's
-       right edge, so the map is never squeezed below its minimum width.
-     • The Toplevel is also used in NAV mode (unchanged from v5).
+FIXES applied (v7):
+  1. Centering fix — drone marker is now centred in the *visible* map area
+     (above the HUD overlay) rather than in the full canvas height.
+     A new helper _hud_height(w, h) mirrors the HUD layout logic and returns
+     the actual HUD box height so every coordinate-to-pixel conversion and the
+     auto-centre pan can offset the effective vertical centre appropriately.
 
-  2. NAV mode fix-row overflow fixed:
-     • A `_FIXROW_WIDE` threshold (≈340 px) decides the layout.
-     • Wide: fix badge + SAT + HDOP + heartbeat + SAT button all on one row.
-     • Narrow: fix badge + SAT + HDOP on row A; heartbeat + SAT button spill
-       to row B directly below.
-     • The layout recalculates on every <Configure> event of the nav panel's
-       inner container frame.
+  2. No-GPS warning — the "NO GPS FIX" overlay is now a large, bold, attention-
+     grabbing banner with a pulsing amber/red border, replacing the small dim
+     text that was easy to miss.
 
-  (all prior v5/v4 fixes retained)
+  (all prior v6/v5/v4 fixes retained)
 """
 
 import tkinter as tk
@@ -78,9 +73,9 @@ _FLM = (_FF,  9, "bold")
 _FV  = (_FF, 14, "bold")
 _FVS = (_FF, 11, "bold")
 _FU  = (_FF,  9)
-_FHD = (_FF, 13, "bold")   # HUD overlay primary value
-_FHL = (_FF, 10, "bold")   # HUD overlay label/secondary
-_FTB = (_FF,  9, "bold")   # Toolbar font
+_FHD = (_FF, 13, "bold")
+_FHL = (_FF, 10, "bold")
+_FTB = (_FF,  9, "bold")
 
 # ── Quality tables (Betaflight 4.5.3) ───────────────────────────────────────
 _QUALITY_LABEL = [
@@ -176,7 +171,6 @@ class _SatPanel(tk.Frame):
                  fg=_C["label"], bg=_C["frame_bg"],
                  font=(_FF, 8, "bold")).pack(side="left")
 
-        # Fixed column header
         self._col_hdr_frame = tk.Frame(self, bg=_C["frame_bg"])
         self._col_hdr_frame.pack(fill="x")
         self._col_hdr_cv = tk.Canvas(self._col_hdr_frame,
@@ -186,7 +180,6 @@ class _SatPanel(tk.Frame):
         self._draw_col_header()
         tk.Frame(self, bg=_C["border"], height=1).pack(fill="x")
 
-        # Scrollable body
         body = tk.Frame(self, bg=_C["bg"])
         body.pack(fill="both", expand=True)
         self._cv = tk.Canvas(body, bg=_C["bg"], highlightthickness=0,
@@ -315,19 +308,20 @@ class _MapCanvas(tk.Frame):
     """
     OSM tile map with aviation HUD overlay.
 
-    HUD tiers (selected by live canvas width w):
-      FULL    w >= 560  — lat/lon/alt row + GS/TRK/DIST/BRG row + roses if h allows
-      COMPACT w >= 380  — lat row + lon row + GS/TRK/DIST/BRG row + roses if h allows
-      STACKED w <  380  — one field per row, vertical stack, grows upward
+    v7 centering fix:
+      _hud_height(w, h) returns the pixel height of the HUD box drawn at the
+      bottom of the canvas.  All coordinate <-> pixel conversions now use an
+      effective canvas centre:
+          eff_cy = (h - hud_h) / 2
+      so the drone marker and auto-centre pan are relative to the visible map
+      strip above the HUD, not the full canvas height.
 
-    Coordinate format (v4 fix):
-      BOTH lat and lon use f"{abs(val):010.6f}" → "044.770131" / "017.210491"
-      NO FIX placeholder: "---.------" for both (same width).
+      _center_on_drone() and the auto-centre path in update_position() both
+      compute the compensated lat so the drone tile lands at eff_cy.
 
-    Box height fix (v4):
-      box_h is always computed before placement.
-      by = max(pad, h - pad - box_h)  → box never goes above canvas top.
-      Compass roses are added ONLY when (h - pad*2 - core_box_h) >= rose_section_h.
+    v7 no-GPS warning:
+      _draw_no_fix_warning() replaces the old single line of small text with a
+      large pulsing banner centred in the visible map strip.
     """
     TILE_SIZE = 256
     _OSM_URL  = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
@@ -350,16 +344,18 @@ class _MapCanvas(tk.Frame):
         self._pan_last   = None
         self._hud        = {}
 
+        self._no_fix_pulse = False   # toggles every 600 ms for warning animation
+
         self._build()
         self._poll_tiles()
+        self._pulse_no_fix()
 
-    # ── UI construction ───────────────────────────────────────────────────────
+    # ── Build ─────────────────────────────────────────────────────────────────
 
     def _build(self):
         self._cv = tk.Canvas(self, bg=_C["map_bg"],
                              highlightthickness=0, cursor="fleur")
         self._cv.pack(fill="both", expand=True)
-
         self._cv.bind("<Configure>",       self._on_resize)
         self._cv.bind("<ButtonPress-1>",   self._on_pan_start)
         self._cv.bind("<B1-Motion>",       self._on_pan)
@@ -368,9 +364,65 @@ class _MapCanvas(tk.Frame):
         self._cv.bind("<Button-4>",        lambda e: self._zoom_in())
         self._cv.bind("<Button-5>",        lambda e: self._zoom_out())
 
-    def zoom_in(self):   self._zoom_in()
-    def zoom_out(self):  self._zoom_out()
+    def zoom_in(self):  self._zoom_in()
+    def zoom_out(self): self._zoom_out()
     def center_drone(self): self._center_on_drone()
+
+    # ── Pulsing no-fix warning ────────────────────────────────────────────────
+
+    def _pulse_no_fix(self):
+        self._no_fix_pulse = not self._no_fix_pulse
+        if not self._fix_valid:
+            self._redraw()
+        self.after(600, self._pulse_no_fix)
+
+    # ── HUD height mirror ─────────────────────────────────────────────────────
+
+    def _hud_height(self, w: int, h: int) -> int:
+        """
+        Return the pixel height of the HUD box that _draw_hud will draw at the
+        bottom of a (w x h) canvas.  Mirrors the layout decisions in _draw_hud
+        so that centering can compensate correctly.  Returns 0 when no HUD data.
+        """
+        if not self._hud:
+            return 0
+
+        pad            = 6
+        avail_h        = h - pad * 2
+        rose_r         = self._ROSE_R
+        rose_section_h = 5 + rose_r * 2 + 14 + 4   # sep_sp + diam + lbl_gap + margin
+
+        if w >= 560:
+            ip, rh, sep_sp = 10, 22, 5
+            core_h     = ip + rh + sep_sp + rh + sep_sp
+            show_roses = (avail_h - core_h - ip) >= rose_section_h
+            return core_h + (rose_section_h if show_roses else 0) + ip
+
+        elif w >= 380:
+            ip, rh, row_gap, sep_sp = 8, 20, 3, 6
+            avail_w    = w - pad * 2
+            box_w      = max(min(avail_w, 600), 164 + 12 + 80 + ip * 2)
+            ix0        = pad + ip
+            ix1        = pad + box_w - ip
+            single_row = (ix0 + 292 + 12 + 80) <= ix1
+            if single_row:
+                core_h = ip + rh + sep_sp + rh + ip
+            else:
+                core_h = ip + rh + row_gap + rh + sep_sp + rh + ip
+            show_roses = (avail_h - core_h) >= (rose_section_h + 8)
+            return core_h + (rose_section_h if show_roses else 0)
+
+        else:
+            ip, rh, sp = 6, 19, 2
+            max_rows   = max(1, (avail_h - ip * 2 + sp) // (rh + sp))
+            n_rows     = min(8, max_rows)
+            return ip + n_rows * rh + (n_rows - 1) * sp + ip
+
+    # ── Effective vertical centre ─────────────────────────────────────────────
+
+    def _eff_center_y(self, w: int, h: int) -> float:
+        """Centre Y of the visible map strip (above HUD overlay)."""
+        return (h - self._hud_height(w, h)) / 2.0
 
     # ── Tile maths ────────────────────────────────────────────────────────────
 
@@ -386,12 +438,13 @@ class _MapCanvas(tk.Frame):
         return self._deg2tile_f(self._center_lat, self._center_lon, self._zoom)
 
     def _latlon_to_canvas(self, lat, lon):
+        """Convert lat/lon → canvas pixel, using the visible-strip centre for Y."""
         w  = self._cv.winfo_width()  or 400
         h  = self._cv.winfo_height() or 300
         cx, cy = self._center_tile_f()
         xf, yf = self._deg2tile_f(lat, lon, self._zoom)
-        return (w / 2 + (xf - cx) * self.TILE_SIZE,
-                h / 2 + (yf - cy) * self.TILE_SIZE)
+        return (w / 2.0 + (xf - cx) * self.TILE_SIZE,
+                self._eff_center_y(w, h) + (yf - cy) * self.TILE_SIZE)
 
     # ── Tile fetching ─────────────────────────────────────────────────────────
 
@@ -443,12 +496,14 @@ class _MapCanvas(tk.Frame):
         self._draw_hud(w, h)
 
     def _draw_tiles(self, w, h):
+        """Draw OSM tiles centred on the visible map strip (above HUD)."""
         n          = 2 ** self._zoom
         cx_f, cy_f = self._center_tile_f()
         cx_ti      = int(cx_f)
         cy_ti      = int(cy_f)
         tiles_x    = w // self.TILE_SIZE + 3
         tiles_y    = h // self.TILE_SIZE + 3
+        eff_cy     = self._eff_center_y(w, h)
 
         for dx in range(-tiles_x // 2 - 1, tiles_x // 2 + 2):
             for dy in range(-tiles_y // 2 - 1, tiles_y // 2 + 2):
@@ -456,8 +511,8 @@ class _MapCanvas(tk.Frame):
                 ty = cy_ti + dy
                 if ty < 0 or ty >= n:
                     continue
-                px  = w / 2 + (cx_ti + dx - cx_f) * self.TILE_SIZE
-                py  = h / 2 + (cy_ti + dy - cy_f) * self.TILE_SIZE
+                px  = w / 2.0  + (cx_ti + dx - cx_f) * self.TILE_SIZE
+                py  = eff_cy   + (cy_ti + dy - cy_f) * self.TILE_SIZE
                 key = (self._zoom, tx, ty)
                 if key in self._tile_img:
                     self._cv.create_image(px, py, anchor="nw",
@@ -470,9 +525,7 @@ class _MapCanvas(tk.Frame):
 
     def _draw_marker(self, w, h):
         if not (self._fix_valid and self._drone_lat is not None):
-            self._cv.create_text(w // 2, h // 2,
-                text="NO GPS FIX", fill=_C["red"],
-                font=(_FF, 13, "bold"))
+            self._draw_no_fix_warning(w, h)
             return
         mx, my = self._latlon_to_canvas(self._drone_lat, self._drone_lon)
         r = 9
@@ -488,6 +541,59 @@ class _MapCanvas(tk.Frame):
                              my + math.sin(rad) * vlen,
                              fill=_C["green"], width=2,
                              arrow="last", arrowshape=(7, 9, 3))
+
+    # ── Prominent no-fix warning ──────────────────────────────────────────────
+
+    def _draw_no_fix_warning(self, w, h):
+        """
+        Large, bold, pulsing NO GPS SIGNAL banner centred in the visible map
+        strip (above the HUD overlay).
+        """
+        hud_h  = self._hud_height(w, h)
+        vis_h  = h - hud_h
+        cx     = w // 2
+        cy     = vis_h // 2
+
+        # Alternate between red and amber for the pulsing border
+        border_col = _C["red"] if self._no_fix_pulse else _C["amber"]
+
+        bw, bh = min(w - 40, 290), 80
+        x0     = cx - bw // 2
+        y0     = cy - bh // 2
+        x1     = cx + bw // 2
+        y1     = cy + bh // 2
+
+        # Outer glow ring (thick)
+        self._cv.create_rectangle(x0 - 5, y0 - 5, x1 + 5, y1 + 5,
+                                  fill="", outline=border_col, width=3)
+        # Inner box
+        self._cv.create_rectangle(x0, y0, x1, y1,
+                                  fill="#110408", outline=border_col, width=2)
+
+        # Main warning text
+        self._cv.create_text(cx, y0 + 22,
+                             text="\u26a0  NO GPS SIGNAL  \u26a0",
+                             fill=border_col,
+                             font=(_FF, 14, "bold"),
+                             anchor="center")
+
+        # Sub-label
+        self._cv.create_text(cx, y0 + 48,
+                             text="WAITING FOR FIX",
+                             fill=_C["label"],
+                             font=(_FF, 10, "bold"),
+                             anchor="center")
+
+        # Animated scanning dots
+        dot_y   = y1 - 13
+        n_dots  = 7
+        spacing = max(bw // (n_dots + 1), 1)
+        for i in range(n_dots):
+            lit     = (i % 2 == (0 if self._no_fix_pulse else 1))
+            dot_col = _C["amber"] if lit else _C["dim"]
+            dx      = x0 + spacing * (i + 1)
+            self._cv.create_oval(dx - 3, dot_y - 3, dx + 3, dot_y + 3,
+                                 fill=dot_col, outline="")
 
     # ── HUD helpers ───────────────────────────────────────────────────────────
 
@@ -598,9 +704,9 @@ class _MapCanvas(tk.Frame):
         rose_sep_sp    = 5
         rose_section_h = rose_sep_sp + rose_diam + lbl_gap + 4
 
-        # ═════════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         # FULL tier  (w >= 560)
-        # ═════════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         if w >= 560:
             ip      = 10
             rh      = 22
@@ -692,9 +798,9 @@ class _MapCanvas(tk.Frame):
                     self._draw_hud_rose(q3, rose_cy, rose_r, "HOME",
                                         brg360 if comp_v else None, _C["home_arrow"])
 
-        # ═════════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         # COMPACT tier  (380 <= w < 560)
-        # ═════════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         elif w >= 380:
             ip      = 8
             rh      = 20
@@ -819,9 +925,9 @@ class _MapCanvas(tk.Frame):
                     self._draw_hud_rose(q3, rose_cy, rose_r, "HOME",
                                         brg360 if comp_v else None, _C["home_arrow"])
 
-        # ═════════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         # STACKED tier  (w < 380)
-        # ═════════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         else:
             ip    = 6
             rh    = 19
@@ -854,20 +960,14 @@ class _MapCanvas(tk.Frame):
             for lbl, val, vcol, hem in rows:
                 cy_r = y_cur + rh // 2
                 vx   = bx + ip + (lbl_w if lbl else 0)
-
                 if lbl:
                     cv.create_text(bx + ip, cy_r, text=lbl,
-                                   anchor="w", fill=_C["label"],
-                                   font=(_FF, 8))
-
+                                   anchor="w", fill=_C["label"], font=(_FF, 8))
                 cv.create_text(vx, cy_r, text=val,
-                               anchor="w", fill=vcol,
-                               font=(_FF, 9, "bold"))
+                               anchor="w", fill=vcol, font=(_FF, 9, "bold"))
                 if hem:
                     cv.create_text(vx + 108, cy_r, text=hem,
-                                   anchor="w", fill=_C["unit"],
-                                   font=(_FF, 8))
-
+                                   anchor="w", fill=_C["unit"], font=(_FF, 8))
                 y_cur += rh + sp
 
     # ── Event handlers ────────────────────────────────────────────────────────
@@ -895,13 +995,10 @@ class _MapCanvas(tk.Frame):
         self._redraw()
 
     def _on_scroll(self, event):
-        if event.delta > 0:
-            self._zoom_in()
-        else:
-            self._zoom_out()
+        if event.delta > 0: self._zoom_in()
+        else:               self._zoom_out()
 
-    def get_zoom(self):
-        return self._zoom
+    def get_zoom(self): return self._zoom
 
     def _zoom_in(self):
         if self._zoom < 19:
@@ -913,10 +1010,31 @@ class _MapCanvas(tk.Frame):
             self._zoom -= 1
             self._redraw()
 
+    def _set_center_for_drone(self, lat, lon, w, h):
+        """
+        Compute _center_lat/_center_lon so the drone's tile position lands at
+        eff_center_y (centre of the visible strip above HUD) rather than h/2.
+
+        The tile-space offset is:
+            y_tile_offset = hud_h / 2 / TILE_SIZE
+        Adding this to the drone's tile y gives the tile-space "centre" that
+        makes _latlon_to_canvas return (_, eff_cy) for the drone.
+        """
+        hud_h         = self._hud_height(w, h)
+        y_tile_offset = hud_h / 2.0 / self.TILE_SIZE
+
+        drone_xf, drone_yf = self._deg2tile_f(lat, lon, self._zoom)
+        center_yf           = drone_yf + y_tile_offset
+        n                   = 2 ** self._zoom
+        self._center_lon    = drone_xf / n * 360.0 - 180.0
+        self._center_lat    = math.degrees(
+            math.atan(math.sinh(math.pi * (1.0 - 2.0 * center_yf / n))))
+
     def _center_on_drone(self):
         if self._drone_lat is not None:
-            self._center_lat = self._drone_lat
-            self._center_lon = self._drone_lon
+            w = self._cv.winfo_width()  or 400
+            h = self._cv.winfo_height() or 300
+            self._set_center_for_drone(self._drone_lat, self._drone_lon, w, h)
         self._auto_center = True
         self._redraw()
 
@@ -926,8 +1044,9 @@ class _MapCanvas(tk.Frame):
             self._drone_lat = lat
             self._drone_lon = lon
             if self._auto_center:
-                self._center_lat = lat
-                self._center_lon = lon
+                w = self._cv.winfo_width()  or 400
+                h = self._cv.winfo_height() or 300
+                self._set_center_for_drone(lat, lon, w, h)
         self._redraw()
 
     def update_hud(self, d: dict):
@@ -942,11 +1061,6 @@ class _MapCanvas(tk.Frame):
 class _NavPanel(tk.Frame):
     """
     Full-detail navigation readout — used when widget is too small for map.
-
-    v5 change: SAT toggle button is embedded here (top-right of the fix row)
-    so users can still open the satellite panel even with no toolbar visible.
-    The button's command is wired by GPSWidget after construction via
-    set_sat_toggle_cmd().
     """
 
     def __init__(self, parent, **kwargs):
@@ -957,11 +1071,9 @@ class _NavPanel(tk.Frame):
         self._build_full()
 
     def set_sat_toggle_cmd(self, cmd):
-        """Wire the SAT toggle button to the parent widget's toggle method."""
         self._sat_btn.config(command=cmd)
 
     def update_sat_btn_text(self, text: str):
-        """Keep the embedded SAT button label in sync with map-mode button."""
         self._sat_btn.config(text=text)
 
     def _sep(self, parent=None):
@@ -977,20 +1089,11 @@ class _NavPanel(tk.Frame):
         lbl.pack(side="left")
         setattr(self, attr, lbl)
 
-    # Minimum width (px) to keep SAT button + heartbeat on the same row as
-    # fix badge / SAT count / HDOP.
-    # fix(~80) + SAT(~65) + HDOP(~90) + hb(~20) + btn(~60) + padx ≈ 340 px
     _FIXROW_WIDE = 340
 
     def _build_full(self):
         c = tk.Frame(self, bg=_C["bg"])
         c.pack(fill="both", expand=True, padx=8, pady=4)
-
-        # ── Row A: fix badge  SAT count  HDOP ─────────────────────────────────
-        # ── Row B (same or next line): heartbeat  [SAT▶] ──────────────────────
-        #
-        # _adapt_fix_rows() moves the heartbeat canvas and SAT button between
-        # fix_row_a (wide layout) and fix_row_b (narrow layout).
 
         self._fix_row_a = tk.Frame(c, bg=_C["bg"])
         self._fix_row_a.pack(fill="x", pady=(2, 0))
@@ -1012,14 +1115,12 @@ class _NavPanel(tk.Frame):
             lbl.pack(side="left")
             setattr(self, attr, lbl)
 
-        # Heartbeat canvas — lives in fix_row_a (wide) or fix_row_b (narrow)
         self._hb_cv  = tk.Canvas(self._fix_row_a, width=12, height=12,
                                  bg=_C["bg"], highlightthickness=0)
         self._hb_cv.pack(side="left", padx=(8, 0))
         self._hb_dot = self._hb_cv.create_oval(1, 1, 11, 11,
                                                fill=_C["hb_off"], outline="")
 
-        # SAT toggle button — lives in fix_row_a (wide) or fix_row_b (narrow)
         self._sat_btn = tk.Button(
             self._fix_row_a, text="SAT▶",
             bg=_C["map_btn"], fg=_C["amber"],
@@ -1030,26 +1131,18 @@ class _NavPanel(tk.Frame):
         )
         self._sat_btn.pack(side="right", padx=(0, 2))
 
-        # Row B — hidden initially; shown when panel is too narrow for one row
-        self._fix_row_b = tk.Frame(c, bg=_C["bg"])
-        # (packed on demand by _adapt_fix_rows)
-
-        self._fix_row_wide = True   # tracks current layout state
-        # Detect width changes on the inner container frame
+        self._fix_row_b    = tk.Frame(c, bg=_C["bg"])
+        self._fix_row_wide = True
         c.bind("<Configure>", self._on_nav_configure, add="+")
         self._nav_c = c
 
-        # ── Position ──────────────────────────────────────────────────────────
         self._sep(c)
-
         tk.Label(c, text="POSITION", fg=_C["label"], bg=_C["bg"],
                  font=_FL).pack(anchor="w")
         self._lrow(c, "LAT", "_lat_lbl", "---.---------- -")
         self._lrow(c, "LON", "_lon_lbl", "---.---------- -")
 
         self._sep(c)
-
-        # ── Altitude ──────────────────────────────────────────────────────────
         tk.Label(c, text="ALTITUDE MSL", fg=_C["label"], bg=_C["bg"],
                  font=_FL).pack(anchor="w")
         alt_r = tk.Frame(c, bg=_C["bg"])
@@ -1062,8 +1155,6 @@ class _NavPanel(tk.Frame):
         self._alt_m_lbl.pack(side="left", padx=(8, 0))
 
         self._sep(c)
-
-        # ── Ground vector ─────────────────────────────────────────────────────
         tk.Label(c, text="GROUND VECTOR", fg=_C["label"], bg=_C["bg"],
                  font=_FL).pack(anchor="w")
         inner = tk.Frame(c, bg=_C["bg"])
@@ -1084,8 +1175,6 @@ class _NavPanel(tk.Frame):
             width=2, arrow="last", arrowshape=(7, 9, 3))
 
         self._sep(c)
-
-        # ── Home point ────────────────────────────────────────────────────────
         tk.Label(c, text="HOME POINT", fg=_C["label"], bg=_C["bg"],
                  font=_FL).pack(anchor="w")
         inner2 = tk.Frame(c, bg=_C["bg"])
@@ -1104,31 +1193,63 @@ class _NavPanel(tk.Frame):
             34, 34, 34, 10, fill=_C["home_arrow"],
             width=2, arrow="last", arrowshape=(7, 9, 3))
 
-    # ── Adaptive fix-row layout ───────────────────────────────────────────────
-
     def _on_nav_configure(self, event):
         self._adapt_fix_rows(event.width)
 
     def _adapt_fix_rows(self, w):
+
         want_wide = w >= self._FIXROW_WIDE
+
         if want_wide == self._fix_row_wide:
             return
+
         self._fix_row_wide = want_wide
 
-        # Detach heartbeat and SAT button from wherever they currently live
+        # reset layout
         self._hb_cv.pack_forget()
         self._sat_btn.pack_forget()
+        self._fix_row_b.pack_forget()
 
+        # ─────────────────────────────────────────────
+        # WIDE LAYOUT
+        # everything stays in row A
+        # ─────────────────────────────────────────────
         if want_wide:
-            # Single-row layout: put both back into row A
-            self._fix_row_b.pack_forget()
-            self._hb_cv.pack(in_=self._fix_row_a, side="left", padx=(8, 0))
-            self._sat_btn.pack(in_=self._fix_row_a, side="right", padx=(0, 2))
+
+            self._hb_cv.pack(
+                side="left",
+                padx=(8, 0),
+                pady=2
+            )
+
+            self._sat_btn.pack(
+                side="right",
+                padx=(0, 2),
+                pady=2
+            )
+
+        # ─────────────────────────────────────────────
+        # COMPACT LAYOUT
+        # second row visible
+        # ─────────────────────────────────────────────
         else:
-            # Two-row layout: spill heartbeat + SAT button onto row B
-            self._fix_row_b.pack(fill="x", after=self._fix_row_a)
-            self._hb_cv.pack(in_=self._fix_row_b, side="left", padx=(2, 0), pady=2)
-            self._sat_btn.pack(in_=self._fix_row_b, side="left", padx=(8, 0), pady=2)
+
+            self._fix_row_b.pack(
+                fill="x",
+                after=self._fix_row_a
+            )
+
+            self._hb_cv.pack(
+                side="left",
+                padx=(2, 0),
+                pady=2
+            )
+
+            self._sat_btn.pack(
+                side="left",
+                padx=(8, 0),
+                pady=2
+            )
 
     def _draw_rose(self, cv, cx, cy, r, cardinals=True):
         cv.create_oval(cx-r, cy-r, cx+r, cy+r,
@@ -1215,7 +1336,7 @@ class _NavPanel(tk.Frame):
             self._alt_m_lbl.config( text=f"({alt_m:6.0f} m)",             fg=_C["unit"])
         else:
             self._alt_ft_lbl.config(text="------ ft",  fg=_C["dim"])
-            self._alt_m_lbl.config( text="(------ m)", fg=_C["unit"])
+            self._alt_m_lbl.config( text="(------ m)", fg=_C["dim"])
 
         if raw_valid:
             self._gs_kt_lbl.config(text=f"{gs_cms * _CMS_TO_KT:5.1f} kt",      fg=_C["text"])
@@ -1252,15 +1373,9 @@ class GPSWidget(tk.Frame):
 
     TOOLBAR (34 px tall) — visible ONLY in MAP mode.
     Contents: [+] [−] [⊙ CTR] | SAT n | HDOP x.xx  ●  [SAT▶]
-    Zoom level label removed (v5).
 
     In NAV mode the toolbar is hidden entirely; a SAT▶ button is embedded
     directly in the nav panel's fix row instead.
-
-    Toolbar adaptive-collapse (v5 fix):
-      Values (sat count, hdop) are NEVER hidden — only the text labels
-      ("SAT", "HDOP") are dropped when the toolbar is too narrow.
-      This prevents HDOP from going missing on re-expand.
 
     Layout modes (auto-selected by widget size):
       MAP MODE  — Full-width map with HUD overlay; SAT panel slides in right.
@@ -1271,8 +1386,6 @@ class GPSWidget(tk.Frame):
     update_gps(ui_data)
     """
 
-    # Width at which we show text labels next to values in the toolbar.
-    # Below this threshold we show values only (no "SAT" / "HDOP" text).
     _TB_LABELS_MIN = 360
 
     def __init__(self, parent, **kwargs):
@@ -1289,15 +1402,9 @@ class GPSWidget(tk.Frame):
         self._build_ui()
         self.bind("<Configure>", self._on_configure)
 
-    # =========================================================================
-    # Build UI
-    # =========================================================================
-
     def _build_ui(self):
-        # ── Toolbar (34 px) — MAP mode only ──────────────────────────────────
         self._toolbar = tk.Frame(self, bg=_C["frame_bg"], height=34)
         self._toolbar.pack_propagate(False)
-        # (packed/unpacked by _apply_map_mode / _apply_nav_mode)
 
         btn_kw = dict(
             bg=_C["map_btn"], fg=_C["text"],
@@ -1307,7 +1414,6 @@ class GPSWidget(tk.Frame):
             cursor="hand2",
         )
 
-        # ── Zoom cluster ──────────────────────────────────────────────────────
         self._btn_plus = tk.Button(self._toolbar, text="+",
                                    command=self._zoom_in, **btn_kw)
         self._btn_plus.pack(side="left", padx=(4, 1), pady=3)
@@ -1325,38 +1431,30 @@ class GPSWidget(tk.Frame):
                                  font=_FTB, padx=3, pady=2)
         self._ctr_lbl.pack(side="left", padx=(0, 4), pady=3)
 
-        # Separator between zoom and status clusters
         self._sep_v1 = tk.Frame(self._toolbar, bg=_C["border"], width=1)
         self._sep_v1.pack(side="left", fill="y", pady=4)
 
-        # ── SAT count ─────────────────────────────────────────────────────────
-        # The text label ("SAT") is optional based on width; value is always shown.
         self._sat_txt_lbl = tk.Label(self._toolbar, text="SAT",
                                      fg=_C["label"], bg=_C["frame_bg"],
                                      font=_FTB)
-        # packed on demand in _adapt_toolbar
 
         self._sat_count_lbl = tk.Label(self._toolbar, text=" --",
                                        fg=_C["dim"], bg=_C["frame_bg"],
                                        font=(_FF, 10, "bold"), width=3)
         self._sat_count_lbl.pack(side="left", padx=(4, 0))
 
-        # Separator between SAT and HDOP
         self._sep_v2 = tk.Frame(self._toolbar, bg=_C["border"], width=1)
         self._sep_v2.pack(side="left", fill="y", pady=4, padx=(4, 0))
 
-        # ── HDOP value ────────────────────────────────────────────────────────
         self._hdop_txt_lbl = tk.Label(self._toolbar, text="HDOP",
                                       fg=_C["label"], bg=_C["frame_bg"],
                                       font=_FTB)
-        # packed on demand
 
         self._hdop_lbl = tk.Label(self._toolbar, text=" --.--",
                                   fg=_C["dim"], bg=_C["frame_bg"],
                                   font=(_FF, 10, "bold"), width=6)
         self._hdop_lbl.pack(side="left", padx=(4, 4))
 
-        # ── Right cluster: heartbeat + SAT toggle ─────────────────────────────
         self._sat_btn = tk.Button(
             self._toolbar, text="SAT▶",
             command=self._toggle_sat,
@@ -1374,11 +1472,8 @@ class GPSWidget(tk.Frame):
         self._hb_dot = self._hb_cv.create_oval(1, 1, 9, 9,
                                                fill=_C["hb_off"], outline="")
 
-        # ── Toolbar bottom border ─────────────────────────────────────────────
         self._toolbar_border = tk.Frame(self, bg=_C["border"], height=1)
-        # packed with toolbar in map mode
 
-        # ── Content area ──────────────────────────────────────────────────────
         self._content = tk.Frame(self, bg=_C["bg"])
         self._content.pack(fill="both", expand=True)
 
@@ -1396,52 +1491,29 @@ class GPSWidget(tk.Frame):
         self._nav_frame = tk.Frame(self._content, bg=_C["bg"])
         self._nav_panel = _NavPanel(self._nav_frame)
         self._nav_panel.pack(fill="both", expand=True)
-        # Wire the embedded SAT button in the nav panel to this widget's toggle
         self._nav_panel.set_sat_toggle_cmd(self._toggle_sat)
-
-    # =========================================================================
-    # Toolbar adaptive-collapse  (MAP mode only)
-    #
-    # Rule: values (sat count, hdop) are ALWAYS visible.
-    #       Text labels ("SAT", "HDOP") are shown only when width allows.
-    # =========================================================================
 
     def _adapt_toolbar(self, w):
         if w == self._toolbar_w:
             return
         self._toolbar_w = w
-
         show_labels = w >= self._TB_LABELS_MIN
-
-        # Unpack text labels, then re-pack if wide enough.
-        # Values stay packed at all times (they were packed once in _build_ui
-        # and never removed by this method).
         self._sat_txt_lbl.pack_forget()
         self._hdop_txt_lbl.pack_forget()
-
         if show_labels:
-            # Insert label immediately before its value in the pack order.
-            # Because pack ordering is positional we re-insert after sep_v1.
             self._sat_txt_lbl.pack(in_=self._toolbar, side="left",
                                    padx=(4, 2), after=self._sep_v1)
             self._hdop_txt_lbl.pack(in_=self._toolbar, side="left",
                                     padx=(4, 2), after=self._sep_v2)
 
-    # =========================================================================
-    # Toolbar relay methods
-    # =========================================================================
-
     def _zoom_in(self):
-        if self._map_mode:
-            self._map_canvas.zoom_in()
+        if self._map_mode: self._map_canvas.zoom_in()
 
     def _zoom_out(self):
-        if self._map_mode:
-            self._map_canvas.zoom_out()
+        if self._map_mode: self._map_canvas.zoom_out()
 
     def _center_on_drone(self):
-        if self._map_mode:
-            self._map_canvas.center_drone()
+        if self._map_mode: self._map_canvas.center_drone()
 
     def _update_toolbar_status(self, raw_valid, fix_type, num_sat, hdop):
         sat_col = (_C["green"] if (raw_valid and num_sat >= 6)
@@ -1449,7 +1521,6 @@ class GPSWidget(tk.Frame):
         self._sat_count_lbl.config(
             text=f"{num_sat:3d}" if raw_valid else " --",
             fg=sat_col)
-
         if raw_valid and hdop < 99.0:
             hdop_col = (_C["green"] if hdop < 1.0
                         else _C["amber"] if hdop < 2.0 else _C["red"])
@@ -1457,36 +1528,21 @@ class GPSWidget(tk.Frame):
         else:
             self._hdop_lbl.config(text=" --.--", fg=_C["dim"])
 
-    # =========================================================================
-    # Layout mode switching
-    # =========================================================================
-
     def _apply_map_mode(self):
         self._map_mode = True
-
-        # Show toolbar + border above content
         self._toolbar.pack(fill="x", before=self._content)
         self._toolbar_border.pack(fill="x", before=self._content)
-
-        # Switch content frames
         self._nav_frame.pack_forget()
         self._map_frame.pack(fill="both", expand=True)
-
         if self._sat_open:
             self._sat_panel.pack(side="right", fill="y")
-
-        # Trigger toolbar label-collapse recalc
         self._toolbar_w = -1
         self._adapt_toolbar(self.winfo_width())
 
     def _apply_nav_mode(self):
         self._map_mode = False
-
-        # Hide toolbar completely — nav panel shows fix/SAT/HDOP/heartbeat
         self._toolbar.pack_forget()
         self._toolbar_border.pack_forget()
-
-        # Switch content frames
         self._map_frame.pack_forget()
         self._sat_panel.pack_forget()
         self._nav_frame.pack(fill="both", expand=True)
@@ -1494,48 +1550,29 @@ class GPSWidget(tk.Frame):
     def _on_configure(self, event):
         w = event.width
         h = event.height
-
-        # In map mode, toolbar occupies 35 px (34 + 1 border)
-        map_h = h - 35 if self._map_mode else h
-
         if self._map_mode:
             self._adapt_toolbar(w)
-
         want_map = (w >= MIN_MAP_W and h >= MIN_MAP_H + 35)
         if want_map != self._map_mode:
-            if want_map:
-                self._apply_map_mode()
-            else:
-                self._apply_nav_mode()
+            if want_map: self._apply_map_mode()
+            else:        self._apply_nav_mode()
             if self._last_ui_data:
                 self._push_data(self._last_ui_data)
 
-    # =========================================================================
-    # Satellite panel toggle
-    # =========================================================================
-
     def _sat_fits_inline(self) -> bool:
-        """
-        Return True when the sat panel (SAT_PANEL_W px) can be packed inline
-        beside the map without squeezing the map below MIN_MAP_W.
-        """
         w = self.winfo_width()
         return (w - _SatPanel.SAT_PANEL_W) >= MIN_MAP_W
 
     def _toggle_sat(self):
         self._sat_open = not self._sat_open
         btn_text = "SAT◀" if self._sat_open else "SAT▶"
-
-        # Keep both buttons (toolbar + nav panel) in sync
         self._sat_btn.config(text=btn_text)
         self._nav_panel.update_sat_btn_text(btn_text)
-
         if self._sat_open:
             if self._map_mode:
                 if self._sat_fits_inline():
                     self._sat_panel.pack(side="right", fill="y")
                 else:
-                    # Not enough room beside map — open as floating window
                     self._open_sat_toplevel()
             else:
                 self._open_sat_toplevel()
@@ -1551,7 +1588,6 @@ class GPSWidget(tk.Frame):
         tl.title("Satellite Constellation")
         tl.configure(bg=_C["frame_bg"])
         tl.resizable(False, True)
-        # Position the popup near the right edge of the widget
         try:
             wx = self.winfo_rootx()
             wy = self.winfo_rooty()
@@ -1562,12 +1598,10 @@ class GPSWidget(tk.Frame):
         except Exception:
             tl.geometry(f"{_SatPanel.SAT_PANEL_W + 20}x400")
         tl.protocol("WM_DELETE_WINDOW", self._close_sat_toplevel)
-
         panel = _SatPanel(tl)
         panel.pack(fill="both", expand=True, padx=4, pady=4)
         self._sat_toplevel_panel = panel
         self._sat_toplevel       = tl
-
         if self._last_ui_data:
             raw  = self._last_ui_data.get("gps_sv_list", [])
             norm = _normalize_sv_list(raw)
@@ -1577,17 +1611,11 @@ class GPSWidget(tk.Frame):
         if self._sat_toplevel and self._sat_toplevel.winfo_exists():
             self._sat_toplevel.destroy()
         self._sat_toplevel = None
-        # Only force-close the toggle state if called from the WM delete handler;
-        # when called from _toggle_sat the caller already manages _sat_open.
         if self._sat_open:
             self._sat_open = False
             btn_text = "SAT▶"
             self._sat_btn.config(text=btn_text)
             self._nav_panel.update_sat_btn_text(btn_text)
-
-    # =========================================================================
-    # Public update
-    # =========================================================================
 
     def update_gps(self, ui_data: dict):
         self._last_ui_data = ui_data
@@ -1620,7 +1648,6 @@ class GPSWidget(tk.Frame):
             heartbeat=heartbeat,
         )
 
-        # Heartbeat dot in toolbar (only relevant in map mode, but harmless)
         if heartbeat is not None and heartbeat != self._prev_heartbeat:
             self._hb_state       = not self._hb_state
             self._prev_heartbeat = heartbeat
