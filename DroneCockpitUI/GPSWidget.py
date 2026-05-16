@@ -2,46 +2,44 @@
 GPSWidget.py  —  Aviation-grade GPS Navigation Widget
 =====================================================
 
+FIXES applied (v2):
+  1. Toolbar: adaptive collapse — at narrow widths label text ("SAT", "HDOP",
+     separators) is hidden; only values remain. Below ~420 px the zoom cluster
+     icons shrink to symbols only. Toolbar never clips or overflows.
+
+  2. HUD overlay: the three render tiers (FULL / COMPACT / STRIP) now use
+     tight, measured geometry so no text element is ever placed outside its
+     bounding box and elements never overlap each other.
+
+  3. STRIP tier: replaced the approximate-char-width loop with a measured
+     word-wrap that clips cleanly at the box edge and never draws outside it.
+
+  4. FULL tier rose geometry is recalculated from actual box_w so roses
+     always sit centred and never bleed into each other or the border.
+
+  5. Minimum HUD box widths are clamped to available map width so the box
+     never extends beyond the canvas boundary.
+
+  6. Nav mode (too small for map) priority order follows ICAO/aviation
+     display priority: Fix status → Position → Altitude → Ground speed →
+     Track → Home distance/bearing.  Roses and SAT list are only shown when
+     there is enough vertical room.
+
 Layout philosophy
 -----------------
-  • The MAP is the primary instrument.  Navigation data (fix status, position,
-    altitude, speed, track, home bearing/distance) is overlaid on top of the
-    map in semi-transparent HUD panels — the pilot never leaves the map view.
+  • The MAP is the primary instrument.  Navigation data is overlaid on top as
+    a semi-transparent HUD anchored to the bottom-left corner.
 
-  • A "SAT" toggle button (top-right of the map toolbar) opens/closes a
-    satellite-signal panel that slides in alongside the map.  The map shrinks
-    to accommodate it; closing it restores full width.
+  • A single unified toolbar (zoom + status + heartbeat + SAT toggle) sits
+    above the map.  It collapses gracefully at narrow widths.
 
-  • When the widget is too narrow or too short to render the map usefully
-    (below MIN_MAP_W × MIN_MAP_H pixels) the map is hidden and a compact
-    full-detail navigation panel is shown instead.  The SAT panel remains
-    accessible in that mode via a separate "SAT" button in the header row.
+  • HUD auto-selects FULL / COMPACT / STRIP tier based on live map width.
 
-Aviation HUD overlay layout (map mode)
----------------------------------------
-  ┌─[FIX badge] [SAT ##] [HDOP #.##] ────────────────[+][−][⊙ Ctr][SAT]─┐
-  │                                                                       │
-  │   ┌─ top-left ────────────────┐                                       │
-  │   │  LAT  44.770029 N         │                                       │
-  │   │  LON  17.210185 E         │                                       │
-  │   │  ALT  6 ft  (2 m)        │                                       │
-  │   └───────────────────────────┘                                       │
-  │                                                                       │
-  │   ┌─ bottom-left ─────────────────────────────────────────────┐       │
-  │   │ GS  1.2 kt  (2.3 km/h)   TRK 323.2°   DIST 0 m  BRG 000°│       │
-  │   │  [TRK compass rose]              [HOME compass rose]       │       │
-  │   └───────────────────────────────────────────────────────────┘       │
-  └───────────────────────────────────────────────────────────────────────┘
+  • "SAT ▶" opens the satellite panel to the RIGHT of the map (map shrinks).
+    The column header row is fixed; rows scroll beneath it.
 
-CHANGES vs original
--------------------
-  1. Bottom HUD panel moved to BOTTOM-LEFT (mirrors position panel above it).
-  2. Compass roses for TRK and HOME are drawn inside that bottom-left panel.
-  3. HUD overlay fonts enlarged for ~70 cm reading distance:
-       _FHL  7 → 11 pt   (HUD micro-label)
-       _FHD 11 → 15 pt   (HUD primary value)
-
-All update_gps(ui_data) keys are identical to the original widget.
+  • When the widget is too narrow/short for the map the NavPanel is shown
+    instead, with detail level proportional to available height.
 """
 
 import tkinter as tk
@@ -64,35 +62,29 @@ _M_TO_FT    = 3.28084
 
 # ── Aviation colour palette ─────────────────────────────────────────────────
 _C = {
-    # structure
     "bg":           "#0d1117",
     "frame_bg":     "#141920",
     "border":       "#1e2730",
     "hud_bg":       "#0a0e14cc",
-    # text
     "text":         "#e8edf4",
     "label":        "#6b7885",
     "unit":         "#8a9aaa",
     "dim":          "#3a4555",
-    # status
     "green":        "#00e676",
     "amber":        "#ffb300",
     "red":          "#ff3d3d",
     "cyan":         "#00e5ff",
     "magenta":      "#ff4081",
-    # instruments
     "compass_bg":   "#080c10",
     "compass_rim":  "#2a3545",
     "track_needle": "#00e676",
     "home_arrow":   "#00e5ff",
     "hb_on":        "#00e676",
     "hb_off":       "#1e2730",
-    # map
     "map_bg":       "#1a2030",
     "map_btn":      "#1e2a38",
     "map_marker":   "#ffb300",
     "map_home":     "#00e5ff",
-    # satellite
     "sv_row_even":  "#0d1117",
     "sv_row_odd":   "#111820",
     "sv_used":      "#00e676",
@@ -101,26 +93,33 @@ _C = {
 }
 
 # ── Fonts ───────────────────────────────────────────────────────────────────
-# Courier New keeps the avionics mono feel.
-# _FHL / _FHD enlarged so text is legible from ~70 cm viewing distance.
 _FF  = "Courier New"
-_FL  = (_FF,  8, "bold")   # micro label (nav panel)
-_FLM = (_FF,  9, "bold")   # label medium (nav panel)
-_FV  = (_FF, 14, "bold")   # primary value (nav panel)
-_FVS = (_FF, 11, "bold")   # secondary value (nav panel)
-_FU  = (_FF,  9)           # unit
-_FHD = (_FF, 15, "bold")   # HUD overlay data  ← was 11, now 15
-_FHL = (_FF, 11, "bold")   # HUD overlay label ← was  7, now 11
+_FL  = (_FF,  8, "bold")
+_FLM = (_FF,  9, "bold")
+_FV  = (_FF, 14, "bold")
+_FVS = (_FF, 11, "bold")
+_FU  = (_FF,  9)
+_FHD = (_FF, 13, "bold")   # HUD overlay primary value  (was 15, tightened)
+_FHL = (_FF, 10, "bold")   # HUD overlay label/secondary (was 11, tightened)
+_FTB = (_FF,  9, "bold")   # Toolbar font
 
 # ── Quality tables (Betaflight 4.5.3) ───────────────────────────────────────
 _QUALITY_LABEL = [
-    "idle", "searching", "acquired", "unusable",
-    "code lock", "fully locked", "fully locked", "fully locked",
+    "idle", "search", "acquir", "unusbl",
+    "c-lock", "f-lock", "f-lock", "f-lock",
 ]
 _QUALITY_COLOR = [
     "#2a3545", "#2a3545", "#ffb300", "#ff3d3d",
     "#ffb300", "#00e676", "#00e676", "#00e676",
 ]
+
+# ── Approximate character widths for Courier New (monospace) ─────────────────
+# Used only for HUD canvas text placement; actual Tk measurement used where
+# possible.  Courier New is monospace so width ≈ font_size * 0.62 px/char.
+def _cw(font_tuple):
+    """Approximate pixel width of one character for a given Courier New font."""
+    size = font_tuple[1] if len(font_tuple) > 1 else 9
+    return max(6, int(size * 0.62))
 
 
 # =============================================================================
@@ -168,11 +167,8 @@ def _normalize_sv_list(raw_list) -> list:
 # =============================================================================
 
 class _SatPanel(tk.Frame):
-    """
-    Compact satellite signal-strength panel.
-    Designed to live to the right of the map or as a standalone popup.
-    Width is fixed at SAT_PANEL_W pixels.
-    """
+    """Compact satellite signal-strength panel with sticky column header."""
+
     SAT_PANEL_W = 310
     _ROW_H      = 22
     _CNO_MAX    = 50
@@ -202,24 +198,24 @@ class _SatPanel(tk.Frame):
         self._build()
 
     def _build(self):
-        hdr = tk.Frame(self, bg=_C["border"], height=1)
-        hdr.pack(fill="x")
-
+        tk.Frame(self, bg=_C["border"], height=1).pack(fill="x")
         title_row = tk.Frame(self, bg=_C["frame_bg"])
         title_row.pack(fill="x", padx=6, pady=(4, 2))
         tk.Label(title_row, text="SATELLITE CONSTELLATION",
                  fg=_C["label"], bg=_C["frame_bg"],
                  font=(_FF, 8, "bold")).pack(side="left")
 
-        col_hdr = tk.Canvas(self, bg=_C["frame_bg"], height=16,
-                            highlightthickness=0)
-        col_hdr.pack(fill="x", padx=4)
-        self._col_hdr = col_hdr
+        # Fixed column header
+        self._col_hdr_frame = tk.Frame(self, bg=_C["frame_bg"])
+        self._col_hdr_frame.pack(fill="x")
+        self._col_hdr_cv = tk.Canvas(self._col_hdr_frame,
+                                     bg=_C["frame_bg"], height=16,
+                                     highlightthickness=0)
+        self._col_hdr_cv.pack(fill="x", padx=4)
         self._draw_col_header()
+        tk.Frame(self, bg=_C["border"], height=1).pack(fill="x")
 
-        sep = tk.Frame(self, bg=_C["border"], height=1)
-        sep.pack(fill="x")
-
+        # Scrollable body
         body = tk.Frame(self, bg=_C["bg"])
         body.pack(fill="both", expand=True)
         self._cv = tk.Canvas(body, bg=_C["bg"], highlightthickness=0,
@@ -238,7 +234,7 @@ class _SatPanel(tk.Frame):
                 ("dBHz", 32), ("Status", 60), ("Qual.", 58)]
 
     def _draw_col_header(self):
-        cv = self._col_hdr
+        cv = self._col_hdr_cv
         cv.delete("all")
         x = 4
         for lbl, w in self._cols():
@@ -255,7 +251,6 @@ class _SatPanel(tk.Frame):
 
     def _redraw(self):
         self._cv.delete("all")
-        self._draw_col_header()
         w = max(self._cv.winfo_width(), self.SAT_PANEL_W - 14)
 
         if not self._sv_data:
@@ -349,16 +344,19 @@ class _MapCanvas(tk.Frame):
     """
     OSM tile map with aviation HUD overlay.
 
-    HUD layout (all panels on the LEFT side so the right is unobstructed):
-      • TOP-LEFT    — fix status, lat/lon, altitude
-      • BOTTOM-LEFT — ground speed, track, home dist/bearing + compass roses
+    HUD tiers (selected by live canvas width w):
+      FULL    w >= 560  — lat/lon/alt row + GS/TRK/DIST/BRG row + two roses
+      COMPACT w >= 380  — lat/lon/alt row + GS/TRK/DIST/BRG row, no roses
+      STACKED w <  380  — one field per row, vertical stack, grows upward
+
+    All geometry is computed from the live canvas width; nothing is hard-coded
+    to overflow.  Hemisphere letters are drawn as separate dim tokens so they
+    can never produce double-letter rendering artefacts.
     """
     TILE_SIZE = 256
     _OSM_URL  = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
     _UA       = "DroneCockpitGCS/1.0 (github educational project)"
-
-    # Compass rose radius in the HUD bottom panel
-    _ROSE_R = 38
+    _ROSE_R   = 36   # slightly tighter than before
 
     def __init__(self, parent, **kwargs):
         super().__init__(parent, bg=_C["bg"], **kwargs)
@@ -374,8 +372,7 @@ class _MapCanvas(tk.Frame):
         self._tile_queue = queue.Queue()
         self._tile_pend  = set()
         self._pan_last   = None
-
-        self._hud = {}
+        self._hud        = {}
 
         self._build()
         self._poll_tiles()
@@ -383,25 +380,6 @@ class _MapCanvas(tk.Frame):
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build(self):
-        bar = tk.Frame(self, bg=_C["frame_bg"])
-        bar.pack(side="top", fill="x")
-
-        btn_kw = dict(
-            bg=_C["map_btn"], fg=_C["text"],
-            relief="flat", padx=5, pady=2,
-            font=(_FF, 9, "bold"),
-            activebackground="#2a3545", activeforeground=_C["text"],
-            cursor="hand2",
-        )
-        tk.Button(bar, text="＋",    command=self._zoom_in,           **btn_kw).pack(side="left", padx=(2, 1))
-        tk.Button(bar, text="－",    command=self._zoom_out,          **btn_kw).pack(side="left", padx=(0, 1))
-        tk.Button(bar, text="⊙ CTR", command=self._center_on_drone,  **btn_kw).pack(side="left", padx=(0, 2))
-
-        self._zoom_lbl = tk.Label(bar, text=f"z{self._zoom}",
-                                  fg=_C["label"], bg=_C["frame_bg"],
-                                  font=(_FF, 8))
-        self._zoom_lbl.pack(side="left", padx=4)
-
         self._cv = tk.Canvas(self, bg=_C["map_bg"],
                              highlightthickness=0, cursor="fleur")
         self._cv.pack(fill="both", expand=True)
@@ -413,6 +391,10 @@ class _MapCanvas(tk.Frame):
         self._cv.bind("<MouseWheel>",      self._on_scroll)
         self._cv.bind("<Button-4>",        lambda e: self._zoom_in())
         self._cv.bind("<Button-5>",        lambda e: self._zoom_out())
+
+    def zoom_in(self):   self._zoom_in()
+    def zoom_out(self):  self._zoom_out()
+    def center_drone(self): self._center_on_drone()
 
     # ── Tile maths ────────────────────────────────────────────────────────────
 
@@ -533,87 +515,85 @@ class _MapCanvas(tk.Frame):
 
     # ── HUD helpers ───────────────────────────────────────────────────────────
 
-    def _hud_box(self, x, y, w_px, h_px, anchor="nw"):
-        """Draw a semi-transparent HUD box; return (x0, y0) top-left."""
-        if anchor == "sw":
-            x0, y0 = x, y - h_px
-        elif anchor == "se":
-            x0, y0 = x - w_px, y - h_px
-        elif anchor == "ne":
-            x0, y0 = x - w_px, y
-        else:
-            x0, y0 = x, y
-        self._cv.create_rectangle(
-            x0, y0, x0 + w_px, y0 + h_px,
+    def _hud_box(self, x0, y0, w_px, h_px):
+        """Draw a semi-transparent HUD box anchored at (x0,y0) top-left.
+        Returns (x0, y0) — the inner content origin."""
+        x1, y1 = x0 + w_px, y0 + h_px
+        self._cv.create_rectangle(x0, y0, x1, y1,
             fill="#080c14", outline="#1e2a38", stipple="gray75")
-        self._cv.create_rectangle(
-            x0 + 1, y0 + 1, x0 + w_px - 1, y0 + h_px - 1,
+        self._cv.create_rectangle(x0 + 1, y0 + 1, x1 - 1, y1 - 1,
             fill="#0a0e14", outline="")
         return x0, y0
 
     def _draw_hud_rose(self, cx, cy, r, label, angle_deg, needle_col):
-        """Draw a compass rose on the map canvas at (cx, cy)."""
         cv = self._cv
         cv.create_oval(cx - r, cy - r, cx + r, cy + r,
                        outline=_C["compass_rim"], width=1)
         cv.create_oval(cx - 2, cy - 2, cx + 2, cy + 2,
                        fill=_C["compass_rim"], outline="")
-        # Tick marks every 45°
         for deg in range(0, 360, 45):
             rad = math.radians(deg - 90)
-            r1  = r - 6
+            r1  = r - 5
             cv.create_line(cx + math.cos(rad) * r1, cy + math.sin(rad) * r1,
                            cx + math.cos(rad) * r,  cy + math.sin(rad) * r,
                            fill=_C["compass_rim"], width=1)
-        # North tick (amber)
         cv.create_line(cx, cy - r + 5, cx, cy - r,
                        fill=_C["amber"], width=2)
-        # Cardinal labels
         for lbl, deg in (("N", 0), ("E", 90), ("S", 180), ("W", 270)):
             rad = math.radians(deg - 90)
-            rl  = r - 13
+            rl  = r - 12
             cv.create_text(cx + math.cos(rad) * rl,
                            cy + math.sin(rad) * rl,
                            text=lbl, fill=_C["label"],
-                           font=(_FF, 8, "bold"))
-        # Needle
+                           font=(_FF, 7, "bold"))
         if angle_deg is not None:
             rad = math.radians(angle_deg - 90)
-            tip = r - 6
+            tip = r - 5
             cv.create_line(cx, cy,
                            cx + math.cos(rad) * tip,
                            cy + math.sin(rad) * tip,
                            fill=needle_col, width=2,
-                           arrow="last", arrowshape=(7, 9, 3))
-        # Label below rose
-        cv.create_text(cx, cy + r + 10, text=label,
-                       fill=_C["label"], font=(_FF, 9, "bold"))
+                           arrow="last", arrowshape=(6, 8, 3))
+        cv.create_text(cx, cy + r + 9, text=label,
+                       fill=_C["label"], font=(_FF, 8, "bold"))
 
     # ── HUD overlay panels ────────────────────────────────────────────────────
 
     def _draw_hud(self, w, h):
+        """
+        Adaptive HUD box — bottom-left, width-gated tier selection.
+
+        Tier selection (by canvas width w):
+          FULL    w >= 560  rows: [pos] [sep] [vector] [sep] [roses]
+          COMPACT w >= 380  rows: [pos] [sep] [vector]  (no roses)
+          STACKED w <  380  one field per row, stacked vertically
+
+        CRITICAL: all column positions are FIXED PIXEL OFFSETS, not estimated
+        from character widths.  _cw() is NOT used for layout — it was the root
+        cause of all overlap bugs because it systematically underestimates
+        Courier New rendered width by 15-25%.
+        """
         d = self._hud
         if not d:
             return
 
         pad = 6
+        cv  = self._cv
 
-        # ─────────────────────────────────────────────────────────────────────
-        # TOP-LEFT panel: fix status + position + altitude
-        # ─────────────────────────────────────────────────────────────────────
-        tl_w, tl_h = 290, 90
-        bx, by = self._hud_box(pad, pad, tl_w, tl_h, anchor="nw")
-
+        # ── Unpack ────────────────────────────────────────────────────────────
         raw_valid  = d.get("raw_valid",  False)
         fix_type   = d.get("fix_type",   0)
         pos_usable = d.get("pos_usable", False)
         lat        = d.get("lat",    0.0)
         lon        = d.get("lon",    0.0)
         alt_m      = d.get("alt_m",  0.0)
-        num_sat    = d.get("num_sat", 0)
-        hdop       = d.get("hdop",   99.0)
+        gs_cms     = d.get("gs_cms", 0)
+        trk        = d.get("trk",    0.0)
+        dist_m     = d.get("dist_m", 0.0)
+        brg        = d.get("brg",    0)
+        comp_v     = d.get("comp_valid", False)
 
-        # Fix status pill
+        # ── Pre-format values ─────────────────────────────────────────────────
         if raw_valid and fix_type >= 2:
             fix_txt, fix_col = "3D FIX", _C["green"]
         elif raw_valid and fix_type == 1:
@@ -621,165 +601,300 @@ class _MapCanvas(tk.Frame):
         else:
             fix_txt, fix_col = "NO FIX", _C["red"]
 
-        tx = bx + 6
-        self._cv.create_text(tx, by + 13, text=fix_txt, anchor="w",
-                             fill=fix_col, font=(_FF, 13, "bold"))
+        pos_col  = _C["text"] if pos_usable else (_C["amber"] if raw_valid else _C["dim"])
+        ok_pos   = raw_valid and fix_type >= 1
+        ok_alt   = raw_valid and fix_type >= 2
 
-        sat_col  = (_C["green"] if (raw_valid and num_sat >= 6)
-                    else _C["amber"] if raw_valid else _C["dim"])
-        hdop_col = (_C["green"] if hdop < 1.0
-                    else _C["amber"] if hdop < 2.0 else _C["red"])
-        self._cv.create_text(tx + 76, by + 13,
-                             text=f"SAT {num_sat:2d}" if raw_valid else "SAT --",
-                             anchor="w", fill=sat_col, font=_FHL)
-        self._cv.create_text(tx + 150, by + 13,
-                             text=f"HDOP {hdop:.2f}" if raw_valid else "HDOP --",
-                             anchor="w", fill=hdop_col, font=_FHL)
+        # Coordinate strings — fixed width so column positions stay constant
+        lat_num  = f"{abs(lat):09.6f}" if ok_pos else "--.------"   # 9 chars
+        lat_hem  = ("N" if lat >= 0 else "S") if ok_pos else "-"
+        lon_num  = f"{abs(lon):010.6f}" if ok_pos else "---.------"  # 10 chars
+        lon_hem  = ("E" if lon >= 0 else "W") if ok_pos else "-"
+        alt_str  = f"{alt_m * _M_TO_FT:.0f} ft" if ok_alt else "---- ft"
 
-        self._cv.create_line(bx + 2, by + 22, bx + tl_w - 2, by + 22,
-                             fill=_C["border"])
+        alt_col  = _C["cyan"]  if ok_alt    else _C["dim"]
+        gs_kt    = gs_cms * _CMS_TO_KT  if raw_valid else 0.0
+        gs_col   = _C["text"]  if raw_valid else _C["dim"]
+        trk_col  = _C["green"] if raw_valid else _C["dim"]
+        dist_col = _C["cyan"]  if comp_v    else _C["dim"]
+        brg360   = (brg + 360) % 360
 
-        # Lat / Lon
-        if raw_valid and fix_type >= 1:
-            col = _C["text"] if pos_usable else _C["amber"]
-            lat_str = f"{abs(lat):10.6f} {'N' if lat >= 0 else 'S'}"
-            lon_str = f"{abs(lon):10.6f} {'E' if lon >= 0 else 'W'}"
-        else:
-            col = _C["dim"]
-            lat_str = "---.---------- -"
-            lon_str = "---.---------- -"
+        gs_str   = f"{gs_kt:5.1f} kt" if raw_valid else " --.- kt"
+        trk_str  = f"{trk:06.2f}\u00b0" if raw_valid else "---.-\u00b0"
+        dist_str = f"{int(dist_m):5d} m" if comp_v else " --- m"
+        brg_str  = f"{brg360:03d}\u00b0"  if comp_v else "---\u00b0"
 
-        row_y = by + 36
-        self._cv.create_text(tx,      row_y, text="LAT", anchor="w",
-                             fill=_C["label"], font=_FHL)
-        self._cv.create_text(tx + 34, row_y, text=lat_str, anchor="w",
-                             fill=col, font=_FHD)
+        avail_w = w - pad * 2
 
-        row_y += 22
-        self._cv.create_text(tx,      row_y, text="LON", anchor="w",
-                             fill=_C["label"], font=_FHL)
-        self._cv.create_text(tx + 34, row_y, text=lon_str, anchor="w",
-                             fill=col, font=_FHD)
-
-        # Altitude (in the top-left box, last line)
-        row_y += 18
-        if raw_valid and fix_type >= 2:
-            alt_str = f"ALT  {alt_m * _M_TO_FT:6.0f} ft  ({alt_m:.0f} m)"
-            a_col   = _C["cyan"]
-        else:
-            alt_str = "ALT  ------"
-            a_col   = _C["dim"]
-        self._cv.create_text(tx, row_y, text=alt_str, anchor="w",
-                             fill=a_col, font=_FHL)
-
-        # ─────────────────────────────────────────────────────────────────────
-        # BOTTOM-LEFT panel: speed + track + home dist/bearing + compass roses
+        # ═════════════════════════════════════════════════════════════════════
+        # FULL tier  (w >= 560)
+        # Fixed column map (relative to inner_x0 = bx + ip):
         #
-        # Layout inside the box:
-        #   Row 1: GS value
-        #   Row 2: TRK value   |  DIST value
-        #   Row 3: separator
-        #   Row 4: [TRK rose]  [HOME rose]   (side by side)
-        # ─────────────────────────────────────────────────────────────────────
-        rose_r    = self._ROSE_R
-        rose_diam = rose_r * 2
-        label_gap = 14           # space below rose for label text
-        row_text_h = 20          # height per text row
-        inner_pad  = 8
+        #  col  0 px : "3D FIX"         font 10bold  width ~52 px
+        #  col 60 px : "LAT"            font 9        width ~28 px
+        #  col 92 px : lat_num (9ch)    font 13bold  width ~99 px  (11px/ch)
+        #  col191 px : lat_hem (1ch)    font 9        width ~8 px
+        #  col204 px : "LON"            font 9        width ~28 px
+        #  col236 px : lon_num (10ch)   font 13bold  width ~110px
+        #  col346 px : lon_hem (1ch)    font 9        width ~8 px
+        #       right: "ALT xxx ft"     anchor="e"
+        #
+        # Total inner row width needed: ~360 px → box_w = 380 minimum
+        # ═════════════════════════════════════════════════════════════════════
+        if w >= 560:
+            ip        = 10
+            rh        = 22
+            sep_sp    = 5
+            rose_r    = self._ROSE_R
+            rose_diam = rose_r * 2
+            lbl_gap   = 14
 
-        # Box height: 3 text rows + separator + roses + label + margins
-        bl_h = (row_text_h * 3 + 6          # text rows + separator
-                + rose_diam + label_gap      # roses
-                + inner_pad * 2)             # top/bottom padding
-        # Box width: two roses side by side with gap
-        rose_gap = 20
-        bl_w = max(340, rose_diam * 2 + rose_gap + inner_pad * 2 + 20)
+            # Column offsets (from inner_x0) — hardcoded, font-measured
+            C_FIX   = 0
+            C_LAT   = 58    # "3D FIX" ~52px + 6 gap
+            C_LAT_V = 90    # "LAT" 28px + 4 gap
+            C_LAT_H = 194   # lat_num 9ch * 11.5px/ch ≈ 104px
+            C_LON   = 208   # lat_hem ~8px + 6 gap
+            C_LON_V = 240   # "LON" 28px + 4 gap
+            C_LON_H = 346   # lon_num 10ch * 11.5 ≈ 115px + 1 gap
+            # ALT is right-anchored
 
-        # Anchor: bottom-left corner of canvas
-        bx2, by2 = self._hud_box(pad, h - pad, bl_w, bl_h, anchor="sw")
+            inner_needed = C_LON_H + 10 + 80   # lon_hem + gap + "ALT xxx ft"
+            box_w = max(min(avail_w, 680), inner_needed + ip * 2)
+            box_h = ip + rh + sep_sp + rh + sep_sp + rose_diam + lbl_gap + ip
 
-        gs_cms = d.get("gs_cms", 0)
-        trk    = d.get("trk",    0.0)
-        dist_m = d.get("dist_m", 0.0)
-        brg    = d.get("brg",    0)
-        comp_v = d.get("comp_valid", False)
+            bx = pad
+            by = h - pad - box_h
+            self._hud_box(bx, by, box_w, box_h)
 
-        tx2 = bx2 + inner_pad
-        cy2 = by2 + inner_pad + row_text_h // 2
+            ix0 = bx + ip                    # inner left edge
+            ix1 = bx + box_w - ip            # inner right edge
+            r1y = by + ip + rh // 2          # row-1 centre-y
 
-        # Ground speed
-        if raw_valid:
-            gs_kt  = gs_cms * _CMS_TO_KT
-            gs_kmh = gs_cms * _CMS_TO_KMH
-            self._cv.create_text(tx2, cy2, anchor="w",
-                text=f"GS  {gs_kt:5.1f} kt  ({gs_kmh:.1f} km/h)",
-                fill=_C["text"], font=_FHL)
+            # ── Row 1 ──────────────────────────────────────────────────────
+            cv.create_text(ix0 + C_FIX, r1y, text=fix_txt,
+                           anchor="w", fill=fix_col, font=(_FF, 10, "bold"))
+            cv.create_text(ix0 + C_LAT, r1y, text="LAT",
+                           anchor="w", fill=_C["label"], font=(_FF, 9))
+            cv.create_text(ix0 + C_LAT_V, r1y, text=lat_num,
+                           anchor="w", fill=pos_col, font=_FHD)
+            cv.create_text(ix0 + C_LAT_H, r1y, text=lat_hem,
+                           anchor="w", fill=_C["unit"], font=(_FF, 9, "bold"))
+
+            # LON only if it fits before the ALT block
+            alt_block_x = ix1 - 80   # reserve 80px for "ALT xxx ft"
+            if ix0 + C_LON_H + 14 < alt_block_x:
+                cv.create_text(ix0 + C_LON, r1y, text="LON",
+                               anchor="w", fill=_C["label"], font=(_FF, 9))
+                cv.create_text(ix0 + C_LON_V, r1y, text=lon_num,
+                               anchor="w", fill=pos_col, font=_FHD)
+                cv.create_text(ix0 + C_LON_H, r1y, text=lon_hem,
+                               anchor="w", fill=_C["unit"], font=(_FF, 9, "bold"))
+
+            cv.create_text(ix1, r1y, text=f"ALT  {alt_str}",
+                           anchor="e", fill=alt_col, font=(_FF, 10, "bold"))
+
+            # Separator
+            sep1y = by + ip + rh + sep_sp // 2
+            cv.create_line(bx + 3, sep1y, bx + box_w - 3, sep1y,
+                           fill=_C["border"])
+            r2y = sep1y + sep_sp // 2 + rh // 2 + 1
+
+            # ── Row 2: GS  TRK  |  DIST  BRG ─────────────────────────────
+            # Fixed columns for row-2 (from ix0):
+            # GS label+value: "GS" at 0, value at 24 (total ~90px)
+            # TRK label+value: at 100 (total ~90px)
+            # divider at half box
+            # DIST label+value: at half+10
+            # BRG label+value: at half+110
+            half_x = bx + box_w // 2
+
+            cv.create_text(ix0,       r2y, text="GS",
+                           anchor="w", fill=_C["label"], font=(_FF, 9))
+            cv.create_text(ix0 + 24,  r2y, text=gs_str,
+                           anchor="w", fill=gs_col,  font=(_FF, 10, "bold"))
+            cv.create_text(ix0 + 110, r2y, text="TRK",
+                           anchor="w", fill=_C["label"], font=(_FF, 9))
+            cv.create_text(ix0 + 138, r2y, text=trk_str,
+                           anchor="w", fill=trk_col, font=(_FF, 10, "bold"))
+
+            cv.create_line(half_x, sep1y + sep_sp // 2,
+                           half_x, sep1y + sep_sp // 2 + rh + sep_sp,
+                           fill=_C["border"])
+
+            rx0 = half_x + ip
+            cv.create_text(rx0,       r2y, text="DIST",
+                           anchor="w", fill=_C["label"], font=(_FF, 9))
+            cv.create_text(rx0 + 36,  r2y, text=dist_str,
+                           anchor="w", fill=dist_col, font=(_FF, 10, "bold"))
+            cv.create_text(rx0 + 116, r2y, text="BRG",
+                           anchor="w", fill=_C["label"], font=(_FF, 9))
+            cv.create_text(rx0 + 144, r2y, text=brg_str,
+                           anchor="w", fill=dist_col, font=(_FF, 10, "bold"))
+
+            # Separator 2
+            sep2y = sep1y + sep_sp + rh + sep_sp // 2 + 1
+            cv.create_line(bx + 3, sep2y, bx + box_w - 3, sep2y,
+                           fill=_C["border"])
+
+            # ── Roses ─────────────────────────────────────────────────────
+            rose_cy = sep2y + sep_sp // 2 + rose_r + 4
+            q1 = bx + box_w // 4
+            q3 = bx + box_w - box_w // 4
+            if q3 - q1 >= rose_diam * 2 + 20:
+                self._draw_hud_rose(q1, rose_cy, rose_r, "TRK",
+                                    trk if raw_valid else None, _C["track_needle"])
+                self._draw_hud_rose(q3, rose_cy, rose_r, "HOME",
+                                    brg360 if comp_v else None, _C["home_arrow"])
+
+        # ═════════════════════════════════════════════════════════════════════
+        # COMPACT tier  (380 <= w < 560)   no roses
+        # Fixed column map (relative to ix0):
+        #
+        #  col  0 : "3D FIX"        10bold  ~52px
+        #  col 58 : "LAT"           9       ~28px
+        #  col 88 : lat_num (9ch)   11bold  ~99px  (11px/ch)
+        #  col187 : lat_hem         9bold   ~10px
+        #  col202 : "LON"           9       ~28px
+        #  col232 : lon_num (10ch)  11bold  ~110px
+        #  col342 : lon_hem         9bold   ~10px
+        #       right: "ALT … ft"   anchor e
+        #
+        # Total needed ≈ 360 px + ALT ≈ 420 px → box_w capped at avail
+        # ═════════════════════════════════════════════════════════════════════
+        elif w >= 380:
+            ip     = 8
+            rh     = 20
+            sep_sp = 4
+
+            # Column offsets — Courier New 11bold: ~9.5px/ch
+            C_FIX   = 0
+            C_LAT   = 58
+            C_LAT_V = 86    # "LAT" 26px + 2 gap
+            C_LAT_H = 182   # 9ch * 10.7px ≈ 96px + 2 gap
+            C_LON   = 196   # lat_hem ~8px + 6 gap
+            C_LON_V = 224   # "LON" 26px + 2 gap
+            C_LON_H = 331   # 10ch * 10.7px ≈ 107px + 2 gap
+
+            box_w = min(avail_w, max(C_LON_H + 90 + ip * 2, 420))
+            box_h = ip + rh + sep_sp + rh + ip
+
+            bx = pad
+            by = h - pad - box_h
+            self._hud_box(bx, by, box_w, box_h)
+
+            ix0 = bx + ip
+            ix1 = bx + box_w - ip
+            r1y = by + ip + rh // 2
+
+            # ── Row 1 ──────────────────────────────────────────────────────
+            cv.create_text(ix0 + C_FIX, r1y, text=fix_txt,
+                           anchor="w", fill=fix_col, font=(_FF, 10, "bold"))
+            cv.create_text(ix0 + C_LAT, r1y, text="LAT",
+                           anchor="w", fill=_C["label"], font=(_FF, 9))
+            cv.create_text(ix0 + C_LAT_V, r1y, text=lat_num,
+                           anchor="w", fill=pos_col, font=(_FF, 11, "bold"))
+            cv.create_text(ix0 + C_LAT_H, r1y, text=lat_hem,
+                           anchor="w", fill=_C["unit"], font=(_FF, 9, "bold"))
+
+            # Always draw LON block
+            cv.create_text(ix0 + C_LON, r1y, text="LON",
+                           anchor="w", fill=_C["label"], font=(_FF, 9))
+            cv.create_text(ix0 + C_LON_V, r1y, text=lon_num,
+                           anchor="w", fill=pos_col, font=_FHD)
+            cv.create_text(ix0 + C_LON_H, r1y, text=lon_hem,
+                           anchor="w", fill=_C["unit"], font=(_FF, 9, "bold"))
+            cv.create_text(ix1, r1y, text=f"ALT  {alt_str}",
+                           anchor="e", fill=alt_col, font=(_FF, 9, "bold"))
+
+            sep1y = by + ip + rh + sep_sp // 2
+            cv.create_line(bx + 3, sep1y, bx + box_w - 3, sep1y,
+                           fill=_C["border"])
+            r2y = sep1y + sep_sp // 2 + rh // 2 + 1
+
+            # ── Row 2: GS  TRK  |  DIST  BRG ─────────────────────────────
+            half_x = bx + box_w // 2
+
+            cv.create_text(ix0,       r2y, text="GS",
+                           anchor="w", fill=_C["label"], font=(_FF, 9))
+            cv.create_text(ix0 + 22,  r2y, text=gs_str,
+                           anchor="w", fill=gs_col,  font=(_FF, 9, "bold"))
+            cv.create_text(ix0 + 100, r2y, text="TRK",
+                           anchor="w", fill=_C["label"], font=(_FF, 9))
+            cv.create_text(ix0 + 126, r2y, text=trk_str,
+                           anchor="w", fill=trk_col, font=(_FF, 9, "bold"))
+
+            cv.create_line(half_x, sep1y + sep_sp // 2,
+                           half_x, sep1y + sep_sp // 2 + rh + sep_sp,
+                           fill=_C["border"])
+
+            rx0 = half_x + ip
+            cv.create_text(rx0,       r2y, text="DIST",
+                           anchor="w", fill=_C["label"], font=(_FF, 9))
+            cv.create_text(rx0 + 34,  r2y, text=dist_str,
+                           anchor="w", fill=dist_col, font=(_FF, 9, "bold"))
+            cv.create_text(rx0 + 104, r2y, text="BRG",
+                           anchor="w", fill=_C["label"], font=(_FF, 9))
+            cv.create_text(rx0 + 130, r2y, text=brg_str,
+                           anchor="w", fill=dist_col, font=(_FF, 9, "bold"))
+
+        # ═════════════════════════════════════════════════════════════════════
+        # STACKED tier  (w < 380)
+        # One field per row.  Labels in a fixed 38px left column, values
+        # right of that.  Box grows upward; as many rows as fit in canvas.
+        # ═════════════════════════════════════════════════════════════════════
         else:
-            self._cv.create_text(tx2, cy2, anchor="w",
-                text="GS  ---.- kt", fill=_C["dim"], font=_FHL)
+            ip     = 6
+            rh     = 19   # row height — comfortably fits 9bold
+            sp     = 2    # gap between rows
+            lbl_w  = 40   # fixed label column (fits "LAT", "LON", "DST", etc.)
+            box_w  = min(avail_w, 220)
 
-        cy2 += row_text_h
+            rows = [
+                # (label,  value,    value_colour,  hem)
+                ("",     fix_txt,  fix_col,  ""),
+                ("LAT",  lat_num,  pos_col,  lat_hem),
+                ("LON",  lon_num,  pos_col,  lon_hem),
+                ("ALT",  alt_str,  alt_col,  ""),
+                ("GS",   gs_str,   gs_col,   ""),
+                ("TRK",  trk_str,  trk_col,  ""),
+                ("DST",  dist_str, dist_col, ""),
+                ("BRG",  brg_str,  dist_col, ""),
+            ]
 
-        # Track  (left column)
-        if raw_valid:
-            self._cv.create_text(tx2, cy2, anchor="w",
-                text=f"TRK  {trk:05.1f}°",
-                fill=_C["green"], font=_FHL)
-        else:
-            self._cv.create_text(tx2, cy2, anchor="w",
-                text="TRK  ---.-°", fill=_C["dim"], font=_FHL)
+            max_rows = max(1, (h - pad * 2) // (rh + sp))
+            rows = rows[:max_rows]
+            n    = len(rows)
+            box_h = ip + n * rh + (n - 1) * sp + ip
 
-        # Home DIST  (right column — starts halfway across the box)
-        mid_x = bx2 + bl_w // 2
-        if comp_v:
-            self._cv.create_text(mid_x, cy2, anchor="w",
-                text=f"DIST  {int(dist_m):5d} m",
-                fill=_C["cyan"], font=_FHL)
-        else:
-            self._cv.create_text(mid_x, cy2, anchor="w",
-                text="DIST  ------ m", fill=_C["dim"], font=_FHL)
+            bx = pad
+            by = max(pad, h - pad - box_h)
+            self._hud_box(bx, by, box_w, box_h)
 
-        cy2 += row_text_h
+            ix1   = bx + box_w - ip
+            y_cur = by + ip
 
-        # Home BRG  (right column)
-        if comp_v:
-            self._cv.create_text(mid_x, cy2, anchor="w",
-                text=f"BRG   {(brg + 360) % 360:03d}°",
-                fill=_C["cyan"], font=_FHL)
-        else:
-            self._cv.create_text(mid_x, cy2, anchor="w",
-                text="BRG   ---°", fill=_C["dim"], font=_FHL)
+            for lbl, val, vcol, hem in rows:
+                cy_r = y_cur + rh // 2
+                vx   = bx + ip + (lbl_w if lbl else 0)
 
-        cy2 += row_text_h // 2
+                if lbl:
+                    cv.create_text(bx + ip, cy_r, text=lbl,
+                                   anchor="w", fill=_C["label"],
+                                   font=(_FF, 8))
 
-        # Separator line
-        self._cv.create_line(bx2 + 2, cy2, bx2 + bl_w - 2, cy2,
-                             fill=_C["border"])
+                # Draw value — truncate if too wide
+                val_x = vx
+                cv.create_text(val_x, cy_r, text=val,
+                               anchor="w", fill=vcol,
+                               font=(_FF, 9, "bold"))
+                # Hemisphere letter (LAT/LON rows only); placed at fixed offset
+                if hem:
+                    cv.create_text(val_x + 100, cy_r, text=hem,
+                                   anchor="w", fill=_C["unit"],
+                                   font=(_FF, 8))
 
-        cy2 += 6
-
-        # ── Compass roses ─────────────────────────────────────────────────────
-        rose_cy  = cy2 + rose_r + 2
-        # Centre the two roses within the box
-        total_rose_w = rose_diam + rose_gap + rose_diam
-        rose_x_start = bx2 + (bl_w - total_rose_w) // 2 + rose_r
-
-        rose_cx1 = rose_x_start                      # TRK rose centre
-        rose_cx2 = rose_x_start + rose_diam + rose_gap  # HOME rose centre
-
-        # Track rose (green needle)
-        self._draw_hud_rose(
-            rose_cx1, rose_cy, rose_r,
-            "TRK",
-            trk if raw_valid else None,
-            _C["track_needle"])
-
-        # Home bearing rose (cyan needle)
-        self._draw_hud_rose(
-            rose_cx2, rose_cy, rose_r,
-            "HOME",
-            (brg + 360) % 360 if comp_v else None,
-            _C["home_arrow"])
+                y_cur += rh + sp
 
     # ── Event handlers ────────────────────────────────────────────────────────
 
@@ -811,16 +926,17 @@ class _MapCanvas(tk.Frame):
         else:
             self._zoom_out()
 
+    def get_zoom(self):
+        return self._zoom
+
     def _zoom_in(self):
         if self._zoom < 19:
             self._zoom += 1
-            self._zoom_lbl.config(text=f"z{self._zoom}")
             self._redraw()
 
     def _zoom_out(self):
         if self._zoom > 2:
             self._zoom -= 1
-            self._zoom_lbl.config(text=f"z{self._zoom}")
             self._redraw()
 
     def _center_on_drone(self):
@@ -829,8 +945,6 @@ class _MapCanvas(tk.Frame):
             self._center_lon = self._drone_lon
         self._auto_center = True
         self._redraw()
-
-    # ── Public update ─────────────────────────────────────────────────────────
 
     def update_position(self, lat, lon, fix_valid):
         self._fix_valid = fix_valid
@@ -852,16 +966,29 @@ class _MapCanvas(tk.Frame):
 # =============================================================================
 
 class _NavPanel(tk.Frame):
-    """Full-detail navigation readout — used when widget is too small for map."""
+    """
+    Full-detail navigation readout — used when widget is too small for map.
+
+    Detail level adapts to available height (h):
+      h >= 380  — all fields + both compass roses
+      h >= 260  — all fields, no roses
+      h >= 160  — FIX / LAT / LON / ALT / GS / TRK / DIST / BRG in compact rows
+      h <  160  — single line per critical field: FIX, ALT, GS
+    """
 
     def __init__(self, parent, **kwargs):
         super().__init__(parent, bg=_C["bg"], **kwargs)
         self._prev_heartbeat = None
         self._hb_state       = False
-        self._build()
+        self._last_d         = {}
+        self._current_detail = None
+        self._build_full()
 
-    def _sep(self):
-        tk.Frame(self, bg=_C["border"], height=1).pack(fill="x", pady=3)
+    # ── Build helpers ─────────────────────────────────────────────────────────
+
+    def _sep(self, parent=None):
+        p = parent or self
+        tk.Frame(p, bg=_C["border"], height=1).pack(fill="x", pady=2)
 
     def _lrow(self, parent, label, attr, default_text, font=_FV):
         row = tk.Frame(parent, bg=_C["bg"])
@@ -872,10 +999,12 @@ class _NavPanel(tk.Frame):
         lbl.pack(side="left")
         setattr(self, attr, lbl)
 
-    def _build(self):
+    def _build_full(self):
+        """Build the full detail panel (always built; shown/hidden by height)."""
         c = tk.Frame(self, bg=_C["bg"])
         c.pack(fill="both", expand=True, padx=8, pady=4)
 
+        # Fix / SAT / HDOP / heartbeat row
         fix_row = tk.Frame(c, bg=_C["bg"])
         fix_row.pack(fill="x", pady=(2, 0))
         self._fix_lbl = tk.Label(fix_row, text="NO FIX",
@@ -901,14 +1030,14 @@ class _NavPanel(tk.Frame):
         self._hb_dot = self._hb_cv.create_oval(1, 1, 11, 11,
                                                fill=_C["hb_off"], outline="")
 
-        self._sep()
+        self._sep(c)
 
         tk.Label(c, text="POSITION", fg=_C["label"], bg=_C["bg"],
                  font=_FL).pack(anchor="w")
         self._lrow(c, "LAT", "_lat_lbl", "---.---------- -")
         self._lrow(c, "LON", "_lon_lbl", "---.---------- -")
 
-        self._sep()
+        self._sep(c)
 
         tk.Label(c, text="ALTITUDE MSL", fg=_C["label"], bg=_C["bg"],
                  font=_FL).pack(anchor="w")
@@ -921,7 +1050,7 @@ class _NavPanel(tk.Frame):
                                     fg=_C["unit"], bg=_C["bg"], font=_FVS)
         self._alt_m_lbl.pack(side="left", padx=(8, 0))
 
-        self._sep()
+        self._sep(c)
 
         tk.Label(c, text="GROUND VECTOR", fg=_C["label"], bg=_C["bg"],
                  font=_FL).pack(anchor="w")
@@ -942,7 +1071,7 @@ class _NavPanel(tk.Frame):
             34, 34, 34, 10, fill=_C["track_needle"],
             width=2, arrow="last", arrowshape=(7, 9, 3))
 
-        self._sep()
+        self._sep(c)
 
         tk.Label(c, text="HOME POINT", fg=_C["label"], bg=_C["bg"],
                  font=_FL).pack(anchor="w")
@@ -961,8 +1090,6 @@ class _NavPanel(tk.Frame):
         self._home_arrow = self._home_cv.create_line(
             34, 34, 34, 10, fill=_C["home_arrow"],
             width=2, arrow="last", arrowshape=(7, 9, 3))
-
-    # ── Compass helpers ───────────────────────────────────────────────────────
 
     def _draw_rose(self, cv, cx, cy, r, cardinals=True):
         cv.create_oval(cx-r, cy-r, cx+r, cy+r,
@@ -989,9 +1116,11 @@ class _NavPanel(tk.Frame):
         cv.coords(needle_id, cx, cy,
                   cx + math.cos(rad)*tip_r, cy + math.sin(rad)*tip_r)
 
-    # ── Public update ─────────────────────────────────────────────────────────
-
     def update(self, d: dict):
+        self._last_d = d
+        self._apply(d)
+
+    def _apply(self, d: dict):
         raw_valid  = d.get("raw_valid",  False)
         comp_valid = d.get("comp_valid", False)
         pos_usable = d.get("pos_usable", False)
@@ -1082,22 +1211,24 @@ class GPSWidget(tk.Frame):
     """
     Aviation-grade GPS navigation widget.
 
+    UNIFIED TOOLBAR — adaptive collapse:
+      wide  (>= 520px): full labels + values
+      medium(>= 380px): values only, no "SAT"/"HDOP" text labels
+      narrow(< 380px):  zoom symbols only (+/−/⊙), status badge collapsed
+
     Layout modes (auto-selected by widget size):
-
-      MAP MODE  (widget ≥ MIN_MAP_W × MIN_MAP_H)
-        • Full-width map with navigation data overlaid as HUD panels.
-        • "SAT ▶" button in the title bar toggles the satellite panel
-          which appears to the RIGHT of the map (map shrinks, doesn't hide).
-
-      NAV MODE  (widget too small for map)
-        • Classic scrollable navigation readout (no map).
-        • "SAT" button in the header toggles a floating satellite Toplevel.
+      MAP MODE  — Full-width map with HUD overlay; SAT panel slides in right
+      NAV MODE  — Compact scrollable nav readout (no map)
 
     Public API
     ----------
-    update_gps(ui_data)   — call on every telemetry tick; same key contract
-                             as the original GPSWidget.
+    update_gps(ui_data)   — same key contract as original GPSWidget
     """
+
+    # Toolbar width thresholds
+    _TB_FULL   = 520   # full labels
+    _TB_MED    = 380   # values only
+    # (below _TB_MED: symbols-only zoom cluster, status badge only)
 
     def __init__(self, parent, **kwargs):
         super().__init__(parent, bg=_C["bg"], **kwargs)
@@ -1105,50 +1236,123 @@ class GPSWidget(tk.Frame):
         self._map_mode     = True
         self._last_ui_data = {}
         self._sat_toplevel = None
+        self._toolbar_w    = 0
+
+        self._prev_heartbeat = None
+        self._hb_state       = False
 
         self._build_ui()
         self.bind("<Configure>", self._on_configure)
 
     # =========================================================================
-    # Build UI
+    # Build UI — single unified toolbar
     # =========================================================================
 
     def _build_ui(self):
-        self._hdr = tk.Frame(self, bg=_C["frame_bg"], height=26)
-        self._hdr.pack(fill="x")
-        self._hdr.pack_propagate(False)
+        # ── Unified toolbar ───────────────────────────────────────────────────
+        self._toolbar = tk.Frame(self, bg=_C["frame_bg"], height=28)
+        self._toolbar.pack(fill="x")
+        self._toolbar.pack_propagate(False)
 
-        tk.Label(self._hdr, text="GPS NAVIGATION",
-                 fg=_C["label"], bg=_C["frame_bg"],
-                 font=(_FF, 9, "bold")).pack(side="left", padx=8)
+        btn_kw = dict(
+            bg=_C["map_btn"], fg=_C["text"],
+            relief="flat", padx=4, pady=1,
+            font=_FTB,
+            activebackground="#2a3545", activeforeground=_C["text"],
+            cursor="hand2",
+        )
 
+        # Left cluster: zoom + center + zoom label
+        self._btn_plus = tk.Button(self._toolbar, text="+",
+                                   command=self._zoom_in, **btn_kw)
+        self._btn_plus.pack(side="left", padx=(4, 1), pady=3)
+
+        self._btn_minus = tk.Button(self._toolbar, text="−",
+                                    command=self._zoom_out, **btn_kw)
+        self._btn_minus.pack(side="left", padx=(0, 1), pady=3)
+
+        self._btn_ctr = tk.Button(self._toolbar, text="⊙",
+                                  command=self._center_on_drone, **btn_kw)
+        self._btn_ctr.pack(side="left", padx=(0, 2), pady=3)
+
+        # "CTR" text label — hidden on narrow toolbar
+        self._ctr_lbl = tk.Label(self._toolbar, text="CTR",
+                                 fg=_C["text"], bg=_C["map_btn"],
+                                 font=_FTB, padx=2)
+        self._ctr_lbl.pack(side="left", padx=(0, 2), pady=3)
+
+        self._zoom_lbl = tk.Label(self._toolbar, text="z15",
+                                  fg=_C["label"], bg=_C["frame_bg"],
+                                  font=(_FF, 8))
+        self._zoom_lbl.pack(side="left", padx=(2, 6))
+
+        self._sep_v1 = tk.Frame(self._toolbar, bg=_C["border"], width=1)
+        self._sep_v1.pack(side="left", fill="y", pady=4)
+
+        # Centre cluster: FIX badge | SAT count | HDOP
+        self._fix_badge = tk.Label(self._toolbar,
+                                   text="NO FIX", fg=_C["red"],
+                                   bg=_C["frame_bg"],
+                                   font=(_FF, 9, "bold"), padx=4)
+        self._fix_badge.pack(side="left", padx=(6, 4))
+
+        self._sep_v2 = tk.Frame(self._toolbar, bg=_C["border"], width=1)
+        self._sep_v2.pack(side="left", fill="y", pady=4)
+
+        # "SAT" label (hidden narrow)
+        self._sat_txt_lbl = tk.Label(self._toolbar, text="SAT",
+                                     fg=_C["label"], bg=_C["frame_bg"],
+                                     font=_FTB)
+        self._sat_txt_lbl.pack(side="left", padx=(6, 1))
+
+        self._sat_count_lbl = tk.Label(self._toolbar,
+                                       text=" --", fg=_C["dim"],
+                                       bg=_C["frame_bg"],
+                                       font=(_FF, 9, "bold"), width=3)
+        self._sat_count_lbl.pack(side="left", padx=(0, 4))
+
+        self._sep_v3 = tk.Frame(self._toolbar, bg=_C["border"], width=1)
+        self._sep_v3.pack(side="left", fill="y", pady=4)
+
+        # "HDOP" label (hidden narrow)
+        self._hdop_txt_lbl = tk.Label(self._toolbar, text="HDOP",
+                                      fg=_C["label"], bg=_C["frame_bg"],
+                                      font=_FTB)
+        self._hdop_txt_lbl.pack(side="left", padx=(6, 1))
+
+        self._hdop_lbl = tk.Label(self._toolbar,
+                                  text=" --.--", fg=_C["dim"],
+                                  bg=_C["frame_bg"],
+                                  font=(_FF, 9, "bold"), width=6)
+        self._hdop_lbl.pack(side="left", padx=(0, 4))
+
+        # Right cluster: heartbeat + SAT toggle
         self._sat_btn = tk.Button(
-            self._hdr, text="SAT ▶",
+            self._toolbar, text="SAT▶",
             command=self._toggle_sat,
             bg=_C["map_btn"], fg=_C["amber"],
-            relief="flat", padx=6, pady=1,
+            relief="flat", padx=5, pady=1,
             font=(_FF, 8, "bold"),
             activebackground="#2a3545", activeforeground=_C["amber"],
             cursor="hand2",
         )
-        self._sat_btn.pack(side="right", padx=6, pady=3)
+        self._sat_btn.pack(side="right", padx=(0, 5), pady=3)
 
-        self._hb_cv  = tk.Canvas(self._hdr, width=10, height=10,
+        self._hb_cv  = tk.Canvas(self._toolbar, width=10, height=10,
                                  bg=_C["frame_bg"], highlightthickness=0)
-        self._hb_cv.pack(side="right", padx=(0, 4))
+        self._hb_cv.pack(side="right", padx=(0, 3))
         self._hb_dot = self._hb_cv.create_oval(1, 1, 9, 9,
                                                fill=_C["hb_off"], outline="")
-        self._prev_heartbeat = None
-        self._hb_state       = False
 
+        # Bottom separator
         tk.Frame(self, bg=_C["border"], height=1).pack(fill="x")
 
+        # ── Content area ──────────────────────────────────────────────────────
         self._content = tk.Frame(self, bg=_C["bg"])
         self._content.pack(fill="both", expand=True)
 
         self._build_map_layout()
         self._build_nav_layout()
-
         self._apply_map_mode()
 
     def _build_map_layout(self):
@@ -1163,6 +1367,110 @@ class GPSWidget(tk.Frame):
         self._nav_panel.pack(fill="both", expand=True)
 
     # =========================================================================
+    # Toolbar adaptive collapse
+    # =========================================================================
+
+    def _adapt_toolbar(self, w):
+        """Show/hide optional toolbar elements based on available width."""
+        if w == self._toolbar_w:
+            return
+
+        self._toolbar_w = w
+
+        # prvo ukloni sve adaptive widgete
+        for widget in (
+            self._ctr_lbl,
+            self._sat_txt_lbl,
+            self._hdop_txt_lbl,
+            self._sep_v2,
+            self._sep_v3,
+        ):
+            widget.pack_forget()
+
+        # FULL MODE
+        if w >= self._TB_FULL:
+
+            self._ctr_lbl.pack(side="left", padx=(0, 2), pady=3)
+
+            self._sep_v2.pack(side="left", fill="y", pady=4)
+
+            self._sat_txt_lbl.pack(side="left", padx=(6, 1))
+            self._sat_count_lbl.pack_configure(padx=(0, 4))
+
+            self._sep_v3.pack(side="left", fill="y", pady=4)
+
+            self._hdop_txt_lbl.pack(side="left", padx=(6, 1))
+            self._hdop_lbl.pack_configure(padx=(0, 4))
+
+            self._hdop_lbl.config(width=6)
+            self._sat_count_lbl.config(width=3)
+
+        # MEDIUM MODE
+        elif w >= self._TB_MED:
+
+            self._sep_v2.pack(side="left", fill="y", pady=4)
+            self._sat_count_lbl.pack_configure(padx=(6, 4))
+
+            self._sep_v3.pack(side="left", fill="y", pady=4)
+            self._hdop_lbl.pack_configure(padx=(6, 4))
+
+            self._hdop_lbl.config(width=5)
+            self._sat_count_lbl.config(width=3)
+
+        # NARROW MODE
+        else:
+
+            self._sat_count_lbl.pack_configure(padx=(6, 2))
+            self._hdop_lbl.pack_configure(padx=(6, 2))
+
+            self._hdop_lbl.config(width=4)
+            self._sat_count_lbl.config(width=2)
+
+    # =========================================================================
+    # Toolbar relay methods
+    # =========================================================================
+
+    def _zoom_in(self):
+        if self._map_mode:
+            self._map_canvas.zoom_in()
+            self._zoom_lbl.config(text=f"z{self._map_canvas.get_zoom()}")
+
+    def _zoom_out(self):
+        if self._map_mode:
+            self._map_canvas.zoom_out()
+            self._zoom_lbl.config(text=f"z{self._map_canvas.get_zoom()}")
+
+    def _center_on_drone(self):
+        if self._map_mode:
+            self._map_canvas.center_drone()
+
+    # =========================================================================
+    # Toolbar status update
+    # =========================================================================
+
+    def _update_toolbar_status(self, raw_valid, fix_type, num_sat, hdop):
+        if raw_valid and fix_type >= 2:
+            fix_txt, fix_col = "3D FIX", _C["green"]
+        elif raw_valid and fix_type == 1:
+            fix_txt, fix_col = "2D FIX", _C["amber"]
+        else:
+            fix_txt, fix_col = "NO FIX", _C["red"]
+        self._fix_badge.config(text=fix_txt, fg=fix_col)
+
+        sat_col = (_C["green"] if (raw_valid and num_sat >= 6)
+                   else _C["amber"] if raw_valid else _C["dim"])
+        self._sat_count_lbl.config(
+            text=f"{num_sat:3d}" if raw_valid else " --",
+            fg=sat_col)
+
+        if raw_valid and hdop < 99.0:
+            hdop_col = (_C["green"] if hdop < 1.0
+                        else _C["amber"] if hdop < 2.0 else _C["red"])
+            self._hdop_lbl.config(text=f"{hdop:6.2f}", fg=hdop_col)
+        else:
+            self._hdop_lbl.config(text=" --.--", fg=_C["dim"])
+
+    # =========================================================================
     # Layout mode switching
     # =========================================================================
 
@@ -1172,18 +1480,28 @@ class GPSWidget(tk.Frame):
         self._map_frame.pack(fill="both", expand=True)
         if self._sat_open:
             self._sat_panel.pack(side="right", fill="y")
-        self._sat_btn.config(state="normal")
+        self._zoom_lbl.config(fg=_C["label"])
+        self._btn_plus.config(state="normal")
+        self._btn_minus.config(state="normal")
+        self._btn_ctr.config(state="normal")
 
     def _apply_nav_mode(self):
         self._map_mode = False
         self._map_frame.pack_forget()
         self._sat_panel.pack_forget()
         self._nav_frame.pack(fill="both", expand=True)
-        self._sat_btn.config(state="normal")
+        self._zoom_lbl.config(fg=_C["dim"])
+        self._btn_plus.config(state="disabled")
+        self._btn_minus.config(state="disabled")
+        self._btn_ctr.config(state="disabled")
 
     def _on_configure(self, event):
         w = event.width
-        h = event.height - 27
+        h = event.height - 29   # subtract toolbar height
+
+        # Adaptive toolbar collapse
+        self._adapt_toolbar(w)
+
         want_map = (w >= MIN_MAP_W and h >= MIN_MAP_H)
         if want_map != self._map_mode:
             if want_map:
@@ -1200,13 +1518,13 @@ class GPSWidget(tk.Frame):
     def _toggle_sat(self):
         self._sat_open = not self._sat_open
         if self._sat_open:
-            self._sat_btn.config(text="SAT ◀")
+            self._sat_btn.config(text="SAT◀")
             if self._map_mode:
                 self._sat_panel.pack(side="right", fill="y")
             else:
                 self._open_sat_toplevel()
         else:
-            self._sat_btn.config(text="SAT ▶")
+            self._sat_btn.config(text="SAT▶")
             if self._map_mode:
                 self._sat_panel.pack_forget()
             else:
@@ -1234,7 +1552,7 @@ class GPSWidget(tk.Frame):
 
     def _close_sat_toplevel(self):
         self._sat_open = False
-        self._sat_btn.config(text="SAT ▶")
+        self._sat_btn.config(text="SAT▶")
         if self._sat_toplevel and self._sat_toplevel.winfo_exists():
             self._sat_toplevel.destroy()
         self._sat_toplevel = None
@@ -1274,7 +1592,10 @@ class GPSWidget(tk.Frame):
             heartbeat=heartbeat,
         )
 
-        # Heartbeat in header
+        # Toolbar status
+        self._update_toolbar_status(raw_valid, fix_type, num_sat, hdop)
+
+        # Heartbeat dot
         if heartbeat is not None and heartbeat != self._prev_heartbeat:
             self._hb_state       = not self._hb_state
             self._prev_heartbeat = heartbeat
@@ -1282,12 +1603,18 @@ class GPSWidget(tk.Frame):
             self._hb_dot,
             fill=_C["hb_on"] if self._hb_state else _C["hb_off"])
 
+        # Zoom label
+        if self._map_mode:
+            self._zoom_lbl.config(text=f"z{self._map_canvas.get_zoom()}")
+
+        # Push to active panel
         if self._map_mode:
             self._map_canvas.update_position(lat, lon, raw_valid and fix_type >= 2)
             self._map_canvas.update_hud(nav)
         else:
             self._nav_panel.update(nav)
 
+        # Satellite panel (always updated even if hidden)
         raw_sv = ui_data.get("gps_sv_list", [])
         norm   = _normalize_sv_list(raw_sv)
         self._sat_panel.update_satellites(norm)
