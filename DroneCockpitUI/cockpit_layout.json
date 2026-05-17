@@ -1,5 +1,5 @@
 {
-  "geometry": "1536x793+-196+58",
+  "geometry": "1536x793+-11+31",
   "locked": false,
   "panels": {
     "imu": {
@@ -31,24 +31,24 @@
       "visible": false
     },
     "gps": {
-      "x": 10,
-      "y": 500,
-      "w": 700,
-      "h": 300,
-      "visible": false
+      "x": 1033,
+      "y": 10,
+      "w": 416,
+      "h": 583,
+      "visible": true
     },
     "fc_status": {
-      "x": 10,
+      "x": 15,
       "y": 10,
-      "w": 440,
-      "h": 140,
+      "w": 320,
+      "h": 614,
       "visible": true
     },
     "arming": {
-      "x": 10,
-      "y": 160,
-      "w": 440,
-      "h": 300,
+      "x": 338,
+      "y": 10,
+      "w": 694,
+      "h": 586,
       "visible": true
     }
   }

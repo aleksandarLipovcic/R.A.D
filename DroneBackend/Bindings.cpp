@@ -46,47 +46,19 @@ PYBIND11_MODULE(DroneBackend, m) {
 
     // =========================================================================
     // SVInfoEntry
-    //
-    // Populated by MSP_GPS_SV_INFO (cmd 164) via GPSNeoM10::parseMspSvInfo().
-    //
-    // Fields always populated (MSP and UBX sources):
-    //   gnss_name, svid, cno, quality, status_str, used, gnss_id, flags, chn
-    //
-    // Fields that are 0 when sv_source == "MSP" (not in cmd 164 payload):
-    //   elev, azim, prRes
-    //
-    // Python UI should check state.sv_source before showing Elev/Azim columns:
-    //   if state.sv_source == "MSP":
-    //       hide elev/azim columns in the satellite table
     // =========================================================================
     py::class_<SVInfoEntry>(m, "SVInfoEntry")
-        .def_readonly("chn", &SVInfoEntry::chn,
-            "Channel index. For MSP source: SV index (0-31). "
-            "For UBX source: receiver tracking channel.")
-        .def_readonly("svid", &SVInfoEntry::svid,
-            "Satellite vehicle ID (PRN for GPS, slot for GLONASS).")
-        .def_readonly("flags", &SVInfoEntry::flags,
-            "Packed flags byte: bits[0:2]=quality, bit[3]=svUsed. "
-            "Same encoding for both MSP and UBX sources.")
-        .def_readonly("quality", &SVInfoEntry::quality,
-            "UBX qualityInd 0-7: 0=no sig,1=searching,2=acquired,3=unusable,"
-            "4=code locked,5-7=code+carrier locked.")
-        .def_readonly("cno", &SVInfoEntry::cno,
-            "Carrier-to-noise density, dBHz. 0-55.")
-        .def_readonly("elev", &SVInfoEntry::elev,
-            "Elevation above horizon, degrees (-90 to +90). "
-            "Always 0 when sv_source == 'MSP' (not available in cmd 164).")
-        .def_readonly("azim", &SVInfoEntry::azim,
-            "Azimuth, degrees (0-360). "
-            "Always 0 when sv_source == 'MSP' (not available in cmd 164).")
-        .def_readonly("gnss_id", &SVInfoEntry::gnssId,
-            "GNSS system ID: 0=GPS,1=SBAS,2=Galileo,3=BeiDou,5=QZSS,6=GLONASS.")
-        .def_readonly("gnss_name", &SVInfoEntry::gnssName,
-            "Human-readable GNSS name: 'GPS', 'GLONASS', 'Galileo', etc.")
-        .def_readonly("status_str", &SVInfoEntry::statusStr,
-            "'used', 'tracked', 'acquired', 'searching', or 'idle'.")
-        .def_readonly("used", &SVInfoEntry::used,
-            "True when this satellite contributes to the fix solution.");
+        .def_readonly("chn", &SVInfoEntry::chn)
+        .def_readonly("svid", &SVInfoEntry::svid)
+        .def_readonly("flags", &SVInfoEntry::flags)
+        .def_readonly("quality", &SVInfoEntry::quality)
+        .def_readonly("cno", &SVInfoEntry::cno)
+        .def_readonly("elev", &SVInfoEntry::elev)
+        .def_readonly("azim", &SVInfoEntry::azim)
+        .def_readonly("gnss_id", &SVInfoEntry::gnssId)
+        .def_readonly("gnss_name", &SVInfoEntry::gnssName)
+        .def_readonly("status_str", &SVInfoEntry::statusStr)
+        .def_readonly("used", &SVInfoEntry::used);
 
     // =========================================================================
     // NavStatus
@@ -94,10 +66,8 @@ PYBIND11_MODULE(DroneBackend, m) {
     py::class_<NavStatus>(m, "NavStatus")
         .def_readonly("fix_type", &NavStatus::fixType)
         .def_readonly("gps_flags", &NavStatus::gpsFlags)
-        .def_readonly("fix_ok", &NavStatus::fixOk,
-            "True when GPS fix is valid (gpsFlags bit0).")
-        .def_readonly("dgps_used", &NavStatus::dgpsUsed,
-            "True when differential GPS correction is active.")
+        .def_readonly("fix_ok", &NavStatus::fixOk)
+        .def_readonly("dgps_used", &NavStatus::dgpsUsed)
         .def_readonly("map_flags", &NavStatus::mapFlags)
         .def_readonly("hw_status", &NavStatus::hwStatus)
         .def_readonly("valid", &NavStatus::valid);
@@ -107,8 +77,7 @@ PYBIND11_MODULE(DroneBackend, m) {
     // =========================================================================
     py::class_<GPSConfig>(m, "GPSConfig")
         .def(py::init<>())
-        .def_readwrite("constellations", &GPSConfig::constellations,
-            "Bitmask of GPSConstellationFlags.")
+        .def_readwrite("constellations", &GPSConfig::constellations)
         .def_readwrite("update_rate_hz", &GPSConfig::updateRateHz)
         .def_readwrite("protocol", &GPSConfig::protocol)
         .def_readwrite("sbas_enabled", &GPSConfig::sbasEnabled)
@@ -190,46 +159,29 @@ PYBIND11_MODULE(DroneBackend, m) {
         .def_readonly("pitch", &DroneState::pitch)
         .def_readonly("yaw", &DroneState::yaw)
 
-        // ── Power — MSP_ANALOG (110) ──────────────────────────────────────────
-        .def_readonly("battery_voltage", &DroneState::batteryVoltage,
-            "Battery voltage in Volts. Overwritten by parseBatteryState() with "
-            "10 mV-resolution value when available.")
-        .def_readonly("battery_current", &DroneState::batteryCurrent,
-            "Battery current draw in Amps (centiamps / 100).")
-        .def_readonly("battery_mah_drawn", &DroneState::batteryMahDrawn,
-            "Cumulative charge consumed in mAh since boot.")
-        .def_readonly("rssi", &DroneState::rssi,
-            "Received signal strength 0-255 from MSP_ANALOG.")
+        // ── Power ─────────────────────────────────────────────────────────────
+        .def_readonly("battery_voltage", &DroneState::batteryVoltage)
+        .def_readonly("battery_current", &DroneState::batteryCurrent)
+        .def_readonly("battery_mah_drawn", &DroneState::batteryMahDrawn)
+        .def_readonly("rssi", &DroneState::rssi)
 
-        // ── Battery detail — MSP_BATTERY_STATE (242) ──────────────────────────
-        .def_readonly("battery_cell_count", &DroneState::batteryCellCount,
-            "Auto-detected LiPo cell count (e.g. 4 for a 4S pack).")
-        .def_readonly("battery_capacity_mah", &DroneState::batteryCapacityMah,
-            "Design capacity in mAh. 0 if not configured in BF Configurator "
-            "(set battery_capacity = <mAh>; save).")
-        .def_readonly("battery_percentage", &DroneState::batteryPercentage,
-            "Remaining capacity 0-100 %. Computed from mAh drawn vs design capacity. "
-            "0 when battery_capacity_mah == 0.")
-        .def_readonly("battery_state", &DroneState::batteryState,
-            "BatteryState enum: OK / WARNING / CRITICAL / NOT_PRESENT / INIT.")
+        // ── Battery detail ────────────────────────────────────────────────────
+        .def_readonly("battery_cell_count", &DroneState::batteryCellCount)
+        .def_readonly("battery_capacity_mah", &DroneState::batteryCapacityMah)
+        .def_readonly("battery_percentage", &DroneState::batteryPercentage)
+        .def_readonly("battery_state", &DroneState::batteryState)
 
-        // ── Barometer — BMP280 via MSP_ALTITUDE (109) ─────────────────────────
-        .def_readonly("baro_altitude_cm", &DroneState::baroAltitudeCm,
-            "FC-fused BMP280 altitude above home point, cm.")
-        .def_readonly("baro_vario_cm_per_sec", &DroneState::baroVarioCmPerSec,
-            "Vertical speed cm/s. Positive = climbing.")
-        .def_readonly("baro_valid", &DroneState::baroValid,
-            "True when a valid MSP_ALTITUDE frame was received.")
+        // ── Barometer ─────────────────────────────────────────────────────────
+        .def_readonly("baro_altitude_cm", &DroneState::baroAltitudeCm)
+        .def_readonly("baro_vario_cm_per_sec", &DroneState::baroVarioCmPerSec)
+        .def_readonly("baro_valid", &DroneState::baroValid)
 
-        // ── Magnetometer — QMC5883L via MSP_DEBUG (254) ───────────────────────
-        .def_readonly("mag_x", &DroneState::magX,
-            "Raw mag X ADC counts. Requires debug_mode=MAG_CALIB in BF CLI.")
+        // ── Magnetometer ──────────────────────────────────────────────────────
+        .def_readonly("mag_x", &DroneState::magX)
         .def_readonly("mag_y", &DroneState::magY)
         .def_readonly("mag_z", &DroneState::magZ)
-        .def_readonly("mag_heading_deg", &DroneState::magHeadingDeg,
-            "Tilt-uncorrected 2D magnetic heading 0-360 deg.")
-        .def_readonly("mag_valid", &DroneState::magValid,
-            "True when mag X/Y/Z are non-zero.")
+        .def_readonly("mag_heading_deg", &DroneState::magHeadingDeg)
+        .def_readonly("mag_valid", &DroneState::magValid)
 
         // ── Calibration state ─────────────────────────────────────────────────
         .def_readonly("mag_cal_active", &DroneState::magCalActive)
@@ -237,134 +189,114 @@ PYBIND11_MODULE(DroneBackend, m) {
         .def_readonly("acc_cal_active", &DroneState::accCalActive)
         .def_readonly("acc_cal_seconds_remaining", &DroneState::accCalSecondsRemaining)
 
-        // ── FC status — MSP_STATUS (101) ──────────────────────────────────────
-        .def_readonly("armed", &DroneState::armed,
-            "True when the ARM box is active (FlightMode::ARM bit set).")
-        .def_readonly("flight_mode_flags", &DroneState::flightModeFlags,
-            "Raw bitmask from MSP_STATUS. Use FlightMode:: constants to decode.")
-        .def_readonly("flight_mode_name", &DroneState::flightModeName,
-            "Human-readable flight mode string, e.g. 'ANGLE', 'ACRO+MAG', "
-            "'GPS RESCUE', 'ANGLE [DISARMED]'.")
-        .def_readonly("sensor_status", &DroneState::sensorStatus,
-            "Sensor presence bitmask from MSP_STATUS. "
-            "Bits: ACC=0, BARO=1, MAG=2, GPS=3, RANGEFINDER=4, GYRO=5.")
-        .def_readonly("i2c_error_count", &DroneState::i2cErrorCount,
-            "I2C bus error count since boot. Non-zero suggests a wiring issue.")
-        .def_readonly("cpu_load_percent", &DroneState::cpuLoadPercent,
-            "Average FC CPU load 0-100 %. >80% risks loop overruns.")
-        .def_readonly("pid_profile", &DroneState::pidProfile,
-            "Active PID profile index (0-based).")
+        // ── FC status ─────────────────────────────────────────────────────────
+        .def_readonly("armed", &DroneState::armed)
+        .def_readonly("flight_mode_flags", &DroneState::flightModeFlags)
+        .def_readonly("flight_mode_name", &DroneState::flightModeName)
+        .def_readonly("sensor_status", &DroneState::sensorStatus)
+        .def_readonly("i2c_error_count", &DroneState::i2cErrorCount)
+        .def_readonly("cpu_load_percent", &DroneState::cpuLoadPercent)
+        .def_readonly("pid_profile", &DroneState::pidProfile)
 
-        // ── Arming diagnostics — MSP_STATUS_EX (150) ─────────────────────────
-        .def_readonly("arming_disable_flags", &DroneState::armingDisableFlags,
-            "Raw bitmask of reasons the FC refuses to arm. "
-            "0 = ready to arm. Use ArmingDisable:: constants to decode.")
-        .def_readonly("arming_disable_str", &DroneState::armingDisableStr,
-            "Comma-separated human-readable arming-block reasons, "
-            "e.g. 'THROTTLE HIGH, NOT LEVEL'. Empty string when ready to arm.")
+        // ── Arming diagnostics ────────────────────────────────────────────────
+        .def_readonly("arming_disable_flags", &DroneState::armingDisableFlags)
+        .def_readonly("arming_disable_str", &DroneState::armingDisableStr)
 
-        // ── Motor outputs — MSP_MOTOR (104) ──────────────────────────────────
+        // ── Motor outputs ─────────────────────────────────────────────────────
         .def_property_readonly("motor_values",
             [](const DroneState& s) {
                 return std::vector<uint16_t>(
                     s.motorValues, s.motorValues + MAX_MOTORS);
-            },
-            "List of 8 motor throttle values in microseconds (1000-2000). "
-            "On a quad only indices 0-3 are non-zero. "
-            "Use motor_count to know how many motors are active.")
-        .def_readonly("motor_count", &DroneState::motorCount,
-            "Number of active motors (index of last non-zero motor + 1). "
-            "4 for a standard quadcopter.")
+            })
+        .def_readonly("motor_count", &DroneState::motorCount)
 
-        // ── RC channel inputs — MSP_RC (105) ─────────────────────────────────
+        // ── RC channel inputs ─────────────────────────────────────────────────
         .def_property_readonly("rc_channels",
             [](const DroneState& s) {
                 return std::vector<uint16_t>(
                     s.rcChannels, s.rcChannels + s.rcChannelCount);
-            },
-            "List of RC channel values in microseconds (1000-2000). "
-            "Length = rc_channel_count. RadioMaster Pocket / CRSF layout (MODE 2): "
-            "[0]=Roll, [1]=Pitch, [2]=Throttle, [3]=Yaw, "
-            "[4]=ARM switch, [5]=Flight mode AUX, [6+]=AUX3...")
-        .def_readonly("rc_channel_count", &DroneState::rcChannelCount,
-            "Number of active RC channels (typically 12-16 with ELRS/CRSF).")
+            })
+        .def_readonly("rc_channel_count", &DroneState::rcChannelCount)
 
-        // ── GPS — NEO-M10 ─────────────────────────────────────────────────────
-        .def_readonly("gps", &DroneState::gps,
-            "GPSReading from NEO-M10. "
-            "Check gps.raw_valid before position fields, "
-            "gps.comp_valid before home fields, "
-            "gps.position_usable before any navigation use.")
-
-        // ── Satellite list ────────────────────────────────────────────────────
-        .def_readonly("sv_list", &DroneState::svList,
-            "List of SVInfoEntry. Updated every ~1 s via MSP cmd 164. "
-            "Fields gnss_name/svid/cno/quality/status_str/used/gnss_id are "
-            "always populated. elev/azim are 0 (not available via MSP).")
-        .def_readonly("sv_info_valid", &DroneState::svInfoValid,
-            "True when sv_list has been populated at least once (~1 s after connect).")
-        .def_readonly("sv_source", &DroneState::svSource,
-            "'MSP' when populated via cmd 164 (normal). "
-            "'UBX' when populated via passthrough (only if gps_auto_config=OFF). "
-            "Check this before showing elev/azim columns in the satellite table.")
-
-        // ── GPS nav engine status — MSP_NAV_STATUS (121) ──────────────────────
-        .def_readonly("nav_status", &DroneState::navStatus,
-            "NavStatus from MSP_NAV_STATUS (121). fix_ok is the authoritative fix flag.")
+        // ── GPS ───────────────────────────────────────────────────────────────
+        .def_readonly("gps", &DroneState::gps)
+        .def_readonly("sv_list", &DroneState::svList)
+        .def_readonly("sv_info_valid", &DroneState::svInfoValid)
+        .def_readonly("sv_source", &DroneState::svSource)
+        .def_readonly("nav_status", &DroneState::navStatus)
 
         // ── Diagnostics ───────────────────────────────────────────────────────
         .def_readonly("last_rtt_ms", &DroneState::lastRttMs)
-        .def_readonly("fc_cycle_ms", &DroneState::fcCycleMs,
-            "FC loop cycle time in ms from MSP_STATUS (101).")
+        .def_readonly("fc_cycle_ms", &DroneState::fcCycleMs)
         .def_readonly("link_healthy", &DroneState::linkHealthy)
         .def_readonly("packet_count", &DroneState::packetCount)
 
-        // ── to_dict() ─────────────────────────────────────────────────────────
-        // Convenience snapshot with all values pre-converted to useful units.
+        // =====================================================================
+        // to_dict()
         //
-        // New keys vs previous version:
-        //   battery_current_a       — current draw in Amps
-        //   battery_mah_drawn       — mAh consumed
-        //   battery_cell_count      — detected cell count
-        //   battery_capacity_mah    — design capacity (0 = not configured in BF)
-        //   battery_percentage      — 0-100 % (0 if capacity not configured)
-        //   battery_state           — BatteryState integer (0=OK,1=WARN,2=CRIT,3=NO BAT,4=INIT)
-        //   battery_state_str       — human-readable state string
-        //   armed                   — bool
-        //   flight_mode_flags       — raw uint32 bitmask
-        //   flight_mode_name        — decoded string
-        //   sensor_status           — raw uint16 bitmask
-        //   sensor_acc/baro/mag/gps_present/rangefinder/gyro — individual bool helpers
-        //   i2c_error_count         — I2C bus errors since boot
-        //   cpu_load_percent        — FC CPU load 0-100 %
-        //   pid_profile             — active PID profile index
-        //   arming_disable_flags    — raw uint32 bitmask (0 = ready to arm)
-        //   arming_disable_str      — comma-separated reason list or ""
-        //   motor_values            — list of 8 uint16 µs values
-        //   motor_count             — number of active motors
-        //   rc_channels             — list of uint16 µs values, length = rc_channel_count
-        //   rc_channel_count        — number of active RC channels
+        // KEY NAME CONTRACT — every key here must match what the Python widgets
+        // actually read via data.get("key_name"). Mismatches cause silent zeros.
         //
-        // gps_sv_list  : py::list of SVInfoEntry objects.
-        // gps_sv_source: "MSP" in normal operation; hide Elev/Azim when "MSP".
+        // FIXED vs original bindings:
+        //   "battery_v"         → "battery_voltage"   (FCStatusWidget, ArmingWidget)
+        //   "battery_current_a" → "battery_current"   (FCStatusWidget)
+        //   battery_state int   → "battery_state" str (FCStatusWidget reads string)
+        //   motor_values list   → motor_1_us…motor_4_us individual keys (both widgets)
+        //   rc_channels list    → rc_roll/pitch/throttle/yaw/arm individual keys
+        //                         (FCStatusWidget)
+        //   [MISSING]           → "rc_link_quality"   (ArmingWidget, FCStatusWidget)
+        //                         derived from rssi: rssi is 0-255, widgets expect 0-100
+        // =====================================================================
         .def("to_dict", [](const DroneState& s) {
 
-        // ── satellite list ────────────────────────────────────────────────────
+        // ── Satellite list ────────────────────────────────────────────────
         py::list sv_list;
         for (const SVInfoEntry& sv : s.svList)
             sv_list.append(py::cast(sv));
 
-        // ── motor values (fixed 8-element list) ───────────────────────────────
+        // ── Motor values (fixed 8-element list, AND individual named keys)
+        // FCStatusWidget / ArmingWidget read motor_1_us … motor_4_us.
+        // to_dict() previously only exported a "motor_values" list —
+        // the individual keys were never emitted, so all motor widgets
+        // showed "—" and the arming check reported NO MOTOR DATA.
         py::list motor_vals;
         for (int i = 0; i < MAX_MOTORS; ++i)
             motor_vals.append(s.motorValues[i]);
 
-        // ── RC channels (variable length, only active channels) ───────────────
+        // ── RC channels (variable length list, AND individual named keys)
+        // FCStatusWidget reads rc_roll, rc_pitch, rc_throttle, rc_yaw, rc_arm.
+        // RadioMaster Pocket / CRSF layout (MODE 2):
+        //   [0]=Roll [1]=Pitch [2]=Throttle [3]=Yaw [4]=ARM switch
         py::list rc_ch;
         for (int i = 0; i < s.rcChannelCount; ++i)
             rc_ch.append(s.rcChannels[i]);
 
-        // ── battery state string ──────────────────────────────────────────────
+        // Helper: safely read an RC channel by index (0 if not present)
+        auto rc = [&](int idx) -> uint16_t {
+            return (idx < s.rcChannelCount) ? s.rcChannels[idx] : 0;
+            };
+
+        // ── RC link quality
+        // DroneState has no dedicated link-quality field — the backend
+        // receives RSSI from MSP_ANALOG (0-255 raw). Widgets expect 0-100.
+        // Scale: quality = rssi * 100 / 255, clamped to 0-100.
+        // When rssi == 0 (no link / not yet received) emit -1 so widgets
+        // display "NO SIGNAL" rather than "0%".
+        int rc_link_quality;
+        if (s.rssi == 0) {
+            rc_link_quality = -1;   // no signal — widget shows "NO SIGNAL"
+        }
+        else {
+            rc_link_quality = static_cast<int>(
+                static_cast<unsigned>(s.rssi) * 100u / 255u);
+        }
+
+        // ── Battery state string
+        // FCStatusWidget reads battery_state as a string
+        // ("OK"|"WARNING"|"CRITICAL"|"UNKNOWN").
+        // The original to_dict() emitted battery_state as a raw integer
+        // and battery_state_str as the string — but the widget only reads
+        // the plain "battery_state" key and calls .upper() on it.
         const char* batt_state_str = "INIT";
         switch (s.batteryState) {
         case BatteryState::OK:          batt_state_str = "OK";          break;
@@ -375,49 +307,53 @@ PYBIND11_MODULE(DroneBackend, m) {
         }
 
         return py::dict(
-            // ── IMU ───────────────────────────────────────────────────────────
+            // ── IMU ───────────────────────────────────────────────────────
             "ax"_a = s.ax, "ay"_a = s.ay, "az"_a = s.az,
             "gx"_a = s.gx, "gy"_a = s.gy, "gz"_a = s.gz,
 
-            // ── Attitude (pre-divided) ────────────────────────────────────────
+            // ── Attitude (pre-divided) ────────────────────────────────────
             "roll_deg"_a = s.roll / 10.0f,
             "pitch_deg"_a = s.pitch / 10.0f,
             "yaw_deg"_a = static_cast<float>(s.yaw),
 
-            // ── Power — MSP_ANALOG (110) ──────────────────────────────────────
-            "battery_v"_a = s.batteryVoltage,
-            "battery_current_a"_a = s.batteryCurrent,
+            // ── Power — MSP_ANALOG (110) ──────────────────────────────────
+            // FIX: was "battery_v" — widgets read "battery_voltage"
+            "battery_voltage"_a = s.batteryVoltage,
+            // FIX: was "battery_current_a" — widgets read "battery_current"
+            "battery_current"_a = s.batteryCurrent,
             "battery_mah_drawn"_a = s.batteryMahDrawn,
             "rssi"_a = s.rssi,
 
-            // ── Battery detail — MSP_BATTERY_STATE (242) ──────────────────────
+            // ── Battery detail — MSP_BATTERY_STATE (242) ──────────────────
             "battery_cell_count"_a = s.batteryCellCount,
             "battery_capacity_mah"_a = s.batteryCapacityMah,
             "battery_percentage"_a = s.batteryPercentage,
-            "battery_state"_a = static_cast<uint8_t>(s.batteryState),
-            "battery_state_str"_a = batt_state_str,
+            // FIX: was int — FCStatusWidget reads string and calls .upper()
+            "battery_state"_a = batt_state_str,
+            // Keep integer version under a distinct key for callers that want it
+            "battery_state_int"_a = static_cast<uint8_t>(s.batteryState),
 
-            // ── Barometer ─────────────────────────────────────────────────────
+            // ── Barometer ─────────────────────────────────────────────────
             "baro_altitude_m"_a = s.baroAltitudeCm * 0.01,
             "baro_altitude_ft"_a = s.baroAltitudeCm * 0.0328084,
             "baro_vario_mps"_a = s.baroVarioCmPerSec * 0.01,
             "baro_vario_fpm"_a = s.baroVarioCmPerSec * 1.9685,
             "baro_valid"_a = s.baroValid,
 
-            // ── Magnetometer ──────────────────────────────────────────────────
+            // ── Magnetometer ──────────────────────────────────────────────
             "mag_x"_a = s.magX,
             "mag_y"_a = s.magY,
             "mag_z"_a = s.magZ,
             "mag_heading_deg"_a = s.magHeadingDeg,
             "mag_valid"_a = s.magValid,
 
-            // ── Calibration ───────────────────────────────────────────────────
+            // ── Calibration ───────────────────────────────────────────────
             "mag_cal_active"_a = s.magCalActive,
             "mag_cal_seconds_remaining"_a = s.magCalSecondsRemaining,
             "acc_cal_active"_a = s.accCalActive,
             "acc_cal_seconds_remaining"_a = s.accCalSecondsRemaining,
 
-            // ── FC status — MSP_STATUS (101) ──────────────────────────────────
+            // ── FC status — MSP_STATUS (101) ──────────────────────────────
             "armed"_a = s.armed,
             "flight_mode_flags"_a = s.flightModeFlags,
             "flight_mode_name"_a = s.flightModeName,
@@ -433,19 +369,50 @@ PYBIND11_MODULE(DroneBackend, m) {
             "cpu_load_percent"_a = s.cpuLoadPercent,
             "pid_profile"_a = s.pidProfile,
 
-            // ── Arming diagnostics — MSP_STATUS_EX (150) ─────────────────────
+            // ── Arming diagnostics — MSP_STATUS_EX (150) ─────────────────
             "arming_disable_flags"_a = s.armingDisableFlags,
             "arming_disable_str"_a = s.armingDisableStr,
 
-            // ── Motor outputs — MSP_MOTOR (104) ───────────────────────────────
-            "motor_values"_a = motor_vals,   // always 8 elements; non-motors = 0
+            // ── Motor outputs — MSP_MOTOR (104) ───────────────────────────
+            // FIX: previously only "motor_values" list was emitted.
+            // FCStatusWidget and ArmingWidget read individual keys motor_1_us … motor_4_us.
+            "motor_values"_a = motor_vals,      // list kept for other consumers
             "motor_count"_a = s.motorCount,
+            "motor_1_us"_a = static_cast<int>(s.motorValues[0]),
+            "motor_2_us"_a = static_cast<int>(s.motorValues[1]),
+            "motor_3_us"_a = static_cast<int>(s.motorValues[2]),
+            "motor_4_us"_a = static_cast<int>(s.motorValues[3]),
+            // Extra motors for hexacopter/octocopter support
+            "motor_5_us"_a = static_cast<int>(s.motorValues[4]),
+            "motor_6_us"_a = static_cast<int>(s.motorValues[5]),
+            "motor_7_us"_a = static_cast<int>(s.motorValues[6]),
+            "motor_8_us"_a = static_cast<int>(s.motorValues[7]),
 
-            // ── RC channels — MSP_RC (105) ────────────────────────────────────
-            "rc_channels"_a = rc_ch,            // variable length list
+            // ── RC channels — MSP_RC (105) ────────────────────────────────
+            // FIX: previously only "rc_channels" list was emitted.
+            // FCStatusWidget reads individual named keys per CRSF layout:
+            //   [0]=Roll [1]=Pitch [2]=Throttle [3]=Yaw [4]=ARM
+            "rc_channels"_a = rc_ch,         // list kept for other consumers
             "rc_channel_count"_a = s.rcChannelCount,
+            "rc_roll"_a = static_cast<int>(rc(0)),
+            "rc_pitch"_a = static_cast<int>(rc(1)),
+            "rc_throttle"_a = static_cast<int>(rc(2)),
+            "rc_yaw"_a = static_cast<int>(rc(3)),
+            "rc_arm"_a = static_cast<int>(rc(4)),
+            // AUX channels preserved for flight mode switches etc.
+            "rc_aux1"_a = static_cast<int>(rc(5)),
+            "rc_aux2"_a = static_cast<int>(rc(6)),
+            "rc_aux3"_a = static_cast<int>(rc(7)),
 
-            // ── GPS — MSP_RAW_GPS (106) ───────────────────────────────────────
+            // ── RC link quality ───────────────────────────────────────────
+            // FIX: was entirely missing from to_dict().
+            // ArmingWidget._check_rc_link() and FCStatusWidget both read
+            // "rc_link_quality" as an integer 0-100 (-1 = no signal).
+            // Derived from RSSI (MSP_ANALOG rssi field, 0-255 raw):
+            //   quality = rssi * 100 / 255  (-1 when rssi == 0)
+            "rc_link_quality"_a = rc_link_quality,
+
+            // ── GPS — MSP_RAW_GPS (106) ───────────────────────────────────
             "gps_fix_type"_a = s.gps.fixType,
             "gps_num_sat"_a = s.gps.numSat,
             "gps_latitude"_a = s.gps.latitude,
@@ -459,12 +426,14 @@ PYBIND11_MODULE(DroneBackend, m) {
             "gps_hdop"_a = s.gps.hdop * 0.01,
             "gps_raw_valid"_a = s.gps.rawValid,
             "gps_position_usable"_a = s.gps.positionUsable,
-
-            // Raw cm/s and decidegrees for GPSWidget._update_navigation()
+            // Raw units for GPSWidget internals
             "gps_ground_speed_cms"_a = static_cast<int>(s.gps.groundSpeedMs),
             "gps_ground_course"_a = static_cast<int>(s.gps.groundCourse),
+            // ArmingWidget reads gps_fix and gps_num_sats (short forms)
+            "gps_fix"_a = s.gps.positionUsable,
+            "gps_num_sats"_a = s.gps.numSat,
 
-            // ── GPS — MSP_COMP_GPS (107) — dual key names for compatibility ───
+            // ── GPS — MSP_COMP_GPS (107) ──────────────────────────────────
             "gps_dist_home_m"_a = static_cast<double>(s.gps.distToHomM),
             "gps_dist_to_home_m"_a = static_cast<double>(s.gps.distToHomM),
             "gps_dist_home_ft"_a = s.gps.distToHomM * 3.28084,
@@ -473,16 +442,16 @@ PYBIND11_MODULE(DroneBackend, m) {
             "gps_heartbeat"_a = s.gps.gpsHeartbeat,
             "gps_comp_valid"_a = s.gps.compValid,
 
-            // ── GPS — satellite list (MSP cmd 164, every ~1 s) ────────────────
+            // ── GPS — satellite list ──────────────────────────────────────
             "gps_sv_list"_a = sv_list,
             "gps_sv_info_valid"_a = s.svInfoValid,
-            "gps_sv_source"_a = s.svSource,   // "MSP" or "UBX"
+            "gps_sv_source"_a = s.svSource,
 
-            // ── GPS — MSP_NAV_STATUS (121) ────────────────────────────────────
+            // ── GPS — MSP_NAV_STATUS (121) ────────────────────────────────
             "gps_nav_fix_ok"_a = s.navStatus.fixOk,
             "gps_nav_dgps"_a = s.navStatus.dgpsUsed,
 
-            // ── Diagnostics ───────────────────────────────────────────────────
+            // ── Diagnostics ───────────────────────────────────────────────
             "rtt_ms"_a = s.lastRttMs,
             "fc_cycle_ms"_a = s.fcCycleMs,
             "link_healthy"_a = s.linkHealthy,
@@ -512,14 +481,8 @@ PYBIND11_MODULE(DroneBackend, m) {
             "UART1=0, UART2=1 (F405 V3 default), UART3=2.\n"
             "Has no effect on satellite polling (uses MSP cmd 164, no UART index needed).\n"
             "Must be called before connect().")
-        .def("start_mag_calibration", &DroneLink::startMagCalibration,
-            "Send MSP_MAG_CALIBRATION (206) to the FC.\n"
-            "FC enters calibration mode for 30 s. Rotate drone on all axes.\n"
-            "Monitor state.mag_cal_active and state.mag_cal_seconds_remaining.")
-        .def("start_acc_calibration", &DroneLink::startAccCalibration,
-            "Send MSP_ACC_CALIBRATION (205) to the FC.\n"
-            "Keep drone perfectly level and still for ~5 s.\n"
-            "Monitor state.acc_cal_active and state.acc_cal_seconds_remaining.")
+        .def("start_mag_calibration", &DroneLink::startMagCalibration)
+        .def("start_acc_calibration", &DroneLink::startAccCalibration)
         .def("apply_gps_config", &DroneLink::applyGPSConfig,
             py::arg("config"),
             "Send UBX CFG-GNSS/RATE/PRT/NAV5/CFG frames to the NEO-M10 via\n"

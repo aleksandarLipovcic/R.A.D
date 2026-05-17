@@ -794,21 +794,22 @@ bool DroneLink::parseBatteryState(const std::vector<uint8_t>& buf, DroneState& s
 
     s.batteryCellCount = buf[5];
     s.batteryCapacityMah = ru16(6);
-    // buf[8] = legacy 0.1V voltage — skipped in favour of buf[14..15]
+    // buf[8] = legacy 0.1 V voltage — skipped; use voltage10mV below
     s.batteryMahDrawn = ru16(9);
 
-    // Amperage cross-check (parseAnalog is the primary source but this
-    // confirms the value; last writer wins — both are equivalent)
     int16_t centiAmps = static_cast<int16_t>(ru16(11));
     s.batteryCurrent = centiAmps / 100.0f;
 
     s.batteryState = static_cast<BatteryState>(buf[13]);
 
-    // High-resolution voltage: overwrite the 0.1 V value from parseAnalog()
-    if (buf.size() >= 18) {
+    // FIX: removed the erroneous "buf.size() >= 18" guard.
+    // Minimum frame is 17 bytes (header 5 + payload 11 + checksum 1).
+    // buf[14] = voltage10mV LSB and buf[15] = voltage10mV MSB are always
+    // present and safe to access once the size-17 check above passes.
+    {
         uint16_t v10mV = ru16(14);
         if (v10mV > 0)
-            s.batteryVoltage = v10mV / 100.0f;   // 10 mV → V
+            s.batteryVoltage = v10mV / 100.0f;   // 10 mV → V  (0.01 V resolution)
     }
 
     // Battery percentage: requires battery_capacity set in BF Configurator
@@ -823,6 +824,7 @@ bool DroneLink::parseBatteryState(const std::vector<uint8_t>& buf, DroneState& s
 
     return true;
 }
+
 
 // -----------------------------------------------------------------------------
 // parseMotors() — MSP_MOTOR (104)
