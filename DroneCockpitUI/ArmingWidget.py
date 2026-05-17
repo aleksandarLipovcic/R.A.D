@@ -8,34 +8,50 @@ SECTION A — AUTOMATIC CHECKS  (telemetry-driven, updates every tick)
   • Battery voltage           • RC link  • GPS fix  • Motors idle
 
 SECTION B — PILOT SIGN-OFF  (manual checkboxes, pilot ticks before each flight)
-  Each item is a clickable row; ticked rows turn green.
-  RESET button clears all for the next flight.
 
 BANNER  (bottom, always visible)
-  Grey  "WAITING FOR DATA…"  — no telemetry yet
-  Red   "BLOCKED — FIX AUTO CHECKS"  — one or more auto checks failing
-  Orange "COMPLETE SIGN-OFF ITEMS"   — auto OK but manual items remain
-  Green  "✔  READY TO ARM"           — everything passed
+  Grey   "WAITING FOR DATA…"       — no telemetry yet
+  Red    "BLOCKED — FIX AUTO CHECKS" — one or more auto checks failing
+  Orange "COMPLETE SIGN-OFF ITEMS"  — auto OK, manual items remain
+  Green  "✔  READY TO ARM"         — everything passed
 
-Counter in header shows items remaining at a glance.
-
-Public API:
-  update_arming(data_dict)   — call every UI tick with telemetry
-  reset_checklist()          — clear all manual checkboxes
-
-Telemetry keys used:
-  arming_disable_flags  int   bitfield
+Telemetry keys consumed:
+  arming_disable_flags  int   bitfield  (ArmingDisable:: constants)
   battery_voltage       float V
   battery_cell_count    int   0 = auto-detect
-  rc_link_quality       int   0-100  (-1 = RSSI not available)
-  rc_channel_count      int   number of active RC channels
-  rc_roll               int   1000-2000 µs  (used as ELRS/CRSF presence probe)
-  gps_fix_type          int   0=no fix, 1=2D, 2=3D   ← replaces gps_fix
-  gps_num_sats          int   satellites in solution  ← was gps_num_sat
+  battery_state         str   "OK"|"WARNING"|"CRITICAL"|"NOT_PRESENT"|"INIT"
+  rc_link_quality       int   0-100   (-1 = RSSI not available, e.g. ELRS/CRSF)
+  rc_channel_count      int   number of RC channels BF is reporting
+  rc_roll               int   channel 0 µs  (presence probe)
+  rc_pitch              int   channel 1 µs
+  rc_throttle           int   channel 2 µs
+  rc_yaw                int   channel 3 µs
+  gps_fix_type          int   0=no fix, 1=2D, 2=3D
+  gps_num_sats          int   satellites used
   gps_hdop              float horizontal DOP
   sensor_gyro_present   bool
   sensor_acc_present    bool
-  motor_1_us … motor_4_us  int  1000-2000 µs
+  motor_1_us…motor_4_us int   1000-2000 µs
+  armed                 bool
+
+RC LINK CHECK — three-state logic for ELRS/CRSF:
+  rc_channel_count == 0 → "NO SIGNAL — UART NOT CONFIGURED"
+    BF returns 0 channels only when the receiver UART isn't set to
+    Serial Rx, or the receiver is completely absent.
+
+  rc_channel_count > 0, sticks out of range → "FAILSAFE / TX OFF"
+    BF is receiving the RC protocol (UART OK, receiver bound), but all
+    stick channels are outside 900-2100 µs — TX is off or in failsafe.
+
+  rc_channel_count > 0, any stick in range → "ACTIVE — N CH (CRSF/ELRS)"
+    TX is on and sending, link is healthy.
+
+BATTERY VOLTAGE CHECK:
+  If voltage == 0 with cells > 0, parseBatteryState is running but
+  reporting 0V — almost always a Betaflight config problem:
+    CLI> get battery_meter_type   (must be ADC, not NONE)
+    CLI> get vbat_scale           (default ~110; 0 means disabled)
+  The C++ parseBatteryState fix also needs a recompile (see patch file).
 """
 
 import tkinter as tk
@@ -90,35 +106,87 @@ _ARMING_BITS = [
     (1 << 26, "ARM SW OFF"),
 ]
 
+# Flags that clear automatically and do not indicate a real hardware problem.
+# The check is still FAIL while they're set (FC won't arm), but the detail
+# message explains they are transient so the pilot knows to wait.
+_TRANSIENT_FLAGS = {
+    1 << 9:  "BOOT GRACE",    # clears ~30 s after power-on
+    1 << 12: "CALIBRATING",   # clears when IMU cal finishes (~5 s)
+}
+
 # ── Auto-check evaluators ─────────────────────────────────────────────────────
 
 def _check_arm_flags(data):
+    """
+    Evaluate MSP_STATUS_EX arming-disable bitmask.
+
+    Distinguishes transient self-clearing flags (BOOT GRACE, CALIBRATING)
+    from real hardware/config problems so the pilot knows whether to wait
+    or to fix something.
+    """
     flags = int(data.get("arming_disable_flags", 0))
     if flags == 0:
         return True, "ALL FLAGS CLEAR"
+
     active = [name for bit, name in _ARMING_BITS if flags & bit]
-    detail = ", ".join(active[:3]) + ("…" if len(active) > 3 else "")
+
+    # Split into transient vs real
+    transient = [name for bit, name in _TRANSIENT_FLAGS.items() if flags & bit]
+    real      = [name for name in active if name not in transient]
+
+    if real:
+        detail = ", ".join(real[:3]) + ("…" if len(real) > 3 else "")
+        return False, detail
+    # Only transient flags remain — still blocking but will self-clear
+    detail = ", ".join(transient) + " (self-clearing)"
     return False, detail
+
 
 def _check_gyro(data):
     ok = bool(data.get("sensor_gyro_present", False))
     return ok, "ONLINE" if ok else "NOT DETECTED"
 
+
 def _check_acc(data):
     ok = bool(data.get("sensor_acc_present", False))
     return ok, "ONLINE" if ok else "NOT DETECTED"
 
+
 def _check_battery(data):
-    v = float(data.get("battery_voltage", 0.0))
-    if v < 1.0:
-        return False, "NO VOLTAGE READING"
+    """
+    Battery voltage check.
+
+    Three failure modes with distinct messages:
+      0V + cells reported → parseBatteryState running but BF reports 0V.
+          Action: check BF CLI  battery_meter_type / vbat_scale, AND
+                  recompile DroneLink.cpp with the parseBatteryState patch.
+      0V + no cells      → MSP_ANALOG also returning 0; battery unplugged
+          or meter type = NONE.
+      <3.40 V/cell       → critically low voltage.
+    """
+    v     = float(data.get("battery_voltage", 0.0))
     cells = int(data.get("battery_cell_count", 0))
+    state = str(data.get("battery_state", "INIT")).upper()
+
+    if v < 1.0:
+        if cells > 0:
+            # parseBatteryState is running (we got a cell count) but voltage = 0.
+            # This is a Betaflight config issue or the C++ patch wasn't compiled.
+            return False, f"0V — CHECK BF VBAT SCALE / METER TYPE  ({cells}S)"
+        if state == "NOT_PRESENT":
+            return False, "BATTERY NOT DETECTED — CHECK CONNECTOR"
+        return False, "NO VOLTAGE — BATTERY UNPLUGGED OR METER=NONE"
+
+    # Auto-detect cells from voltage if BF didn't report a count
     if cells == 0:
         for n in range(1, 9):
             if v <= n * 4.25 + 0.1:
-                cells = n; break
+                cells = n
+                break
+
     if cells == 0:
         return False, f"{v:.2f}V — CELL COUNT UNKNOWN"
+
     cv = v / cells
     if cv < 3.40:
         return False, f"{v:.2f}V  {cv:.2f}V/cell — CRITICAL"
@@ -126,41 +194,72 @@ def _check_battery(data):
         return True,  f"{v:.2f}V  {cv:.2f}V/cell — LOW"
     return True,      f"{v:.2f}V  {cv:.2f}V/cell"
 
-# FIX: RC link — ELRS/CRSF radios do NOT populate MSP_ANALOG's rssi byte,
-# so rc_link_quality will be -1 even with a healthy link.  When rssi is
-# unavailable we probe RC channel presence as a reliable fallback:
-# if rc_channel_count > 0 and any stick channel is in the valid µs range
-# (800-2200) the receiver is clearly active.
-def _check_rc_link(data):
-    lq = int(data.get("rc_link_quality", -1))
 
+def _check_rc_link(data):
+    """
+    RC link check — three-state logic that handles ELRS/CRSF correctly.
+
+    RSSI from MSP_ANALOG is always 0 for ELRS/CRSF, so rc_link_quality
+    will be -1.  We use rc_channel_count (the number of channels BF
+    returned in the last MSP_RC response) as the primary indicator:
+
+      0 channels:
+        BF isn't receiving any RC protocol on the configured UART.
+        Fix: BF Ports tab → enable "Serial Rx" on the receiver UART.
+        Also verify: Configuration tab → Receiver Mode = Serial,
+                     Serial Receiver Provider = CRSF.
+
+      >0 channels, all sticks outside 900-2100 µs:
+        BF sees the protocol (UART + receiver OK) but TX is off or in
+        failsafe.  ELRS sends failsafe values (often 0 or 885 µs).
+        Fix: turn on the transmitter and verify binding.
+
+      >0 channels, any stick in 900-2100 µs:
+        TX is on, link active.  Pass.
+    """
+    lq       = int(data.get("rc_link_quality", -1))
+    rc_count = int(data.get("rc_channel_count", 0))
+
+    # ── Path A: RSSI-based quality available (PWM / SBUS analogue RSSI) ──────
     if lq >= 0:
-        # RSSI is available (PWM/SBUS analogue path)
         if lq < 30:
             return False, f"WEAK  {lq}%"
         return True, f"QUALITY  {lq}%"
 
-    # RSSI not available — fall back to RC channel presence check.
-    # rc_roll (channel 0) is always transmitted and will be in 800-2200 µs
-    # if the receiver is active, regardless of radio protocol.
-    rc_count = int(data.get("rc_channel_count", 0))
-    rc_roll  = int(data.get("rc_roll", 0))
-    if rc_count > 0 and 800 <= rc_roll <= 2200:
-        return True, f"ACTIVE — {rc_count} CH  (RSSI N/A / CRSF)"
-    return False, "NO SIGNAL"
+    # ── Path B: ELRS / CRSF — no RSSI byte from MSP_ANALOG ──────────────────
 
-# FIX: GPS check — previously used gps_fix (= GPSReading.positionUsable) which
-# requires HDOP < 5.0 in addition to 3D fix and ≥4 satellites.  A perfectly
-# usable GPS lock with HDOP just above 5.0 (e.g. 5.06) was incorrectly
-# reported as NO FIX in the checklist while the GPS widget showed 3D FIX.
-#
-# Now uses gps_fix_type (raw fix quality from MSP_RAW_GPS) and gps_num_sats
-# directly, matching what the GPS widget displays.
+    # State 1: BF reports 0 channels → UART not configured as Serial Rx
+    if rc_count == 0:
+        return False, "NO CH — UART SERIAL RX NOT ENABLED IN BF"
+
+    # State 2: Channels present — check if any stick is in valid flight range.
+    # On an active ELRS link sticks will be 1000-2000 µs.
+    # When TX is off, ELRS sends failsafe values which are typically 0 or
+    # 885 µs depending on ELRS config (both outside 900-2100 range).
+    sticks = [
+        int(data.get("rc_roll",     0)),
+        int(data.get("rc_pitch",    0)),
+        int(data.get("rc_throttle", 0)),
+        int(data.get("rc_yaw",      0)),
+    ]
+    if any(900 <= v <= 2100 for v in sticks):
+        return True, f"ACTIVE — {rc_count} CH  (CRSF/ELRS)"
+
+    # State 3: Protocol detected but sticks out of range → TX off / failsafe
+    return False, f"FAILSAFE / TX OFF — {rc_count} CH DETECTED"
+
+
 def _check_gps(data):
+    """
+    GPS fix check using raw fix_type and satellite count.
+
+    Uses gps_fix_type (0/1/2) directly rather than gps_fix (positionUsable)
+    which additionally requires HDOP < 5.0 and can fail with marginal HDOP
+    even when a solid 3D lock is present (e.g. HDOP 5.06).
+    """
     fix_type = int(data.get("gps_fix_type", 0))
-    # gps_num_sats and gps_num_sat are both exported by to_dict(); accept either
-    sats = int(data.get("gps_num_sats", 0) or data.get("gps_num_sat", 0))
-    hdop = float(data.get("gps_hdop", 99.0))
+    sats     = int(data.get("gps_num_sats", 0) or data.get("gps_num_sat", 0))
+    hdop     = float(data.get("gps_hdop", 99.0))
 
     if fix_type < 2:
         return False, f"NO 3D FIX  ({sats} sats)"
@@ -169,13 +268,9 @@ def _check_gps(data):
     hdop_str = f"  HDOP {hdop:.2f}" if hdop < 90 else ""
     return True, f"3D FIX  {sats} SATS{hdop_str}"
 
+
 def _check_motors(data):
-    # BF MSP_MOTOR returns 0 for all motors when disarmed — this is correct
-    # behaviour, not a missing-data condition. We distinguish:
-    #   • All zero AND armed      → real problem (motors should report idle ~1000 µs)
-    #   • All zero AND disarmed   → normal; pass as "DISARMED / IDLE"
-    #   • Non-zero values present → check they are in idle range (900–1100 µs)
-    vals = [int(data.get(f"motor_{i}_us", 0)) for i in range(1, 5)]
+    vals  = [int(data.get(f"motor_{i}_us", 0)) for i in range(1, 5)]
     armed = bool(data.get("armed", False))
     if all(v == 0 for v in vals):
         if armed:
@@ -185,6 +280,7 @@ def _check_motors(data):
     if bad:
         return False, f"M{bad} OUT OF IDLE RANGE"
     return True, "ALL IDLE OK"
+
 
 # (id, display label, evaluator)
 _AUTO_CHECKS = [
@@ -219,8 +315,8 @@ class ArmingWidget(tk.Frame):
         self._manual_vars:  dict[str, tk.BooleanVar]  = {}
         self._manual_lbls:  dict[str, tk.Label]       = {}
         self._cb_widgets:   dict[str, tuple]          = {}
-        self._has_data = False
-        self._n_auto_cols = 0
+        self._has_data     = False
+        self._n_auto_cols  = 0
         self._build_ui()
         self.bind("<Configure>", self._on_resize)
 
@@ -229,7 +325,6 @@ class ArmingWidget(tk.Frame):
     # =========================================================================
 
     def _build_ui(self):
-        # ── Header ────────────────────────────────────────────────────────────
         hdr = tk.Frame(self, bg=_BG2,
                        highlightthickness=1, highlightbackground=_BORDER)
         hdr.pack(fill="x", padx=6, pady=(6, 3))
@@ -240,7 +335,6 @@ class ArmingWidget(tk.Frame):
                                     bg=_BG2, fg=_ORANGE, font=_F_COUNTER)
         self._count_lbl.pack(side="right", padx=8, pady=5)
 
-        # ── Section A: Automatic checks ───────────────────────────────────────
         self._build_section_hdr("A  AUTOMATIC CHECKS  (telemetry)")
 
         auto_outer = tk.Frame(self, bg=_BG2,
@@ -253,7 +347,6 @@ class ArmingWidget(tk.Frame):
         self._auto_col_frames: list[tk.Frame] = []
         self._layout_auto_cols(1)
 
-        # ── Section B: Pilot sign-off ─────────────────────────────────────────
         self._build_section_hdr("B  PILOT SIGN-OFF  (manual)")
 
         signoff = tk.Frame(self, bg=_BG3,
@@ -272,14 +365,13 @@ class ArmingWidget(tk.Frame):
             cv.pack(side="left", padx=(2, 4))
             box  = cv.create_rectangle(1, 1, 15, 15, outline=_LABEL_FG,
                                         fill=_BG3, width=1)
-            tick = cv.create_text(8, 8, text="", fill=_GREEN,
-                                   font=_F_ITEM_B)
+            tick = cv.create_text(8, 8, text="", fill=_GREEN, font=_F_ITEM_B)
 
             lbl = tk.Label(row, text=item_text, bg=_BG3, fg=_LABEL_FG,
                            font=_F_ITEM, anchor="w", cursor="hand2")
             lbl.pack(side="left", fill="x")
             self._manual_lbls[item_id] = lbl
-            self._cb_widgets[item_id] = (var, cv, box, tick, lbl)
+            self._cb_widgets[item_id]  = (var, cv, box, tick, lbl)
 
             def _toggle(e, v=var, cv=cv, box=box, tick=tick,
                         lbl=lbl, iid=item_id):
@@ -290,7 +382,6 @@ class ArmingWidget(tk.Frame):
             cv.bind("<Button-1>", _toggle)
             lbl.bind("<Button-1>", _toggle)
 
-        # Reset button
         rst_row = tk.Frame(signoff, bg=_BG3)
         rst_row.pack(fill="x", padx=6, pady=(4, 6))
         tk.Button(
@@ -301,7 +392,6 @@ class ArmingWidget(tk.Frame):
             command=self.reset_checklist,
         ).pack(side="right")
 
-        # ── Banner ────────────────────────────────────────────────────────────
         self._banner_frame = tk.Frame(self, bg=_BG,
                                        highlightthickness=1,
                                        highlightbackground=_BORDER)
@@ -320,7 +410,7 @@ class ArmingWidget(tk.Frame):
             side="left", fill="x", expand=True, padx=(6, 0), pady=4)
 
     # =========================================================================
-    # Custom checkbox draw helper
+    # Checkbox helper
     # =========================================================================
 
     @staticmethod
@@ -339,21 +429,19 @@ class ArmingWidget(tk.Frame):
     # =========================================================================
 
     def _on_resize(self, event):
-        w = event.width
-        n = 2 if w >= 420 else 1
+        n = 2 if event.width >= 420 else 1
         if n != self._n_auto_cols:
             self._layout_auto_cols(n)
 
     def _layout_auto_cols(self, n: int):
         self._n_auto_cols = n
-
         for cf in self._auto_col_frames:
             cf.destroy()
         self._auto_col_frames = []
         self._auto_rows = {}
 
-        total         = len(_AUTO_CHECKS)
-        rows_per_col  = (total + n - 1) // n
+        total        = len(_AUTO_CHECKS)
+        rows_per_col = (total + n - 1) // n
 
         for i in range(n):
             cf = tk.Frame(self._auto_inner, bg=_BG2)
@@ -362,8 +450,8 @@ class ArmingWidget(tk.Frame):
             self._auto_col_frames.append(cf)
 
         for idx, (chk_id, label, _fn) in enumerate(_AUTO_CHECKS):
-            col_i = min(idx // rows_per_col, n - 1)
-            row_i = idx % rows_per_col
+            col_i     = min(idx // rows_per_col, n - 1)
+            row_i     = idx % rows_per_col
             col_frame = self._auto_col_frames[col_i]
 
             rf = tk.Frame(col_frame, bg=_BG2)
@@ -396,7 +484,7 @@ class ArmingWidget(tk.Frame):
                     detail_lbl.config(text="✗  FAIL", fg=_ORANGE)
 
     # =========================================================================
-    # Banner refresh
+    # Banner
     # =========================================================================
 
     def _refresh_banner(self):
@@ -406,9 +494,8 @@ class ArmingWidget(tk.Frame):
             self._banner_frame.config(highlightbackground=_BORDER)
             return
 
-        auto_ok    = all(self._auto_state.get(cid, False)
-                         for cid, _, _ in _AUTO_CHECKS)
-        manual_ok  = all(var.get() for var in self._manual_vars.values())
+        auto_ok  = all(self._auto_state.get(cid, False)
+                       for cid, _, _ in _AUTO_CHECKS)
 
         n_auto_bad   = sum(1 for cid, _, _ in _AUTO_CHECKS
                            if not self._auto_state.get(cid, False))
@@ -417,8 +504,7 @@ class ArmingWidget(tk.Frame):
 
         if remaining == 0:
             self._count_lbl.config(text="ALL CHECKS PASSED", fg=_GREEN)
-            self._banner_lbl.config(text="✔  READY TO ARM",
-                                     fg=_GREEN, bg=_BG)
+            self._banner_lbl.config(text="✔  READY TO ARM", fg=_GREEN, bg=_BG)
             self._banner_frame.config(highlightbackground=_GREEN)
         else:
             word = f"item{'s' if remaining != 1 else ''}"
@@ -461,7 +547,6 @@ class ArmingWidget(tk.Frame):
     # =========================================================================
 
     def reset_checklist(self):
-        """Clear all manual sign-off items (call before each new flight)."""
         for item_id, (var, cv, box, tick, lbl) in self._cb_widgets.items():
             var.set(False)
             self._update_checkbox(var, cv, box, tick, lbl)

@@ -132,15 +132,12 @@ void DroneLink::startAccCalibration() { accCalRequested.store(true); }
 //   8.  MSP_COMP_GPS     (107)  distance + bearing to home, GPS heartbeat
 //   9.  MSP_NAV_STATUS   (121)  GPS nav engine status + fix flags
 //  10.  MSP_STATUS_EX    (150)  arming-disable flags (extended status)
-//  11.  MSP_MOTOR        (104)  motor throttle outputs (1000–2000 µs)
-//  12.  MSP_RC           (105)  RC channel inputs (1000–2000 µs)
+//  11.  MSP_MOTOR        (104)  motor throttle outputs (1000-2000 µs)
+//  12.  MSP_RC           (105)  RC channel inputs (1000-2000 µs)
 //
 //   ── Throttled polls ──
 //  13.  MSP_GPS_SV_INFO  (164)  satellite list, every SV_POLL_TICKS   (~1 s)
 //  14.  MSP_BATTERY_STATE(242)  full battery detail, every SLOW_POLL_TICKS (~500 ms)
-//
-// Budget note: 12 polls × ~1–2 ms each fits the 10 ms budget on F405 hardware.
-// If overruns occur (link_healthy flapping), call setPollIntervalMs(20).
 // =============================================================================
 
 void DroneLink::communicationLoop() {
@@ -157,7 +154,7 @@ void DroneLink::communicationLoop() {
 
         bool anySuccess = false;
 
-        // ── Magnetometer calibration request ──────────────────────────────────
+        // ── Magnetometer calibration request ─────────────────────────────────
         if (magCalRequested.exchange(false)) {
             sendMSP(MSP::MAG_CAL);
             magCalActive_ = true;
@@ -230,12 +227,6 @@ void DroneLink::communicationLoop() {
         { auto buf = sendMSP(MSP::NAV_STATUS); parseNavStatus(buf, pending); }
 
         // ── Extended telemetry — every tick ───────────────────────────────────
-        //
-        // STATUS_EX (150): arming-disable flags change infrequently but we poll
-        // every tick so the GCS shows the reason immediately when it changes.
-        //
-        // MOTOR (104) / RC (105): polled every tick for real-time motor and
-        // stick display, essential for autonomous-flight monitoring.
         { auto buf = sendMSP(MSP::STATUS_EX);  parseStatusEx(buf, pending); }
         { auto buf = sendMSP(MSP::MOTOR);      parseMotors(buf, pending); }
         { auto buf = sendMSP(MSP::RC);         parseRCChannels(buf, pending); }
@@ -248,9 +239,6 @@ void DroneLink::communicationLoop() {
         --svPollTickCounter_;
 
         // ── Battery detail — MSP_BATTERY_STATE (242), every ~500 ms ──────────
-        // Battery state changes slowly (seconds between WARNING/CRITICAL
-        // transitions). Polling at 2 Hz reduces loop pressure while keeping
-        // display values fresh.
         if (slowPollTickCounter_ <= 0) {
             auto buf = sendMSP(MSP::BATTERY_STATE);
             parseBatteryState(buf, pending);
@@ -280,13 +268,6 @@ void DroneLink::communicationLoop() {
 
 // =============================================================================
 // pollSatellitesMSP()
-//
-// PRIMARY satellite polling path. Sends MSP_GPS_SV_INFO (cmd 164) and passes
-// the response to GPSNeoM10::parseMspSvInfo(). No passthrough, no port cycle.
-//
-// On success: pending.svList is updated, pending.svInfoValid = true,
-//             pending.svSource = "MSP".
-// On failure: svList and svInfoValid are left unchanged (retain last good data).
 // =============================================================================
 
 bool DroneLink::pollSatellitesMSP(DroneState& pending) {
@@ -304,9 +285,7 @@ bool DroneLink::pollSatellitesMSP(DroneState& pending) {
 
 // =============================================================================
 // pollSatellites() — UBX passthrough path — RETAINED FOR applyGPSConfig()
-//
-// NOT called from communicationLoop(). sv_baud_probe.py confirmed BF returns
-// 0 bytes on all UART indices with gps_auto_config=ON.
+// NOT called from communicationLoop().
 // =============================================================================
 
 void DroneLink::pollSatellites(DroneState& pending) {
@@ -438,46 +417,103 @@ std::vector<uint8_t> DroneLink::readUbxResponse(HANDLE h, int timeoutMs) {
 
 // =============================================================================
 // sendMSP()
+//
+// FIX (RC / large-frame reliability):
+//   The original code called PurgeComm(PURGE_RXCLEAR) unconditionally at the
+//   top of every poll. With 12+ back-to-back polls at 100 Hz, the purge on
+//   poll N+1 was flushing the tail of poll N's response before it finished
+//   arriving over the serial FIFO.
+//
+//   Small responses (STATUS, ANALOG, etc. — 12-20 bytes) arrived fast enough
+//   to escape truncation most of the time. MSP_RC with ELRS/CRSF returns
+//   16 channels = 32 payload bytes → 38-byte frame. At 57600 baud, 38 bytes
+//   takes ~6.6 ms to arrive. The next sendMSP() was issued well inside that
+//   window, killing the RC frame mid-read and leaving rcChannelCount = 0
+//   in DroneState — which ArmingWidget reported as "NO SIGNAL / UART NOT
+//   CONFIGURED" even though the receiver was bound and working perfectly in BF.
+//
+//   Fix: remove the unconditional pre-poll purge. The read loop already drains
+//   exactly payloadLen+6 bytes (or times out). Any genuine stale garbage from
+//   a previous timeout is discarded by the header-sync logic inside the read
+//   loop (we only accept '$','M','>').  A targeted purge is still issued if
+//   we detect an unexpected header byte, so bus wedge recovery is preserved.
 // =============================================================================
 
 std::vector<uint8_t> DroneLink::sendMSP(uint8_t mspID) {
     if (hSerial == INVALID_HANDLE_VALUE) return {};
 
-    PurgeComm(hSerial, PURGE_RXCLEAR);
-
+    // ── Write request ─────────────────────────────────────────────────────────
     uint8_t req[] = { '$', 'M', '<', 0, mspID, mspID };
     DWORD   written = 0;
     if (!WriteFile(hSerial, req, sizeof(req), &written, NULL)
         || written != sizeof(req))
         return {};
 
+    // ── Read response with header-sync ────────────────────────────────────────
+    // We look for the '$','M','>' preamble before trusting payloadLen.
+    // This discards any stale bytes left from a previous timed-out poll
+    // without a blanket PurgeComm that would also throw away bytes still
+    // in transit for the current response.
     constexpr size_t MAX_FRAME = 512;
-    uint8_t raw[MAX_FRAME];
-    size_t  total = 0;
-    int     payloadLen = -1;
+    constexpr int    SYNC_TRIES = 64;   // bytes to scan before giving up sync
 
     auto deadline = std::chrono::steady_clock::now()
         + std::chrono::milliseconds(80);
 
-    while (total < MAX_FRAME) {
-        if (std::chrono::steady_clock::now() > deadline) break;
-
-        DWORD rd = 0; uint8_t b = 0;
-        if (!ReadFile(hSerial, &b, 1, &rd, NULL) || rd == 0) {
+    auto readByte = [&](uint8_t& out) -> bool {
+        while (std::chrono::steady_clock::now() < deadline) {
+            DWORD rd = 0;
+            if (ReadFile(hSerial, &out, 1, &rd, NULL) && rd == 1) return true;
             std::this_thread::sleep_for(std::chrono::microseconds(150));
-            continue;
         }
+        return false;
+        };
 
-        raw[total++] = b;
-        if (total == 4) payloadLen = raw[3];
+    // Step 1: sync to '$','M','>'
+    uint8_t b0 = 0, b1 = 0, b2 = 0;
+    int syncTries = 0;
+    while (syncTries < SYNC_TRIES) {
+        if (!readByte(b0)) return {};
+        if (b0 != '$') { ++syncTries; continue; }
+        if (!readByte(b1)) return {};
+        if (b1 != 'M') { ++syncTries; continue; }
+        if (!readByte(b2)) return {};
+        if (b2 == '>') break;   // found header
+        // b2 was not '>' — could be '<' (echo) or error byte; keep scanning
+        ++syncTries;
+    }
+    if (syncTries >= SYNC_TRIES) return {};
 
-        if (payloadLen >= 0 &&
-            total == static_cast<size_t>(payloadLen + 6))
-            break;
+    // Step 2: read payloadLen + cmd bytes
+    uint8_t payloadLen = 0, cmdByte = 0;
+    if (!readByte(payloadLen)) return {};
+    if (!readByte(cmdByte))    return {};
+
+    // Sanity: cmd byte must match what we requested
+    if (cmdByte != mspID) {
+        // Stale frame from a different command — flush and bail
+        PurgeComm(hSerial, PURGE_RXCLEAR);
+        return {};
     }
 
-    if (total < 6) return {};
-    return std::vector<uint8_t>(raw, raw + total);
+    if (payloadLen > MAX_FRAME - 6) return {};
+
+    // Step 3: read payload + checksum
+    std::vector<uint8_t> frame;
+    frame.reserve(6u + payloadLen);
+    frame.push_back('$');
+    frame.push_back('M');
+    frame.push_back('>');
+    frame.push_back(payloadLen);
+    frame.push_back(cmdByte);
+
+    for (int i = 0; i < static_cast<int>(payloadLen) + 1 /*checksum*/; ++i) {
+        uint8_t pb = 0;
+        if (!readByte(pb)) return {};
+        frame.push_back(pb);
+    }
+
+    return frame;
 }
 
 // =============================================================================
@@ -560,12 +596,10 @@ GPSConfigResult DroneLink::applyGPSConfig(const GPSConfig& cfg) {
 // Payload layout (BF 4.5.x, all little-endian), offsets from buf[5]:
 //   [0..1]  uint16  cycleTime           µs  → fcCycleMs
 //   [2..3]  uint16  i2cErrorCount           → i2cErrorCount
-//   [4..5]  uint16  sensorStatus            → sensorStatus  (SensorStatus:: bits)
-//   [6..9]  uint32  flightModeFlags         → flightModeFlags (FlightMode:: bits)
+//   [4..5]  uint16  sensorStatus            → sensorStatus
+//   [6..9]  uint32  flightModeFlags         → flightModeFlags
 //   [10]    uint8   currentPidProfile       → pidProfile
 //   [11..12]uint16  averageSystemLoad %     → cpuLoadPercent
-//
-// Derives: armed (ARM bit in flightModeFlags), flightModeName (via decode helper)
 //
 // Min frame: header(5) + payload(13) + checksum(1) = 19 bytes
 // -----------------------------------------------------------------------------
@@ -627,30 +661,68 @@ bool DroneLink::parseAttitude(const std::vector<uint8_t>& buf, DroneState& s) {
 // -----------------------------------------------------------------------------
 // parseAnalog() — MSP_ANALOG (110)
 //
-// Payload layout (BF 4.5.x):
-//   buf[5]     uint8   vbat       0.1 V units
-//   buf[6..7]  uint16  mAhDrawn   mAh consumed
-//   buf[8]     uint8   rssi       0–255
-//   buf[9..10] int16   amperage   centiamps (divide by 100 → Amps)
+// BF 4.x payload layout (little-endian):
+//   buf[5]      uint8   vbat_legacy    0.1 V units  (max 25.5 V — kept for
+//                                      compatibility; unreliable above 25 V)
+//   buf[6..7]   uint16  mAhDrawn       mAh consumed
+//   buf[8]      uint8   rssi           0-255
+//   buf[9..10]  int16   amperage       centiamps  (divide by 100 → Amps)
+//   buf[11..12] uint16  vbat_10mV      10 mV per LSB  (BF 4.x extended field)
+//                                      → divide by 100 → Volts (0.01 V res.)
 //
-// Min frame: header(5) + payload(6) + checksum(1) = 12 bytes
+// FIX: The original parser only read buf[5] (the legacy single-byte 0.1 V
+// field).  On BF 4.x the authoritative voltage is the uint16 at buf[11..12]
+// (10 mV resolution).  For a 4S pack at 16.24 V the raw value is 1624
+// (0x0658); buf[5] legacy field holds 162 → 16.2 V which is passable, but
+// if BF clips the legacy field to uint8 max (255 → 25.5 V) or the cell
+// voltage ever exceeded ~2.55 V × cells the legacy read would be wrong.
+//
+// We now prefer the 10 mV field and fall back to the legacy byte only when
+// the extended field is absent (older BF firmware / very short frame).
+//
+// FIX: rssi from MSP_ANALOG is always 0 for ELRS/CRSF receivers because
+// ELRS does not populate the RSSI byte in the MSP_ANALOG response — it uses
+// a dedicated link statistics packet instead.  The rc_link_quality field in
+// to_dict() must therefore emit -1 when rssi == 0 so the widget switches to
+// the channel-count / stick-range path rather than showing "0% quality".
+// That logic already lives in to_dict(); parseAnalog() just stores rssi as-is.
+//
+// Min frame (legacy only):  header(5) + payload(6)  + checksum(1) = 12 bytes
+// Min frame (with 10mV ext): header(5) + payload(8) + checksum(1) = 14 bytes
 // -----------------------------------------------------------------------------
 
 bool DroneLink::parseAnalog(const std::vector<uint8_t>& buf, DroneState& s) {
+    // Need at least the 6-byte legacy payload
     if (buf.size() < 12 || buf[4] != MSP::ANALOG) return false;
 
-    s.batteryVoltage = buf[5] / 10.0f;
+    // ── Legacy voltage (0.1 V, 1 byte) — used only as fallback ──────────────
+    float legacyVoltage = buf[5] / 10.0f;
 
+    // ── mAh drawn (uint16) ───────────────────────────────────────────────────
     s.batteryMahDrawn = static_cast<uint16_t>(buf[6]) |
         (static_cast<uint16_t>(buf[7]) << 8);
 
+    // ── RSSI (uint8, 0-255) — always 0 on ELRS/CRSF ─────────────────────────
     s.rssi = buf[8];
 
-    // Amperage: signed int16 in centiamps; 100 cA = 1 A
+    // ── Amperage (int16, centiamps) ───────────────────────────────────────────
     int16_t centiAmps = static_cast<int16_t>(
         static_cast<uint16_t>(buf[9]) |
         (static_cast<uint16_t>(buf[10]) << 8));
     s.batteryCurrent = centiAmps / 100.0f;
+
+    // ── Extended 10 mV voltage field (BF 4.x, buf[11..12]) ───────────────────
+    // Prefer this over the legacy byte; it has 10x finer resolution and
+    // correctly represents voltages > 25.5 V (future 6S+ support).
+    if (buf.size() >= 14) {
+        uint16_t v10mV = static_cast<uint16_t>(buf[11]) |
+            (static_cast<uint16_t>(buf[12]) << 8);
+        s.batteryVoltage = (v10mV > 0) ? (v10mV / 100.0f) : legacyVoltage;
+    }
+    else {
+        // Older firmware — fall back to the legacy 0.1 V byte
+        s.batteryVoltage = legacyVoltage;
+    }
 
     return true;
 }
@@ -707,7 +779,7 @@ bool DroneLink::parseNavStatus(const std::vector<uint8_t>& buf, DroneState& s) {
 }
 
 // -----------------------------------------------------------------------------
-// parseMspSvInfo() — DroneLink wrapper around GPSNeoM10::parseMspSvInfo()
+// parseMspSvInfo() — DroneLink wrapper
 // -----------------------------------------------------------------------------
 
 bool DroneLink::parseMspSvInfo(const std::vector<uint8_t>& buf, DroneState& s) {
@@ -720,15 +792,11 @@ bool DroneLink::parseMspSvInfo(const std::vector<uint8_t>& buf, DroneState& s) {
 }
 
 // =============================================================================
-// NEW parsers
+// NEW / FIXED parsers
 // =============================================================================
 
 // -----------------------------------------------------------------------------
 // parseStatusEx() — MSP_STATUS_EX (150)
-//
-// Superset of MSP_STATUS (101). Shares the same first 17 payload bytes.
-// The extra fields carry the arming-disable reason bitmask, which tells
-// the GCS exactly why the FC refuses to arm.
 //
 // Payload layout (BF 4.5.x, little-endian):
 //   buf[5..6]   uint16  cycleTime           (same as STATUS — not re-read)
@@ -737,11 +805,8 @@ bool DroneLink::parseMspSvInfo(const std::vector<uint8_t>& buf, DroneState& s) {
 //   buf[11..14] uint32  flightModeFlags     (same as STATUS — not re-read)
 //   buf[15]     uint8   currentPidProfile   (same as STATUS — not re-read)
 //   buf[16..17] uint16  averageSystemLoad   (same as STATUS — not re-read)
-//   buf[18..19] uint16  armingDisableCount  informational count of set bits
-//   buf[20..23] uint32  armingDisableFlags  ArmingDisable:: bitmask ← the one we want
-//
-// Note: parseStatusEx does NOT re-write fields already set by parseStatus()
-// (which runs first). It only enriches the arming-disable information.
+//   buf[18..19] uint16  armingDisableCount
+//   buf[20..23] uint32  armingDisableFlags  ← the field we want
 //
 // Min frame: header(5) + payload(19) + checksum(1) = 25 bytes
 // -----------------------------------------------------------------------------
@@ -764,28 +829,30 @@ bool DroneLink::parseStatusEx(const std::vector<uint8_t>& buf, DroneState& s) {
 // -----------------------------------------------------------------------------
 // parseBatteryState() — MSP_BATTERY_STATE (242)
 //
-// Authoritative source for cell count, design capacity, battery health state,
-// and high-resolution voltage (10 mV resolution vs 100 mV from ANALOG).
-//
-// Battery percentage is computed from mAh drawn / design capacity. It is 0
-// when batteryCapacityMah == 0 (not configured in BF Configurator).
-// Configure in BF: set battery_capacity = <mAh>; save
-//
 // Payload layout (BF 4.5.x, little-endian):
 //   buf[5]      uint8   cellCount
-//   buf[6..7]   uint16  capacity    design capacity, mAh
-//   buf[8]      uint8   voltage     0.1 V legacy — skipped; use buf[14..15]
-//   buf[9..10]  uint16  mAhDrawn    consumed mAh (cross-checks ANALOG)
-//   buf[11..12] uint16  amperage    centiamps (cross-checks ANALOG)
-//   buf[13]     uint8   battState   BatteryState enum
-//   buf[14..15] uint16  voltage10mV 10 mV per unit (0.01 V resolution)
+//   buf[6..7]   uint16  capacity        design capacity mAh
+//   buf[8]      uint8   voltage_legacy  0.1 V — skipped; use buf[14..15]
+//   buf[9..10]  uint16  mAhDrawn
+//   buf[11..12] uint16  amperage        centiamps
+//   buf[13]     uint8   battState       BatteryState enum
+//   buf[14..15] uint16  voltage_10mV    10 mV per unit  (BF 4.1+)
 //
-// Min frame: header(5) + payload(11) + checksum(1) = 17 bytes
-// Full frame with voltage10mV: header(5) + payload(11) + 2 + checksum = 19
+// FIX: The original code had a minimum size guard of < 17 bytes.
+// On BF 4.5 the frame is header(5) + payload(9) + checksum(1) = 15 bytes.
+// The guard of 17 caused every parseBatteryState() call to return false
+// immediately, so batteryVoltage, batteryCellCount, and batteryState were
+// never written — leaving the widgets showing "—" and "INIT" forever.
+//
+// Corrected guard:
+//   >= 15 bytes → can read cellCount through battState  (buf[5..13])
+//   >= 17 bytes → can also read voltage_10mV            (buf[14..15])
 // -----------------------------------------------------------------------------
 
 bool DroneLink::parseBatteryState(const std::vector<uint8_t>& buf, DroneState& s) {
-    if (buf.size() < 17 || buf[4] != MSP::BATTERY_STATE) return false;
+    // Minimum: header(5) + cellCount(1) + capacity(2) + vlegacy(1)
+    //          + mAhDrawn(2) + amperage(2) + battState(1) + checksum(1) = 15
+    if (buf.size() < 15 || buf[4] != MSP::BATTERY_STATE) return false;
 
     auto ru16 = [&](int i) -> uint16_t {
         return static_cast<uint16_t>(buf[i]) |
@@ -794,7 +861,7 @@ bool DroneLink::parseBatteryState(const std::vector<uint8_t>& buf, DroneState& s
 
     s.batteryCellCount = buf[5];
     s.batteryCapacityMah = ru16(6);
-    // buf[8] = legacy 0.1 V voltage — skipped; use voltage10mV below
+    // buf[8] = legacy 0.1 V — skip in favour of 10 mV field below
     s.batteryMahDrawn = ru16(9);
 
     int16_t centiAmps = static_cast<int16_t>(ru16(11));
@@ -802,17 +869,19 @@ bool DroneLink::parseBatteryState(const std::vector<uint8_t>& buf, DroneState& s
 
     s.batteryState = static_cast<BatteryState>(buf[13]);
 
-    // FIX: removed the erroneous "buf.size() >= 18" guard.
-    // Minimum frame is 17 bytes (header 5 + payload 11 + checksum 1).
-    // buf[14] = voltage10mV LSB and buf[15] = voltage10mV MSB are always
-    // present and safe to access once the size-17 check above passes.
-    {
+    // ── High-resolution voltage (10 mV, BF 4.1+) ─────────────────────────────
+    // Only present when frame is long enough. Guard is >= 17 because we need
+    // buf[14] (LSB) AND buf[15] (MSB), and the frame vector is 0-indexed.
+    if (buf.size() >= 17) {
         uint16_t v10mV = ru16(14);
         if (v10mV > 0)
             s.batteryVoltage = v10mV / 100.0f;   // 10 mV → V  (0.01 V resolution)
     }
+    // If the 10mV field is absent (older BF or short frame), batteryVoltage
+    // retains the value already written by parseAnalog() this tick — so we
+    // always have at least the 0.1 V resolution reading available.
 
-    // Battery percentage: requires battery_capacity set in BF Configurator
+    // ── Battery percentage (requires battery_capacity set in BF) ─────────────
     if (s.batteryCapacityMah > 0 && s.batteryMahDrawn <= s.batteryCapacityMah) {
         uint16_t remaining = s.batteryCapacityMah - s.batteryMahDrawn;
         s.batteryPercentage = static_cast<uint8_t>(
@@ -825,20 +894,10 @@ bool DroneLink::parseBatteryState(const std::vector<uint8_t>& buf, DroneState& s
     return true;
 }
 
-
 // -----------------------------------------------------------------------------
 // parseMotors() — MSP_MOTOR (104)
 //
-// Up to 8 × uint16 motor throttle values (1000–2000 µs).
-// On a quad (F405 V3), only motors[0..3] will be non-zero.
-// motorCount is set to the index of the last non-zero motor + 1.
-//
-// Payload layout:
-//   buf[5..6]   motor[0]  uint16 µs
-//   buf[7..8]   motor[1]  uint16 µs
-//   ...
-//   buf[19..20] motor[7]  uint16 µs  (16 bytes total payload)
-//
+// Up to 8 × uint16 motor throttle values (1000-2000 µs).
 // Min frame: header(5) + payload(16) + checksum(1) = 22 bytes
 // -----------------------------------------------------------------------------
 
@@ -858,27 +917,35 @@ bool DroneLink::parseMotors(const std::vector<uint8_t>& buf, DroneState& s) {
 // -----------------------------------------------------------------------------
 // parseRCChannels() — MSP_RC (105)
 //
-// N × uint16 RC channel values (1000–2000 µs).
-// N is determined from the payload length field (buf[3]).
-// With RadioMaster Pocket + ELRS you typically get 12–16 channels.
+// N × uint16 RC channel values (1000-2000 µs).
+// N = payloadLen / 2.  With RadioMaster Pocket + ELRS, BF reports 16 channels
+// = 32-byte payload → 38-byte frame.
 //
-// RadioMaster Pocket / CRSF default channel layout (MODE 2):
-//   [0] Roll (Aileron)    [1] Pitch (Elevator)
-//   [2] Throttle          [3] Yaw   (Rudder)
-//   [4] ARM switch        [5] Flight mode AUX
-//   [6..] AUX3, AUX4, ...
+// FIX: The original sendMSP() called PurgeComm(PURGE_RXCLEAR) at the top of
+// every poll. At 57 600 baud a 38-byte MSP_RC frame takes ~6.6 ms to arrive.
+// The unconditional purge in the immediately following sendMSP() call was
+// flushing the tail of the RC frame before it was fully read, leaving
+// rcChannelCount = 0 and causing ArmingWidget to report "NO SIGNAL".
+// The fix is in sendMSP() (see its comment above); parseRCChannels() itself
+// is unchanged except for added documentation.
 //
-// Min frame: header(5) + ≥2 bytes payload + checksum(1) = 8 bytes
+// RadioMaster Pocket / CRSF channel layout (MODE 2):
+//   [0] Roll   [1] Pitch   [2] Throttle   [3] Yaw
+//   [4] ARM switch         [5] Flight mode AUX
+//   [6..15] AUX3-AUX12
+//
+// Min frame: header(5) + 2-byte payload (1 ch) + checksum(1) = 8 bytes
+// Typical:   header(5) + 32-byte payload (16 ch) + checksum(1) = 38 bytes
 // -----------------------------------------------------------------------------
 
 bool DroneLink::parseRCChannels(const std::vector<uint8_t>& buf, DroneState& s) {
     if (buf.size() < 8 || buf[4] != MSP::RC) return false;
 
     uint8_t payloadLen = buf[3];
-    int chCount = (static_cast<int>(payloadLen / 2) < MAX_RC_CH)
-        ? static_cast<int>(payloadLen / 2) : MAX_RC_CH;
+    int chCount = static_cast<int>(payloadLen / 2);
+    if (chCount > MAX_RC_CH) chCount = MAX_RC_CH;
 
-    // Sanity: entire frame must be present
+    // Sanity: the entire declared frame must have arrived
     if (buf.size() < static_cast<size_t>(5u + payloadLen + 1u)) return false;
 
     s.rcChannelCount = static_cast<uint8_t>(chCount);
@@ -892,17 +959,6 @@ bool DroneLink::parseRCChannels(const std::vector<uint8_t>& buf, DroneState& s) 
 // =============================================================================
 // Decode helpers (static)
 // =============================================================================
-
-// -----------------------------------------------------------------------------
-// decodeFlightMode()
-//
-// Translates the flightModeFlags bitmask from MSP_STATUS into a human-readable
-// string for the GCS status bar.
-//
-// Priority order: FAILSAFE > GPS_RESCUE > ANGLE > HORIZON > ACRO (default)
-// Augmentation modes (MAG, HEADFREE, ANTIGRAV) are appended with '+'.
-// "[DISARMED]" is appended when the ARM bit is clear.
-// -----------------------------------------------------------------------------
 
 /*static*/
 std::string DroneLink::decodeFlightMode(uint32_t flags) {
@@ -927,7 +983,6 @@ std::string DroneLink::decodeFlightMode(uint32_t flags) {
         mode = "ACRO";
     }
 
-    // Augmentation flags only make sense in non-emergency modes
     if (!isEmergency) {
         if (flags & FlightMode::MAG)       mode += "+MAG";
         if (flags & FlightMode::HEADFREE)  mode += "+HEADFREE";
@@ -939,14 +994,6 @@ std::string DroneLink::decodeFlightMode(uint32_t flags) {
 
     return mode;
 }
-
-// -----------------------------------------------------------------------------
-// decodeArmingDisable()
-//
-// Translates the armingDisableFlags bitmask from MSP_STATUS_EX into a
-// comma-separated string listing every active reason the FC won't arm.
-// Returns "" when flags == 0 (ready to arm).
-// -----------------------------------------------------------------------------
 
 /*static*/
 std::string DroneLink::decodeArmingDisable(uint32_t flags) {
