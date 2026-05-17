@@ -22,11 +22,17 @@
     <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="ArmingWidget.py">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="BaroWidget.py">
       <SubType>Code</SubType>
     </Compile>
     <Compile Include="DroneCockpitUI.py" />
     <Compile Include="DroneTest.py">
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="FCStatusWidget.py">
       <SubType>Code</SubType>
     </Compile>
     <Compile Include="GPSWidget.py">
