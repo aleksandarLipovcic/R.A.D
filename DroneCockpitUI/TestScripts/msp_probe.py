@@ -11,8 +11,8 @@ Fixes vs original probe:
   5. RC link check uses correct 885 µs YAW threshold (ELRS failsafe value).
 
 Usage:
-    python msp_probe_fixed.py COM4
-    python msp_probe_fixed.py COM4 --baud 57600
+    python msp_probe.py COM4
+    python msp_probe.py COM4 --baud 57600
 """
 
 import serial

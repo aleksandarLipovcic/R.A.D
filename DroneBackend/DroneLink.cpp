@@ -692,41 +692,37 @@ bool DroneLink::parseAttitude(const std::vector<uint8_t>& buf, DroneState& s) {
 // -----------------------------------------------------------------------------
 
 bool DroneLink::parseAnalog(const std::vector<uint8_t>& buf, DroneState& s) {
-    // Need at least the 6-byte legacy payload
     if (buf.size() < 12 || buf[4] != MSP::ANALOG) return false;
 
-    // ── Legacy voltage (0.1 V, 1 byte) — used only as fallback ──────────────
     float legacyVoltage = buf[5] / 10.0f;
 
-    // ── mAh drawn (uint16) ───────────────────────────────────────────────────
     s.batteryMahDrawn = static_cast<uint16_t>(buf[6]) |
         (static_cast<uint16_t>(buf[7]) << 8);
 
-    // ── RSSI (uint8, 0-255) — always 0 on ELRS/CRSF ─────────────────────────
     s.rssi = buf[8];
 
-    // ── Amperage (int16, centiamps) ───────────────────────────────────────────
     int16_t centiAmps = static_cast<int16_t>(
         static_cast<uint16_t>(buf[9]) |
         (static_cast<uint16_t>(buf[10]) << 8));
     s.batteryCurrent = centiAmps / 100.0f;
 
-    // ── Extended 10 mV voltage field (BF 4.x, buf[11..12]) ───────────────────
-    // Prefer this over the legacy byte; it has 10x finer resolution and
-    // correctly represents voltages > 25.5 V (future 6S+ support).
-    if (buf.size() >= 14) {
-        uint16_t v10mV = static_cast<uint16_t>(buf[11]) |
-            (static_cast<uint16_t>(buf[12]) << 8);
-        s.batteryVoltage = (v10mV > 0) ? (v10mV / 100.0f) : legacyVoltage;
+    // FIX: was buf[11..12] — correct offset is buf[12..13].
+    // Need the full 15-byte frame (header 5 + payload 9 + checksum 1).
+    if (buf.size() >= 15) {
+        uint16_t v10mV = static_cast<uint16_t>(buf[12]) |
+            (static_cast<uint16_t>(buf[13]) << 8);
+
+        // Sanity clamp: reject readings outside plausible LiPo range (1S–12S).
+        // This catches the old off-by-one garbage value of 207 V.
+        float extV = v10mV / 100.0f;
+        s.batteryVoltage = (extV >= 2.0f && extV <= 60.0f) ? extV : legacyVoltage;
     }
     else {
-        // Older firmware — fall back to the legacy 0.1 V byte
         s.batteryVoltage = legacyVoltage;
     }
 
     return true;
 }
-
 // -----------------------------------------------------------------------------
 // parseDebug() — MSP_DEBUG (254)
 // Requires: set debug_mode = MAG_CALIB; save  in BF CLI

@@ -860,169 +860,269 @@ class DroneCockpitApp:
             self._update_job = self.root.after(UI_REFRESH_MS, self._update_loop)
 
     def _update_loop(self) -> None:
-        self._update_job = None
+            self._update_job = None
 
-        if not self.hub.is_connected():
-            self._reconnect()
-            return
+            if not self.hub.is_connected():
+                self._reconnect()
+                return
 
-        try:
-            state = self.hub.get_latest_state()
+            try:
+                state = self.hub.get_latest_state()
 
-            if not state.link_healthy:
-                self.status_label.config(text="Status: Link degraded", fg="orange")
-            else:
-                self.status_label.config(text="Status: Connected", fg="#00ff88")
+                if not state.link_healthy:
+                    self.status_label.config(text="Status: Link degraded", fg="orange")
+                else:
+                    self.status_label.config(text="Status: Connected", fg="#00ff88")
 
-            raw_yaw   = float(state.yaw)
-            mag_hdg   = getattr(state, "mag_heading_deg", 0.0)
-            mag_valid = getattr(state, "mag_valid", False)
+                raw_yaw   = float(state.yaw)
+                mag_hdg   = getattr(state, "mag_heading_deg", 0.0)
+                mag_valid = getattr(state, "mag_valid", False)
 
-            self._last_raw_yaw     = raw_yaw
-            self._last_mag_heading = mag_hdg
-            self._last_mag_valid   = mag_valid
+                self._last_raw_yaw     = raw_yaw
+                self._last_mag_heading = mag_hdg
+                self._last_mag_valid   = mag_valid
 
-            trimmed_yaw = (raw_yaw - self._yaw_trim + 360) % 360
+                trimmed_yaw = (raw_yaw - self._yaw_trim + 360) % 360
 
-            # ── GPS sub-object ────────────────────────────────────────────────
-            gps = getattr(state, "gps", None)
-            if gps is not None:
-                gps_hdop_raw  = getattr(gps, "hdop", 9999)
-                gps_hdop_real = (gps_hdop_raw / 100.0
-                                 if gps_hdop_raw != 9999 else 99.0)
+                # ── GPS sub-object ────────────────────────────────────────────────
+                gps = getattr(state, "gps", None)
+                if gps is not None:
+                    gps_hdop_raw  = getattr(gps, "hdop", 9999)
+                    gps_hdop_real = (gps_hdop_raw / 100.0
+                                     if gps_hdop_raw != 9999 else 99.0)
 
-                sv_list_raw   = list(state.sv_list)
-                sv_info_valid = getattr(state, "sv_info_valid", False)
-                sv_source     = getattr(state, "sv_source", "")
+                    sv_list_raw   = list(state.sv_list)
+                    sv_info_valid = getattr(state, "sv_info_valid", False)
+                    sv_source     = getattr(state, "sv_source", "")
 
-                if self._sv_debug_frames < self._sv_debug_limit:
-                    self._sv_debug_frames += 1
-                    print(
-                        f"[GPS-SV] frame={self._sv_debug_frames}"
-                        f"  sv_info_valid={sv_info_valid}"
-                        f"  sv_source={sv_source!r}"
-                        f"  sv_count={len(sv_list_raw)}"
-                    )
-                    for sv in sv_list_raw:
+                    if self._sv_debug_frames < self._sv_debug_limit:
+                        self._sv_debug_frames += 1
                         print(
-                            f"         gnss_name="
-                            f"{getattr(sv,'gnss_name','?'):8s}"
-                            f"  svid={getattr(sv,'svid',0):3d}"
-                            f"  cno={getattr(sv,'cno',0):3d}"
-                            f"  used={getattr(sv,'used',False)!s:5s}"
-                            f"  quality={getattr(sv,'quality',0)}"
-                            f"  status={getattr(sv,'status_str','idle')}"
+                            f"[GPS-SV] frame={self._sv_debug_frames}"
+                            f"  sv_info_valid={sv_info_valid}"
+                            f"  sv_source={sv_source!r}"
+                            f"  sv_count={len(sv_list_raw)}"
                         )
+                        for sv in sv_list_raw:
+                            print(
+                                f"         gnss_name="
+                                f"{getattr(sv, 'gnss_name', '?'):8s}"
+                                f"  svid={getattr(sv, 'svid', 0):3d}"
+                                f"  cno={getattr(sv, 'cno', 0):3d}"
+                                f"  used={getattr(sv, 'used', False)!s:5s}"
+                                f"  quality={getattr(sv, 'quality', 0)}"
+                                f"  status={getattr(sv, 'status_str', 'idle')}"
+                            )
 
-                sv_list = [
-                    {
-                        "gnss_id": getattr(sv, "gnss_name",  "?"),
-                        "sv_id":   getattr(sv, "svid",        0),
-                        "cno":     getattr(sv, "cno",         0),
-                        "used":    getattr(sv, "used",        False),
-                        "quality": getattr(sv, "quality",     0),
-                        "status":  getattr(sv, "status_str",  "idle"),
-                        "elev":    getattr(sv, "elev",        0),
-                        "azim":    getattr(sv, "azim",        0),
+                    sv_list = [
+                        {
+                            "gnss_id": getattr(sv, "gnss_name",  "?"),
+                            "sv_id":   getattr(sv, "svid",        0),
+                            "cno":     getattr(sv, "cno",         0),
+                            "used":    getattr(sv, "used",        False),
+                            "quality": getattr(sv, "quality",     0),
+                            "status":  getattr(sv, "status_str",  "idle"),
+                            "elev":    getattr(sv, "elev",        0),
+                            "azim":    getattr(sv, "azim",        0),
+                        }
+                        for sv in sv_list_raw
+                    ]
+
+                    heartbeat = getattr(gps, "heartbeat",
+                                getattr(gps, "gps_heartbeat", None))
+
+                    gps_data = {
+                        "gps_fix_type":         getattr(gps, "fix_type",         0),
+                        "gps_num_sat":          getattr(gps, "num_sat",           0),
+                        "gps_hdop":             gps_hdop_real,
+                        "gps_latitude":         getattr(gps, "latitude",          0.0),
+                        "gps_longitude":        getattr(gps, "longitude",         0.0),
+                        "gps_altitude_m":       float(getattr(gps, "altitude_m",  0)),
+                        "gps_ground_speed_cms": getattr(gps, "ground_speed_cms",  0),
+                        "gps_ground_course":    getattr(gps, "ground_course",     0),
+                        "gps_dist_to_home_m":   float(getattr(gps, "dist_to_home_m", 0)),
+                        "gps_bearing_to_home":  getattr(gps, "bearing_to_home",  0),
+                        "gps_heartbeat":        heartbeat,
+                        "gps_raw_valid":        getattr(gps, "raw_valid",         False),
+                        "gps_comp_valid":       getattr(gps, "comp_valid",        False),
+                        "gps_position_usable":  getattr(gps, "position_usable",   False),
+                        "gps_sv_list":          sv_list,
+                        "gps_sv_info_valid":    sv_info_valid,
+                        "gps_sv_source":        sv_source,
+                        # Short-form aliases read by ArmingWidget
+                        "gps_num_sats":         getattr(gps, "num_sat",           0),
+                        "gps_fix":              getattr(gps, "position_usable",   False),
                     }
-                    for sv in sv_list_raw
-                ]
+                else:
+                    gps_data = {
+                        "gps_fix_type": 0, "gps_num_sat": 0, "gps_hdop": 99.0,
+                        "gps_latitude": 0.0, "gps_longitude": 0.0,
+                        "gps_altitude_m": 0.0, "gps_ground_speed_cms": 0,
+                        "gps_ground_course": 0, "gps_dist_to_home_m": 0.0,
+                        "gps_bearing_to_home": 0, "gps_heartbeat": None,
+                        "gps_raw_valid": False, "gps_comp_valid": False,
+                        "gps_position_usable": False,
+                        "gps_sv_list": [], "gps_sv_info_valid": False,
+                        "gps_sv_source": "",
+                        "gps_num_sats": 0,
+                        "gps_fix": False,
+                    }
 
-                heartbeat = getattr(gps, "heartbeat",
-                            getattr(gps, "gps_heartbeat", None))
+                # ── RC and motor helpers ──────────────────────────────────────────
+                # state.rc_channels and state.motor_values are typed lists exposed
+                # by the pybind11 property_readonly lambdas in the bindings.
+                rc_ch = list(state.rc_channels)
+                rc_n  = int(state.rc_channel_count)
+                mot   = list(state.motor_values)   # always MAX_MOTORS (8) elements
 
-                gps_data = {
-                    "gps_fix_type":         getattr(gps, "fix_type",         0),
-                    "gps_num_sat":          getattr(gps, "num_sat",           0),
-                    "gps_hdop":             gps_hdop_real,
-                    "gps_latitude":         getattr(gps, "latitude",          0.0),
-                    "gps_longitude":        getattr(gps, "longitude",         0.0),
-                    "gps_altitude_m":       float(getattr(gps, "altitude_m",  0)),
-                    "gps_ground_speed_cms": getattr(gps, "ground_speed_cms",  0),
-                    "gps_ground_course":    getattr(gps, "ground_course",     0),
-                    "gps_dist_to_home_m":   float(getattr(gps, "dist_to_home_m", 0)),
-                    "gps_bearing_to_home":  getattr(gps, "bearing_to_home",  0),
-                    "gps_heartbeat":        heartbeat,
-                    "gps_raw_valid":        getattr(gps, "raw_valid",         False),
-                    "gps_comp_valid":       getattr(gps, "comp_valid",        False),
-                    "gps_position_usable":  getattr(gps, "position_usable",   False),
-                    "gps_sv_list":          sv_list,
-                    "gps_sv_info_valid":    sv_info_valid,
-                    "gps_sv_source":        sv_source,
+                def _rc(i):
+                    return int(rc_ch[i]) if rc_n > i else 0
+
+                def _mot(i):
+                    return int(mot[i]) if len(mot) > i else 0
+
+                # rc_link_quality: ELRS/CRSF always reports rssi=0 via MSP_ANALOG.
+                # Emit -1 so FCStatusWidget and ArmingWidget switch to the
+                # channel-count path rather than displaying "0% quality".
+                _rssi = int(state.rssi)
+                rc_link_quality = -1 if _rssi == 0 else int(_rssi * 100 / 255)
+
+                # battery_state is a BatteryState pybind11 enum value.
+                # .name returns the Python-side string ("OK", "WARNING", etc.)
+                # which matches what FCStatusWidget expects after .upper().
+                try:
+                    bat_state_str = state.battery_state.name
+                except Exception:
+                    bat_state_str = "INIT"
+
+                # ── Assemble full telemetry dict ──────────────────────────────────
+                ui_data = {
+                    # ── IMU ───────────────────────────────────────────────────────
+                    "ax": state.ax, "ay": state.ay, "az": state.az,
+                    "gx": state.gx, "gy": state.gy, "gz": state.gz,
+                    "roll":  state.roll  / 10.0,
+                    "pitch": state.pitch / 10.0,
+                    "yaw":   trimmed_yaw,
+
+                    # ── Battery ───────────────────────────────────────────────────
+                    # FIX: was keyed as "voltage" — FCStatusWidget and ArmingWidget
+                    # both read "battery_voltage". The old key caused VBAT to show
+                    # "— V" and the battery check to report "NO VOLTAGE" even with
+                    # a fully charged 4S pack connected.
+                    "battery_voltage":      state.battery_voltage,
+                    "battery_current":      state.battery_current,
+                    "battery_mah_drawn":    state.battery_mah_drawn,
+                    "battery_cell_count":   state.battery_cell_count,
+                    "battery_capacity_mah": state.battery_capacity_mah,
+                    "battery_percentage":   state.battery_percentage,
+                    # FIX: BatteryState enum → string. FCStatusWidget calls
+                    # .upper() on this value and looks it up in _BAT_STATE_COLORS.
+                    "battery_state":        bat_state_str,
+
+                    # ── Motors ────────────────────────────────────────────────────
+                    # FIX: was entirely absent. FCStatusWidget reads motor_N_us
+                    # individual keys; ArmingWidget._check_motors() does too.
+                    # Without these, motors always showed "—" and ArmingWidget
+                    # reported "NO MOTOR DATA" even with ESCs connected.
+                    "motor_1_us": _mot(0),
+                    "motor_2_us": _mot(1),
+                    "motor_3_us": _mot(2),
+                    "motor_4_us": _mot(3),
+                    "motor_5_us": _mot(4),
+                    "motor_6_us": _mot(5),
+                    "motor_7_us": _mot(6),
+                    "motor_8_us": _mot(7),
+                    "motor_count": int(state.motor_count),
+
+                    # ── RC channels ───────────────────────────────────────────────
+                    # FIX: was entirely absent. FCStatusWidget reads the individual
+                    # rc_* keys to drive the channel bars. ArmingWidget._check_rc_link()
+                    # reads rc_channel_count to distinguish "no UART" from "TX off".
+                    # Without these, ArmingWidget always reported
+                    # "NO CH — UART SERIAL RX NOT ENABLED" regardless of link state.
+                    "rc_channel_count": rc_n,
+                    "rc_roll":          _rc(0),
+                    "rc_pitch":         _rc(1),
+                    "rc_throttle":      _rc(2),
+                    "rc_yaw":           _rc(3),
+                    "rc_arm":           _rc(4),
+                    "rc_aux1":          _rc(5),
+                    "rc_aux2":          _rc(6),
+                    "rc_aux3":          _rc(7),
+
+                    # ── RC link quality ───────────────────────────────────────────
+                    # FIX: was entirely absent. Both widgets read "rc_link_quality".
+                    # -1 tells them RSSI is unavailable (ELRS/CRSF normal) and to
+                    # use the channel-count path instead.
+                    "rc_link_quality": rc_link_quality,
+
+                    # ── Misc telemetry ────────────────────────────────────────────
+                    "rssi":        _rssi,
+                    "rtt_ms":      state.last_rtt_ms,
+                    "fc_cycle_ms": state.fc_cycle_ms,
+
+                    # ── Baro ──────────────────────────────────────────────────────
+                    "baro_altitude_cm":      getattr(state, "baro_altitude_cm",      0),
+                    "baro_vario_cm_per_sec": getattr(state, "baro_vario_cm_per_sec", 0),
+                    "baro_valid":            getattr(state, "baro_valid",             False),
+
+                    # ── Magnetometer ──────────────────────────────────────────────
+                    "mag_x":                     getattr(state, "mag_x",             0),
+                    "mag_y":                     getattr(state, "mag_y",             0),
+                    "mag_z":                     getattr(state, "mag_z",             0),
+                    "mag_heading_deg":           mag_hdg,
+                    "mag_valid":                 mag_valid,
+                    "mag_cal_active":            getattr(state, "mag_cal_active",            False),
+                    "mag_cal_seconds_remaining": getattr(state, "mag_cal_seconds_remaining", 0),
+                    "acc_cal_active":            getattr(state, "acc_cal_active",            False),
+                    "acc_cal_seconds_remaining": getattr(state, "acc_cal_seconds_remaining", 0),
+
+                    # ── FC status ─────────────────────────────────────────────────
+                    "armed":             getattr(state, "armed",             False),
+                    "flight_mode_flags": getattr(state, "flight_mode_flags", 0),
+                    "flight_mode_name":  getattr(state, "flight_mode_name",  "ACRO [DISARMED]"),
+                    "sensor_status":     getattr(state, "sensor_status",     0),
+                    # Individual sensor booleans decoded from the bitmask so
+                    # widgets don't need to know the bit positions.
+                    "sensor_acc_present":         bool(getattr(state, "sensor_status", 0) & (1 << 0)),
+                    "sensor_baro_present":        bool(getattr(state, "sensor_status", 0) & (1 << 1)),
+                    "sensor_mag_present":         bool(getattr(state, "sensor_status", 0) & (1 << 2)),
+                    "sensor_gps_present":         bool(getattr(state, "sensor_status", 0) & (1 << 3)),
+                    "sensor_rangefinder_present": bool(getattr(state, "sensor_status", 0) & (1 << 4)),
+                    "sensor_gyro_present":        bool(getattr(state, "sensor_status", 0) & (1 << 5)),
+                    "i2c_error_count":  getattr(state, "i2c_error_count",  0),
+                    "cpu_load_percent": getattr(state, "cpu_load_percent", 0),
+                    "pid_profile":      getattr(state, "pid_profile",      0),
+
+                    # ── Arming diagnostics ────────────────────────────────────────
+                    "arming_disable_flags": getattr(state, "arming_disable_flags", 0),
+                    "arming_disable_str":   getattr(state, "arming_disable_str",   ""),
+
+                    # ── GPS ───────────────────────────────────────────────────────
+                    **gps_data,
                 }
-            else:
-                gps_data = {
-                    "gps_fix_type": 0, "gps_num_sat": 0, "gps_hdop": 99.0,
-                    "gps_latitude": 0.0, "gps_longitude": 0.0,
-                    "gps_altitude_m": 0.0, "gps_ground_speed_cms": 0,
-                    "gps_ground_course": 0, "gps_dist_to_home_m": 0.0,
-                    "gps_bearing_to_home": 0, "gps_heartbeat": None,
-                    "gps_raw_valid": False, "gps_comp_valid": False,
-                    "gps_position_usable": False,
-                    "gps_sv_list": [], "gps_sv_info_valid": False,
-                    "gps_sv_source": "",
-                }
 
-            # ── Assemble full telemetry dict ──────────────────────────────────
-            ui_data = {
-                "ax": state.ax, "ay": state.ay, "az": state.az,
-                "gx": state.gx, "gy": state.gy, "gz": state.gz,
-                "roll":  state.roll  / 10.0,
-                "pitch": state.pitch / 10.0,
-                "yaw":   trimmed_yaw,
-                "voltage":          state.battery_voltage,
-                "rssi":             state.rssi,
-                "rtt_ms":           state.last_rtt_ms,
-                "fc_cycle_ms":      state.fc_cycle_ms,
-                "baro_altitude_cm":      getattr(state, "baro_altitude_cm",      0),
-                "baro_vario_cm_per_sec": getattr(state, "baro_vario_cm_per_sec", 0),
-                "baro_valid":            getattr(state, "baro_valid",             False),
-                "mag_x":                     getattr(state, "mag_x",             0),
-                "mag_y":                     getattr(state, "mag_y",             0),
-                "mag_z":                     getattr(state, "mag_z",             0),
-                "mag_heading_deg":           mag_hdg,
-                "mag_valid":                 mag_valid,
-                "mag_cal_active":            getattr(state, "mag_cal_active",            False),
-                "mag_cal_seconds_remaining": getattr(state, "mag_cal_seconds_remaining", 0),
-                "acc_cal_active":            getattr(state, "acc_cal_active",            False),
-                "acc_cal_seconds_remaining": getattr(state, "acc_cal_seconds_remaining", 0),
-                "armed":                  getattr(state, "armed",             False),
-                "flight_mode_flags":      getattr(state, "flight_mode_flags", 0),
-                "flight_mode_name":       getattr(state, "flight_mode_name",  "ACRO [DISARMED]"),
-                "sensor_status":          getattr(state, "sensor_status",     0),
-                "sensor_acc_present":     bool(getattr(state, "sensor_status", 0) & (1 << 0)),
-                "sensor_baro_present":    bool(getattr(state, "sensor_status", 0) & (1 << 1)),
-                "sensor_mag_present":     bool(getattr(state, "sensor_status", 0) & (1 << 2)),
-                "sensor_gps_present":     bool(getattr(state, "sensor_status", 0) & (1 << 3)),
-                "sensor_rangefinder_present": bool(getattr(state, "sensor_status", 0) & (1 << 4)),
-                "sensor_gyro_present":    bool(getattr(state, "sensor_status", 0) & (1 << 5)),
-                "i2c_error_count":        getattr(state, "i2c_error_count",   0),
-                "cpu_load_percent":       getattr(state, "cpu_load_percent",  0),
-                "pid_profile":            getattr(state, "pid_profile",       0),
-                "arming_disable_flags":   getattr(state, "arming_disable_flags", 0),
-                "arming_disable_str":     getattr(state, "arming_disable_str",   ""),
-                **gps_data,
-            }
+                # ── Feed widgets ──────────────────────────────────────────────────
+                self.imu_view.update_ui(ui_data)
+                self.baro_view.update_baro(ui_data)
+                self.drone_3d.update_orientation(
+                    roll=ui_data["roll"],
+                    pitch=ui_data["pitch"],
+                    yaw=ui_data["yaw"],
+                    mag_heading=ui_data["mag_heading_deg"],
+                    mag_valid=ui_data["mag_valid"],
+                )
+                self.mag_view.update_mag(ui_data)
+                self.gps_view.update_gps(ui_data)
+                self.fc_status_view.update_fc_status(ui_data)
+                self.arming_view.update_arming(ui_data)
 
-            self.imu_view.update_ui(ui_data)
-            self.baro_view.update_baro(ui_data)
-            self.drone_3d.update_orientation(
-                roll=ui_data["roll"], pitch=ui_data["pitch"],
-                yaw=ui_data["yaw"],
-                mag_heading=ui_data["mag_heading_deg"],
-                mag_valid=ui_data["mag_valid"],
-            )
-            self.mag_view.update_mag(ui_data)
-            self.gps_view.update_gps(ui_data)
-            self.fc_status_view.update_fc_status(ui_data)
-            self.arming_view.update_arming(ui_data)
+            except Exception as e:
+                print(f"[update_loop] {e}")
+                self._reconnect()
+                return
 
-        except Exception as e:
-            print(f"[update_loop] {e}")
-            self._reconnect()
-            return
-
-        self._update_job = self.root.after(UI_REFRESH_MS, self._update_loop)
+            self._update_job = self.root.after(UI_REFRESH_MS, self._update_loop)
 
     # =========================================================================
     # Clean shutdown
