@@ -3,52 +3,52 @@
   "locked": false,
   "panels": {
     "imu": {
-      "x": 10,
+      "x": 0,
       "y": 10,
       "w": 460,
-      "h": 260,
-      "visible": false
+      "h": 282,
+      "visible": true
     },
     "mag": {
-      "x": 10,
-      "y": 280,
-      "w": 460,
+      "x": 5,
+      "y": 538,
+      "w": 384,
       "h": 210,
-      "visible": false
+      "visible": true
     },
     "adi": {
-      "x": 480,
-      "y": 10,
+      "x": 1068,
+      "y": 318,
       "w": 450,
       "h": 430,
-      "visible": false
+      "visible": true
     },
     "baro": {
-      "x": 940,
-      "y": 10,
-      "w": 220,
+      "x": 910,
+      "y": 321,
+      "w": 164,
       "h": 430,
-      "visible": false
+      "visible": true
     },
     "gps": {
-      "x": 1033,
+      "x": 395,
       "y": 10,
-      "w": 416,
-      "h": 583,
+      "w": 516,
+      "h": 729,
       "visible": true
     },
     "fc_status": {
-      "x": 15,
+      "x": 360,
       "y": 10,
-      "w": 384,
-      "h": 671,
+      "w": 492,
+      "h": 559,
       "visible": true
     },
     "arming": {
-      "x": 405,
-      "y": 38,
+      "x": 910,
+      "y": 10,
       "w": 615,
-      "h": 586,
+      "h": 295,
       "visible": true
     }
   }

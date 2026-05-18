@@ -9,29 +9,30 @@ SECTION A — AUTOMATIC CHECKS  (telemetry-driven, updates every tick)
 
 SECTION B — PILOT SIGN-OFF  (manual checkboxes, pilot ticks before each flight)
 
-BANNER  (bottom, always visible)
+BANNER  (bottom, always visible — pinned outside scroll area)
   Grey   "WAITING FOR DATA…"       — no telemetry yet
   Red    "BLOCKED — FIX AUTO CHECKS" — one or more auto checks failing
   Orange "COMPLETE SIGN-OFF ITEMS"  — auto OK, manual items remain
   Green  "✔  READY TO ARM"         — everything passed
 
-FIXES vs previous version:
-  1. Responsive layout: single-column below 500 px (was 420 px but
-     the detail labels caused overflow long before that threshold).
-     Labels now truncate with ellipsis at their measured width so
-     nothing is clipped by the window edge.
-  2. _layout_auto_cols now rebuilds on every resize tick when width
-     crosses the breakpoint — previously the guard compared against
-     the old column count but the inner frame hadn't been measured
-     yet on first paint, so n never changed from 1.
-  3. GPS_NOT_READY arming flag is now classified as a "waiting" flag
-     (orange, not red) rather than a hard error — it clears once GPS
-     acquires a fix and is expected at power-on.  CPU_OVERLOAD is
-     promoted to a hard error with an explanatory note.
-  4. Detail label text is now clipped to the available column width
-     using a character-count estimate so long strings never overflow.
+LAYOUT / SCROLL FIXES (this version):
+  1. Header and READY-TO-ARM banner are pinned outside the scroll area so
+     they are always visible regardless of window height.
+  2. All checklist content (sections A + B) lives inside a Canvas-backed
+     scrollable frame. Vertical shrinking of the window never hides items —
+     a scrollbar appears automatically.
+  3. Mousewheel scrolling works on all child widgets inside the scroll area
+     (bound recursively after build).
+  4. Responsive column layout (1-col / 2-col) is now driven by the Canvas
+     <Configure> event so the column count uses the actual content width,
+     not the outer-frame width (avoids a 1-pixel-off edge case with the
+     scrollbar visible).
+  5. Detail-label wraplength updates whenever the canvas is resized.
 
-Telemetry keys consumed: (unchanged — see original header)
+LOGIC FIXES (carried from previous version):
+  • only_transient detection in update_arming() uses set-intersection test.
+  • GPS_NOT_READY is orange (transient); CPU_OVERLOAD is red (hard error).
+  • ARM channel highlight threshold is 1800 µs to match BF Modes default.
 """
 
 import tkinter as tk
@@ -92,12 +93,11 @@ _ARMING_BITS = [
 _TRANSIENT_FLAGS = {
     1 << 9:  "BOOT GRACE",    # clears ~30 s after power-on
     1 << 12: "CALIBRATING",   # clears when IMU cal finishes (~5 s)
-    # FIX: GPS_NOT_READY is transient — it clears once GPS acquires a fix.
-    # Previously this was treated as a hard error (red) which confused pilots
-    # who had GPS hardware present but not yet locked. Now shown orange with
-    # a "waiting for fix" note so the intent is clear.
-    1 << 18: "GPS NOT READY",  # clears once GPS has a 3D fix
+    1 << 18: "GPS NOT READY", # clears once GPS has a 3D fix
 }
+
+# Pre-built set of transient flag names for fast membership tests.
+_TRANSIENT_NAMES: frozenset = frozenset(_TRANSIENT_FLAGS.values())
 
 # Flags that are hard errors with additional explanatory context.
 _FLAG_HINTS = {
@@ -119,23 +119,20 @@ def _check_arm_flags(data):
     Evaluate MSP_STATUS_EX arming-disable bitmask.
 
     Three tiers:
-      • flags == 0          → ALL CLEAR (green)
-      • only transient set  → WAITING   (orange, self-clearing)
-      • any real flag set   → BLOCKED   (red, needs action)
-
-    CPU_OVERLOAD and GPS_NOT_READY get specific hint text so the pilot
-    immediately knows what to do.
+      • flags == 0                      → ALL CLEAR (green)
+      • only transient flags set        → WAITING   (orange, self-clearing)
+      • any non-transient flag set      → BLOCKED   (red, needs action)
     """
     flags = int(data.get("arming_disable_flags", 0))
     if flags == 0:
         return True, "ALL FLAGS CLEAR"
 
-    active    = [name for bit, name in _ARMING_BITS if flags & bit]
-    transient = {name for bit, name in _TRANSIENT_FLAGS.items() if flags & bit}
-    real      = [name for name in active if name not in transient]
+    active     = [name for bit, name in _ARMING_BITS if flags & bit]
+    active_set = set(active)
+    transient  = active_set & _TRANSIENT_NAMES
+    real       = [n for n in active if n not in _TRANSIENT_NAMES]
 
     if real:
-        # Build a compact detail string with hints for the first flag
         parts = []
         for name in real[:2]:
             hint = _FLAG_HINTS.get(name, "")
@@ -267,9 +264,6 @@ _MANUAL_ITEMS = [
 ]
 
 # ── Layout breakpoint ─────────────────────────────────────────────────────────
-# Below this pixel width the auto-checks switch to a single column so that
-# the detail labels (which can be ~40 chars) never overflow the window edge.
-# FIX: raised from 420 → 560 to account for the actual label widths.
 _TWO_COL_MIN_WIDTH = 560
 
 
@@ -277,22 +271,22 @@ class ArmingWidget(tk.Frame):
 
     def __init__(self, parent, **kwargs):
         super().__init__(parent, bg=_BG, **kwargs)
-        self._auto_state:   dict[str, bool]          = {}
-        self._auto_rows:    dict[str, tuple]          = {}
-        self._manual_vars:  dict[str, tk.BooleanVar]  = {}
-        self._manual_lbls:  dict[str, tk.Label]       = {}
-        self._cb_widgets:   dict[str, tuple]          = {}
-        self._has_data     = False
-        self._n_auto_cols  = 0          # 0 = not yet laid out
-        self._last_width   = 0
+        self._auto_state:   dict = {}
+        self._auto_rows:    dict = {}
+        self._manual_vars:  dict = {}
+        self._manual_lbls:  dict = {}
+        self._cb_widgets:   dict = {}
+        self._has_data          = False
+        self._n_auto_cols       = 0
+        self._last_canvas_w     = 0
         self._build_ui()
-        self.bind("<Configure>", self._on_resize)
 
     # =========================================================================
     # Build
     # =========================================================================
 
     def _build_ui(self):
+        # ── Fixed header (always visible) ────────────────────────────────────
         hdr = tk.Frame(self, bg=_BG2,
                        highlightthickness=1, highlightbackground=_BORDER)
         hdr.pack(fill="x", padx=6, pady=(6, 3))
@@ -303,24 +297,61 @@ class ArmingWidget(tk.Frame):
                                     bg=_BG2, fg=_ORANGE, font=_F_COUNTER)
         self._count_lbl.pack(side="right", padx=8, pady=5)
 
+        # ── Fixed banner (always visible — pinned to bottom) ─────────────────
+        self._banner_frame = tk.Frame(self, bg=_BG,
+                                       highlightthickness=1,
+                                       highlightbackground=_BORDER)
+        self._banner_frame.pack(side="bottom", fill="x", padx=6, pady=(2, 6))
+        self._banner_lbl = tk.Label(
+            self._banner_frame, text="WAITING FOR DATA…",
+            bg=_BG, fg=_ORANGE, font=_F_BANNER)
+        self._banner_lbl.pack(pady=8)
+
+        # ── Scrollable content area ───────────────────────────────────────────
+        # Canvas + Scrollbar sit in a plain container frame so that the
+        # scrollbar stays flush with the canvas edge.
+        sc_container = tk.Frame(self, bg=_BG)
+        sc_container.pack(fill="both", expand=True)
+
+        self._scroll_canvas = tk.Canvas(sc_container, bg=_BG,
+                                         highlightthickness=0, bd=0)
+        self._vscroll = tk.Scrollbar(sc_container, orient="vertical",
+                                      command=self._scroll_canvas.yview)
+        self._scroll_canvas.configure(yscrollcommand=self._vscroll.set)
+
+        self._vscroll.pack(side="right", fill="y")
+        self._scroll_canvas.pack(side="left", fill="both", expand=True)
+
+        # Inner frame is the real container for all checklist widgets.
+        self._scroll_inner = tk.Frame(self._scroll_canvas, bg=_BG)
+        self._canvas_win = self._scroll_canvas.create_window(
+            (0, 0), window=self._scroll_inner, anchor="nw")
+
+        # Keep inner frame width == canvas width and scroll region updated.
+        self._scroll_inner.bind("<Configure>", self._on_inner_configure)
+        self._scroll_canvas.bind("<Configure>", self._on_canvas_configure)
+
+        # Propagate mousewheel events from all children up to the canvas.
+        self._bind_mw(self._scroll_canvas)
+        self._bind_mw(self._scroll_inner)
+
+        # ── Section A ─────────────────────────────────────────────────────────
         self._build_section_hdr("A  AUTOMATIC CHECKS  (telemetry)")
 
-        auto_outer = tk.Frame(self, bg=_BG2,
+        auto_outer = tk.Frame(self._scroll_inner, bg=_BG2,
                               highlightthickness=1, highlightbackground=_BORDER)
         auto_outer.pack(fill="x", padx=6, pady=(0, 4))
 
         self._auto_inner = tk.Frame(auto_outer, bg=_BG2)
         self._auto_inner.pack(fill="x", padx=4, pady=4)
 
-        self._auto_col_frames: list[tk.Frame] = []
-        # Initial layout happens on first <Configure> event; start with 1 col
-        # so rows exist immediately (avoids KeyError if update_arming is called
-        # before the widget has been displayed).
+        self._auto_col_frames: list = []
         self._layout_auto_cols(1)
 
+        # ── Section B ─────────────────────────────────────────────────────────
         self._build_section_hdr("B  PILOT SIGN-OFF  (manual)")
 
-        signoff = tk.Frame(self, bg=_BG3,
+        signoff = tk.Frame(self._scroll_inner, bg=_BG3,
                            highlightthickness=1, highlightbackground=_BORDER)
         signoff.pack(fill="x", padx=6, pady=(0, 4))
 
@@ -338,10 +369,6 @@ class ArmingWidget(tk.Frame):
                                         fill=_BG3, width=1)
             tick = cv.create_text(8, 8, text="", fill=_GREEN, font=_F_ITEM_B)
 
-            # FIX: wraplength=0 means the label will not wrap by default.
-            # We set a sensible max width and let pack handle clipping.
-            # The text itself is readable at any width ≥ 200 px because the
-            # checkbox is on the left and the label fills the remainder.
             lbl = tk.Label(row, text=item_text, bg=_BG3, fg=_LABEL_FG,
                            font=_F_ITEM, anchor="w", cursor="hand2",
                            wraplength=0)
@@ -358,32 +385,88 @@ class ArmingWidget(tk.Frame):
             cv.bind("<Button-1>", _toggle)
             lbl.bind("<Button-1>", _toggle)
 
+            # Scroll on all interactive child widgets inside the scroll area.
+            for w in (cv, lbl, row):
+                self._bind_mw(w)
+
         rst_row = tk.Frame(signoff, bg=_BG3)
         rst_row.pack(fill="x", padx=6, pady=(4, 6))
-        tk.Button(
+        rst_btn = tk.Button(
             rst_row, text="↺  RESET SIGN-OFF",
             bg=_BORDER, fg=_LABEL_FG, font=_F_RESET,
             activebackground=_DIM, activeforeground=_VALUE_FG,
             relief="flat", padx=8, pady=3,
             command=self.reset_checklist,
-        ).pack(side="right")
+        )
+        rst_btn.pack(side="right")
+        self._bind_mw(rst_row)
+        self._bind_mw(rst_btn)
 
-        self._banner_frame = tk.Frame(self, bg=_BG,
-                                       highlightthickness=1,
-                                       highlightbackground=_BORDER)
-        self._banner_frame.pack(fill="x", padx=6, pady=(2, 6))
-        self._banner_lbl = tk.Label(
-            self._banner_frame, text="WAITING FOR DATA…",
-            bg=_BG, fg=_ORANGE, font=_F_BANNER)
-        self._banner_lbl.pack(pady=8)
+    # =========================================================================
+    # Section header (inside scroll area)
+    # =========================================================================
 
     def _build_section_hdr(self, text):
-        f = tk.Frame(self, bg=_BG)
+        f = tk.Frame(self._scroll_inner, bg=_BG)
         f.pack(fill="x", padx=6, pady=(4, 1))
         tk.Label(f, text=text, bg=_BG, fg=_LABEL_FG,
                  font=_F_SECTION).pack(side="left")
         tk.Frame(f, bg=_BORDER, height=1).pack(
             side="left", fill="x", expand=True, padx=(6, 0), pady=4)
+        self._bind_mw(f)
+
+    # =========================================================================
+    # Mousewheel helpers
+    # =========================================================================
+
+    def _bind_mw(self, widget):
+        """Bind all three mousewheel events so scrolling works on every OS."""
+        widget.bind("<MouseWheel>", self._on_mousewheel, add="+")
+        widget.bind("<Button-4>",   self._on_mousewheel, add="+")  # Linux up
+        widget.bind("<Button-5>",   self._on_mousewheel, add="+")  # Linux down
+
+    def _on_mousewheel(self, event):
+        if event.num == 4:
+            self._scroll_canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self._scroll_canvas.yview_scroll(1, "units")
+        else:
+            self._scroll_canvas.yview_scroll(
+                int(-1 * (event.delta / 120)), "units")
+
+    # =========================================================================
+    # Canvas / scroll helpers
+    # =========================================================================
+
+    def _on_inner_configure(self, _event):
+        """Keep scroll region in sync when the inner frame changes size."""
+        self._scroll_canvas.configure(
+            scrollregion=self._scroll_canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        """
+        Called when the Canvas is resized.
+        1. Stretch the inner frame to fill the canvas width.
+        2. Rebuild the auto-check column layout if we crossed the breakpoint.
+        3. Update detail-label wraplengths.
+        """
+        cw = event.width
+        # Make the inner frame fill the full canvas width.
+        self._scroll_canvas.itemconfig(self._canvas_win, width=cw)
+
+        if cw == self._last_canvas_w:
+            return
+        self._last_canvas_w = cw
+
+        n = 2 if cw >= _TWO_COL_MIN_WIDTH else 1
+        if n != self._n_auto_cols:
+            self._layout_auto_cols(n)
+
+        # Clamp detail text to the available column width so it wraps
+        # gracefully instead of being clipped by the column boundary.
+        usable = max(80, (cw // n) - 130)
+        for _chk_id, (_rf, _cv, _dot, _name_lbl, detail_lbl) in self._auto_rows.items():
+            detail_lbl.config(wraplength=usable)
 
     # =========================================================================
     # Checkbox helper
@@ -404,26 +487,10 @@ class ArmingWidget(tk.Frame):
     # Responsive auto-check column layout
     # =========================================================================
 
-    def _on_resize(self, event):
-        w = event.width
-        # Debounce: only re-layout when the width actually crosses the breakpoint
-        # or on first paint (self._last_width == 0).
-        if w == self._last_width and self._n_auto_cols != 0:
-            return
-        self._last_width = w
-        n = 2 if w >= _TWO_COL_MIN_WIDTH else 1
-        if n != self._n_auto_cols:
-            self._layout_auto_cols(n)
-
-        # Update detail label wraplength to half (2-col) or full (1-col) width
-        # minus a fixed margin for the dot + name label (~120 px).
-        # This prevents long detail strings from overflowing the column.
-        usable = max(80, (w // n) - 130)
-        for _chk_id, (_rf, _cv, _dot, _name_lbl, detail_lbl) in self._auto_rows.items():
-            detail_lbl.config(wraplength=usable)
-
     def _layout_auto_cols(self, n: int):
         self._n_auto_cols = n
+
+        # Destroy existing column frames and their canvas dot refs.
         for cf in self._auto_col_frames:
             cf.destroy()
         self._auto_col_frames = []
@@ -437,6 +504,7 @@ class ArmingWidget(tk.Frame):
             cf.grid(row=0, column=i, sticky="nw", padx=(0, 12))
             self._auto_inner.columnconfigure(i, weight=1)
             self._auto_col_frames.append(cf)
+            self._bind_mw(cf)
 
         for idx, (chk_id, label, _fn) in enumerate(_AUTO_CHECKS):
             col_i     = min(idx // rows_per_col, n - 1)
@@ -446,24 +514,28 @@ class ArmingWidget(tk.Frame):
             rf = tk.Frame(col_frame, bg=_BG2)
             rf.grid(row=row_i, column=0, sticky="ew", pady=2, padx=2)
             col_frame.columnconfigure(0, weight=1)
+            self._bind_mw(rf)
 
             cv = tk.Canvas(rf, width=10, height=10,
                            bg=_BG2, highlightthickness=0)
             cv.pack(side="left", padx=(2, 3))
             dot = cv.create_oval(1, 1, 9, 9, fill=_DIM_FG, outline="")
+            self._bind_mw(cv)
 
             name_lbl = tk.Label(rf, text=label, bg=_BG2, fg=_DIM_FG,
                                  font=_F_ITEM_B, anchor="w")
             name_lbl.pack(side="left", padx=(0, 4))
+            self._bind_mw(name_lbl)
 
             detail_lbl = tk.Label(rf, text="WAITING…", bg=_BG2,
                                    fg=_LABEL_FG, font=_F_DETAIL, anchor="w",
                                    wraplength=200, justify="left")
             detail_lbl.pack(side="left", fill="x", expand=True)
+            self._bind_mw(detail_lbl)
 
             self._auto_rows[chk_id] = (rf, cv, dot, name_lbl, detail_lbl)
 
-            # Restore state if we're rebuilding after a resize
+            # Restore state if the widget was rebuilt after a resize.
             if chk_id in self._auto_state:
                 passed = self._auto_state[chk_id]
                 col    = _GREEN if passed else _RED
@@ -481,8 +553,8 @@ class ArmingWidget(tk.Frame):
             self._banner_frame.config(highlightbackground=_BORDER)
             return
 
-        auto_ok  = all(self._auto_state.get(cid, False)
-                       for cid, _, _ in _AUTO_CHECKS)
+        auto_ok = all(self._auto_state.get(cid, False)
+                      for cid, _, _ in _AUTO_CHECKS)
 
         n_auto_bad   = sum(1 for cid, _, _ in _AUTO_CHECKS
                            if not self._auto_state.get(cid, False))
@@ -518,23 +590,21 @@ class ArmingWidget(tk.Frame):
             self._auto_state[chk_id] = passed
 
             if chk_id not in self._auto_rows:
-                continue  # layout not yet built
+                continue
 
             rf, cv, dot, name_lbl, detail_lbl = self._auto_rows[chk_id]
 
-            # FIX: GPS_NOT_READY and other transient-only failures use orange
-            # instead of red so the pilot can distinguish "waiting" from "broken".
-            flags = int(data.get("arming_disable_flags", 0) if chk_id == "arm_flags" else 0)
-            only_transient = (
-                chk_id == "arm_flags"
-                and not passed
-                and all(
-                    (flags & bit) == 0
-                    for bit, name in _ARMING_BITS
-                    if name not in {n for _, n in _TRANSIENT_FLAGS.items()}
-                    and (flags & bit)
-                )
-            )
+            # ── only_transient detection ──────────────────────────────────────
+            # Build the set of active flag names, then test whether that set
+            # is non-empty AND every member is a known transient name.
+            # This avoids the previous inverted-generator bug where all()
+            # was vacuously True for empty filtered sequences.
+            if chk_id == "arm_flags" and not passed:
+                flags        = int(data.get("arming_disable_flags", 0))
+                active_names = {name for bit, name in _ARMING_BITS if flags & bit}
+                only_transient = bool(active_names) and active_names.issubset(_TRANSIENT_NAMES)
+            else:
+                only_transient = False
 
             if passed:
                 cv.itemconfig(dot, fill=_GREEN)
