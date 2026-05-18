@@ -3,43 +3,23 @@ FCStatusWidget.py  —  Flight Controller Status Panel
 =====================================================
 Priority-based responsive layout — critical info always visible.
 
+FIXES vs previous version:
+  1. ARM channel highlight threshold corrected from 1700 → 1800.
+     The previous value matched no real arm configuration and caused
+     the ARM bar/dot to go green at 1775 (ELRS failsafe value) before
+     Betaflight would actually arm.  Now matches the BF Modes tab
+     minimum (1800–2100).  Defined as a single constant ARM_THRESHOLD
+     so it never diverges between bar mode and dot mode.
+  2. FCStatusWidget now exports ARM_THRESHOLD so external code
+     (e.g. the probe script) can import a single authoritative value.
+
 PRIORITY TIERS:
   P1 (always visible): ARM state, flight mode, battery voltage/cell V/state,
                         voltage bar, flight timer + warnings
   P2 (always visible): secondary battery stats, sensors
   P3 (collapses on narrow): CPU/metrics, motors, RC channels
 
-Responsive width behaviour:
-  ≥ 300 px  →  motors / RC as vertical bars with µs values
-  < 300 px  →  motors / RC as coloured LED dots only (no bars)
-
-Flight timer (always visible):
-  • Counts up from arm event (elapsed flight time).
-  • Pilot sets planned duration via the spinbox (default 10 min).
-  • Remaining < 2 min  →  orange CAUTION banner.
-  • Remaining < 30 s   →  flashing red WARNING banner.
-  • Time expired       →  steady red ENDURANCE EXCEEDED.
-  set_planned_duration(minutes)  also callable programmatically.
-
 Feed via  update_fc_status(data_dict)  every UI tick (~20 ms).
-
-Expected data keys:
-  armed                   bool
-  flight_mode_name        str
-  battery_voltage         float  V
-  battery_current         float  A
-  battery_mah_drawn       float  mAh
-  battery_cell_count      int    0 = auto-detect
-  battery_percentage      int    0-100 or -1
-  battery_state           str    "OK"|"WARNING"|"CRITICAL"|"NOT_PRESENT"|"INIT"
-  cpu_load_percent        int    0-100
-  fc_cycle_ms             float  ms
-  i2c_error_count         int
-  pid_profile             int    0-based
-  sensor_{acc,baro,mag,gps,rangefinder,gyro}_present  bool
-  motor_1_us … motor_4_us int    1000-2000
-  rc_roll/pitch/throttle/yaw/arm  int  1000-2000
-  rc_link_quality         int    0-100  (-1 = RSSI N/A)
 """
 
 import tkinter as tk
@@ -70,6 +50,11 @@ _F_VOLT   = ("Consolas", 18, "bold")
 _F_TIMER  = ("Consolas", 13, "bold")
 _F_WARN   = ("Consolas", 10, "bold")
 
+# FIX: single authoritative ARM channel threshold.
+# Must match the minimum value of the ARM range configured in BF Modes tab.
+# Default BF ARM range is 1800–2100; change this if you move the left handle.
+ARM_THRESHOLD = 1800
+
 _SENSORS = [
     ("ACC",  "sensor_acc_present"),
     ("BARO", "sensor_baro_present"),
@@ -93,18 +78,13 @@ _CELL_CRIT = 3.40
 _CELL_WARN = 3.65
 _CELL_FULL = 4.20
 
-# FIX: complete battery-state → (fg, bg) colour map.
-# Previously only OK/WARNING/CRITICAL/UNKNOWN were listed.
-# "INIT" (BF default before detection) and "NOT_PRESENT" both fell through
-# to the dict's default, rendering as dim UNKNOWN text even when the key
-# was correctly set.  Now all five BatteryState strings are mapped.
 _BAT_STATE_COLORS = {
     "OK":          (_GREEN,   _BG3),
     "WARNING":     (_ORANGE,  _BG3),
     "CRITICAL":    (_RED,     _BG3),
     "NOT_PRESENT": (_DIM_FG,  _BORDER),
     "INIT":        (_DIM_FG,  _BORDER),
-    "UNKNOWN":     (_DIM_FG,  _BORDER),   # fallback label
+    "UNKNOWN":     (_DIM_FG,  _BORDER),
 }
 
 
@@ -125,7 +105,7 @@ class FCStatusWidget(tk.Frame):
     def __init__(self, parent, **kwargs):
         super().__init__(parent, bg=_BG, **kwargs)
         self._last_data: dict  = {}
-        self._planned_sec: int = 600        # default 10 min
+        self._planned_sec: int = 600
         self._arm_start: float = 0.0
         self._was_armed: bool  = False
         self._flash_on: bool   = False
@@ -141,7 +121,6 @@ class FCStatusWidget(tk.Frame):
     # =========================================================================
 
     def set_planned_duration(self, minutes: float):
-        """Set planned flight duration in minutes (0 = no limit)."""
         self._planned_sec = int(minutes * 60)
         try:
             self._plan_spin.delete(0, "end")
@@ -154,7 +133,7 @@ class FCStatusWidget(tk.Frame):
     # =========================================================================
 
     def _build_ui(self):
-        # ── P1a: ARM state + flight mode  (always visible) ────────────────────
+        # ── P1a: ARM state + flight mode ──────────────────────────────────────
         p1 = tk.Frame(self, bg=_BG2,
                       highlightthickness=1, highlightbackground=_BORDER)
         p1.pack(fill="x", padx=6, pady=(6, 2))
@@ -182,7 +161,7 @@ class FCStatusWidget(tk.Frame):
                                    fg=_ORANGE, font=_F_MODE)
         self._mode_lbl.pack(anchor="w")
 
-        # ── P1b: Battery critical strip  (always visible) ─────────────────────
+        # ── P1b: Battery critical strip ───────────────────────────────────────
         bs = tk.Frame(self, bg=_BG3,
                       highlightthickness=1, highlightbackground=_BORDER)
         bs.pack(fill="x", padx=6, pady=(0, 2))
@@ -230,7 +209,7 @@ class FCStatusWidget(tk.Frame):
         self._vbat_outer.bind(
             "<Configure>", lambda e: self.after_idle(self._redraw_vbat))
 
-        # ── P1c: Flight timer  (always visible) ───────────────────────────────
+        # ── P1c: Flight timer ─────────────────────────────────────────────────
         tf = tk.Frame(self, bg=_BG2,
                       highlightthickness=1, highlightbackground=_BORDER)
         tf.pack(fill="x", padx=6, pady=(0, 2))
@@ -272,7 +251,6 @@ class FCStatusWidget(tk.Frame):
         self._plan_spin.bind("<Return>",   lambda e: self._on_plan_change())
         self._plan_spin.bind("<FocusOut>", lambda e: self._on_plan_change())
 
-        # Timer warning banner (hidden until needed)
         self._twarn_outer = tk.Frame(self, bg=_BG,
                                       highlightthickness=1,
                                       highlightbackground=_BG)
@@ -280,7 +258,7 @@ class FCStatusWidget(tk.Frame):
                                     bg=_BG, fg=_ORANGE, font=_F_WARN)
         self._twarn_lbl.pack(pady=3)
 
-        # ── P2: Battery detail + sensors  (always visible) ────────────────────
+        # ── P2: Battery detail + sensors ──────────────────────────────────────
         _sep(self)
         _sec_hdr(self, "BATTERY DETAIL")
         bat_det = tk.Frame(self, bg=_BG)
@@ -542,7 +520,7 @@ class FCStatusWidget(tk.Frame):
         return _RED if cv < _CELL_CRIT else _ORANGE if cv < _CELL_WARN else _GREEN
 
     # =========================================================================
-    # Flight timer  (runs every 500 ms independently)
+    # Flight timer
     # =========================================================================
 
     def _on_plan_change(self):
@@ -635,11 +613,6 @@ class FCStatusWidget(tk.Frame):
         mah    = float(data.get("battery_mah_drawn", 0.0))
         pct    = int(data.get("battery_percentage", -1))
         cells  = self._detect_cells(data)
-        # FIX: normalise state string; map all BatteryState enum values.
-        # to_dict() emits "OK"/"WARNING"/"CRITICAL"/"NOT_PRESENT"/"INIT".
-        # Previously only OK/WARNING/CRITICAL/UNKNOWN were in the colour map
-        # so INIT (the BF power-on default) rendered as the fallback "UNKNOWN"
-        # text with no useful colour context.
         state  = str(data.get("battery_state", "INIT")).upper()
         cell_v = (volts / cells) if cells > 0 else 0.0
         vcol   = self._cell_color(cell_v) if volts > 0 else _DIM_FG
@@ -735,7 +708,10 @@ class FCStatusWidget(tk.Frame):
                         bi.place(x=0, rely=0.5, relwidth=1.0,
                                  height=max(1, int(abs(dev) * h)),
                                  anchor="sw" if dev >= 0 else "nw")
-                    col = _GREEN if ch_name == "ARM" and us > 1700 else _BLUE
+                    # FIX: ARM channel goes green only at or above ARM_THRESHOLD
+                    # (1800), not at 1700 as before. At 1775 (ELRS failsafe
+                    # value) the bar correctly stays blue — disarmed.
+                    col = _GREEN if ch_name == "ARM" and us >= ARM_THRESHOLD else _BLUE
                     bi.config(bg=col)
                     lbl.config(text=str(us), fg=_VALUE_FG)
                 else:
@@ -744,7 +720,8 @@ class FCStatusWidget(tk.Frame):
                     lbl.config(text="—", fg=_DIM_FG)
             else:
                 cv, d, ll = self._rc_dots[i]
-                col = _GREEN if ch_name == "ARM" and us > 1700 else _BLUE
+                # FIX: same threshold fix for dot mode
+                col = _GREEN if ch_name == "ARM" and us >= ARM_THRESHOLD else _BLUE
                 cv.itemconfig(d, fill=col if valid else _DIM_FG)
                 ll.config(fg=_VALUE_FG if valid else _DIM_FG)
 
@@ -755,7 +732,6 @@ class FCStatusWidget(tk.Frame):
                 text=f"{lq}%",
                 fg=_RED if lq < 30 else _ORANGE if lq < 70 else _GREEN)
         else:
-            # ELRS/CRSF path: show channel count instead of percentage
             rc_count = int(data.get("rc_channel_count", 0))
             rc_roll  = int(data.get("rc_roll", 0))
             if rc_count > 0 and 800 <= rc_roll <= 2200:

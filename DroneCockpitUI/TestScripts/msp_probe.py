@@ -417,10 +417,10 @@ def check_rc(frame: bytes, round_n: int):
         note = ""
         if ch == "YAW" and val == 885:
             note = f"  {YEL}← ELRS failsafe trim (normal, not a link failure){RST}"
-        elif ch == "ARM" and val < 1500:
-            note = f"  {DIM}← DISARMED{RST}"
-        elif ch == "ARM" and val >= 1700:
+        elif ch == "ARM" and val >= 1800:
             note = f"  {GRN}← ARMED{RST}"
+        elif ch == "ARM" and val < 1800:
+            note = f"  {DIM}← DISARMED  ({val} < 1800 arm threshold){RST}"
         print_kv(f"  {ch}", f"{val}{note}", good=(in_range or (ch == "YAW" and val == 885)))
 
     print()
