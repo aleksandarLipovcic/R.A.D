@@ -4,35 +4,31 @@ ArmingWidget.py  —  Pre-Flight Checklist & Arming Diagnostics
 Two-tier aviation-style checklist.
 
 SECTION A — AUTOMATIC CHECKS  (telemetry-driven, updates every tick)
-  • FC arming disable flags  • Gyro  • Accelerometer
-  • Battery voltage           • RC link  • GPS fix  • Motors idle
+  • Gyro  • Accelerometer  • Battery voltage
+  • RC link  • GPS fix  • Motors idle
 
 SECTION B — PILOT SIGN-OFF  (manual checkboxes, pilot ticks before each flight)
 
 BANNER  (bottom, always visible — pinned outside scroll area)
-  Grey   "WAITING FOR DATA…"       — no telemetry yet
+  Grey   "WAITING FOR DATA…"        — no telemetry yet
   Red    "BLOCKED — FIX AUTO CHECKS" — one or more auto checks failing
-  Orange "COMPLETE SIGN-OFF ITEMS"  — auto OK, manual items remain
-  Green  "✔  READY TO ARM"         — everything passed
+  Orange "COMPLETE SIGN-OFF ITEMS"   — auto OK, manual items remain
+  Green  "✔  READY TO ARM"          — everything passed
 
-LAYOUT / SCROLL FIXES (this version):
-  1. Header and READY-TO-ARM banner are pinned outside the scroll area so
-     they are always visible regardless of window height.
-  2. All checklist content (sections A + B) lives inside a Canvas-backed
-     scrollable frame. Vertical shrinking of the window never hides items —
-     a scrollbar appears automatically.
-  3. Mousewheel scrolling works on all child widgets inside the scroll area
-     (bound recursively after build).
-  4. Responsive column layout (1-col / 2-col) is now driven by the Canvas
-     <Configure> event so the column count uses the actual content width,
-     not the outer-frame width (avoids a 1-pixel-off edge case with the
-     scrollbar visible).
-  5. Detail-label wraplength updates whenever the canvas is resized.
+NOTE: FC STATUS / arming-disable-flags check is intentionally omitted.
+The raw arming-disable bitmask always contains MSP_OVERRIDE, CLI_ACTIVE,
+and OSD_MENU whenever the FC is connected over USB.  These flags cannot be
+cleared by the pilot without physically unplugging the cable.  Individual
+hardware health items (gyro, acc, I2C) are already covered by their own
+dedicated checks below.
 
-LOGIC FIXES (carried from previous version):
-  • only_transient detection in update_arming() uses set-intersection test.
-  • GPS_NOT_READY is orange (transient); CPU_OVERLOAD is red (hard error).
-  • ARM channel highlight threshold is 1800 µs to match BF Modes default.
+LAYOUT / SCROLL FIXES:
+  1. Header and banner are pinned outside the scroll area — always visible.
+  2. Sections A + B live inside a Canvas-backed scrollable frame; vertical
+     shrinking never hides items.
+  3. Mousewheel scrolling is bound on every child widget.
+  4. Column layout (1-col / 2-col) is driven by the Canvas <Configure> event.
+  5. Detail-label wraplength updates on every canvas resize.
 """
 
 import tkinter as tk
@@ -59,97 +55,7 @@ _F_BANNER  = ("Consolas", 14, "bold")
 _F_COUNTER = ("Consolas", 10, "bold")
 _F_RESET   = ("Consolas",  8, "bold")
 
-# ── Arming-flag bits ──────────────────────────────────────────────────────────
-_ARMING_BITS = [
-    (1 << 0,  "NO GYRO"),
-    (1 << 1,  "FAILSAFE"),
-    (1 << 2,  "RX FAILSAFE"),
-    (1 << 3,  "BAD RX"),
-    (1 << 4,  "BOX FAILSAFE"),
-    (1 << 5,  "RUNAWAY TKOFF"),
-    (1 << 6,  "CRASH DETECT"),
-    (1 << 7,  "THROTTLE HIGH"),
-    (1 << 8,  "NOT LEVEL"),
-    (1 << 9,  "BOOT GRACE"),
-    (1 << 10, "NO PREARM"),
-    (1 << 11, "CPU OVERLOAD"),
-    (1 << 12, "CALIBRATING"),
-    (1 << 13, "CLI ACTIVE"),
-    (1 << 14, "OSD MENU"),
-    (1 << 15, "BST"),
-    (1 << 16, "MSP OVERRIDE"),
-    (1 << 17, "PARALYZE"),
-    (1 << 18, "GPS NOT READY"),
-    (1 << 21, "RESCUE SW"),
-    (1 << 23, "DSHOT BITBANG"),
-    (1 << 24, "ACC CAL NEEDED"),
-    (1 << 25, "MOTOR PROTOCOL"),
-    (1 << 26, "ARM SW OFF"),
-]
-
-# Flags that self-clear and do not indicate a permanent hardware problem.
-# Still shown as FAIL (FC won't arm), but coloured orange and labelled
-# "waiting" so the pilot knows to wait rather than investigate hardware.
-_TRANSIENT_FLAGS = {
-    1 << 9:  "BOOT GRACE",    # clears ~30 s after power-on
-    1 << 12: "CALIBRATING",   # clears when IMU cal finishes (~5 s)
-    1 << 18: "GPS NOT READY", # clears once GPS has a 3D fix
-}
-
-# Pre-built set of transient flag names for fast membership tests.
-_TRANSIENT_NAMES: frozenset = frozenset(_TRANSIENT_FLAGS.values())
-
-# Flags that are hard errors with additional explanatory context.
-_FLAG_HINTS = {
-    "CPU OVERLOAD":   "→ disable GPS Rescue or reduce loop rate",
-    "GPS NOT READY":  "→ waiting for GPS fix",
-    "NO GYRO":        "→ hardware fault or FC not initialised",
-    "RUNAWAY TKOFF":  "→ check PID tune / motor direction",
-    "CRASH DETECT":   "→ power-cycle FC",
-    "BOOT GRACE":     "→ wait ~30 s after power-on",
-    "CALIBRATING":    "→ wait for IMU calibration",
-    "MSP OVERRIDE":   "→ GCS is holding override — disconnect MSP",
-    "MOTOR PROTOCOL": "→ check ESC protocol in BF Config tab",
-}
-
 # ── Auto-check evaluators ─────────────────────────────────────────────────────
-
-def _check_arm_flags(data):
-    """
-    Evaluate MSP_STATUS_EX arming-disable bitmask.
-
-    Three tiers:
-      • flags == 0                      → ALL CLEAR (green)
-      • only transient flags set        → WAITING   (orange, self-clearing)
-      • any non-transient flag set      → BLOCKED   (red, needs action)
-    """
-    flags = int(data.get("arming_disable_flags", 0))
-    if flags == 0:
-        return True, "ALL FLAGS CLEAR"
-
-    active     = [name for bit, name in _ARMING_BITS if flags & bit]
-    active_set = set(active)
-    transient  = active_set & _TRANSIENT_NAMES
-    real       = [n for n in active if n not in _TRANSIENT_NAMES]
-
-    if real:
-        parts = []
-        for name in real[:2]:
-            hint = _FLAG_HINTS.get(name, "")
-            parts.append(f"{name}{(' ' + hint) if hint else ''}")
-        detail = " | ".join(parts)
-        if len(real) > 2:
-            detail += f" +{len(real)-2} more"
-        return False, detail
-
-    # Only transient flags — still blocking but will self-clear
-    parts = []
-    for name in sorted(transient):
-        hint = _FLAG_HINTS.get(name, "")
-        parts.append(f"{name}{(' ' + hint) if hint else ''}")
-    detail = ", ".join(parts) + " (self-clearing)"
-    return False, detail
-
 
 def _check_gyro(data):
     ok = bool(data.get("sensor_gyro_present", False))
@@ -222,7 +128,7 @@ def _check_gps(data):
     if fix_type < 2:
         return False, f"NO 3D FIX  ({sats} sats)"
     if sats < 6:
-        return False, f"3D FIX  {sats} SATS — NEED ≥ 6"
+        return False, f"3D FIX  {sats} SATS — NEED >= 6"
     hdop_str = f"  HDOP {hdop:.2f}" if hdop < 90 else ""
     return True, f"3D FIX  {sats} SATS{hdop_str}"
 
@@ -240,15 +146,16 @@ def _check_motors(data):
     return True, "ALL IDLE OK"
 
 
-# (id, display label, evaluator)
+# ── Check registry ────────────────────────────────────────────────────────────
+# fc_status / arming-disable-flags check is intentionally excluded — see module
+# docstring for rationale.  Individual hardware items are covered below.
 _AUTO_CHECKS = [
-    ("arm_flags", "FC ARMING FLAGS",    _check_arm_flags),
-    ("gyro",      "GYRO",               _check_gyro),
-    ("acc",       "ACCELEROMETER",      _check_acc),
-    ("battery",   "BATTERY VOLTAGE",    _check_battery),
-    ("rc_link",   "RC LINK",            _check_rc_link),
-    ("gps",       "GPS FIX",            _check_gps),
-    ("motors",    "MOTORS IDLE",        _check_motors),
+    ("gyro",      "GYRO",            _check_gyro),
+    ("acc",       "ACCELEROMETER",   _check_acc),
+    ("battery",   "BATTERY VOLTAGE", _check_battery),
+    ("rc_link",   "RC LINK",         _check_rc_link),
+    ("gps",       "GPS FIX",         _check_gps),
+    ("motors",    "MOTORS IDLE",     _check_motors),
 ]
 
 # ── Manual sign-off items ─────────────────────────────────────────────────────
@@ -271,14 +178,14 @@ class ArmingWidget(tk.Frame):
 
     def __init__(self, parent, **kwargs):
         super().__init__(parent, bg=_BG, **kwargs)
-        self._auto_state:   dict = {}
-        self._auto_rows:    dict = {}
-        self._manual_vars:  dict = {}
-        self._manual_lbls:  dict = {}
-        self._cb_widgets:   dict = {}
-        self._has_data          = False
-        self._n_auto_cols       = 0
-        self._last_canvas_w     = 0
+        self._auto_state:  dict = {}
+        self._auto_rows:   dict = {}
+        self._manual_vars: dict = {}
+        self._manual_lbls: dict = {}
+        self._cb_widgets:  dict = {}
+        self._has_data         = False
+        self._n_auto_cols      = 0
+        self._last_canvas_w    = 0
         self._build_ui()
 
     # =========================================================================
@@ -297,19 +204,17 @@ class ArmingWidget(tk.Frame):
                                     bg=_BG2, fg=_ORANGE, font=_F_COUNTER)
         self._count_lbl.pack(side="right", padx=8, pady=5)
 
-        # ── Fixed banner (always visible — pinned to bottom) ─────────────────
+        # ── Fixed banner (pinned to bottom — packed BEFORE scroll area) ───────
         self._banner_frame = tk.Frame(self, bg=_BG,
                                        highlightthickness=1,
                                        highlightbackground=_BORDER)
         self._banner_frame.pack(side="bottom", fill="x", padx=6, pady=(2, 6))
         self._banner_lbl = tk.Label(
-            self._banner_frame, text="WAITING FOR DATA…",
+            self._banner_frame, text="WAITING FOR DATA...",
             bg=_BG, fg=_ORANGE, font=_F_BANNER)
         self._banner_lbl.pack(pady=8)
 
         # ── Scrollable content area ───────────────────────────────────────────
-        # Canvas + Scrollbar sit in a plain container frame so that the
-        # scrollbar stays flush with the canvas edge.
         sc_container = tk.Frame(self, bg=_BG)
         sc_container.pack(fill="both", expand=True)
 
@@ -322,16 +227,13 @@ class ArmingWidget(tk.Frame):
         self._vscroll.pack(side="right", fill="y")
         self._scroll_canvas.pack(side="left", fill="both", expand=True)
 
-        # Inner frame is the real container for all checklist widgets.
         self._scroll_inner = tk.Frame(self._scroll_canvas, bg=_BG)
         self._canvas_win = self._scroll_canvas.create_window(
             (0, 0), window=self._scroll_inner, anchor="nw")
 
-        # Keep inner frame width == canvas width and scroll region updated.
         self._scroll_inner.bind("<Configure>", self._on_inner_configure)
         self._scroll_canvas.bind("<Configure>", self._on_canvas_configure)
 
-        # Propagate mousewheel events from all children up to the canvas.
         self._bind_mw(self._scroll_canvas)
         self._bind_mw(self._scroll_inner)
 
@@ -384,15 +286,13 @@ class ArmingWidget(tk.Frame):
 
             cv.bind("<Button-1>", _toggle)
             lbl.bind("<Button-1>", _toggle)
-
-            # Scroll on all interactive child widgets inside the scroll area.
             for w in (cv, lbl, row):
                 self._bind_mw(w)
 
         rst_row = tk.Frame(signoff, bg=_BG3)
         rst_row.pack(fill="x", padx=6, pady=(4, 6))
         rst_btn = tk.Button(
-            rst_row, text="↺  RESET SIGN-OFF",
+            rst_row, text="RESET SIGN-OFF",
             bg=_BORDER, fg=_LABEL_FG, font=_F_RESET,
             activebackground=_DIM, activeforeground=_VALUE_FG,
             relief="flat", padx=8, pady=3,
@@ -403,7 +303,7 @@ class ArmingWidget(tk.Frame):
         self._bind_mw(rst_btn)
 
     # =========================================================================
-    # Section header (inside scroll area)
+    # Section header helper
     # =========================================================================
 
     def _build_section_hdr(self, text):
@@ -420,10 +320,10 @@ class ArmingWidget(tk.Frame):
     # =========================================================================
 
     def _bind_mw(self, widget):
-        """Bind all three mousewheel events so scrolling works on every OS."""
+        """Bind scroll events for Windows/macOS (MouseWheel) and Linux (4/5)."""
         widget.bind("<MouseWheel>", self._on_mousewheel, add="+")
-        widget.bind("<Button-4>",   self._on_mousewheel, add="+")  # Linux up
-        widget.bind("<Button-5>",   self._on_mousewheel, add="+")  # Linux down
+        widget.bind("<Button-4>",   self._on_mousewheel, add="+")
+        widget.bind("<Button-5>",   self._on_mousewheel, add="+")
 
     def _on_mousewheel(self, event):
         if event.num == 4:
@@ -435,7 +335,7 @@ class ArmingWidget(tk.Frame):
                 int(-1 * (event.delta / 120)), "units")
 
     # =========================================================================
-    # Canvas / scroll helpers
+    # Canvas / scroll event handlers
     # =========================================================================
 
     def _on_inner_configure(self, _event):
@@ -445,13 +345,11 @@ class ArmingWidget(tk.Frame):
 
     def _on_canvas_configure(self, event):
         """
-        Called when the Canvas is resized.
-        1. Stretch the inner frame to fill the canvas width.
-        2. Rebuild the auto-check column layout if we crossed the breakpoint.
-        3. Update detail-label wraplengths.
+        1. Stretch inner frame to match canvas width.
+        2. Rebuild column layout if 1-col / 2-col breakpoint was crossed.
+        3. Recalculate detail-label wraplength for the new column width.
         """
         cw = event.width
-        # Make the inner frame fill the full canvas width.
         self._scroll_canvas.itemconfig(self._canvas_win, width=cw)
 
         if cw == self._last_canvas_w:
@@ -462,11 +360,9 @@ class ArmingWidget(tk.Frame):
         if n != self._n_auto_cols:
             self._layout_auto_cols(n)
 
-        # Clamp detail text to the available column width so it wraps
-        # gracefully instead of being clipped by the column boundary.
         usable = max(80, (cw // n) - 130)
-        for _chk_id, (_rf, _cv, _dot, _name_lbl, detail_lbl) in self._auto_rows.items():
-            detail_lbl.config(wraplength=usable)
+        for _id, (_rf, _cv, _dot, _nl, dl) in self._auto_rows.items():
+            dl.config(wraplength=usable)
 
     # =========================================================================
     # Checkbox helper
@@ -476,7 +372,7 @@ class ArmingWidget(tk.Frame):
     def _update_checkbox(var, cv, box, tick, lbl):
         if var.get():
             cv.itemconfig(box,  outline=_TICK_OK, fill=_BG3)
-            cv.itemconfig(tick, text="✔", fill=_TICK_OK)
+            cv.itemconfig(tick, text="v", fill=_TICK_OK)
             lbl.config(fg=_TICK_OK)
         else:
             cv.itemconfig(box,  outline=_LABEL_FG, fill=_BG3)
@@ -490,7 +386,6 @@ class ArmingWidget(tk.Frame):
     def _layout_auto_cols(self, n: int):
         self._n_auto_cols = n
 
-        # Destroy existing column frames and their canvas dot refs.
         for cf in self._auto_col_frames:
             cf.destroy()
         self._auto_col_frames = []
@@ -527,7 +422,7 @@ class ArmingWidget(tk.Frame):
             name_lbl.pack(side="left", padx=(0, 4))
             self._bind_mw(name_lbl)
 
-            detail_lbl = tk.Label(rf, text="WAITING…", bg=_BG2,
+            detail_lbl = tk.Label(rf, text="WAITING...", bg=_BG2,
                                    fg=_LABEL_FG, font=_F_DETAIL, anchor="w",
                                    wraplength=200, justify="left")
             detail_lbl.pack(side="left", fill="x", expand=True)
@@ -535,11 +430,10 @@ class ArmingWidget(tk.Frame):
 
             self._auto_rows[chk_id] = (rf, cv, dot, name_lbl, detail_lbl)
 
-            # Restore state if the widget was rebuilt after a resize.
+            # Restore colour state when grid is rebuilt after a resize.
             if chk_id in self._auto_state:
                 passed = self._auto_state[chk_id]
-                col    = _GREEN if passed else _RED
-                cv.itemconfig(dot, fill=col)
+                cv.itemconfig(dot, fill=_GREEN if passed else _RED)
                 name_lbl.config(fg=_VALUE_FG if passed else _RED)
 
     # =========================================================================
@@ -549,7 +443,7 @@ class ArmingWidget(tk.Frame):
     def _refresh_banner(self):
         if not self._has_data:
             self._count_lbl.config(text="WAITING FOR DATA", fg=_ORANGE)
-            self._banner_lbl.config(text="WAITING FOR DATA…", fg=_ORANGE)
+            self._banner_lbl.config(text="WAITING FOR DATA...", fg=_ORANGE)
             self._banner_frame.config(highlightbackground=_BORDER)
             return
 
@@ -563,7 +457,7 @@ class ArmingWidget(tk.Frame):
 
         if remaining == 0:
             self._count_lbl.config(text="ALL CHECKS PASSED", fg=_GREEN)
-            self._banner_lbl.config(text="✔  READY TO ARM", fg=_GREEN, bg=_BG)
+            self._banner_lbl.config(text="v  READY TO ARM", fg=_GREEN, bg=_BG)
             self._banner_frame.config(highlightbackground=_GREEN)
         else:
             word = f"item{'s' if remaining != 1 else ''}"
@@ -571,11 +465,11 @@ class ArmingWidget(tk.Frame):
                 text=f"{remaining} {word} remaining", fg=_ORANGE)
             if not auto_ok:
                 self._banner_lbl.config(
-                    text="✗  BLOCKED — FIX AUTO CHECKS", fg=_RED, bg=_BG)
+                    text="x  BLOCKED — FIX AUTO CHECKS", fg=_RED, bg=_BG)
                 self._banner_frame.config(highlightbackground=_RED)
             else:
                 self._banner_lbl.config(
-                    text="◉  COMPLETE SIGN-OFF ITEMS", fg=_ORANGE, bg=_BG)
+                    text="o  COMPLETE SIGN-OFF ITEMS", fg=_ORANGE, bg=_BG)
                 self._banner_frame.config(highlightbackground=_ORANGE)
 
     # =========================================================================
@@ -585,39 +479,23 @@ class ArmingWidget(tk.Frame):
     def update_arming(self, data: dict):
         self._has_data = True
 
-        for chk_id, label, evaluator in _AUTO_CHECKS:
+        for chk_id, _label, evaluator in _AUTO_CHECKS:
             passed, detail = evaluator(data)
             self._auto_state[chk_id] = passed
 
             if chk_id not in self._auto_rows:
                 continue
 
-            rf, cv, dot, name_lbl, detail_lbl = self._auto_rows[chk_id]
-
-            # ── only_transient detection ──────────────────────────────────────
-            # Build the set of active flag names, then test whether that set
-            # is non-empty AND every member is a known transient name.
-            # This avoids the previous inverted-generator bug where all()
-            # was vacuously True for empty filtered sequences.
-            if chk_id == "arm_flags" and not passed:
-                flags        = int(data.get("arming_disable_flags", 0))
-                active_names = {name for bit, name in _ARMING_BITS if flags & bit}
-                only_transient = bool(active_names) and active_names.issubset(_TRANSIENT_NAMES)
-            else:
-                only_transient = False
+            _rf, cv, dot, name_lbl, detail_lbl = self._auto_rows[chk_id]
 
             if passed:
                 cv.itemconfig(dot, fill=_GREEN)
                 name_lbl.config(fg=_VALUE_FG)
-                detail_lbl.config(text=f"✔  {detail}", fg=_TICK_OK)
-            elif only_transient:
-                cv.itemconfig(dot, fill=_ORANGE)
-                name_lbl.config(fg=_ORANGE)
-                detail_lbl.config(text=f"◉  {detail}", fg=_ORANGE)
+                detail_lbl.config(text=f"OK  {detail}", fg=_TICK_OK)
             else:
                 cv.itemconfig(dot, fill=_RED)
                 name_lbl.config(fg=_RED)
-                detail_lbl.config(text=f"✗  {detail}", fg=_ORANGE)
+                detail_lbl.config(text=f"X  {detail}", fg=_ORANGE)
 
         self._refresh_banner()
 
