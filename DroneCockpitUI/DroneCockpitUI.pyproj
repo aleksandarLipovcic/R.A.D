@@ -12,6 +12,7 @@
     <RootNamespace>DroneCockpitUI</RootNamespace>
     <LaunchProvider>Standard Python launcher</LaunchProvider>
     <EnableNativeCodeDebugging>False</EnableNativeCodeDebugging>
+    <TestFramework>Pytest</TestFramework>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
     <DebugSymbols>true</DebugSymbols>
@@ -45,6 +46,9 @@
       <SubType>Code</SubType>
     </Compile>
     <Compile Include="MagWidget.py">
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="telemetry_worker.py">
       <SubType>Code</SubType>
     </Compile>
     <Compile Include="TestScripts\gps_sv_reader.py">

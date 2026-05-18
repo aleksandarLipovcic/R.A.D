@@ -7,33 +7,29 @@ and panel visibility control.
 Toolbar:
   [Status]  [Panels ▾]  [⟳ Reset Layout]  [🔓 Save & Lock Layout]
 
+Architecture
+------------
+  Telemetry polling and ui_data dict construction run in a dedicated
+  background thread (TelemetryWorker).  The Tk main thread only:
+    • drains the worker's queue (non-blocking get_frame())
+    • feeds the resulting dict to each widget
+    • handles all Tk/UI events
+
+  This keeps the main thread free for redraws, drag, resize, and
+  z-order changes — eliminating the lag seen when lifting/lowering
+  panels while a heavy widget was blocking the update loop.
+
+  Widget refresh rates are throttled independently:
+    • IMU / Baro / FC Status / Arming / Mag  →  every frame  (~50 Hz)
+    • 3-D attitude view                      →  every 3rd frame (~17 Hz)
+    • GPS (heaviest — map redraws)            →  every 5th frame (~10 Hz)
+
 FIXES vs previous version
 --------------------------
   1. GPS debug console output removed.
-     The _sv_debug_frames / _sv_debug_limit block and all associated
-     print() calls have been deleted. GPS is working; the debug was
-     left in by accident.
-
-  2. Z-order now works correctly.
-     The previous code called self._ws.tag_raise(self._item) and
-     tag_lower(self._item).  These Canvas methods control the drawing
-     order of Canvas *items* (lines, rectangles, text) but have no
-     effect on embedded Windows — tk.Frame widgets placed via
-     create_window() are native child windows, not canvas items, and
-     their stacking order is controlled by the Tk window manager, not
-     the Canvas renderer.
-     Fix: raise_panel() now calls self.lift() on the Frame itself,
-     and lower_panel() calls self.lower().  The canvas item calls are
-     kept as no-ops to avoid breaking anything that reads _item, but
-     the actual raise/lower is done via the Tk window stack.
-
+  2. Z-order now works correctly via lift() / lower().
   3. Click-to-front on any panel interaction.
-     Any click anywhere on a panel (title bar, content, or the ⬆⬇
-     button) now brings that panel to the front.  This is bound with
-     add=True so existing bindings are not replaced — the panel rises
-     on click and still fires drag-start / resize-start as before.
-     The ⬆⬇ button now toggles between "raise to top" and "send to
-     back" as before, but correctly uses lift()/lower().
+  4. Telemetry offloaded to TelemetryWorker background thread.
 """
 
 import sys
@@ -42,6 +38,8 @@ import json
 from pathlib import Path
 
 import tkinter as tk
+
+from telemetry_worker import TelemetryWorker
 
 from IMUWidget      import IMUWidget
 from Drone3DView    import Drone3DView
@@ -65,8 +63,14 @@ if hasattr(os, 'add_dll_directory'):
 import DroneBackend
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-UI_REFRESH_MS  = 20
+#
+# UI_REFRESH_MS is how often the Tk loop wakes up to drain the queue and
+# feed widgets.  The backend is polled at 60 Hz inside the worker thread,
+# independently of this value.
+#
+UI_REFRESH_MS  = 20          # ~50 Hz Tk pump — keeps UI snappy
 RECONNECT_MS   = 2000
+
 BG_WORKSPACE   = "#1a1a2e"
 PANEL_BG       = "#0f0f1a"
 PANEL_TITLE_BG = "#16213e"
@@ -81,6 +85,18 @@ SNAP_COLOR     = "#00d4ff"
 GUIDE_DASH     = (4, 3)
 
 _LAYOUT_FILE = Path(script_dir) / "cockpit_layout.json"
+
+# ── Per-widget throttle divisors (frames between updates) ────────────────────
+#   1 = every Tk pump cycle, 3 = every third, etc.
+_THROTTLE = {
+    "imu":       1,
+    "baro":      1,
+    "fc_status": 1,
+    "arming":    1,
+    "mag":       1,
+    "adi":       3,   # 3-D canvas — heavy redraw, 17 Hz is plenty
+    "gps":       5,   # map widget — heaviest, 10 Hz is plenty
+}
 
 # ── Default panel layout (x, y, w, h) ────────────────────────────────────────
 _DEFAULT_PANELS = {
@@ -128,7 +144,7 @@ class DraggablePanel(tk.Frame):
         self._drag_x        = 0
         self._drag_y        = 0
         self._guide_lines   = []
-        self._z_raised      = False   # tracks current ⬆⬇ toggle state
+        self._z_raised      = False
 
         self._item = workspace.create_window(x, y, anchor="nw",
                                              window=self, width=w, height=h)
@@ -171,14 +187,7 @@ class DraggablePanel(tk.Frame):
                                 relwidth=1.0, width=0)
 
         # ── Bindings ──────────────────────────────────────────────────────────
-        # FIX: Every clickable surface raises the panel first (add=True keeps
-        # the original drag / resize binding active on the same event).
-        # Previously raise_panel() called tag_raise() which only affects canvas
-        # item draw order, not the native window stacking order.  Now it calls
-        # self.lift() which correctly brings the Frame to the top of the Tk
-        # window stack.
-        for w_ in (self, self._title_bar, self._title_lbl,
-                   self.content):
+        for w_ in (self, self._title_bar, self._title_lbl, self.content):
             w_.bind("<ButtonPress-1>", self._on_click_raise, add=True)
 
         for w_ in (self._title_bar, self._title_lbl):
@@ -198,50 +207,24 @@ class DraggablePanel(tk.Frame):
         self._bottom_edge.bind("<B1-Motion>",     self._resize_v)
 
     # =========================================================================
-    # Z-order  (FIX: use lift() / lower() not tag_raise / tag_lower)
+    # Z-order
     # =========================================================================
 
     def _on_click_raise(self, event=None):
-        """Raise this panel to the top of the window stack on any click."""
         self.raise_panel()
 
     def raise_panel(self):
-        """
-        Bring this panel to the front.
-
-        FIX: the previous implementation called self._ws.tag_raise(self._item).
-        Canvas tag_raise only re-orders canvas *drawing primitives* (lines,
-        rectangles, text).  Embedded windows created with create_window() are
-        native child windows whose z-order is controlled by the Tk window
-        manager, not the canvas renderer — tag_raise has no visible effect on
-        them.  The correct call is widget.lift(), which invokes the Tk
-        'raise' command on the window and physically moves it to the top of
-        the window stack.
-        """
         self.lift()
-        # Keep canvas item in sync (harmless for windows, helps if ever mixed
-        # with canvas primitives that should appear above the grid).
         self._ws.tag_raise(self._item)
 
     def lower_panel(self):
-        """
-        Send this panel to the back.
-
-        FIX: same issue as raise_panel — use lower() instead of tag_lower.
-        lower() accepts an optional belowThis argument; omitting it sends the
-        window below all siblings, which is exactly "send to back".
-        We then re-raise the grid lines so they remain on top of the background
-        but below all panels.
-        """
         self.lower()
-        # Keep canvas grid lines on top of the background colour but below panels.
         try:
             self._ws.tag_raise("grid")
         except Exception:
             pass
 
     def _z_btn_click(self, event):
-        """Toggle between 'bring to front' and 'send to back'."""
         self._z_raised = not self._z_raised
         if self._z_raised:
             self.raise_panel()
@@ -521,19 +504,27 @@ class DroneCockpitApp:
         self.hub = DroneBackend.DroneLink()
         self._update_job = None
 
-        self._yaw_trim         = 0.0
-        self._last_raw_yaw     = 0.0
-        self._last_mag_heading = 0.0
-        self._last_mag_valid   = False
+        # Yaw trim is now owned here on the Tk side; the worker gets a copy
+        # via set_yaw_trim() whenever it changes.
+        self._yaw_trim = 0.0
 
         self._locked_ref  = [False]
         self._vis_vars: dict[str, tk.BooleanVar] = {}
         self._panels:   dict[str, DraggablePanel] = {}
 
+        # Per-widget frame counters for throttling
+        self._frame_counters: dict[str, int] = {k: 0 for k in _THROTTLE}
+
         self._layout = self._load_layout()
         self._setup_ui()
         self._apply_layout()
-        self._auto_connect()
+
+        # ── Background telemetry worker ────────────────────────────────────
+        # Starts after UI is built so widgets exist before first frame arrives.
+        self._worker = TelemetryWorker(self.hub)
+        self._worker.set_yaw_trim(self._yaw_trim)
+
+        self._auto_connect()   # connects hub, then starts worker + pump
 
     # =========================================================================
     # Layout persistence
@@ -701,11 +692,19 @@ class DroneCockpitApp:
     # =========================================================================
 
     def _apply_heading_trim(self) -> None:
-        if not self._last_mag_valid:
+        """
+        Called from the IMU widget button on the Tk thread.
+        Reads the last-seen sensor snapshot from the worker (thread-safe)
+        and updates the trim, then pushes the new value back to the worker.
+        """
+        raw_yaw, mag_heading, mag_valid = self._worker.get_last_state_snapshot()
+        if not mag_valid:
             return
-        current_trimmed = (self._last_raw_yaw - self._yaw_trim + 360) % 360
-        drift = (current_trimmed - self._last_mag_heading + 540) % 360 - 180
+        current_trimmed = (raw_yaw - self._yaw_trim + 360) % 360
+        drift = (current_trimmed - mag_heading + 540) % 360 - 180
         self._yaw_trim = (self._yaw_trim + drift + 360) % 360
+        # Push updated trim to worker so subsequent frames use it
+        self._worker.set_yaw_trim(self._yaw_trim)
 
     # =========================================================================
     # UI setup
@@ -852,6 +851,8 @@ class DroneCockpitApp:
         if self.hub.connect(port):
             self.status_label.config(
                 text=f"Status: Connected — {port}", fg="#00ff88")
+            # Start background worker and Tk pump only after a real connection
+            self._worker.start()
             self._schedule_update()
         else:
             self.status_label.config(
@@ -860,13 +861,21 @@ class DroneCockpitApp:
             self.root.after(RECONNECT_MS, self._auto_connect)
 
     def _reconnect(self) -> None:
+        """
+        Called when the Tk pump detects the worker has lost the connection.
+        Stops the worker cleanly, disconnects the hub, then retries.
+        """
+        self._worker.stop()
         self.hub.disconnect()
         self.status_label.config(
             text="Status: Link lost — reconnecting...", fg="red")
+        # Re-create a fresh worker so its internal state is clean
+        self._worker = TelemetryWorker(self.hub)
+        self._worker.set_yaw_trim(self._yaw_trim)
         self.root.after(RECONNECT_MS, self._auto_connect)
 
     # =========================================================================
-    # Update loop
+    # Update loop  —  Tk main thread only
     # =========================================================================
 
     def _schedule_update(self) -> None:
@@ -876,205 +885,68 @@ class DroneCockpitApp:
     def _update_loop(self) -> None:
         self._update_job = None
 
-        if not self.hub.is_connected():
-            self._reconnect()
+        # ── Connection health check ───────────────────────────────────────────
+        # The worker monitors the backend independently; we just check its flag.
+        if not self._worker.is_connected:
+            # Only show "degraded" if the hub thinks it's still up but the
+            # worker hasn't received valid data recently.
+            if not self.hub.is_connected():
+                self._reconnect()
+                return
+            # Hub says connected but worker hasn't delivered a frame yet —
+            # this is normal during the first few ms after connect.
+            self.status_label.config(text="Status: Waiting for data...",
+                                     fg="orange")
+            self._update_job = self.root.after(UI_REFRESH_MS, self._update_loop)
             return
 
-        try:
-            state = self.hub.get_latest_state()
+        # ── Drain queue — get the freshest frame only ─────────────────────────
+        ui_data = self._worker.get_frame()
+        if ui_data is None:
+            # Worker is alive but no new frame this tick — reschedule and yield
+            self._update_job = self.root.after(UI_REFRESH_MS, self._update_loop)
+            return
 
-            if not state.link_healthy:
-                self.status_label.config(text="Status: Link degraded", fg="orange")
-            else:
-                self.status_label.config(text="Status: Connected", fg="#00ff88")
+        # ── Update status label from frame data ───────────────────────────────
+        if ui_data.get("link_healthy", True):
+            self.status_label.config(text="Status: Connected", fg="#00ff88")
+        else:
+            self.status_label.config(text="Status: Link degraded", fg="orange")
 
-            raw_yaw   = float(state.yaw)
-            mag_hdg   = getattr(state, "mag_heading_deg", 0.0)
-            mag_valid = getattr(state, "mag_valid", False)
+        # ── Feed widgets with per-widget throttling ───────────────────────────
+        #
+        # Increment every counter.  A widget only gets updated when its
+        # counter reaches its divisor, then it resets to 0.
+        # This keeps fast widgets (IMU) at full rate and slow/heavy ones
+        # (GPS map, 3-D view) at a fraction — without stalling the Tk thread.
+        #
+        for key in self._frame_counters:
+            self._frame_counters[key] += 1
 
-            self._last_raw_yaw     = raw_yaw
-            self._last_mag_heading = mag_hdg
-            self._last_mag_valid   = mag_valid
-
-            trimmed_yaw = (raw_yaw - self._yaw_trim + 360) % 360
-
-            # ── GPS sub-object ────────────────────────────────────────────────
-            gps = getattr(state, "gps", None)
-            if gps is not None:
-                gps_hdop_raw  = getattr(gps, "hdop", 9999)
-                gps_hdop_real = (gps_hdop_raw / 100.0
-                                 if gps_hdop_raw != 9999 else 99.0)
-
-                sv_list_raw   = list(state.sv_list)
-                sv_info_valid = getattr(state, "sv_info_valid", False)
-                sv_source     = getattr(state, "sv_source", "")
-
-                # FIX: GPS debug prints removed. GPS is working correctly;
-                # the debug block (_sv_debug_frames / _sv_debug_limit) was
-                # left in by accident and spammed the console on every frame.
-
-                sv_list = [
-                    {
-                        "gnss_id": getattr(sv, "gnss_name",  "?"),
-                        "sv_id":   getattr(sv, "svid",        0),
-                        "cno":     getattr(sv, "cno",         0),
-                        "used":    getattr(sv, "used",        False),
-                        "quality": getattr(sv, "quality",     0),
-                        "status":  getattr(sv, "status_str",  "idle"),
-                        "elev":    getattr(sv, "elev",        0),
-                        "azim":    getattr(sv, "azim",        0),
-                    }
-                    for sv in sv_list_raw
-                ]
-
-                heartbeat = getattr(gps, "heartbeat",
-                            getattr(gps, "gps_heartbeat", None))
-
-                gps_data = {
-                    "gps_fix_type":         getattr(gps, "fix_type",         0),
-                    "gps_num_sat":          getattr(gps, "num_sat",           0),
-                    "gps_hdop":             gps_hdop_real,
-                    "gps_latitude":         getattr(gps, "latitude",          0.0),
-                    "gps_longitude":        getattr(gps, "longitude",         0.0),
-                    "gps_altitude_m":       float(getattr(gps, "altitude_m",  0)),
-                    "gps_ground_speed_cms": getattr(gps, "ground_speed_cms",  0),
-                    "gps_ground_course":    getattr(gps, "ground_course",     0),
-                    "gps_dist_to_home_m":   float(getattr(gps, "dist_to_home_m", 0)),
-                    "gps_bearing_to_home":  getattr(gps, "bearing_to_home",  0),
-                    "gps_heartbeat":        heartbeat,
-                    "gps_raw_valid":        getattr(gps, "raw_valid",         False),
-                    "gps_comp_valid":       getattr(gps, "comp_valid",        False),
-                    "gps_position_usable":  getattr(gps, "position_usable",   False),
-                    "gps_sv_list":          sv_list,
-                    "gps_sv_info_valid":    sv_info_valid,
-                    "gps_sv_source":        sv_source,
-                    "gps_num_sats":         getattr(gps, "num_sat",           0),
-                    "gps_fix":              getattr(gps, "position_usable",   False),
-                }
-            else:
-                gps_data = {
-                    "gps_fix_type": 0, "gps_num_sat": 0, "gps_hdop": 99.0,
-                    "gps_latitude": 0.0, "gps_longitude": 0.0,
-                    "gps_altitude_m": 0.0, "gps_ground_speed_cms": 0,
-                    "gps_ground_course": 0, "gps_dist_to_home_m": 0.0,
-                    "gps_bearing_to_home": 0, "gps_heartbeat": None,
-                    "gps_raw_valid": False, "gps_comp_valid": False,
-                    "gps_position_usable": False,
-                    "gps_sv_list": [], "gps_sv_info_valid": False,
-                    "gps_sv_source": "",
-                    "gps_num_sats": 0,
-                    "gps_fix": False,
-                }
-
-            # ── RC and motor helpers ──────────────────────────────────────────
-            rc_ch = list(state.rc_channels)
-            rc_n  = int(state.rc_channel_count)
-            mot   = list(state.motor_values)
-
-            def _rc(i):
-                return int(rc_ch[i]) if rc_n > i else 0
-
-            def _mot(i):
-                return int(mot[i]) if len(mot) > i else 0
-
-            _rssi = int(state.rssi)
-            rc_link_quality = -1 if _rssi == 0 else int(_rssi * 100 / 255)
-
-            try:
-                bat_state_str = state.battery_state.name
-            except Exception:
-                bat_state_str = "INIT"
-
-            # ── Assemble full telemetry dict ──────────────────────────────────
-            ui_data = {
-                # ── IMU ───────────────────────────────────────────────────────
-                "ax": state.ax, "ay": state.ay, "az": state.az,
-                "gx": state.gx, "gy": state.gy, "gz": state.gz,
-                "roll":  state.roll  / 10.0,
-                "pitch": state.pitch / 10.0,
-                "yaw":   trimmed_yaw,
-
-                # ── Battery ───────────────────────────────────────────────────
-                "battery_voltage":      state.battery_voltage,
-                "battery_current":      state.battery_current,
-                "battery_mah_drawn":    state.battery_mah_drawn,
-                "battery_cell_count":   state.battery_cell_count,
-                "battery_capacity_mah": state.battery_capacity_mah,
-                "battery_percentage":   state.battery_percentage,
-                "battery_state":        bat_state_str,
-
-                # ── Motors ────────────────────────────────────────────────────
-                "motor_1_us": _mot(0),
-                "motor_2_us": _mot(1),
-                "motor_3_us": _mot(2),
-                "motor_4_us": _mot(3),
-                "motor_5_us": _mot(4),
-                "motor_6_us": _mot(5),
-                "motor_7_us": _mot(6),
-                "motor_8_us": _mot(7),
-                "motor_count": int(state.motor_count),
-
-                # ── RC channels ───────────────────────────────────────────────
-                "rc_channel_count": rc_n,
-                "rc_roll":          _rc(0),
-                "rc_pitch":         _rc(1),
-                "rc_throttle":      _rc(2),
-                "rc_yaw":           _rc(3),
-                "rc_arm":           _rc(4),
-                "rc_aux1":          _rc(5),
-                "rc_aux2":          _rc(6),
-                "rc_aux3":          _rc(7),
-
-                # ── RC link quality ───────────────────────────────────────────
-                "rc_link_quality": rc_link_quality,
-
-                # ── Misc telemetry ────────────────────────────────────────────
-                "rssi":        _rssi,
-                "rtt_ms":      state.last_rtt_ms,
-                "fc_cycle_ms": state.fc_cycle_ms,
-
-                # ── Baro ──────────────────────────────────────────────────────
-                "baro_altitude_cm":      getattr(state, "baro_altitude_cm",      0),
-                "baro_vario_cm_per_sec": getattr(state, "baro_vario_cm_per_sec", 0),
-                "baro_valid":            getattr(state, "baro_valid",             False),
-
-                # ── Magnetometer ──────────────────────────────────────────────
-                "mag_x":                     getattr(state, "mag_x",             0),
-                "mag_y":                     getattr(state, "mag_y",             0),
-                "mag_z":                     getattr(state, "mag_z",             0),
-                "mag_heading_deg":           mag_hdg,
-                "mag_valid":                 mag_valid,
-                "mag_cal_active":            getattr(state, "mag_cal_active",            False),
-                "mag_cal_seconds_remaining": getattr(state, "mag_cal_seconds_remaining", 0),
-                "acc_cal_active":            getattr(state, "acc_cal_active",            False),
-                "acc_cal_seconds_remaining": getattr(state, "acc_cal_seconds_remaining", 0),
-
-                # ── FC status ─────────────────────────────────────────────────
-                "armed":             getattr(state, "armed",             False),
-                "flight_mode_flags": getattr(state, "flight_mode_flags", 0),
-                "flight_mode_name":  getattr(state, "flight_mode_name",  "ACRO [DISARMED]"),
-                "sensor_status":     getattr(state, "sensor_status",     0),
-                "sensor_acc_present":         bool(getattr(state, "sensor_status", 0) & (1 << 0)),
-                "sensor_baro_present":        bool(getattr(state, "sensor_status", 0) & (1 << 1)),
-                "sensor_mag_present":         bool(getattr(state, "sensor_status", 0) & (1 << 2)),
-                "sensor_gps_present":         bool(getattr(state, "sensor_status", 0) & (1 << 3)),
-                "sensor_rangefinder_present": bool(getattr(state, "sensor_status", 0) & (1 << 4)),
-                "sensor_gyro_present":        bool(getattr(state, "sensor_status", 0) & (1 << 5)),
-                "i2c_error_count":  getattr(state, "i2c_error_count",  0),
-                "cpu_load_percent": getattr(state, "cpu_load_percent", 0),
-                "pid_profile":      getattr(state, "pid_profile",      0),
-
-                # ── Arming diagnostics ────────────────────────────────────────
-                "arming_disable_flags": getattr(state, "arming_disable_flags", 0),
-                "arming_disable_str":   getattr(state, "arming_disable_str",   ""),
-
-                # ── GPS ───────────────────────────────────────────────────────
-                **gps_data,
-            }
-
-            # ── Feed widgets ──────────────────────────────────────────────────
+        # ── Fast widgets — update every frame ────────────────────────────────
+        if self._frame_counters["imu"] >= _THROTTLE["imu"]:
+            self._frame_counters["imu"] = 0
             self.imu_view.update_ui(ui_data)
+
+        if self._frame_counters["baro"] >= _THROTTLE["baro"]:
+            self._frame_counters["baro"] = 0
             self.baro_view.update_baro(ui_data)
+
+        if self._frame_counters["fc_status"] >= _THROTTLE["fc_status"]:
+            self._frame_counters["fc_status"] = 0
+            self.fc_status_view.update_fc_status(ui_data)
+
+        if self._frame_counters["arming"] >= _THROTTLE["arming"]:
+            self._frame_counters["arming"] = 0
+            self.arming_view.update_arming(ui_data)
+
+        if self._frame_counters["mag"] >= _THROTTLE["mag"]:
+            self._frame_counters["mag"] = 0
+            self.mag_view.update_mag(ui_data)
+
+        # ── Medium widget — 3-D attitude view (~17 Hz) ────────────────────────
+        if self._frame_counters["adi"] >= _THROTTLE["adi"]:
+            self._frame_counters["adi"] = 0
             self.drone_3d.update_orientation(
                 roll=ui_data["roll"],
                 pitch=ui_data["pitch"],
@@ -1082,15 +954,11 @@ class DroneCockpitApp:
                 mag_heading=ui_data["mag_heading_deg"],
                 mag_valid=ui_data["mag_valid"],
             )
-            self.mag_view.update_mag(ui_data)
-            self.gps_view.update_gps(ui_data)
-            self.fc_status_view.update_fc_status(ui_data)
-            self.arming_view.update_arming(ui_data)
 
-        except Exception as e:
-            print(f"[update_loop] {e}")
-            self._reconnect()
-            return
+        # ── Heavy widget — GPS map (~10 Hz) ──────────────────────────────────
+        if self._frame_counters["gps"] >= _THROTTLE["gps"]:
+            self._frame_counters["gps"] = 0
+            self.gps_view.update_gps(ui_data)
 
         self._update_job = self.root.after(UI_REFRESH_MS, self._update_loop)
 
@@ -1102,6 +970,7 @@ class DroneCockpitApp:
         self._save_layout()
         if self._update_job is not None:
             self.root.after_cancel(self._update_job)
+        self._worker.stop()
         self.hub.disconnect()
         self.root.destroy()
 

@@ -225,7 +225,7 @@ def _check_gps(data):
     if fix_type < 2:
         return False, f"NO 3D FIX  ({sats} sats)"
     if sats < 6:
-        return False, f"3D FIX  {sats} SATS — NEED ≥6"
+        return False, f"3D FIX  {sats} SATS — NEED ≥ 6"
     hdop_str = f"  HDOP {hdop:.2f}" if hdop < 90 else ""
     return True, f"3D FIX  {sats} SATS{hdop_str}"
 
