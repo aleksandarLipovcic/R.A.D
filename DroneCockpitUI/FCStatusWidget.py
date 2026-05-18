@@ -3,23 +3,21 @@ FCStatusWidget.py  —  Flight Controller Status Panel
 =====================================================
 Priority-based responsive layout — critical info always visible.
 
-FIXES vs previous version:
-  1. ARM channel highlight threshold corrected from 1700 → 1800.
-     The previous value matched no real arm configuration and caused
-     the ARM bar/dot to go green at 1775 (ELRS failsafe value) before
-     Betaflight would actually arm.  Now matches the BF Modes tab
-     minimum (1800–2100).  Defined as a single constant ARM_THRESHOLD
-     so it never diverges between bar mode and dot mode.
-  2. FCStatusWidget now exports ARM_THRESHOLD so external code
-     (e.g. the probe script) can import a single authoritative value.
-
-PRIORITY TIERS:
-  P1 (always visible): ARM state, flight mode, battery voltage/cell V/state,
-                        voltage bar, flight timer + warnings
-  P2 (always visible): secondary battery stats, sensors
-  P3 (collapses on narrow): CPU/metrics, motors, RC channels
-
-Feed via  update_fc_status(data_dict)  every UI tick (~20 ms).
+LAYOUT FIXES (this version):
+  1. P1 (ARM state, flight mode, battery strip, voltage bar, flight timer)
+     is packed OUTSIDE the scroll area and is always visible regardless of
+     window height.  Shrinking the window never hides the battery voltage or
+     ARM state.
+  2. P2 + P3 (battery detail, sensors, FC metrics, motors, RC channels) live
+     inside a Canvas-backed scrollable frame.  A scrollbar appears when the
+     content overflows vertically.
+  3. Mousewheel scrolling is bound on every child widget inside the scroll
+     area.
+  4. Compact mode (motors/RC switch from bar graphs to dots) at width < 300
+     is preserved.  An additional compact battery-strip mode at width < 270
+     condenses the voltage display into a single row to save vertical space.
+  5. Mode label wraps when text is too long for the available space.
+  6. Sensors row wraps to multiple lines when too narrow to fit all pills.
 """
 
 import tkinter as tk
@@ -47,12 +45,12 @@ _F_VALUE  = ("Consolas", 10, "bold")
 _F_ARMED  = ("Consolas", 14, "bold")
 _F_MODE   = ("Consolas", 11, "bold")
 _F_VOLT   = ("Consolas", 18, "bold")
+_F_VOLT_C = ("Consolas", 11, "bold")   # compact voltage font
 _F_TIMER  = ("Consolas", 13, "bold")
 _F_WARN   = ("Consolas", 10, "bold")
 
-# FIX: single authoritative ARM channel threshold.
-# Must match the minimum value of the ARM range configured in BF Modes tab.
-# Default BF ARM range is 1800–2100; change this if you move the left handle.
+# ARM channel threshold — single authoritative value.
+# Must match the minimum of the ARM range in BF Modes tab (default 1800–2100).
 ARM_THRESHOLD = 1800
 
 _SENSORS = [
@@ -79,13 +77,18 @@ _CELL_WARN = 3.65
 _CELL_FULL = 4.20
 
 _BAT_STATE_COLORS = {
-    "OK":          (_GREEN,   _BG3),
-    "WARNING":     (_ORANGE,  _BG3),
-    "CRITICAL":    (_RED,     _BG3),
-    "NOT_PRESENT": (_DIM_FG,  _BORDER),
-    "INIT":        (_DIM_FG,  _BORDER),
-    "UNKNOWN":     (_DIM_FG,  _BORDER),
+    "OK":          (_GREEN,  _BG3),
+    "WARNING":     (_ORANGE, _BG3),
+    "CRITICAL":    (_RED,    _BG3),
+    "NOT_PRESENT": (_DIM_FG, _BORDER),
+    "INIT":        (_DIM_FG, _BORDER),
+    "UNKNOWN":     (_DIM_FG, _BORDER),
 }
+
+# Width below which the battery strip switches to the compact single-row layout.
+_COMPACT_BAT_W = 270
+# Width below which motor/RC bars switch to dots.
+_COMPACT_MOT_W = 300
 
 
 def _sep(parent):
@@ -112,6 +115,7 @@ class FCStatusWidget(tk.Frame):
         self._width: int       = 500
         self._motor_mode       = "bars"
         self._rc_mode          = "bars"
+        self._bat_compact      = False
         self._build_ui()
         self.bind("<Configure>", self._on_resize)
         self._tick()
@@ -129,10 +133,12 @@ class FCStatusWidget(tk.Frame):
             pass
 
     # =========================================================================
-    # Build
+    # Build — P1 (always visible, NOT inside scroll area)
     # =========================================================================
 
-    def _build_ui(self):
+    def _build_p1(self):
+        """Build the always-visible top section (ARM, battery, timer)."""
+
         # ── P1a: ARM state + flight mode ──────────────────────────────────────
         p1 = tk.Frame(self, bg=_BG2,
                       highlightthickness=1, highlightbackground=_BORDER)
@@ -153,21 +159,30 @@ class FCStatusWidget(tk.Frame):
         tk.Frame(p1, bg=_BORDER, width=1).pack(
             side="left", fill="y", padx=(10, 10), pady=4)
 
+        # Mode block — allow text to wrap so long mode names don't get clipped
         mode_blk = tk.Frame(p1, bg=_BG2)
-        mode_blk.pack(side="left", pady=6)
+        mode_blk.pack(side="left", pady=6, fill="x", expand=True)
         tk.Label(mode_blk, text="MODE", bg=_BG2, fg=_LABEL_FG,
                  font=_F_SMALL).pack(anchor="w")
         self._mode_lbl = tk.Label(mode_blk, text="—", bg=_BG2,
-                                   fg=_ORANGE, font=_F_MODE)
-        self._mode_lbl.pack(anchor="w")
+                                   fg=_ORANGE, font=_F_MODE,
+                                   anchor="w", justify="left",
+                                   wraplength=1)   # updated on resize
+        self._mode_lbl.pack(anchor="w", fill="x", expand=True)
+        # Keep a reference to update wraplength on resize
+        self._mode_blk = mode_blk
 
-        # ── P1b: Battery critical strip ───────────────────────────────────────
-        bs = tk.Frame(self, bg=_BG3,
-                      highlightthickness=1, highlightbackground=_BORDER)
-        bs.pack(fill="x", padx=6, pady=(0, 2))
-        self._bat_strip = bs
+        # ── P1b: Battery strip (full layout) ──────────────────────────────────
+        self._bat_strip = tk.Frame(self, bg=_BG3,
+                                    highlightthickness=1,
+                                    highlightbackground=_BORDER)
+        self._bat_strip.pack(fill="x", padx=6, pady=(0, 2))
 
-        vblk = tk.Frame(bs, bg=_BG3)
+        # Full layout — big voltage number
+        self._bat_full_row = tk.Frame(self._bat_strip, bg=_BG3)
+        self._bat_full_row.pack(fill="x")
+
+        vblk = tk.Frame(self._bat_full_row, bg=_BG3)
         vblk.pack(side="left", padx=(10, 0), pady=6)
         tk.Label(vblk, text="VBAT", bg=_BG3, fg=_LABEL_FG,
                  font=_F_TINY).pack(anchor="w")
@@ -179,7 +194,7 @@ class FCStatusWidget(tk.Frame):
         tk.Label(vrow, text="V", bg=_BG3, fg=_LABEL_FG,
                  font=_F_VALUE).pack(side="left", anchor="s", padx=(2, 0))
 
-        cblk = tk.Frame(bs, bg=_BG3)
+        cblk = tk.Frame(self._bat_full_row, bg=_BG3)
         cblk.pack(side="left", padx=(12, 0), pady=6)
         tk.Label(cblk, text="PER CELL", bg=_BG3, fg=_LABEL_FG,
                  font=_F_TINY).pack(anchor="w")
@@ -187,7 +202,7 @@ class FCStatusWidget(tk.Frame):
                                    fg=_GREEN, font=_F_VALUE)
         self._cell_lbl.pack(anchor="w")
 
-        rblk = tk.Frame(bs, bg=_BG3)
+        rblk = tk.Frame(self._bat_full_row, bg=_BG3)
         rblk.pack(side="right", padx=(0, 10), pady=6)
         self._bat_state_lbl = tk.Label(rblk, text="INIT",
                                         bg=_BORDER, fg=_DIM_FG,
@@ -197,7 +212,31 @@ class FCStatusWidget(tk.Frame):
                                       fg=_VALUE_FG, font=_F_VALUE)
         self._bat_pct_lbl.pack(anchor="e", pady=(2, 0))
 
-        # Voltage bar
+        # Compact layout — single row, smaller font
+        self._bat_compact_row = tk.Frame(self._bat_strip, bg=_BG3)
+        # (not packed until _apply_compact_bat switches modes)
+
+        cv_row = tk.Frame(self._bat_compact_row, bg=_BG3)
+        cv_row.pack(side="left", padx=(8, 0), pady=4)
+        self._big_volt_c = tk.Label(cv_row, text="—", bg=_BG3,
+                                     fg=_GREEN, font=_F_VOLT_C)
+        self._big_volt_c.pack(side="left")
+        tk.Label(cv_row, text="V", bg=_BG3, fg=_LABEL_FG,
+                 font=_F_TINY).pack(side="left", anchor="s")
+
+        tk.Frame(self._bat_compact_row, bg=_BORDER, width=1).pack(
+            side="left", fill="y", padx=6, pady=3)
+
+        self._cell_lbl_c = tk.Label(self._bat_compact_row, text="— V/cell",
+                                     bg=_BG3, fg=_GREEN, font=_F_TINY)
+        self._cell_lbl_c.pack(side="left")
+
+        self._bat_state_lbl_c = tk.Label(self._bat_compact_row, text="INIT",
+                                          bg=_BORDER, fg=_DIM_FG,
+                                          font=_F_TINY, padx=4, pady=1)
+        self._bat_state_lbl_c.pack(side="right", padx=(0, 8), pady=4)
+
+        # ── P1c: Voltage bar ──────────────────────────────────────────────────
         vbf = tk.Frame(self, bg=_BG)
         vbf.pack(fill="x", padx=6, pady=(0, 2))
         tk.Label(vbf, text="VBAT", bg=_BG, fg=_LABEL_FG,
@@ -209,7 +248,7 @@ class FCStatusWidget(tk.Frame):
         self._vbat_outer.bind(
             "<Configure>", lambda e: self.after_idle(self._redraw_vbat))
 
-        # ── P1c: Flight timer ─────────────────────────────────────────────────
+        # ── P1d: Flight timer ─────────────────────────────────────────────────
         tf = tk.Frame(self, bg=_BG2,
                       highlightthickness=1, highlightbackground=_BORDER)
         tf.pack(fill="x", padx=6, pady=(0, 2))
@@ -251,6 +290,7 @@ class FCStatusWidget(tk.Frame):
         self._plan_spin.bind("<Return>",   lambda e: self._on_plan_change())
         self._plan_spin.bind("<FocusOut>", lambda e: self._on_plan_change())
 
+        # Time warning strip (conditional — shown/hidden by _tick)
         self._twarn_outer = tk.Frame(self, bg=_BG,
                                       highlightthickness=1,
                                       highlightbackground=_BG)
@@ -258,24 +298,59 @@ class FCStatusWidget(tk.Frame):
                                     bg=_BG, fg=_ORANGE, font=_F_WARN)
         self._twarn_lbl.pack(pady=3)
 
-        # ── P2: Battery detail + sensors ──────────────────────────────────────
-        _sep(self)
-        _sec_hdr(self, "BATTERY DETAIL")
-        bat_det = tk.Frame(self, bg=_BG)
+    # =========================================================================
+    # Build — P2 + P3 (inside scroll area)
+    # =========================================================================
+
+    def _build_scrollable(self):
+        """Build the scrollable section containing P2 and P3."""
+
+        sc_container = tk.Frame(self, bg=_BG)
+        sc_container.pack(fill="both", expand=True)
+
+        self._scroll_canvas = tk.Canvas(sc_container, bg=_BG,
+                                         highlightthickness=0, bd=0)
+        self._vscroll = tk.Scrollbar(sc_container, orient="vertical",
+                                      command=self._scroll_canvas.yview)
+        self._scroll_canvas.configure(yscrollcommand=self._vscroll.set)
+
+        self._vscroll.pack(side="right", fill="y")
+        self._scroll_canvas.pack(side="left", fill="both", expand=True)
+
+        self._scroll_inner = tk.Frame(self._scroll_canvas, bg=_BG)
+        self._canvas_win = self._scroll_canvas.create_window(
+            (0, 0), window=self._scroll_inner, anchor="nw")
+
+        self._scroll_inner.bind("<Configure>", self._on_inner_configure)
+        self._scroll_canvas.bind("<Configure>", self._on_canvas_configure)
+
+        self._bind_mw(self._scroll_canvas)
+        self._bind_mw(self._scroll_inner)
+
+        p = self._scroll_inner   # shorthand
+
+        # ── P2: Battery detail ────────────────────────────────────────────────
+        _sep(p)
+        _sec_hdr(p, "BATTERY DETAIL")
+        bat_det = tk.Frame(p, bg=_BG)
         bat_det.pack(fill="x", padx=6, pady=(0, 3))
         self._bat_curr_lbl  = self._mini_stat(bat_det, "CURRENT", "A")
         self._bat_mah_lbl   = self._mini_stat(bat_det, "USED",   "mAh")
         self._bat_cells_lbl = self._mini_stat(bat_det, "CELLS",    "S")
+        self._bind_mw(bat_det)
 
-        _sep(self)
-        _sec_hdr(self, "SENSORS")
-        sens_row = tk.Frame(self, bg=_BG)
-        sens_row.pack(fill="x", padx=6, pady=(0, 3))
-        self._sensor_refs: dict[str, tuple] = {}
+        # ── P2: Sensors ───────────────────────────────────────────────────────
+        _sep(p)
+        _sec_hdr(p, "SENSORS")
+        # Pills are placed with grid so we can change ncols without re-parenting.
+        self._sens_outer = tk.Frame(p, bg=_BG)
+        self._sens_outer.pack(fill="x", padx=6, pady=(0, 3))
+        self._sensor_refs: dict = {}
+        self._sensor_pills: list = []
+        self._sens_ncols: int = 0          # track current column count
         for sname, _ in _SENSORS:
-            pill = tk.Frame(sens_row, bg=_DIM,
+            pill = tk.Frame(self._sens_outer, bg=_DIM,
                             highlightthickness=1, highlightbackground=_BORDER)
-            pill.pack(side="left", padx=2, pady=1)
             cv = tk.Canvas(pill, width=9, height=9,
                            bg=_DIM, highlightthickness=0)
             cv.pack(side="left", padx=(3, 1), pady=2)
@@ -284,11 +359,18 @@ class FCStatusWidget(tk.Frame):
                            font=_F_TINY)
             lbl.pack(side="left", padx=(0, 4), pady=2)
             self._sensor_refs[sname] = (cv, dot, lbl, pill)
+            self._sensor_pills.append(pill)
+            for w in (pill, cv, lbl):
+                self._bind_mw(w)
+        # Initial grid layout — all 6 pills in one row
+        self._relayout_sensors(6)
+        self._bind_mw(self._sens_outer)
+        self._sens_outer.bind("<Configure>", self._on_sens_configure)
 
         # ── P3: FC metrics ────────────────────────────────────────────────────
-        _sep(self)
-        _sec_hdr(self, "FC METRICS")
-        met_row = tk.Frame(self, bg=_BG)
+        _sep(p)
+        _sec_hdr(p, "FC METRICS")
+        met_row = tk.Frame(p, bg=_BG)
         met_row.pack(fill="x", padx=6, pady=(0, 3))
         cpu_blk = tk.Frame(met_row, bg=_BG)
         cpu_blk.pack(side="left", padx=(2, 14), fill="y")
@@ -303,30 +385,32 @@ class FCStatusWidget(tk.Frame):
                                   fg=_GREEN, font=_F_VALUE)
         self._cpu_lbl.pack(anchor="w")
         self._lbl_cycle = self._mini_stat(met_row, "LOOP",    "ms")
-        self._lbl_i2c   = self._mini_stat(met_row, "I²C ERR")
+        self._lbl_i2c   = self._mini_stat(met_row, "I2C ERR")
         self._lbl_pid   = self._mini_stat(met_row, "PID")
+        self._bind_mw(met_row)
 
         # ── P3: Motors ────────────────────────────────────────────────────────
-        _sep(self)
-        mot_hdr = tk.Frame(self, bg=_BG)
+        _sep(p)
+        mot_hdr = tk.Frame(p, bg=_BG)
         mot_hdr.pack(fill="x", padx=6, pady=(3, 1))
         tk.Label(mot_hdr, text="MOTORS", bg=_BG, fg=_LABEL_FG,
                  font=_F_TINY).pack(side="left")
-        self._mot_unit_lbl = tk.Label(mot_hdr, text="(µs)", bg=_BG,
+        self._mot_unit_lbl = tk.Label(mot_hdr, text="(us)", bg=_BG,
                                        fg=_LABEL_FG, font=_F_MICRO)
         self._mot_unit_lbl.pack(side="left", padx=(3, 0))
         tk.Frame(mot_hdr, bg=_BORDER, height=1).pack(
             side="left", fill="x", expand=True, padx=(4, 0), pady=4)
 
-        self._mot_wrapper = tk.Frame(self, bg=_BG)
+        self._mot_wrapper = tk.Frame(p, bg=_BG)
         self._mot_wrapper.pack(fill="x", padx=6, pady=(0, 3))
+        self._bind_mw(self._mot_wrapper)
 
         self._mot_bar_f = tk.Frame(self._mot_wrapper, bg=_BG)
         self._mot_bar_f.pack(fill="x")
 
-        self._motor_bars:   list[tk.Frame] = []
-        self._motor_lbls:   list[tk.Label] = []
-        self._motor_outers: list[tk.Frame] = []
+        self._motor_bars:   list = []
+        self._motor_lbls:   list = []
+        self._motor_outers: list = []
         for i in range(4):
             blk = tk.Frame(self._mot_bar_f, bg=_BG2,
                            highlightthickness=1, highlightbackground=_BORDER)
@@ -343,10 +427,11 @@ class FCStatusWidget(tk.Frame):
             self._motor_outers.append(bo)
             self._motor_bars.append(bi)
             self._motor_lbls.append(vl)
+            self._bind_mw(blk)
 
         self._mot_dot_f = tk.Frame(self._mot_wrapper, bg=_BG)
 
-        self._motor_dots: list[tuple] = []
+        self._motor_dots: list = []
         dot_row = tk.Frame(self._mot_dot_f, bg=_BG)
         dot_row.pack(fill="x", padx=6, pady=2)
         for i in range(4):
@@ -360,25 +445,28 @@ class FCStatusWidget(tk.Frame):
                           font=_F_TINY)
             ll.pack(side="left")
             self._motor_dots.append((cv, d, ll))
+            for w in (blk, cv, ll):
+                self._bind_mw(w)
 
         # ── P3: RC channels ───────────────────────────────────────────────────
-        _sep(self)
-        rc_hdr = tk.Frame(self, bg=_BG)
+        _sep(p)
+        rc_hdr = tk.Frame(p, bg=_BG)
         rc_hdr.pack(fill="x", padx=6, pady=(3, 1))
         tk.Label(rc_hdr, text="RC CHANNELS", bg=_BG, fg=_LABEL_FG,
                  font=_F_TINY).pack(side="left")
         tk.Frame(rc_hdr, bg=_BORDER, height=1).pack(
             side="left", fill="x", expand=True, padx=(4, 0), pady=4)
 
-        self._rc_wrapper = tk.Frame(self, bg=_BG)
+        self._rc_wrapper = tk.Frame(p, bg=_BG)
         self._rc_wrapper.pack(fill="x", padx=6, pady=(0, 3))
+        self._bind_mw(self._rc_wrapper)
 
         self._rc_bar_f = tk.Frame(self._rc_wrapper, bg=_BG)
         self._rc_bar_f.pack(fill="x")
 
-        self._rc_bars:   list[tk.Frame] = []
-        self._rc_lbls:   list[tk.Label] = []
-        self._rc_outers: list[tk.Frame] = []
+        self._rc_bars:   list = []
+        self._rc_lbls:   list = []
+        self._rc_outers: list = []
         for ch_name, _ in _RC_CHANNELS:
             blk = tk.Frame(self._rc_bar_f, bg=_BG2,
                            highlightthickness=1, highlightbackground=_BORDER)
@@ -395,10 +483,11 @@ class FCStatusWidget(tk.Frame):
             self._rc_outers.append(bo)
             self._rc_bars.append(bi)
             self._rc_lbls.append(vl)
+            self._bind_mw(blk)
 
         self._rc_dot_f = tk.Frame(self._rc_wrapper, bg=_BG)
 
-        self._rc_dots: list[tuple] = []
+        self._rc_dots: list = []
         rdot_row = tk.Frame(self._rc_dot_f, bg=_BG)
         rdot_row.pack(fill="x", padx=6, pady=2)
         for ch_name, _ in _RC_CHANNELS:
@@ -412,14 +501,21 @@ class FCStatusWidget(tk.Frame):
                           font=_F_TINY)
             ll.pack(side="left")
             self._rc_dots.append((cv, d, ll))
+            for w in (blk, cv, ll):
+                self._bind_mw(w)
 
-        lq_f = tk.Frame(self, bg=_BG)
+        lq_f = tk.Frame(p, bg=_BG)
         lq_f.pack(fill="x", padx=8, pady=(0, 5))
         tk.Label(lq_f, text="LINK QUALITY", bg=_BG, fg=_LABEL_FG,
                  font=_F_MICRO).pack(side="left")
         self._lq_lbl = tk.Label(lq_f, text="—%", bg=_BG,
                                   fg=_VALUE_FG, font=_F_TINY)
         self._lq_lbl.pack(side="left", padx=5)
+        self._bind_mw(lq_f)
+
+    def _build_ui(self):
+        self._build_p1()
+        self._build_scrollable()
 
     # =========================================================================
     # Helpers
@@ -437,7 +533,71 @@ class FCStatusWidget(tk.Frame):
         if unit:
             tk.Label(vrow, text=unit, bg=_BG, fg=_LABEL_FG,
                      font=_F_MICRO).pack(side="left", padx=(2, 0))
+        self._bind_mw(blk)
         return v
+
+    # =========================================================================
+    # Mousewheel helpers
+    # =========================================================================
+
+    def _bind_mw(self, widget):
+        widget.bind("<MouseWheel>", self._on_mousewheel, add="+")
+        widget.bind("<Button-4>",   self._on_mousewheel, add="+")
+        widget.bind("<Button-5>",   self._on_mousewheel, add="+")
+
+    def _on_mousewheel(self, event):
+        if event.num == 4:
+            self._scroll_canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self._scroll_canvas.yview_scroll(1, "units")
+        else:
+            self._scroll_canvas.yview_scroll(
+                int(-1 * (event.delta / 120)), "units")
+
+    # =========================================================================
+    # Canvas / scroll event handlers
+    # =========================================================================
+
+    def _on_inner_configure(self, _event):
+        self._scroll_canvas.configure(
+            scrollregion=self._scroll_canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        self._scroll_canvas.itemconfig(self._canvas_win, width=event.width)
+
+    # =========================================================================
+    # Sensors wrap layout
+    # =========================================================================
+
+    def _on_sens_configure(self, event):
+        """Re-grid sensor pills when the container width changes."""
+        self.after_idle(lambda: self._relayout_sensors_by_width(event.width))
+
+    def _relayout_sensors_by_width(self, available_w: int):
+        """Choose the right number of columns based on available width and re-grid."""
+        # Each pill is roughly 48 px wide including padding.
+        PILL_W = 48
+        ncols = max(3, min(len(self._sensor_pills),
+                           max(1, available_w // PILL_W)))
+        self._relayout_sensors(ncols)
+
+    def _relayout_sensors(self, ncols: int):
+        """Place all sensor pills into a grid with `ncols` columns.
+
+        All pills remain children of _sens_outer — we never re-parent them,
+        so there is no TclError. Only grid() coordinates change.
+        """
+        if ncols == self._sens_ncols:
+            return
+        self._sens_ncols = ncols
+
+        for col in range(ncols):
+            self._sens_outer.columnconfigure(col, weight=0)
+
+        for idx, pill in enumerate(self._sensor_pills):
+            row = idx // ncols
+            col = idx % ncols
+            pill.grid(row=row, column=col, padx=2, pady=1, sticky="w")
 
     # =========================================================================
     # Resize handler
@@ -449,18 +609,25 @@ class FCStatusWidget(tk.Frame):
             return
         self._width = w
 
-        mode = "bars" if w >= 300 else "dots"
+        # ── Mode label wraplength ─────────────────────────────────────────────
+        # Approximate available width for mode text: total - arm block (~140px) - padding
+        mode_wrap = max(60, w - 160)
+        self._mode_lbl.config(wraplength=mode_wrap)
+
+        # ── Motor display mode ────────────────────────────────────────────────
+        mode = "bars" if w >= _COMPACT_MOT_W else "dots"
         if mode != self._motor_mode:
             self._motor_mode = mode
             if mode == "bars":
                 self._mot_dot_f.pack_forget()
                 self._mot_bar_f.pack(fill="x")
-                self._mot_unit_lbl.config(text="(µs)")
+                self._mot_unit_lbl.config(text="(us)")
             else:
                 self._mot_bar_f.pack_forget()
                 self._mot_dot_f.pack(fill="x")
                 self._mot_unit_lbl.config(text="")
 
+        # ── RC display mode ───────────────────────────────────────────────────
         if mode != self._rc_mode:
             self._rc_mode = mode
             if mode == "bars":
@@ -470,8 +637,23 @@ class FCStatusWidget(tk.Frame):
                 self._rc_bar_f.pack_forget()
                 self._rc_dot_f.pack(fill="x")
 
+        # ── Battery strip compact mode ────────────────────────────────────────
+        compact_bat = w < _COMPACT_BAT_W
+        if compact_bat != self._bat_compact:
+            self._bat_compact = compact_bat
+            self._apply_compact_bat(compact_bat)
+
         self.after_idle(self._redraw_cpu)
         self.after_idle(self._redraw_vbat)
+
+    def _apply_compact_bat(self, compact: bool):
+        """Switch the battery strip between full (big volt) and compact layouts."""
+        if compact:
+            self._bat_full_row.pack_forget()
+            self._bat_compact_row.pack(fill="x")
+        else:
+            self._bat_compact_row.pack_forget()
+            self._bat_full_row.pack(fill="x")
 
     # =========================================================================
     # Redraw helpers
@@ -554,7 +736,8 @@ class FCStatusWidget(tk.Frame):
                 self._twarn_outer.pack(fill="x", padx=6, pady=(0, 2))
                 self._twarn_outer.config(highlightbackground=_RED)
                 self._twarn_lbl.config(
-                    text="⚠  ENDURANCE EXCEEDED — LAND IMMEDIATELY", fg=_RED)
+                    text="WARNING — ENDURANCE EXCEEDED — LAND IMMEDIATELY",
+                    fg=_RED)
             elif remaining <= 30:
                 self._flash_on = not self._flash_on
                 fc = _RED if self._flash_on else _ORANGE
@@ -562,13 +745,13 @@ class FCStatusWidget(tk.Frame):
                 self._twarn_outer.pack(fill="x", padx=6, pady=(0, 2))
                 self._twarn_outer.config(highlightbackground=fc)
                 self._twarn_lbl.config(
-                    text="⚠  WARNING — RETURN TO HOME IMMEDIATELY", fg=fc)
+                    text="WARNING — RETURN TO HOME IMMEDIATELY", fg=fc)
             elif remaining <= 120:
                 self._remain_lbl.config(fg=_ORANGE)
                 self._twarn_outer.pack(fill="x", padx=6, pady=(0, 2))
                 self._twarn_outer.config(highlightbackground=_ORANGE)
                 self._twarn_lbl.config(
-                    text="◉  CAUTION — PLAN YOUR RETURN TO HOME", fg=_ORANGE)
+                    text="CAUTION — PLAN YOUR RETURN TO HOME", fg=_ORANGE)
             else:
                 self._remain_lbl.config(fg=_VALUE_FG)
                 self._twarn_outer.pack_forget()
@@ -607,7 +790,7 @@ class FCStatusWidget(tk.Frame):
             mc = _VALUE_FG
         self._mode_lbl.config(text=mode, fg=mc)
 
-        # ── Battery P1 ────────────────────────────────────────────────────────
+        # ── Battery P1 (both full and compact rows updated) ───────────────────
         volts  = float(data.get("battery_voltage", 0.0))
         amps   = float(data.get("battery_current", 0.0))
         mah    = float(data.get("battery_mah_drawn", 0.0))
@@ -617,9 +800,16 @@ class FCStatusWidget(tk.Frame):
         cell_v = (volts / cells) if cells > 0 else 0.0
         vcol   = self._cell_color(cell_v) if volts > 0 else _DIM_FG
 
-        self._big_volt.config(text=f"{volts:.1f}" if volts > 0 else "—", fg=vcol)
-        self._cell_lbl.config(
-            text=f"{cell_v:.2f}  V" if cell_v > 0 else "—  V", fg=vcol)
+        volt_str = f"{volts:.1f}" if volts > 0 else "—"
+        cell_str = f"{cell_v:.2f}  V" if cell_v > 0 else "—  V"
+        cell_str_c = f"{cell_v:.2f} V/cell" if cell_v > 0 else "— V/cell"
+
+        # Full layout labels
+        self._big_volt.config(text=volt_str, fg=vcol)
+        self._cell_lbl.config(text=cell_str, fg=vcol)
+        # Compact layout labels
+        self._big_volt_c.config(text=volt_str, fg=vcol)
+        self._cell_lbl_c.config(text=cell_str_c, fg=vcol)
 
         pcol = _RED if 0 <= pct < 15 else _ORANGE if 0 <= pct < 30 else _VALUE_FG
         self._bat_pct_lbl.config(
@@ -628,6 +818,7 @@ class FCStatusWidget(tk.Frame):
 
         sfg, sbg = _BAT_STATE_COLORS.get(state, (_DIM_FG, _BORDER))
         self._bat_state_lbl.config(text=state, fg=sfg, bg=sbg)
+        self._bat_state_lbl_c.config(text=state, fg=sfg, bg=sbg)
         self._bat_strip.config(
             highlightbackground=_RED   if state == "CRITICAL" else
                                 _ORANGE if state == "WARNING"  else _BORDER)
@@ -708,9 +899,7 @@ class FCStatusWidget(tk.Frame):
                         bi.place(x=0, rely=0.5, relwidth=1.0,
                                  height=max(1, int(abs(dev) * h)),
                                  anchor="sw" if dev >= 0 else "nw")
-                    # FIX: ARM channel goes green only at or above ARM_THRESHOLD
-                    # (1800), not at 1700 as before. At 1775 (ELRS failsafe
-                    # value) the bar correctly stays blue — disarmed.
+                    # ARM bar: green only at or above ARM_THRESHOLD (1800).
                     col = _GREEN if ch_name == "ARM" and us >= ARM_THRESHOLD else _BLUE
                     bi.config(bg=col)
                     lbl.config(text=str(us), fg=_VALUE_FG)
@@ -720,7 +909,7 @@ class FCStatusWidget(tk.Frame):
                     lbl.config(text="—", fg=_DIM_FG)
             else:
                 cv, d, ll = self._rc_dots[i]
-                # FIX: same threshold fix for dot mode
+                # Same ARM threshold in dot mode.
                 col = _GREEN if ch_name == "ARM" and us >= ARM_THRESHOLD else _BLUE
                 cv.itemconfig(d, fill=col if valid else _DIM_FG)
                 ll.config(fg=_VALUE_FG if valid else _DIM_FG)
