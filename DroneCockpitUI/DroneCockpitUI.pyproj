@@ -45,6 +45,9 @@
     <Compile Include="Drone3DView.py">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="it_tests\conftest.py">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="MagWidget.py">
       <SubType>Code</SubType>
     </Compile>
@@ -72,6 +75,18 @@
     <Compile Include="TestScripts\test_imu_widget.py">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="it_tests\test_IT_IMU_001.py">
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="it_tests\test_IT_IMU_002.py">
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="it_tests\test_IT_IMU_003.py">
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="it_tests\test_IT_IMU_004.py">
+      <SubType>Code</SubType>
+    </Compile>
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\DroneBackend\DroneBackend.vcxproj">
@@ -81,12 +96,14 @@
     </ProjectReference>
   </ItemGroup>
   <ItemGroup>
+    <Folder Include="it_tests\" />
     <Folder Include="TestScripts\" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="TestScripts\pytest.ini">
       <SubType>Code</SubType>
     </Content>
+    <Content Include="it_tests\Readme.md" />
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
   <!-- Uncomment the CoreCompile target to enable the Build command in

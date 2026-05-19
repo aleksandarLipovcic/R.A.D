@@ -247,15 +247,18 @@ void DroneLink::communicationLoop() {
         --slowPollTickCounter_;
 
         // ── Health tracking ───────────────────────────────────────────────────
+        // FIXED — packetCount increments every committed loop tick.
+        // anySuccess still controls link health, but packet counting is
+        // independent — it tracks loop throughput, not IMU parse success.
         if (anySuccess) {
             consecutiveFails = 0;
             pending.linkHealthy = true;
-            pending.packetCount++;
         }
         else {
             if (++consecutiveFails >= FAIL_THRESHOLD)
                 pending.linkHealthy = false;
         }
+        pending.packetCount++;   // always — one tick = one committed state
 
         commitState(pending);
 
