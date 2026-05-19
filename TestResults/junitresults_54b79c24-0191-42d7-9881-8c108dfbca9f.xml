@@ -1,0 +1,211 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="35" time="22.847" timestamp="2026-05-19T13:30:07.426959+02:00" hostname="TheSilent"><testcase classname="TestScripts.test_imu_widget" name="test_accel_scale" file="TestScripts\test_imu_widget.py" line="358" time="0.725"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget" name="test_flash_ms" file="TestScripts\test_imu_widget.py" line="378" time="0.607"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget" name="test_gyro_crit_dps" file="TestScripts\test_imu_widget.py" line="366" time="0.604"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget" name="test_gyro_scale" file="TestScripts\test_imu_widget.py" line="354" time="0.602"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget" name="test_gyro_warn_dps" file="TestScripts\test_imu_widget.py" line="362" time="0.605"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget" name="test_hold_crit_sec" file="TestScripts\test_imu_widget.py" line="374" time="0.604"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget" name="test_hold_warn_sec" file="TestScripts\test_imu_widget.py" line="370" time="0.602"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestCritState" name="test_UT_ALERT_003_after_expiry_safe_band_is_safe" file="TestScripts\test_imu_widget.py" line="267" time="0.613"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestCritState" name="test_UT_ALERT_003_after_expiry_warn_band_is_warn" file="TestScripts\test_imu_widget.py" line="260" time="0.607"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestCritState" name="test_UT_ALERT_003_crit_overrides_warn" file="TestScripts\test_imu_widget.py" line="243" time="0.607"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestCritState" name="test_UT_ALERT_003_entry_above_100dps" file="TestScripts\test_imu_widget.py" line="220" time="0.606"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestCritState" name="test_UT_ALERT_003_entry_at_100dps" file="TestScripts\test_imu_widget.py" line="216" time="0.606"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestCritState" name="test_UT_ALERT_003_four_sample_sequence" file="TestScripts\test_imu_widget.py" line="224" time="0.607"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestCritState" name="test_UT_ALERT_003_hold_refreshed_during_crit" file="TestScripts\test_imu_widget.py" line="251" time="0.607"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestCritState" name="test_UT_ALERT_003_hold_timer_set_to_4s" file="TestScripts\test_imu_widget.py" line="236" time="0.606"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestFlashTicker" name="test_UT_ALERT_004_flash_ms_constant" file="TestScripts\test_imu_widget.py" line="282" time="0.613"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestFlashTicker" name="test_UT_ALERT_004_partial_unregister_keeps_ticker" file="TestScripts\test_imu_widget.py" line="329" time="1.317"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestFlashTicker" name="test_UT_ALERT_004_registry_tracks_labels" file="TestScripts\test_imu_widget.py" line="306" time="0.605"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestFlashTicker" name="test_UT_ALERT_004_ticker_not_duplicated" file="TestScripts\test_imu_widget.py" line="294" time="0.612"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestFlashTicker" name="test_UT_ALERT_004_ticker_starts_on_register" file="TestScripts\test_imu_widget.py" line="286" time="0.605"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestFlashTicker" name="test_UT_ALERT_004_ticker_stops_after_last_unregister" file="TestScripts\test_imu_widget.py" line="314" time="1.318"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestSafeState" name="test_UT_ALERT_001_all_axes_independent" file="TestScripts\test_imu_widget.py" line="147" time="0.603"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestSafeState" name="test_UT_ALERT_001_below_warn_threshold" file="TestScripts\test_imu_widget.py" line="124" time="0.607"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestSafeState" name="test_UT_ALERT_001_boundary_just_below" file="TestScripts\test_imu_widget.py" line="137" time="0.605"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestSafeState" name="test_UT_ALERT_001_hold_until_zero_after_safe" file="TestScripts\test_imu_widget.py" line="141" time="0.607"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestSafeState" name="test_UT_ALERT_001_small_positive_rate" file="TestScripts\test_imu_widget.py" line="133" time="0.605"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestSafeState" name="test_UT_ALERT_001_zero_rate_is_safe" file="TestScripts\test_imu_widget.py" line="129" time="0.608"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestWarnState" name="test_UT_ALERT_002_axes_independent" file="TestScripts\test_imu_widget.py" line="202" time="0.605"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestWarnState" name="test_UT_ALERT_002_entry_at_30dps" file="TestScripts\test_imu_widget.py" line="162" time="0.607"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestWarnState" name="test_UT_ALERT_002_entry_at_50dps" file="TestScripts\test_imu_widget.py" line="167" time="0.606"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestWarnState" name="test_UT_ALERT_002_entry_at_99p9dps" file="TestScripts\test_imu_widget.py" line="171" time="0.605"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestWarnState" name="test_UT_ALERT_002_hold_active_at_0p5s" file="TestScripts\test_imu_widget.py" line="175" time="0.606"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestWarnState" name="test_UT_ALERT_002_hold_active_at_1p9s" file="TestScripts\test_imu_widget.py" line="181" time="0.607"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestWarnState" name="test_UT_ALERT_002_hold_expires_at_2p1s" file="TestScripts\test_imu_widget.py" line="187" time="0.603"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestWarnState" name="test_UT_ALERT_002_hold_timer_value" file="TestScripts\test_imu_widget.py" line="193" time="0.629"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase></testsuite></testsuites>

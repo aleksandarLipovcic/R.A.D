@@ -51,6 +51,9 @@
     <Compile Include="telemetry_worker.py">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="TestScripts\conftest.py">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="TestScripts\gps_sv_reader.py">
       <SubType>Code</SubType>
     </Compile>
@@ -66,6 +69,9 @@
     <Compile Include="Setup_Project.py">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="TestScripts\test_imu_widget.py">
+      <SubType>Code</SubType>
+    </Compile>
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\DroneBackend\DroneBackend.vcxproj">
@@ -76,6 +82,11 @@
   </ItemGroup>
   <ItemGroup>
     <Folder Include="TestScripts\" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="TestScripts\pytest.ini">
+      <SubType>Code</SubType>
+    </Content>
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
   <!-- Uncomment the CoreCompile target to enable the Build command in

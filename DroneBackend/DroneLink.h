@@ -298,7 +298,7 @@ public:
     bool isConnected() const { return connected.load(); }
 
     // ── State snapshot (thread-safe copy) ─────────────────────────────────────
-    DroneState getLatestState();
+    virtual DroneState getLatestState();
 
     // ── Calibration triggers ──────────────────────────────────────────────────
     void startMagCalibration();
@@ -320,6 +320,9 @@ public:
 
     // ── GPS configuration via UBX passthrough ─────────────────────────────────
     GPSConfigResult applyGPSConfig(const GPSConfig& cfg);
+	// Moved to protected so the tests can access it without making it public in the header.
+protected:
+    bool parseIMU(const std::vector<uint8_t>& buf, DroneState& s);
 
 private:
     HANDLE            hSerial;
@@ -371,7 +374,7 @@ private:
 
     // ── Parsers — one per MSP response type ───────────────────────────────────
     bool parseStatus(const std::vector<uint8_t>& buf, DroneState& s);
-    bool parseIMU(const std::vector<uint8_t>& buf, DroneState& s);
+    //bool parseIMU(const std::vector<uint8_t>& buf, DroneState& s); Uncoment when not doing testing
     bool parseAttitude(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseAnalog(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseDebug(const std::vector<uint8_t>& buf, DroneState& s);
