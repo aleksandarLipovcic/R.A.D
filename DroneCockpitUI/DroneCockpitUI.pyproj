@@ -51,6 +51,24 @@
     <Compile Include="MagWidget.py">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="sat_imu\conftest.py">
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="sat_imu\test_SAT_IMU_001.py">
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="sat_imu\test_SAT_IMU_002.py">
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="sat_imu\test_SAT_IMU_003.py">
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="sat_imu\test_SAT_IMU_004.py">
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="sat_imu\test_SAT_IMU_005.py">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="telemetry_worker.py">
       <SubType>Code</SubType>
     </Compile>
@@ -97,9 +115,13 @@
   </ItemGroup>
   <ItemGroup>
     <Folder Include="it_tests\" />
+    <Folder Include="sat_imu\" />
     <Folder Include="TestScripts\" />
   </ItemGroup>
   <ItemGroup>
+    <Content Include="sat_imu\Readme.md">
+      <SubType>Code</SubType>
+    </Content>
     <Content Include="TestScripts\pytest.ini">
       <SubType>Code</SubType>
     </Content>
