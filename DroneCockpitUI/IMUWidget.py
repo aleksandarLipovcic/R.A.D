@@ -769,9 +769,9 @@ class IMUWidget(tk.Frame):
         priority = {self.C_CRIT_BG_A: 2, self.C_WARN_BG: 1,
                     self.C_SAFE_FG: 0, self.C_NEUTRAL: 0}
         return max(colors, key=lambda c: priority.get(c, 0))
-    
+
     def destroy(self):
-    # Cancel all pending after() jobs before Tkinter destroys the widget
+        # Cancel all pending after() jobs before Tkinter destroys the widget
         for job in [self._cell_flash_job, self._flash_job]:
             if job is not None:
                 try:
