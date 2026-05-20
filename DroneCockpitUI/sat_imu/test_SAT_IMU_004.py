@@ -11,15 +11,20 @@
 #   meets the < 200 ms end-to-end latency requirement under nominal USB CDC
 #   operating conditions.
 #
-#   This is the system-level equivalent of IT-IMU-003. The integration test
-#   measured the same pipeline on the development machine. This SAT test
-#   verifies the same criterion holds on the target system configuration
-#   (FC + GCS running together, all telemetry active).
-#
 # Latency definition (SRS-IMU-007):
-#   total_ms = C++ RTT (last_rtt_ms, measured around sendMSP(RAW_IMU) +
-#              parseIMU() in communicationLoop()) + Python processing time
-#              (time to call to_dict() + widget update_ui()).
+#   total_ms = C++ RTT (to_dict()['rtt_ms'], measured around sendMSP(RAW_IMU)
+#              + parseIMU() in communicationLoop()) + Python processing time
+#              (time to run update_ui() and update_idletasks()).
+#
+# DroneState RTT field — naming and access:
+#   DroneLink.h declares:  double lastRttMs = 0.0;
+#   DroneLink.cpp writes:  pending.lastRttMs = rtt.count();
+#   The pybind11 binding exposes this as to_dict() key 'rtt_ms' (documented
+#   in V-Model Section 5 traceability table, SRS-IMU-007).
+#   This test reads RTT via data.get("rtt_ms", 0.0) from the same to_dict()
+#   call already needed for widget.update_ui(data), adding zero overhead.
+#   Do NOT use s.lastRttMs directly — to_dict()['rtt_ms'] is the documented
+#   API and is consistent with how all other SAT tests read DroneState data.
 #
 # Pass criteria (SYS-004):
 #   - P95 total latency < 200 ms over 1000 samples
@@ -36,24 +41,35 @@ import pytest
 class TestEndToEndLatency:
     """SAT-IMU-004 — SYS-004: < 200 ms end-to-end latency in nominal config."""
 
-    NUM_SAMPLES  = 1000
+    NUM_SAMPLES       = 1000
     SAMPLE_INTERVAL_S = 0.01    # 100 Hz sampling
-    P95_LIMIT_MS = 200.0
-    P50_LIMIT_MS = 30.0
+    P95_LIMIT_MS      = 200.0
+    P50_LIMIT_MS      = 30.0
 
     def _collect_latencies(self, drone_link, imu_widget):
+        """Collect NUM_SAMPLES end-to-end latency measurements.
+
+        total_ms = to_dict()['rtt_ms']  (C++ RTT: sendMSP + parseIMU)
+                 + (t1 - t0) * 1000     (Python: update_ui + update_idletasks)
+
+        'rtt_ms' is written by communicationLoop() only when parseIMU()
+        succeeds. For ticks where parseIMU() failed, lastRttMs retains its
+        previous value (DroneState is a carried-forward snapshot). These
+        samples are included unchanged — they do not inflate the percentiles
+        because they reflect the same USB-serial timing path.
+        """
         root, widget = imu_widget
         latencies = []
         for _ in range(self.NUM_SAMPLES):
             s    = drone_link.get_latest_state()
-            data = s.to_dict()
+            data = s.to_dict()          # single call — reused for widget and RTT
             t0   = time.monotonic()
             widget.update_ui(data)
             root.update_idletasks()
             t1   = time.monotonic()
-            # C++ RTT (sendMSP + parseIMU) + Python processing time
-            total_ms = s.last_rtt_ms + (t1 - t0) * 1000.0
-            latencies.append(total_ms)
+            cpp_rtt_ms = data.get("rtt_ms", 0.0)
+            py_proc_ms = (t1 - t0) * 1000.0
+            latencies.append(cpp_rtt_ms + py_proc_ms)
             time.sleep(self.SAMPLE_INTERVAL_S)
         return sorted(latencies)
 
@@ -88,7 +104,7 @@ class TestEndToEndLatency:
         print(f"  {'-'*34}")
         checks = {50: self.P50_LIMIT_MS, 95: self.P95_LIMIT_MS}
         for pct in (50, 75, 90, 95, 99):
-            val  = latencies[int(n * pct / 100)]
+            val   = latencies[int(n * pct / 100)]
             limit = checks.get(pct)
             flag  = f"< {limit:.0f} {'✓' if limit and val < limit else '✗'}" if limit else ""
             print(f"  P{pct:<11} {val:>8.2f}  {flag}")

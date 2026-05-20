@@ -10,29 +10,29 @@
 #   survives corrupt or missing MSP frames without crashing, without
 #   displaying stale data without indication, and recovers automatically.
 #
-#   SRS-IMU-008:  parseIMU() rejects bad frames, DroneState unchanged
-#   SRS-IMU-008b: worker thread does not crash on consecutive failures
-#   SYS-005:      No crash AND no silent stale data after fault injection
-#
 # Test strategy (three fault scenarios):
-#
-#   SCENARIO A — Link stress (set_poll_interval_ms(0))
-#     Spins the worker loop so fast that the 80 ms sendMSP() timeout fires
-#     continuously. parseIMU() sees empty buffers (size < 18) and returns
-#     false on every tick, driving consecutiveFails above FAIL_THRESHOLD.
-#     Validates: no crash, link_healthy recovers, IMUWidget keeps rendering.
-#
-#   SCENARIO B — Stale data indication (link_healthy flag)
-#     When link_healthy goes False, the widget must not silently display
-#     values as if they were live. We verify that link_healthy is exposed
-#     to the widget via to_dict()['link_healthy'] and that packet_count
-#     stops incrementing (no false-positive fresh data).
-#     Validates SYS-005 "without displaying stale data without indication".
-#
+#   SCENARIO A — Link stress (setPollIntervalMs(0))
+#   SCENARIO B — Stale data indication (linkHealthy flag via to_dict())
 #   SCENARIO C — IMU field range integrity during fault
-#     While faults are being injected, DroneState.ax/ay/az/gx/gy/gz must
-#     never contain values outside the int16 physical range.
-#     Validates SRS-IMU-008 "DroneState left unchanged on rejection".
+#
+# DroneState attribute naming (pybind11):
+#   C++ members are camelCase: linkHealthy, packetCount.
+#   Accessed here via to_dict() keys 'link_healthy' and 'packet_count'
+#   (pybind11 binding may snake_case to_dict() keys separately from the
+#   attribute names — use to_dict() for all dict-path reads, and the
+#   camelCase attribute names for direct DroneState attribute reads).
+#   Direct attribute reads: s.linkHealthy, s.packetCount, s.ax … s.gz.
+#
+# DroneLink method naming (pybind11):
+#   C++ method setPollIntervalMs() is exposed as-is: drone_link.setPollIntervalMs().
+#   The snake_case alias set_poll_interval_ms() does NOT exist unless the
+#   binding explicitly defines it.
+#
+# Packet-count floor (post-recovery, Scenario A, DEF-003):
+#   PACKET_MONITOR_S = 3.0 s window.
+#   Floor = 3 Hz × 3.0 s × 0.8 tolerance = 7.2 → MIN_PACKETS_AFTER_RECOVERY = 7.
+#   IT-IMU-004 uses floor=5 over 2.0 s (3 × 2.0 × 0.8 = 4.8 → 5).
+#   Both derive from the same DEF-003 formula; only the window differs.
 #
 # Board required: F405 V3 connected, Betaflight 4.5.3.
 # =============================================================================
@@ -45,8 +45,11 @@ NORMAL_INTERVAL_MS = 10     # DroneLink.h POLL_INTERVAL_MS
 FAIL_THRESHOLD     = 5      # DroneLink.h FAIL_THRESHOLD
 INJECT_DURATION_S  = 2.0
 RECOVERY_WINDOW_S  = 2.0
-INT16_MIN          = -32768
-INT16_MAX          =  32767
+PACKET_MONITOR_S   = 3.0
+# 3 Hz × 3.0 s × 0.8 tolerance = 7.2 → 7  (DEF-003 derivation, 3 s window)
+MIN_PACKETS_AFTER_RECOVERY = 7
+INT16_MIN = -32768
+INT16_MAX =  32767
 
 
 class TestFaultTolerance:
@@ -57,108 +60,119 @@ class TestFaultTolerance:
     def test_SAT_IMU_005_A_no_crash_during_fault_injection(self, drone_link):
         """DroneLink worker thread must not raise an exception during stress.
 
-        Scenario A: set_poll_interval_ms(0) spins the loop at maximum rate.
-        At near-zero sleep, the 80 ms sendMSP() timeout fires on every call,
-        returning empty buffers that parseIMU() rejects (size < 18 bytes).
-        This simulates a continuous stream of corrupt / missing frames.
+        setPollIntervalMs(0) spins the loop at maximum rate. At near-zero
+        sleep the 80 ms sendMSP() timeout fires on every call, returning
+        empty buffers that parseIMU() rejects (size < 18 bytes).
         """
         try:
-            drone_link.set_poll_interval_ms(0)
+            drone_link.setPollIntervalMs(0)
             time.sleep(INJECT_DURATION_S)
         except Exception as exc:
             pytest.fail(f"Exception during fault injection: {exc}")
         finally:
-            drone_link.set_poll_interval_ms(NORMAL_INTERVAL_MS)
+            drone_link.setPollIntervalMs(NORMAL_INTERVAL_MS)
 
-        # If we reach here the worker thread did not crash or raise
         assert True
 
     def test_SAT_IMU_005_A_link_healthy_recovers(self, drone_link):
-        """link_healthy must return True within 2 s after fault injection ends.
+        """linkHealthy must return True within 2 s after fault injection ends.
 
-        FAIL_THRESHOLD = 5 consecutive failures → link_healthy = False.
+        FAIL_THRESHOLD = 5 consecutive failures → linkHealthy = False.
         After restoring normal polling, the next successful parseIMU() resets
-        consecutiveFails and sets link_healthy = True.
+        consecutiveFails and sets linkHealthy = True.
         """
-        drone_link.set_poll_interval_ms(0)
+        drone_link.setPollIntervalMs(0)
         time.sleep(INJECT_DURATION_S)
-        drone_link.set_poll_interval_ms(NORMAL_INTERVAL_MS)
+        drone_link.setPollIntervalMs(NORMAL_INTERVAL_MS)
 
         recovered = False
         deadline  = time.monotonic() + RECOVERY_WINDOW_S
         while time.monotonic() < deadline:
-            if drone_link.get_latest_state().link_healthy:
+            if drone_link.get_latest_state().linkHealthy:
                 recovered = True
                 break
             time.sleep(0.05)
 
-        print(f"\n  link_healthy recovered within {RECOVERY_WINDOW_S} s: {recovered}")
+        print(f"\n  linkHealthy recovered within {RECOVERY_WINDOW_S} s: {recovered}")
         assert recovered, (
-            f"link_healthy did not return True within {RECOVERY_WINDOW_S} s. "
+            f"linkHealthy did not return True within {RECOVERY_WINDOW_S} s. "
             "Worker thread may be stalled or FAIL_THRESHOLD logic is broken."
         )
 
     def test_SAT_IMU_005_A_packet_count_resumes(self, drone_link):
-        """packet_count must resume incrementing after recovery (no thread stall)."""
-        drone_link.set_poll_interval_ms(0)
-        time.sleep(INJECT_DURATION_S)
-        drone_link.set_poll_interval_ms(NORMAL_INTERVAL_MS)
-        time.sleep(RECOVERY_WINDOW_S)   # allow full recovery
+        """packetCount must increase by >= 7 over 3 s after recovery.
 
-        c0 = drone_link.get_latest_state().packet_count
-        time.sleep(3.0)
-        c1 = drone_link.get_latest_state().packet_count
+        packetCount increments on every committed loop tick (regardless of
+        IMU parse success). Floor = 3 Hz × 3.0 s × 0.8 = 7 (DEF-003).
+        A stalled thread returns 0; any delta >= 7 confirms liveness.
+        """
+        drone_link.setPollIntervalMs(0)
+        time.sleep(INJECT_DURATION_S)
+        drone_link.setPollIntervalMs(NORMAL_INTERVAL_MS)
+        time.sleep(RECOVERY_WINDOW_S)   # allow full recovery before counting
+
+        c0 = drone_link.get_latest_state().packetCount
+        time.sleep(PACKET_MONITOR_S)
+        c1 = drone_link.get_latest_state().packetCount
 
         delta = c1 - c0
-        # At ≥ 3 Hz over 3 s we expect ≥ 5 new packets (80% tolerance)
-        print(f"\n  packet_count delta after recovery: {delta}  (need ≥ 5)")
-        assert delta >= 5, (
-            f"Only {delta} new packets in 3 s after recovery — "
-            "worker thread may have stalled permanently"
+        print(f"\n  packetCount delta after recovery: {delta}  "
+              f"(need >= {MIN_PACKETS_AFTER_RECOVERY} over {PACKET_MONITOR_S} s)")
+        assert delta >= MIN_PACKETS_AFTER_RECOVERY, (
+            f"Only {delta} new packets in {PACKET_MONITOR_S} s after recovery — "
+            f"worker thread may have stalled permanently "
+            f"(need >= {MIN_PACKETS_AFTER_RECOVERY}: "
+            f"3 Hz × {PACKET_MONITOR_S} s × 0.8 = "
+            f"{3 * PACKET_MONITOR_S * 0.8:.1f})"
         )
 
     # ── Scenario B ────────────────────────────────────────────────────────────
 
     def test_SAT_IMU_005_B_link_healthy_in_to_dict(self, drone_link):
-        """to_dict() must expose link_healthy so the widget can indicate fault.
+        """to_dict() must expose 'link_healthy' so the widget can indicate fault.
 
-        SYS-005 prohibits silent stale data. The binding must pass
-        link_healthy through to_dict() so the Python layer can decide
-        whether to grey out cells or show a connection-lost banner.
+        SYS-005 prohibits silent stale data. The binding must include
+        link_healthy in to_dict() so the Python layer can grey out cells
+        or show a connection-lost banner.
+
+        Note: to_dict() key names are set by the pybind11 binding and may
+        use snake_case ('link_healthy') even though the C++ member is
+        camelCase (linkHealthy). This sub-test verifies the key name
+        actually present in to_dict() output.
         """
         s    = drone_link.get_latest_state()
         data = s.to_dict()
 
         assert "link_healthy" in data, (
             "to_dict() does not include 'link_healthy' key. "
-            "The Python widget cannot indicate stale data to the operator."
+            "The Python widget cannot indicate stale data to the operator. "
+            "Check the pybind11 DroneBackend binding for this key."
         )
-        print(f"\n  link_healthy in to_dict(): True  value={data['link_healthy']}")
+        print(f"\n  'link_healthy' in to_dict(): True  value={data['link_healthy']}")
 
     def test_SAT_IMU_005_B_unhealthy_link_flagged_during_injection(self, drone_link):
-        """link_healthy must flip False during sustained fault injection.
+        """linkHealthy must flip False during sustained fault injection.
 
-        Confirms FAIL_THRESHOLD logic works: after 5 consecutive parseIMU()
-        failures the worker marks the link unhealthy, which to_dict() then
-        exposes so the operator can see the GCS is not receiving fresh data.
+        Confirms FAIL_THRESHOLD logic: after 5 consecutive parseIMU()
+        failures the worker marks the link unhealthy.
         """
-        drone_link.set_poll_interval_ms(0)
+        drone_link.setPollIntervalMs(0)
 
         unhealthy_seen = False
         deadline = time.monotonic() + INJECT_DURATION_S + 1.0
         try:
             while time.monotonic() < deadline:
-                if not drone_link.get_latest_state().link_healthy:
+                if not drone_link.get_latest_state().linkHealthy:
                     unhealthy_seen = True
                     break
                 time.sleep(0.05)
         finally:
-            drone_link.set_poll_interval_ms(NORMAL_INTERVAL_MS)
+            drone_link.setPollIntervalMs(NORMAL_INTERVAL_MS)
 
-        print(f"\n  link_healthy went False during injection: {unhealthy_seen}")
+        print(f"\n  linkHealthy went False during injection: {unhealthy_seen}")
         assert unhealthy_seen, (
-            "link_healthy never went False during fault injection. "
-            "FAIL_THRESHOLD may not be triggering, or set_poll_interval_ms(0) "
+            "linkHealthy never went False during fault injection. "
+            "FAIL_THRESHOLD may not be triggering, or setPollIntervalMs(0) "
             "is not generating enough parse failures."
         )
 
@@ -170,24 +184,22 @@ class TestFaultTolerance:
         """
         root, widget = imu_widget
 
-        # Inject fault, capture a to_dict() snapshot with link_healthy=False
-        drone_link.set_poll_interval_ms(0)
+        drone_link.setPollIntervalMs(0)
         snapshot_with_fault = None
         deadline = time.monotonic() + INJECT_DURATION_S + 1.0
         try:
             while time.monotonic() < deadline:
                 s = drone_link.get_latest_state()
-                if not s.link_healthy:
+                if not s.linkHealthy:
                     snapshot_with_fault = s.to_dict()
                     break
                 time.sleep(0.05)
         finally:
-            drone_link.set_poll_interval_ms(NORMAL_INTERVAL_MS)
+            drone_link.setPollIntervalMs(NORMAL_INTERVAL_MS)
 
         if snapshot_with_fault is None:
-            pytest.skip("Could not capture link_healthy=False snapshot")
+            pytest.skip("Could not capture linkHealthy=False snapshot")
 
-        # Now call update_ui() with the fault snapshot — must not raise
         try:
             widget.update_ui(snapshot_with_fault)
             root.update_idletasks()
@@ -203,13 +215,12 @@ class TestFaultTolerance:
         """IMU fields must stay within int16 range during fault injection.
 
         SRS-IMU-008 states DroneState is left unchanged when parseIMU()
-        rejects a frame. At the system level this means ax/ay/az/gx/gy/gz
-        must never contain out-of-range garbage values even during sustained
-        parse failures.
+        rejects a frame. ax/ay/az/gx/gy/gz must never contain out-of-range
+        garbage values even during sustained parse failures.
         """
         violations = []
 
-        drone_link.set_poll_interval_ms(0)
+        drone_link.setPollIntervalMs(0)
         t0 = time.monotonic()
         try:
             while time.monotonic() - t0 < INJECT_DURATION_S:
@@ -219,10 +230,12 @@ class TestFaultTolerance:
                     ("gx", s.gx), ("gy", s.gy), ("gz", s.gz),
                 ]:
                     if not (INT16_MIN <= val <= INT16_MAX):
-                        violations.append(f"{name}={val} at t+{time.monotonic()-t0:.2f}s")
+                        violations.append(
+                            f"{name}={val} at t+{time.monotonic()-t0:.2f}s"
+                        )
                 time.sleep(0.01)
         finally:
-            drone_link.set_poll_interval_ms(NORMAL_INTERVAL_MS)
+            drone_link.setPollIntervalMs(NORMAL_INTERVAL_MS)
 
         print(f"\n  Out-of-range violations: {len(violations)}")
         assert len(violations) == 0, (
@@ -233,27 +246,24 @@ class TestFaultTolerance:
     def test_SAT_IMU_005_C_full_recovery_after_all_scenarios(self, drone_link, imu_widget):
         """GCS must be fully operational after all fault scenarios complete.
 
-        Final health check: after all Scenario A/B/C tests have run,
-        the system must be back to nominal — link healthy, data flowing,
-        widget rendering without errors.
+        Final health check: link healthy, data flowing, widget rendering
+        without errors.
         """
         root, widget = imu_widget
 
-        # Ensure normal polling is restored
-        drone_link.set_poll_interval_ms(NORMAL_INTERVAL_MS)
+        drone_link.setPollIntervalMs(NORMAL_INTERVAL_MS)
         time.sleep(RECOVERY_WINDOW_S)
 
         s = drone_link.get_latest_state()
         print(f"\n  Final state:")
-        print(f"    link_healthy  = {s.link_healthy}")
-        print(f"    packet_count  = {s.packet_count}")
+        print(f"    linkHealthy  = {s.linkHealthy}")
+        print(f"    packetCount  = {s.packetCount}")
         print(f"    ax={s.ax}  ay={s.ay}  az={s.az}")
 
-        assert s.link_healthy, "link_healthy is False after full recovery period"
+        assert s.linkHealthy, "linkHealthy is False after full recovery period"
         assert any([s.ax, s.ay, s.az, s.gx, s.gy, s.gz]), \
             "All IMU fields are zero after recovery — sensor may have stopped"
 
-        # Final widget update must not raise
         try:
             widget.update_ui(s.to_dict())
             root.update_idletasks()
