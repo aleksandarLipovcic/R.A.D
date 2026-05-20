@@ -711,8 +711,9 @@ class IMUWidget(tk.Frame):
             s["state"]      = "crit"
             s["hold_until"] = now + self.HOLD_CRIT_SEC
         elif abs_dps >= self.GYRO_WARN_DPS:
-            # Only block downgrade while hold is still active
-            if s["state"] != "crit" or now >= s["hold_until"]:
+            if s["state"] == "crit" and now < s["hold_until"]:
+                pass  # CRIT hold active — suppress downgrade to WARN
+            else:
                 s["state"]      = "warn"
                 s["hold_until"] = now + self.HOLD_WARN_SEC
         else:

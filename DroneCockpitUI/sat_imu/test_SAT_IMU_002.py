@@ -1,225 +1,280 @@
 # =============================================================================
-# test_SAT_IMU_002.py  —  Physical Units Correctness — Full GCS Pipeline
+# test_SAT_IMU_002.py  —  Physical Unit Correctness — Gravity Reference
 #
 # V-Model reference: System Acceptance Testing, SAT-IMU-002
 # SYS requirement:   SYS-002
 # SRS coverage:      SRS-IMU-004a, SRS-IMU-004b, SRS-IMU-004c
 #
 # Objective:
-#   Verify that the complete unit-conversion chain produces physically
-#   correct outputs at the operator level with real hardware.
+#   With the FC stationary and level, verify that the widget az cell reads
+#   1.0 g ± 0.05 g and that all gyroscope cells read close to 0 °/s
+#   (|gx|, |gy|, |gz| ≤ 2 °/s). Confirms the full unit-conversion chain:
 #
-# Implementation note — why this test reads DroneState directly:
-#   Raw counts (ax/ay/az/gx/gy/gz) are read from DroneState via
-#   drone_link.get_latest_state().  The scale constants ACC_SCALE = 1/2048
-#   and GYRO_SCALE = 1/16.4 are applied locally, matching IMUSensor.h after
-#   DEF-002 (ACC_SCALE = 1.0f / 2048.0f; GYRO_SCALE = 1.0f / 16.4f).
-#   The widget cross-check sub-test verifies IMUWidget.ACCEL_SCALE = 2048.0.
+#     Raw az  (MSP_RAW_IMU)
+#       → IMUSensor.getScaledData().accZ  via ACC_SCALE = 1/2048  [SRS-IMU-004a]
+#       → IMUWidget display               via ACCEL_SCALE = 2048  [SRS-IMU-004c]
 #
-# Scale constants (post-DEF-002, matching IMUSensor.h):
-#   ACC_SCALE  = 1.0 / 2048.0
-#     Betaflight MSP_RAW_IMU pre-divides accelerometer counts by 4.
-#     Effective MSP-layer sensitivity: 8192 / 4 = 2048 LSB/g.
-#     NOT the raw ADC constant (1/8192) — that was the pre-DEF-002 error.
-#   GYRO_SCALE = 1.0 / 16.4
-#     BF does not pre-scale gyroscope counts. ±2000°/s MPU-6500 default.
+#     Raw gx/gy/gz (MSP_RAW_IMU)
+#       → IMUSensor.getScaledData().gyroX/Y/Z  via GYRO_SCALE = 1/16.4  [SRS-IMU-004b]
+#       → IMUWidget display                    via GYRO_SCALE = 16.4    [SRS-IMU-004c]
 #
-# DroneState attribute naming (pybind11):
-#   C++ DroneState members are camelCase (ax, ay, az, gx, gy, gz are already
-#   lowercase so no ambiguity there). All attribute accesses match DroneLink.h.
+# Scale rationale (DEF-002, corrected):
+#   BF MSP_RAW_IMU pre-divides accel ADC by 4 before transmission.
+#   Effective MSP-layer sensitivity = 2048 LSB/g  (not raw 8192 LSB/g).
+#   ACC_SCALE = 1/2048. Gyroscope is transmitted at full hardware sensitivity:
+#   16.4 LSB/(°/s) at ±2000 °/s.
 #
-# Precondition:
-#   Place the F405 V3 FLAT AND LEVEL on anti-vibration foam.  Props OFF.
-#   The +Z axis of the MPU-6500 faces upward in this orientation.
+# Preconditions:
+#   - F405 V3 flat and LEVEL on anti-vibration foam
+#   - Props OFF, no vibration sources nearby
+#   - Allow 5 s for values to stabilise before reading
 #
-# Pass criteria (SYS-002):
-#   - mean(az * ACC_SCALE) in [0.95, 1.05] g  (gravity reference)
-#   - stdev(az * ACC_SCALE) < 0.02 g           (noise floor)
-#   - |mean(ax * ACC_SCALE)| < 0.15 g          (level: near-zero lateral)
-#   - |mean(ay * ACC_SCALE)| < 0.15 g          (level: near-zero lateral)
-#   - |mean(gx * GYRO_SCALE)| < 5.0 °/s        (at rest: noise floor)
-#   - |mean(gy * GYRO_SCALE)| < 5.0 °/s
-#   - |mean(gz * GYRO_SCALE)| < 5.0 °/s
-#   - widget.ACCEL_SCALE == 2048.0              (confirms DEF-002 fix in widget)
-#   - widget-computed az in [0.95, 1.05] g      (end-to-end widget display check)
+# Pass Criteria (SYS-002):
+#   - mean(accZ)     in [0.95, 1.05] g over 10 s (100+ samples)
+#   - std(accZ)      < 0.01 g  (sensor noise floor; stationary FC)
+#   - mean(|gyroX|)  ≤ 2.0 °/s
+#   - mean(|gyroY|)  ≤ 2.0 °/s
+#   - mean(|gyroZ|)  ≤ 2.0 °/s
+#   - Widget-computed az (raw_az / ACCEL_SCALE) matches imu_sensor.accZ ± 0.01 g
 #
-# Board required: F405 V3 flat on foam, Betaflight 4.5.3, props OFF.
+# Run:
+#   pytest sat_tests/test_SAT_IMU_002.py -v -s
 # =============================================================================
 
+import ctypes
 import time
-import statistics
+import winsound
+
 import pytest
 
-# Scale constants — match IMUSensor.h post-DEF-002 values exactly.
-ACC_SCALE  = 1.0 / 2048.0   # MSP-layer: BF pre-divides accel counts by 4
-GYRO_SCALE = 1.0 / 16.4     # ±2000 °/s MPU-6500 default range (not pre-scaled)
+
+# ── Operator notification helpers (same pattern as SAT-IMU-003) ───────────────
+
+_MB_OK              = 0x00
+_MB_ICONINFORMATION = 0x40
+_MB_ICONWARNING     = 0x30
+_MB_TOPMOST         = 0x40000
+_MB_SETFOREGROUND   = 0x10000
 
 
-class TestPhysicalUnitsCorrectness:
-    """SAT-IMU-002 — SYS-002: unit-conversion chain correct at system level."""
-
-    SAMPLE_DURATION_S = 5.0
-    SAMPLE_INTERVAL_S = 0.05   # 20 Hz polling — above actual 3–6 Hz MSP rate
-
-    # Accelerometer pass criteria
-    AZ_MEAN_LOW   = 0.95   # g
-    AZ_MEAN_HIGH  = 1.05   # g
-    AZ_MAX_STDEV  = 0.02   # g  (relaxed vs IT-IMU-002's 0.01 g for system test)
-    LAT_MAX_MEAN  = 0.15   # g  (ax, ay near-zero when level)
-
-    # Gyroscope pass criteria (at rest)
-    GYRO_MAX_MEAN = 5.0    # °/s
-
-    def _collect(self, drone_link):
-        """Collect DroneState snapshots for SAMPLE_DURATION_S seconds.
-        Returns list of dicts: {az_g, ax_g, ay_g, gx_dps, gy_dps, gz_dps}.
-        """
-        samples = []
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < self.SAMPLE_DURATION_S:
-            s = drone_link.get_latest_state()
-            samples.append({
-                "az_g":   s.az * ACC_SCALE,
-                "ax_g":   s.ax * ACC_SCALE,
-                "ay_g":   s.ay * ACC_SCALE,
-                "gx_dps": s.gx * GYRO_SCALE,
-                "gy_dps": s.gy * GYRO_SCALE,
-                "gz_dps": s.gz * GYRO_SCALE,
-            })
-            time.sleep(self.SAMPLE_INTERVAL_S)
-        return samples
-
-    # ── Sub-test 1 ────────────────────────────────────────────────────────────
-
-    def test_SAT_IMU_002_accel_z_mean_is_1g(self, drone_link):
-        """mean(az * ACC_SCALE) must be in [0.95, 1.05] g with FC flat.
-
-        Validates the full conversion chain:
-          DroneState.az (MSP counts) × (1/2048) → g
-
-        If mean ≈ 0.25 g: ACC_SCALE is still 1/8192 (pre-DEF-002 value).
-          Fix: IMUSensor.h, ACC_SCALE = 1.0f / 2048.0f
-        If mean > 1.05 g: FC is not level or is vibrating.
-        """
-        print(
-            "\n  [SAT-002] Ensure FC is FLAT AND LEVEL on foam. Props OFF."
+def _msgbox(title: str, message: str, icon: int = _MB_ICONINFORMATION) -> None:
+    try:
+        ctypes.windll.user32.MessageBoxW(
+            0, message, title,
+            _MB_OK | icon | _MB_TOPMOST | _MB_SETFOREGROUND
         )
-        samples = self._collect(drone_link)
-        vals  = [d["az_g"] for d in samples]
-        mean  = statistics.mean(vals)
-        stdev = statistics.stdev(vals)
+    except AttributeError:
+        print(f"\n[OPERATOR PROMPT] {title}\n{message}")
 
-        print(f"  samples   : {len(vals)}")
-        print(f"  az mean   : {mean:.4f} g  (need {self.AZ_MEAN_LOW}–{self.AZ_MEAN_HIGH})")
-        print(f"  az stdev  : {stdev:.4f} g  (need < {self.AZ_MAX_STDEV})")
 
-        assert self.AZ_MEAN_LOW <= mean <= self.AZ_MEAN_HIGH, (
-            f"az mean = {mean:.4f} g — outside [{self.AZ_MEAN_LOW}, {self.AZ_MEAN_HIGH}] g.\n"
-            f"  mean ≈ 0.25 g → ACC_SCALE still 1/8192 (DEF-002 not applied in IMUSensor.h).\n"
-            f"  mean > 1.05 g → FC tilted or vibrating — place flat on foam."
-        )
-        assert stdev < self.AZ_MAX_STDEV, (
-            f"az stdev = {stdev:.4f} g — exceeds {self.AZ_MAX_STDEV} g. "
-            "Place FC on anti-vibration foam and ensure props are off."
-        )
+def _beep() -> None:
+    try:
+        winsound.Beep(880, 200)
+        time.sleep(0.05)
+        winsound.Beep(1100, 300)
+    except Exception:
+        pass
 
-    # ── Sub-test 2 ────────────────────────────────────────────────────────────
 
-    def test_SAT_IMU_002_lateral_accel_near_zero(self, drone_link):
-        """|mean(ax * ACC_SCALE)| and |mean(ay * ACC_SCALE)| must be < 0.15 g.
+# ── Constants ─────────────────────────────────────────────────────────────────
 
-        Lateral acceleration must be near zero when the FC is level.
-        Values >= 0.15 g indicate the board is tilted or vibrating.
-        """
-        samples = self._collect(drone_link)
-        ax_mean = abs(statistics.mean(d["ax_g"] for d in samples))
-        ay_mean = abs(statistics.mean(d["ay_g"] for d in samples))
+_STABILISE_S    = 5.0    # wait before collecting samples
+_COLLECT_S      = 10.0   # collection window
+_POLL_INTERVAL  = 0.1    # 10 Hz — well above 3–6 Hz actual MSP rate
+_ACC_MEAN_LO    = 0.95   # g — lower acceptance bound
+_ACC_MEAN_HI    = 1.05   # g — upper acceptance bound
+_ACC_STD_MAX    = 0.01   # g — maximum standard deviation (stationary FC)
+_GYRO_MAX_DPS   = 2.0    # °/s — maximum gyro magnitude at rest
 
-        print(f"\n  |ax mean| = {ax_mean:.4f} g  (need < {self.LAT_MAX_MEAN})")
-        print(f"  |ay mean| = {ay_mean:.4f} g  (need < {self.LAT_MAX_MEAN})")
 
-        assert ax_mean < self.LAT_MAX_MEAN, (
-            f"|ax mean| = {ax_mean:.4f} g — FC may be tilted sideways (roll axis)."
-        )
-        assert ay_mean < self.LAT_MAX_MEAN, (
-            f"|ay mean| = {ay_mean:.4f} g — FC may be tilted fore/aft (pitch axis)."
-        )
+class TestGravityReference:
+    """SAT-IMU-002 — SYS-002: Physical unit correctness against gravity vector."""
 
-    # ── Sub-test 3 ────────────────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def test_SAT_IMU_002_gyro_near_zero_at_rest(self, drone_link):
-        """|mean(g* * GYRO_SCALE)| must be < 5.0 °/s on all axes at rest.
+    def _collect_samples(self, drone_link, imu_widget, imu_sensor,
+                         duration_s: float) -> dict[str, list]:
+        """Collect scaled IMU samples over duration_s seconds.
 
-        Validates GYRO_SCALE = 1/16.4 through the full MSP pipeline.
-        Non-zero noise floor is expected; values > 5 °/s indicate wrong
-        scale constant or significant vibration.
-        """
-        samples = self._collect(drone_link)
-        gx_mean = abs(statistics.mean(d["gx_dps"] for d in samples))
-        gy_mean = abs(statistics.mean(d["gy_dps"] for d in samples))
-        gz_mean = abs(statistics.mean(d["gz_dps"] for d in samples))
-
-        print(f"\n  |gx mean| = {gx_mean:.3f} °/s  (need < {self.GYRO_MAX_MEAN})")
-        print(f"  |gy mean| = {gy_mean:.3f} °/s  (need < {self.GYRO_MAX_MEAN})")
-        print(f"  |gz mean| = {gz_mean:.3f} °/s  (need < {self.GYRO_MAX_MEAN})")
-
-        assert gx_mean < self.GYRO_MAX_MEAN, (
-            f"|gx mean| = {gx_mean:.3f} °/s at rest. "
-            "If >> 5: check GYRO_SCALE = 1/16.4 in IMUSensor.h."
-        )
-        assert gy_mean < self.GYRO_MAX_MEAN, (
-            f"|gy mean| = {gy_mean:.3f} °/s at rest."
-        )
-        assert gz_mean < self.GYRO_MAX_MEAN, (
-            f"|gz mean| = {gz_mean:.3f} °/s at rest."
-        )
-
-    # ── Sub-test 4 ────────────────────────────────────────────────────────────
-
-    def test_SAT_IMU_002_widget_accel_scale_correct(self, imu_widget):
-        """IMUWidget.ACCEL_SCALE must equal 2048.0 (DEF-002 fix applied).
-
-        IMUWidget._render() divides raw MSP counts by ACCEL_SCALE.
-        The constant must be 2048 (MSP-layer sensitivity after BF's
-        ÷4 pre-scale) to match IMUSensor.ACC_SCALE = 1/2048.
-        If still 8192, the widget underreads acceleration by 4×.
-        """
-        _, widget = imu_widget
-
-        print(f"\n  IMUWidget.ACCEL_SCALE = {widget.ACCEL_SCALE}")
-        assert widget.ACCEL_SCALE == 2048.0, (
-            f"IMUWidget.ACCEL_SCALE = {widget.ACCEL_SCALE}, expected 2048.0. "
-            "DEF-002 fix has not been applied to IMUWidget.py."
-        )
-
-    # ── Sub-test 5 ────────────────────────────────────────────────────────────
-
-    def test_SAT_IMU_002_widget_displays_correct_az(self, drone_link, imu_widget):
-        """Widget-computed az must be in [0.95, 1.05] g after 3 s of live data.
-
-        Confirms the end-to-end path: raw MSP counts arrive in to_dict(),
-        the widget divides by ACCEL_SCALE = 2048, and the result matches
-        the gravity reference within the acceptance band.
-        az_display = data['az'] / widget.ACCEL_SCALE
+        Returns a dict of lists:
+          'acc_z'   : accZ in g    (from imu_sensor.getScaledData())
+          'gyro_x'  : gyroX in °/s
+          'gyro_y'  : gyroY in °/s
+          'gyro_z'  : gyroZ in °/s
+          'widget_az': raw_az / ACCEL_SCALE  (what the widget displays)
         """
         root, widget = imu_widget
-        collected = []
-
+        results: dict[str, list] = {
+            "acc_z": [], "gyro_x": [], "gyro_y": [], "gyro_z": [],
+            "widget_az": [],
+        }
         t0 = time.monotonic()
-        while time.monotonic() - t0 < 3.0:
+
+        while time.monotonic() - t0 < duration_s:
+            # Update widget with latest state (also refreshes imu_sensor internally)
             s    = drone_link.get_latest_state()
             data = s.to_dict()
             widget.update_ui(data)
             root.update_idletasks()
-            raw_az = data.get("az", 0)
-            collected.append(raw_az / widget.ACCEL_SCALE)
-            time.sleep(0.1)
 
-        mean_az = statistics.mean(collected)
-        print(f"\n  Widget az mean : {mean_az:.4f} g")
-        print(f"  ACCEL_SCALE    : {widget.ACCEL_SCALE}")
+            # Scaled values via IMUSensor C++ API
+            scaled = imu_sensor.getScaledData()
+            results["acc_z"].append(scaled.accZ)
+            results["gyro_x"].append(abs(scaled.gyroX))
+            results["gyro_y"].append(abs(scaled.gyroY))
+            results["gyro_z"].append(abs(scaled.gyroZ))
 
-        assert self.AZ_MEAN_LOW <= mean_az <= self.AZ_MEAN_HIGH, (
-            f"Widget-computed az mean = {mean_az:.4f} g — "
-            f"outside [{self.AZ_MEAN_LOW}, {self.AZ_MEAN_HIGH}] g."
+            # Widget-computed az: what the widget displays (SRS-IMU-004c)
+            # IMUWidget divides raw az by ACCEL_SCALE = 2048
+            raw_az   = data.get("az", 0)
+            widget_g = raw_az / widget.ACCEL_SCALE
+            results["widget_az"].append(widget_g)
+
+            time.sleep(_POLL_INTERVAL)
+
+        return results
+
+    @staticmethod
+    def _mean(values: list[float]) -> float:
+        return sum(values) / len(values) if values else 0.0
+
+    @staticmethod
+    def _std(values: list[float]) -> float:
+        if len(values) < 2:
+            return 0.0
+        m = sum(values) / len(values)
+        variance = sum((v - m) ** 2 for v in values) / (len(values) - 1)
+        return variance ** 0.5
+
+    # ── Tests ─────────────────────────────────────────────────────────────────
+
+    def test_SAT_IMU_002_setup_prompt(self, drone_link, imu_widget, imu_sensor):
+        """Operator placement prompt — must pass before gravity tests run.
+
+        Not a true assertion test; ensures operator has placed the FC correctly
+        before the measurement tests collect samples.
+        """
+        _beep()
+        _msgbox(
+            "SAT-IMU-002 — Setup Required",
+            "Place the F405 V3 FLAT and LEVEL on anti-vibration foam.\n\n"
+            "Orientation: Z axis pointing UP (USB connector horizontal).\n\n"
+            f"Allow {_STABILISE_S:.0f} s for values to stabilise after clicking OK.",
+            _MB_ICONWARNING,
+        )
+
+        root, widget = imu_widget
+        print(f"\n  [SAT-002] Stabilising for {_STABILISE_S:.0f} s...")
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < _STABILISE_S:
+            s = drone_link.get_latest_state()
+            widget.update_ui(s.to_dict())
+            root.update_idletasks()
+            time.sleep(_POLL_INTERVAL)
+
+        # This test always passes — it is purely a setup gate.
+        assert True
+
+    def test_SAT_IMU_002_accZ_mean_in_range(self, drone_link, imu_widget, imu_sensor):
+        """Mean accZ must be in [0.95, 1.05] g with FC stationary and level.
+
+        Validates ACC_SCALE = 1/2048 (SRS-IMU-004a, DEF-002):
+          raw_az ≈ 2048 counts → 2048 × (1/2048) = 1.000 g.
+        Cross-validated against IT-IMU-002: mean = 1.001 g (475 samples).
+        """
+        samples = self._collect_samples(
+            drone_link, imu_widget, imu_sensor, _COLLECT_S
+        )
+        mean_g = self._mean(samples["acc_z"])
+        n      = len(samples["acc_z"])
+
+        print(f"\n  [SAT-002] accZ  mean={mean_g:.4f} g  "
+              f"n={n}  range=[{_ACC_MEAN_LO}, {_ACC_MEAN_HI}] g")
+
+        assert _ACC_MEAN_LO <= mean_g <= _ACC_MEAN_HI, (
+            f"accZ mean {mean_g:.4f} g is outside acceptance band "
+            f"[{_ACC_MEAN_LO}, {_ACC_MEAN_HI}] g.\n"
+            f"  Samples: {n}\n"
+            "  Common causes:\n"
+            "    • ACC_SCALE still set to 1/8192 (raw ADC) instead of 1/2048 "
+            "(MSP-layer) — see DEF-002\n"
+            "    • FC not level — check bubble level\n"
+            "    • Accelerometer calibration not performed in Betaflight"
+        )
+
+    def test_SAT_IMU_002_accZ_std_within_noise_floor(
+            self, drone_link, imu_widget, imu_sensor):
+        """AccZ standard deviation must be < 0.01 g (stationary FC).
+
+        Validates that the sensor is not saturating, oscillating, or producing
+        noise beyond the MPU-6500 datasheet noise floor.
+        """
+        samples = self._collect_samples(
+            drone_link, imu_widget, imu_sensor, _COLLECT_S
+        )
+        std_g = self._std(samples["acc_z"])
+
+        print(f"\n  [SAT-002] accZ  std={std_g:.5f} g  (limit < {_ACC_STD_MAX} g)")
+
+        assert std_g < _ACC_STD_MAX, (
+            f"accZ std {std_g:.5f} g exceeds {_ACC_STD_MAX} g noise floor.\n"
+            "  → Check for vibration sources. Place FC on foam, not rigid surface."
+        )
+
+    def test_SAT_IMU_002_gyro_at_rest(self, drone_link, imu_widget, imu_sensor):
+        """Mean |gyroX|, |gyroY|, |gyroZ| must each be ≤ 2 °/s at rest.
+
+        Validates GYRO_SCALE = 1/16.4 (SRS-IMU-004b): stationary MPU-6500
+        gyroscope bias drift is typically < 1 °/s. The 2 °/s limit is a
+        generous acceptance band that covers sensor-to-sensor variation.
+        """
+        samples = self._collect_samples(
+            drone_link, imu_widget, imu_sensor, _COLLECT_S
+        )
+        means = {
+            "gyroX": self._mean(samples["gyro_x"]),
+            "gyroY": self._mean(samples["gyro_y"]),
+            "gyroZ": self._mean(samples["gyro_z"]),
+        }
+
+        for axis, mean_dps in means.items():
+            print(f"\n  [SAT-002] {axis}  mean |rate| = {mean_dps:.3f} °/s  "
+                  f"(limit ≤ {_GYRO_MAX_DPS} °/s)")
+
+        violations = {
+            axis: v for axis, v in means.items() if v > _GYRO_MAX_DPS
+        }
+        assert not violations, (
+            f"Gyro axes exceed {_GYRO_MAX_DPS} °/s at rest: {violations}\n"
+            "  → Confirm FC is stationary. Run gyro calibration in Betaflight\n"
+            "    (set gyro_calib_dur = 3 ; gyro_calib_temperature = 0).\n"
+            "  → Check GYRO_SCALE constant in IMUSensor.h: must be 1/16.4."
+        )
+
+    def test_SAT_IMU_002_widget_az_matches_sensor(
+            self, drone_link, imu_widget, imu_sensor):
+        """Widget-displayed az must agree with imu_sensor.accZ within ±0.01 g.
+
+        Validates SRS-IMU-004c: the widget applies ACCEL_SCALE = 2048 to the
+        raw ADC value from to_dict(), which must produce the same physical
+        output as IMUSensor.getScaledData().accZ (ACC_SCALE = 1/2048).
+        Both paths read from the same DroneState.az field.
+        """
+        samples = self._collect_samples(
+            drone_link, imu_widget, imu_sensor, _COLLECT_S
+        )
+
+        mean_sensor = self._mean(samples["acc_z"])
+        mean_widget = self._mean(samples["widget_az"])
+        delta       = abs(mean_sensor - mean_widget)
+
+        print(f"\n  [SAT-002] sensor accZ = {mean_sensor:.4f} g  "
+              f"widget az = {mean_widget:.4f} g  "
+              f"delta = {delta:.5f} g")
+
+        assert delta < 0.01, (
+            f"Widget az ({mean_widget:.4f} g) diverges from "
+            f"sensor accZ ({mean_sensor:.4f} g) by {delta:.5f} g (limit < 0.01 g).\n"
+            "  → IMUSensor.ACC_SCALE and IMUWidget.ACCEL_SCALE must both\n"
+            "    resolve to the same 1/2048 factor. Check both constants."
         )

@@ -1,0 +1,350 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="10" skipped="0" tests="10" time="27.771" timestamp="2026-05-20T19:05:43.026568+02:00" hostname="TheSilent"><testcase classname="sat_imu.test_SAT_IMU_001.TestRealTimeDataPipeline" name="test_SAT_IMU_001_link_healthy_after_warmup" file="sat_imu\test_SAT_IMU_001.py" line="55" time="4.035"><failure message="AttributeError: 'DroneBackend.DroneState' object has no attribute 'linkHealthy'. Did you mean: 'link_healthy'?">self = &lt;test_SAT_IMU_001.TestRealTimeDataPipeline object at 0x000001FA7C351A90&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x000001FA79C7C870&gt;
+
+    def test_SAT_IMU_001_link_healthy_after_warmup(self, drone_link):
+        """linkHealthy must be True after 2 s warmup.
+    
+        linkHealthy goes True as soon as one parseIMU() succeeds in the
+        worker thread.  False after warmup means every IMU parse is failing:
+        check serial port, FC power, no Betaflight Configurator open on the
+        same COM port.
+        """
+        time.sleep(self.WARMUP_S)
+        s = drone_link.get_latest_state()
+    
+&gt;       print(f"\n  linkHealthy  = {s.linkHealthy}")
+                                    ^^^^^^^^^^^^^
+E       AttributeError: 'DroneBackend.DroneState' object has no attribute 'linkHealthy'. Did you mean: 'link_healthy'?
+
+sat_imu\test_SAT_IMU_001.py:67: AttributeError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+[SAT conftest] Connected on COM4 — waiting 2 s for telemetry to stabilise
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_001.TestRealTimeDataPipeline" name="test_SAT_IMU_001_packet_rate_sustained" file="sat_imu\test_SAT_IMU_001.py" line="115" time="0.001"><failure message="AttributeError: 'DroneBackend.DroneState' object has no attribute 'packetCount'. Did you mean: 'packet_count'?">self = &lt;test_SAT_IMU_001.TestRealTimeDataPipeline object at 0x000001FA7C336EA0&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x000001FA79C7C870&gt;
+
+    def test_SAT_IMU_001_packet_rate_sustained(self, drone_link):
+        """packetCount must increase by &gt;= 15 over 5 s (&gt;= 3 Hz loop rate).
+    
+        Confirms the communicationLoop() worker thread is alive and cycling
+        continuously.  packetCount increments on every tick irrespective of
+        IMU parse success, so this measures loop throughput, not IMU rate.
+        At 57 600 baud the loop runs at 3–10 Hz in practice; the &gt;= 15
+        floor (3 Hz × 5 s) is a conservative liveness check.
+        """
+        s0 = drone_link.get_latest_state()
+&gt;       c0 = s0.packetCount
+             ^^^^^^^^^^^^^^
+E       AttributeError: 'DroneBackend.DroneState' object has no attribute 'packetCount'. Did you mean: 'packet_count'?
+
+sat_imu\test_SAT_IMU_001.py:126: AttributeError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_crit_alert_triggers" file="sat_imu\test_SAT_IMU_003.py" line="183" time="5.165"><failure message="AssertionError: CRIT state never entered after 5.0 s. Max rate seen: 0.4 °/s (need ≥ 100.0 °/s). Rotate the FC more forcefully.&#10;assert False">self = &lt;test_SAT_IMU_003.TestOperatorAlertSystem object at 0x000001FA7C337230&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x000001FA79C7C870&gt;
+imu_widget = (&lt;tkinter.Tk object .&gt;, &lt;IMUWidget.IMUWidget object .!imuwidget&gt;)
+
+    def test_SAT_IMU_003_crit_alert_triggers(self, drone_link, imu_widget):
+        """CRIT state must be entered when gyro reads ≥ 100 °/s.
+    
+        Operator: rotate FC very rapidly (~120 °/s) when prompted.
+        The flash ticker must be active (_cell_flash_job not None).
+        """
+        root, widget = imu_widget
+    
+        print(f"\n  [SAT-003 CRIT] ► Rotate FC RAPIDLY (~120 °/s). "
+              f"You have {self.MOTION_WINDOW_S:.0f} s ◄")
+    
+        crit_seen = False
+        max_dps   = 0.0
+        t0 = time.monotonic()
+    
+        while time.monotonic() - t0 &lt; self.MOTION_WINDOW_S:
+            s    = drone_link.get_latest_state()
+            data = s.to_dict()
+            widget.update_ui(data)
+            root.update_idletasks()
+    
+            gs  = widget.GYRO_SCALE
+            dps = max(abs(data.get("gx",0))/gs, abs(data.get("gy",0))/gs,
+                      abs(data.get("gz",0))/gs)
+            max_dps = max(max_dps, dps)
+    
+            if self._any_axis_state(widget, "crit"):
+                crit_seen = True
+                print(f"  CRIT entered at t+{time.monotonic()-t0:.1f}s "
+                      f"(max {max_dps:.1f} °/s)")
+                break
+            time.sleep(self.POLL_INTERVAL_S)
+    
+        print(f"  Max gyro rate observed: {max_dps:.1f} °/s")
+&gt;       assert crit_seen, (
+            f"CRIT state never entered after {self.MOTION_WINDOW_S} s. "
+            f"Max rate seen: {max_dps:.1f} °/s (need ≥ {self.CRIT_THRESHOLD} °/s). "
+            "Rotate the FC more forcefully."
+        )
+E       AssertionError: CRIT state never entered after 5.0 s. Max rate seen: 0.4 °/s (need ≥ 100.0 °/s). Rotate the FC more forcefully.
+E       assert False
+
+sat_imu\test_SAT_IMU_003.py:218: AssertionError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-003 CRIT] ► Rotate FC RAPIDLY (~120 °/s). You have 5 s ◄
+  Max gyro rate observed: 0.4 °/s
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_crit_flash_ticker_active" file="sat_imu\test_SAT_IMU_003.py" line="223" time="5.030"><failure message="AssertionError: Flash ticker (_cell_flash_job) was None during CRIT state. The _register_crit() → _start_cell_flash() chain has a defect.&#10;assert False">self = &lt;test_SAT_IMU_003.TestOperatorAlertSystem object at 0x000001FA7C3375C0&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x000001FA79C7C870&gt;
+imu_widget = (&lt;tkinter.Tk object .&gt;, &lt;IMUWidget.IMUWidget object .!imuwidget&gt;)
+
+    def test_SAT_IMU_003_crit_flash_ticker_active(self, drone_link, imu_widget):
+        """Flash ticker must be active (_cell_flash_job not None) during CRIT.
+    
+        Validates SRS-IMU-006a at system level — the shared flash ticker
+        that drives 500 ms cadence must start when a CRIT cell is registered.
+        """
+        root, widget = imu_widget
+    
+        print(f"\n  [SAT-003 FLASH] ► Rotate FC rapidly to trigger CRIT. "
+              f"You have {self.MOTION_WINDOW_S:.0f} s ◄")
+    
+        ticker_confirmed = False
+        t0 = time.monotonic()
+    
+        while time.monotonic() - t0 &lt; self.MOTION_WINDOW_S:
+            s = drone_link.get_latest_state()
+            widget.update_ui(s.to_dict())
+            root.update_idletasks()
+    
+            if self._any_axis_state(widget, "crit"):
+                # Give ticker one cycle to start (up to 600 ms)
+                deadline = time.monotonic() + 0.6
+                while time.monotonic() &lt; deadline:
+                    root.update()
+                    if widget._cell_flash_job is not None:
+                        ticker_confirmed = True
+                        break
+                    time.sleep(0.05)
+                break
+            time.sleep(self.POLL_INTERVAL_S)
+    
+        print(f"  Flash ticker active: {ticker_confirmed}  "
+              f"job={widget._cell_flash_job}")
+&gt;       assert ticker_confirmed, (
+            "Flash ticker (_cell_flash_job) was None during CRIT state. "
+            "The _register_crit() → _start_cell_flash() chain has a defect."
+        )
+E       AssertionError: Flash ticker (_cell_flash_job) was None during CRIT state. The _register_crit() → _start_cell_flash() chain has a defect.
+E       assert False
+
+sat_imu\test_SAT_IMU_003.py:257: AssertionError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-003 FLASH] ► Rotate FC rapidly to trigger CRIT. You have 5 s ◄
+  Flash ticker active: False  job=None
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_warn_alert_triggers" file="sat_imu\test_SAT_IMU_003.py" line="96" time="5.042"><failure message="AssertionError: WARN state never entered after 5.0 s. Max rate seen: 0.5 °/s (need ≥ 30.0 °/s). Rotate the FC more briskly.&#10;assert False">self = &lt;test_SAT_IMU_003.TestOperatorAlertSystem object at 0x000001FA7C351D10&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x000001FA79C7C870&gt;
+imu_widget = (&lt;tkinter.Tk object .&gt;, &lt;IMUWidget.IMUWidget object .!imuwidget&gt;)
+
+    def test_SAT_IMU_003_warn_alert_triggers(self, drone_link, imu_widget):
+        """WARN state must be entered when gyro reads ≥ 30 °/s.
+    
+        Operator: rotate FC briskly (~45 °/s) on any axis when prompted.
+        The test waits up to 5 s for the WARN state to appear.
+        """
+        root, widget = imu_widget
+    
+        print(f"\n  [SAT-003 WARN] ► Rotate FC briskly (~45 °/s) on any axis. "
+              f"You have {self.MOTION_WINDOW_S:.0f} s ◄")
+    
+        warn_seen  = False
+        max_dps    = 0.0
+        t0 = time.monotonic()
+    
+        while time.monotonic() - t0 &lt; self.MOTION_WINDOW_S:
+            s    = drone_link.get_latest_state()
+            data = s.to_dict()
+            widget.update_ui(data)
+            root.update_idletasks()
+    
+            gs = widget.GYRO_SCALE
+            dps = max(abs(data.get("gx",0))/gs, abs(data.get("gy",0))/gs,
+                      abs(data.get("gz",0))/gs)
+            max_dps = max(max_dps, dps)
+    
+            if self._any_axis_state(widget, "warn") or \
+               self._any_axis_state(widget, "crit"):
+                warn_seen = True
+                print(f"  Alert state entered at t+{time.monotonic()-t0:.1f}s "
+                      f"(max {max_dps:.1f} °/s)")
+                break
+            time.sleep(self.POLL_INTERVAL_S)
+    
+        print(f"  Max gyro rate observed: {max_dps:.1f} °/s")
+&gt;       assert warn_seen, (
+            f"WARN state never entered after {self.MOTION_WINDOW_S} s. "
+            f"Max rate seen: {max_dps:.1f} °/s (need ≥ {self.WARN_THRESHOLD} °/s). "
+            "Rotate the FC more briskly."
+        )
+E       AssertionError: WARN state never entered after 5.0 s. Max rate seen: 0.5 °/s (need ≥ 30.0 °/s). Rotate the FC more briskly.
+E       assert False
+
+sat_imu\test_SAT_IMU_003.py:132: AssertionError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-003 WARN] ► Rotate FC briskly (~45 °/s) on any axis. You have 5 s ◄
+  Max gyro rate observed: 0.5 °/s
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_A_link_healthy_recovers" file="sat_imu\test_SAT_IMU_005.py" line="75" time="2.001"><failure message="AttributeError: 'DroneBackend.DroneState' object has no attribute 'linkHealthy'. Did you mean: 'link_healthy'?">self = &lt;test_SAT_IMU_005.TestFaultTolerance object at 0x000001FA7C352C10&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x000001FA79C7C870&gt;
+
+    def test_SAT_IMU_005_A_link_healthy_recovers(self, drone_link):
+        """linkHealthy must return True within 2 s after fault injection ends.
+    
+        FAIL_THRESHOLD = 5 consecutive failures → linkHealthy = False.
+        After restoring normal polling, the next successful parseIMU() resets
+        consecutiveFails and sets linkHealthy = True.
+        """
+        drone_link.set_poll_interval_ms(0)
+        time.sleep(INJECT_DURATION_S)
+        drone_link.set_poll_interval_ms(NORMAL_INTERVAL_MS)
+    
+        recovered = False
+        deadline  = time.monotonic() + RECOVERY_WINDOW_S
+        while time.monotonic() &lt; deadline:
+&gt;           if drone_link.get_latest_state().linkHealthy:
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'DroneBackend.DroneState' object has no attribute 'linkHealthy'. Did you mean: 'link_healthy'?
+
+sat_imu\test_SAT_IMU_005.py:90: AttributeError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_A_packet_count_resumes" file="sat_imu\test_SAT_IMU_005.py" line="100" time="4.001"><failure message="AttributeError: 'DroneBackend.DroneState' object has no attribute 'packetCount'. Did you mean: 'packet_count'?">self = &lt;test_SAT_IMU_005.TestFaultTolerance object at 0x000001FA7C337E10&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x000001FA79C7C870&gt;
+
+    def test_SAT_IMU_005_A_packet_count_resumes(self, drone_link):
+        """packetCount must increase by &gt;= 7 over 3 s after recovery.
+    
+        packetCount increments on every committed loop tick (regardless of
+        IMU parse success). Floor = 3 Hz × 3.0 s × 0.8 = 7 (DEF-003).
+        A stalled thread returns 0; any delta &gt;= 7 confirms liveness.
+        """
+        drone_link.set_poll_interval_ms(0)
+        time.sleep(INJECT_DURATION_S)
+        drone_link.set_poll_interval_ms(NORMAL_INTERVAL_MS)
+        time.sleep(RECOVERY_WINDOW_S)   # allow full recovery before counting
+    
+&gt;       c0 = drone_link.get_latest_state().packetCount
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'DroneBackend.DroneState' object has no attribute 'packetCount'. Did you mean: 'packet_count'?
+
+sat_imu\test_SAT_IMU_005.py:113: AttributeError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_B_unhealthy_link_flagged_during_injection" file="sat_imu\test_SAT_IMU_005.py" line="151" time="0.001"><failure message="AttributeError: 'DroneBackend.DroneState' object has no attribute 'linkHealthy'. Did you mean: 'link_healthy'?">self = &lt;test_SAT_IMU_005.TestFaultTolerance object at 0x000001FA7C2E7E30&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x000001FA79C7C870&gt;
+
+    def test_SAT_IMU_005_B_unhealthy_link_flagged_during_injection(self, drone_link):
+        """linkHealthy must flip False during sustained fault injection.
+    
+        Confirms FAIL_THRESHOLD logic: after 5 consecutive parseIMU()
+        failures the worker marks the link unhealthy.
+        """
+        drone_link.set_poll_interval_ms(0)
+    
+        unhealthy_seen = False
+        deadline = time.monotonic() + INJECT_DURATION_S + 1.0
+        try:
+            while time.monotonic() &lt; deadline:
+&gt;               if not drone_link.get_latest_state().linkHealthy:
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E               AttributeError: 'DroneBackend.DroneState' object has no attribute 'linkHealthy'. Did you mean: 'link_healthy'?
+
+sat_imu\test_SAT_IMU_005.py:164: AttributeError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_B_widget_receives_link_status" file="sat_imu\test_SAT_IMU_005.py" line="177" time="0.001"><failure message="AttributeError: 'DroneBackend.DroneState' object has no attribute 'linkHealthy'. Did you mean: 'link_healthy'?">self = &lt;test_SAT_IMU_005.TestFaultTolerance object at 0x000001FA7C31FCE0&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x000001FA79C7C870&gt;
+imu_widget = (&lt;tkinter.Tk object .&gt;, &lt;IMUWidget.IMUWidget object .!imuwidget&gt;)
+
+    def test_SAT_IMU_005_B_widget_receives_link_status(self, drone_link, imu_widget):
+        """IMUWidget.update_ui() must not raise when link_healthy = False.
+    
+        During a fault, to_dict() will have link_healthy=False. The widget
+        must handle this gracefully — no KeyError, no exception.
+        """
+        root, widget = imu_widget
+    
+        drone_link.set_poll_interval_ms(0)
+        snapshot_with_fault = None
+        deadline = time.monotonic() + INJECT_DURATION_S + 1.0
+        try:
+            while time.monotonic() &lt; deadline:
+                s = drone_link.get_latest_state()
+&gt;               if not s.linkHealthy:
+                       ^^^^^^^^^^^^^
+E               AttributeError: 'DroneBackend.DroneState' object has no attribute 'linkHealthy'. Did you mean: 'link_healthy'?
+
+sat_imu\test_SAT_IMU_005.py:192: AttributeError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_C_full_recovery_after_all_scenarios" file="sat_imu\test_SAT_IMU_005.py" line="244" time="2.359"><failure message="AttributeError: 'DroneBackend.DroneState' object has no attribute 'linkHealthy'. Did you mean: 'link_healthy'?">self = &lt;test_SAT_IMU_005.TestFaultTolerance object at 0x000001FA7C3F4950&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x000001FA79C7C870&gt;
+imu_widget = (&lt;tkinter.Tk object .&gt;, &lt;IMUWidget.IMUWidget object .!imuwidget&gt;)
+
+    def test_SAT_IMU_005_C_full_recovery_after_all_scenarios(self, drone_link, imu_widget):
+        """GCS must be fully operational after all fault scenarios complete.
+    
+        Final health check: link healthy, data flowing, widget rendering
+        without errors.
+        """
+        root, widget = imu_widget
+    
+        drone_link.set_poll_interval_ms(NORMAL_INTERVAL_MS)
+        time.sleep(RECOVERY_WINDOW_S)
+    
+        s = drone_link.get_latest_state()
+        print(f"\n  Final state:")
+&gt;       print(f"     linkHealthy  = {s.linkHealthy}")
+                                     ^^^^^^^^^^^^^
+E       AttributeError: 'DroneBackend.DroneState' object has no attribute 'linkHealthy'. Did you mean: 'link_healthy'?
+
+sat_imu\test_SAT_IMU_005.py:258: AttributeError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  Final state:
+
+[SAT conftest] Disconnected
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase></testsuite></testsuites>

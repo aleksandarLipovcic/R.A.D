@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="1" time="40.161" timestamp="2026-05-20T22:03:28.491651+02:00" hostname="TheSilent"><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_crit_alert_triggers" file="sat_imu\test_SAT_IMU_003.py" line="297" time="40.087"><failure message="AssertionError: CRIT state never entered after 5 s.&#10;    Max rate seen     : 500.0 °/s&#10;    CRIT threshold    : 100 °/s&#10;    widget.GYRO_SCALE : 16.4&#10;    Shortfall         : -400.0 °/s (-400% below threshold)&#10;  &#10;    ── Technique reminder ──────────────────────────────────────&#10;    SNAP through 30–45° in &lt; 0.25 s, then stop hard (yaw axis).&#10;    Do NOT sweep slowly through a wide arc.&#10;    A 40° snap in 0.25 s = ~160 °/s average — easily above 100.&#10;    A 90° sweep in 1 s   = ~90 °/s average — not enough.&#10;    ────────────────────────────────────────────────────────────&#10;assert False">self = &lt;test_SAT_IMU_003.TestOperatorAlertSystem object at 0x000002349BE56780&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x000002349BEEE7F0&gt;
+imu_widget = (&lt;tkinter.Tk object .&gt;, &lt;IMUWidget.IMUWidget object .!imuwidget&gt;)
+
+    def test_SAT_IMU_003_crit_alert_triggers(self, drone_link, imu_widget):
+        """CRIT state must be entered when gyro reads ≥ 100 °/s (SRS-IMU-006).
+    
+        Operator: rotate FC very rapidly (~120 °/s) within the window.
+        Target raw count: ≥ 1640 counts on any gyro axis (1640 / 16.4 = 100 °/s).
+        """
+        root, widget = imu_widget
+    
+        _beep_attention()
+        _beep_attention()
+        _msgbox(
+            "SAT-IMU-003 — CRIT Test",
+            f"TARGET: ≥ {self.CRIT_THRESHOLD:.0f} °/s on any axis "
+            f"(raw ≥ {int(self.CRIT_THRESHOLD * widget.GYRO_SCALE)} counts).\n\n"
+            "── HOW TO ACHIEVE THIS ─────────────────────────────────\n"
+            "Use a SHORT, SHARP SNAP — NOT a slow sweep.\n\n"
+            "  ✓ CORRECT: Snap the FC through ~30–45° in under 0.25 s,\n"
+            "             then stop hard. Yaw (horizontal spin) is easiest.\n"
+            "             Think of flicking a wrist to crack a whip.\n\n"
+            "  ✗ WRONG:   Sweeping slowly through 90° or 180°.\n"
+            "             That peaks at ~80–90 °/s — not enough.\n\n"
+            "── WHY ─────────────────────────────────────────────────\n"
+            "The sensor needs ONE sample above 1640 raw counts.\n"
+            "A 40° snap in 0.25 s averages ~160 °/s — well above threshold.\n"
+            "A 90° sweep in 1 s averages ~90 °/s — not enough.\n\n"
+            f"You have {self.MOTION_WINDOW_S:.0f} s after clicking OK. "
+            "The double-beep will confirm capture.\n\n"
+            "⚠ Props must be OFF. Hold FC securely at the edges.",
+            _MB_ICONWARNING,
+        )
+    
+        crit_seen, max_dps = self._poll_loop(
+            drone_link, imu_widget,
+            duration_s=self.MOTION_WINDOW_S,
+            stop_on_state="crit",
+        )
+    
+        if crit_seen:
+            _beep_success()
+        else:
+            _beep_fail()
+    
+        print(f"\n  [SAT-003 CRIT] seen={crit_seen}  max={max_dps:.1f} °/s")
+    
+&gt;       assert crit_seen, (
+            f"CRIT state never entered after {self.MOTION_WINDOW_S:.0f} s.\n"
+            f"  Max rate seen     : {max_dps:.1f} °/s\n"
+            f"  CRIT threshold    : {self.CRIT_THRESHOLD:.0f} °/s\n"
+            f"  widget.GYRO_SCALE : {widget.GYRO_SCALE}\n"
+            f"  Shortfall         : {self.CRIT_THRESHOLD - max_dps:.1f} °/s "
+            f"({(self.CRIT_THRESHOLD - max_dps) / self.CRIT_THRESHOLD * 100:.0f}% below threshold)\n\n"
+            "  ── Technique reminder ──────────────────────────────────────\n"
+            "  SNAP through 30–45° in &lt; 0.25 s, then stop hard (yaw axis).\n"
+            "  Do NOT sweep slowly through a wide arc.\n"
+            "  A 40° snap in 0.25 s = ~160 °/s average — easily above 100.\n"
+            "  A 90° sweep in 1 s   = ~90 °/s average — not enough.\n"
+            "  ────────────────────────────────────────────────────────────"
+        )
+E       AssertionError: CRIT state never entered after 5 s.
+E           Max rate seen     : 500.0 °/s
+E           CRIT threshold    : 100 °/s
+E           widget.GYRO_SCALE : 16.4
+E           Shortfall         : -400.0 °/s (-400% below threshold)
+E         
+E           ── Technique reminder ──────────────────────────────────────
+E           SNAP through 30–45° in &lt; 0.25 s, then stop hard (yaw axis).
+E           Do NOT sweep slowly through a wide arc.
+E           A 40° snap in 0.25 s = ~160 °/s average — easily above 100.
+E           A 90° sweep in 1 s   = ~90 °/s average — not enough.
+E           ────────────────────────────────────────────────────────────
+E       assert False
+
+sat_imu\test_SAT_IMU_003.py:342: AssertionError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+[SAT conftest] Connected on COM4 — waiting 2 s for telemetry to stabilise
+
+  [SAT-003 CRIT] seen=False  max=500.0 °/s
+
+[SAT conftest] Disconnected
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase></testsuite></testsuites>

@@ -1,0 +1,458 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="9" tests="58" time="105.898" timestamp="2026-05-20T22:35:47.836922+02:00" hostname="TheSilent"><testcase classname="it_tests.test_IT_IMU_001.TestLiveDataContinuity" name="test_IT_IMU_001_effective_rate_report" file="it_tests\test_IT_IMU_001.py" line="157" time="6.023"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+[conftest] Connected on COM4 — waiting 1 s for telemetry to stabilise
+
+  ── IT-IMU-001 Rate Report ──────────────────────────────
+  Observed poll rate : 3.20 Hz
+  Packets in 5.0 s    : 16
+  Baud rate          : 57 600
+  MSP polls/tick     : 12 (sequential, single serial port)
+  Theoretical max    : ~24 Hz  (42 ms minimum tick)
+  ────────────────────────────────────────────────────────
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="it_tests.test_IT_IMU_001.TestLiveDataContinuity" name="test_IT_IMU_001_imu_fields_nonzero" file="it_tests\test_IT_IMU_001.py" line="87" time="5.057"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  snapshots collected : 100
+  all-zero snapshots  : 0
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="it_tests.test_IT_IMU_001.TestLiveDataContinuity" name="test_IT_IMU_001_packet_rate" file="it_tests\test_IT_IMU_001.py" line="59" time="5.001"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  packet delta   = 17  (need ≥ 15)
+  effective rate = 3.40 Hz
+  note: 57 600 baud + 12 sequential polls → ceiling ~24 Hz
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="it_tests.test_IT_IMU_001.TestLiveDataContinuity" name="test_IT_IMU_001_rtt_under_50ms" file="it_tests\test_IT_IMU_001.py" line="122" time="5.051"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  RTT samples collected : 100
+  RTT &lt; 50 ms           : 100.0%  (need ≥ 95.0%)
+  RTT min / mean / max  : 6.60 / 20.86 / 32.25 ms
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="it_tests.test_IT_IMU_002.TestScaleValidation" name="test_IT_IMU_002_accel_z_mean" file="it_tests\test_IT_IMU_002.py" line="33" time="5.017"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  samples     : 476
+  accZ mean   : 1.0005 g  (need 0.95 – 1.05)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="it_tests.test_IT_IMU_002.TestScaleValidation" name="test_IT_IMU_002_accel_z_stdev" file="it_tests\test_IT_IMU_002.py" line="45" time="5.016"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  samples     : 476
+  accZ stdev  : 0.0007 g  (need &lt; 0.01)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="it_tests.test_IT_IMU_002.TestScaleValidation" name="test_IT_IMU_002_sample_count" file="it_tests\test_IT_IMU_002.py" line="57" time="5.010"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  samples collected : 476  (need ≥ 400)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="it_tests.test_IT_IMU_003.TestEndToEndLatency" name="test_IT_IMU_003_latency_summary" file="it_tests\test_IT_IMU_003.py" line="97" time="12.004"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  Percentile         ms
+  ----------------------
+  P50             14.37 ✓
+  P75             30.95
+  P90             31.48
+  P95             32.20 ✓
+  P99             32.85
+  min              5.00
+  max             32.95
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="it_tests.test_IT_IMU_003.TestEndToEndLatency" name="test_IT_IMU_003_p50_under_30ms" file="it_tests\test_IT_IMU_003.py" line="86" time="11.880"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  samples : 1000
+  P50     : 14.59 ms  (need &lt; 30.0)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="it_tests.test_IT_IMU_003.TestEndToEndLatency" name="test_IT_IMU_003_p95_under_200ms" file="it_tests\test_IT_IMU_003.py" line="75" time="11.951"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  samples : 1000
+  P95     : 32.03 ms  (need &lt; 200.0)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="it_tests.test_IT_IMU_004.TestCorruptFrameRecovery" name="test_IT_IMU_004_dronestate_unchanged_on_bad_frame" file="it_tests\test_IT_IMU_004.py" line="150" time="2.002"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  out-of-range violations : 0
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="it_tests.test_IT_IMU_004.TestCorruptFrameRecovery" name="test_IT_IMU_004_link_recovers_after_injection" file="it_tests\test_IT_IMU_004.py" line="92" time="2.001"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  link_healthy recovered : True
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="it_tests.test_IT_IMU_004.TestCorruptFrameRecovery" name="test_IT_IMU_004_no_crash_during_injection" file="it_tests\test_IT_IMU_004.py" line="80" time="2.001"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="it_tests.test_IT_IMU_004.TestCorruptFrameRecovery" name="test_IT_IMU_004_packet_count_continues" file="it_tests\test_IT_IMU_004.py" line="113" time="5.002"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  packet_count before : 265
+  packet_count after  : 271
+  delta               : 6  (need ≥ 5)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_004.TestEndToEndLatency" name="test_SAT_IMU_004_latency_report" file="sat_imu\test_SAT_IMU_004.py" line="97" time="0.001"><skipped type="pytest.skip" message="F405 not found — connect board via USB and retry">C:\Users\TheSilent\Desktop\Project R.A.D\DroneCockpitUI\sat_imu\test_SAT_IMU_004.py:98: F405 not found — connect board via USB and retry</skipped><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_004.TestEndToEndLatency" name="test_SAT_IMU_004_p50_under_30ms" file="sat_imu\test_SAT_IMU_004.py" line="86" time="0.001"><skipped type="pytest.skip" message="F405 not found — connect board via USB and retry">C:\Users\TheSilent\Desktop\Project R.A.D\DroneCockpitUI\sat_imu\test_SAT_IMU_004.py:87: F405 not found — connect board via USB and retry</skipped><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_004.TestEndToEndLatency" name="test_SAT_IMU_004_p95_under_200ms" file="sat_imu\test_SAT_IMU_004.py" line="75" time="0.000"><skipped type="pytest.skip" message="F405 not found — connect board via USB and retry">C:\Users\TheSilent\Desktop\Project R.A.D\DroneCockpitUI\sat_imu\test_SAT_IMU_004.py:76: F405 not found — connect board via USB and retry</skipped><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_A_link_healthy_recovers" file="sat_imu\test_SAT_IMU_005.py" line="74" time="0.000"><skipped type="pytest.skip" message="F405 not found — connect board via USB and retry">C:\Users\TheSilent\Desktop\Project R.A.D\DroneCockpitUI\sat_imu\test_SAT_IMU_005.py:75: F405 not found — connect board via USB and retry</skipped><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_A_no_crash_during_fault_injection" file="sat_imu\test_SAT_IMU_005.py" line="57" time="0.000"><skipped type="pytest.skip" message="F405 not found — connect board via USB and retry">C:\Users\TheSilent\Desktop\Project R.A.D\DroneCockpitUI\sat_imu\test_SAT_IMU_005.py:58: F405 not found — connect board via USB and retry</skipped><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_A_packet_count_resumes" file="sat_imu\test_SAT_IMU_005.py" line="99" time="0.000"><skipped type="pytest.skip" message="F405 not found — connect board via USB and retry">C:\Users\TheSilent\Desktop\Project R.A.D\DroneCockpitUI\sat_imu\test_SAT_IMU_005.py:100: F405 not found — connect board via USB and retry</skipped><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_B_link_healthy_in_to_dict" file="sat_imu\test_SAT_IMU_005.py" line="128" time="0.000"><skipped type="pytest.skip" message="F405 not found — connect board via USB and retry">C:\Users\TheSilent\Desktop\Project R.A.D\DroneCockpitUI\sat_imu\test_SAT_IMU_005.py:129: F405 not found — connect board via USB and retry</skipped><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_C_full_recovery_after_all_scenarios" file="sat_imu\test_SAT_IMU_005.py" line="242" time="0.000"><skipped type="pytest.skip" message="F405 not found — connect board via USB and retry">C:\Users\TheSilent\Desktop\Project R.A.D\DroneCockpitUI\sat_imu\test_SAT_IMU_005.py:243: F405 not found — connect board via USB and retry</skipped><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_C_imu_fields_in_range_during_fault" file="sat_imu\test_SAT_IMU_005.py" line="210" time="0.000"><skipped type="pytest.skip" message="F405 not found — connect board via USB and retry">C:\Users\TheSilent\Desktop\Project R.A.D\DroneCockpitUI\sat_imu\test_SAT_IMU_005.py:211: F405 not found — connect board via USB and retry</skipped><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget" name="test_accel_scale" file="TestScripts\test_imu_widget.py" line="358" time="0.655"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget" name="test_flash_ms" file="TestScripts\test_imu_widget.py" line="378" time="0.602"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget" name="test_gyro_crit_dps" file="TestScripts\test_imu_widget.py" line="366" time="0.603"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget" name="test_gyro_scale" file="TestScripts\test_imu_widget.py" line="354" time="0.603"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget" name="test_gyro_warn_dps" file="TestScripts\test_imu_widget.py" line="362" time="0.604"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget" name="test_hold_crit_sec" file="TestScripts\test_imu_widget.py" line="374" time="0.604"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget" name="test_hold_warn_sec" file="TestScripts\test_imu_widget.py" line="370" time="0.605"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestCritState" name="test_UT_ALERT_003_after_expiry_safe_band_is_safe" file="TestScripts\test_imu_widget.py" line="267" time="0.611"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestCritState" name="test_UT_ALERT_003_after_expiry_warn_band_is_warn" file="TestScripts\test_imu_widget.py" line="260" time="0.607"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestCritState" name="test_UT_ALERT_003_crit_overrides_warn" file="TestScripts\test_imu_widget.py" line="243" time="0.605"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestCritState" name="test_UT_ALERT_003_entry_above_100dps" file="TestScripts\test_imu_widget.py" line="220" time="0.606"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestCritState" name="test_UT_ALERT_003_entry_at_100dps" file="TestScripts\test_imu_widget.py" line="216" time="0.612"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestCritState" name="test_UT_ALERT_003_four_sample_sequence" file="TestScripts\test_imu_widget.py" line="224" time="0.613"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestCritState" name="test_UT_ALERT_003_hold_refreshed_during_crit" file="TestScripts\test_imu_widget.py" line="251" time="0.607"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestCritState" name="test_UT_ALERT_003_hold_timer_set_to_4s" file="TestScripts\test_imu_widget.py" line="236" time="0.606"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestFlashTicker" name="test_UT_ALERT_004_flash_ms_constant" file="TestScripts\test_imu_widget.py" line="282" time="0.603"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestFlashTicker" name="test_UT_ALERT_004_partial_unregister_keeps_ticker" file="TestScripts\test_imu_widget.py" line="329" time="1.321"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestFlashTicker" name="test_UT_ALERT_004_registry_tracks_labels" file="TestScripts\test_imu_widget.py" line="306" time="0.607"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestFlashTicker" name="test_UT_ALERT_004_ticker_not_duplicated" file="TestScripts\test_imu_widget.py" line="294" time="0.609"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestFlashTicker" name="test_UT_ALERT_004_ticker_starts_on_register" file="TestScripts\test_imu_widget.py" line="286" time="0.606"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestFlashTicker" name="test_UT_ALERT_004_ticker_stops_after_last_unregister" file="TestScripts\test_imu_widget.py" line="314" time="1.314"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestSafeState" name="test_UT_ALERT_001_all_axes_independent" file="TestScripts\test_imu_widget.py" line="147" time="0.605"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestSafeState" name="test_UT_ALERT_001_below_warn_threshold" file="TestScripts\test_imu_widget.py" line="124" time="0.605"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestSafeState" name="test_UT_ALERT_001_boundary_just_below" file="TestScripts\test_imu_widget.py" line="137" time="0.606"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestSafeState" name="test_UT_ALERT_001_hold_until_zero_after_safe" file="TestScripts\test_imu_widget.py" line="141" time="0.614"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestSafeState" name="test_UT_ALERT_001_small_positive_rate" file="TestScripts\test_imu_widget.py" line="133" time="0.603"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestSafeState" name="test_UT_ALERT_001_zero_rate_is_safe" file="TestScripts\test_imu_widget.py" line="129" time="0.606"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestWarnState" name="test_UT_ALERT_002_axes_independent" file="TestScripts\test_imu_widget.py" line="202" time="0.607"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestWarnState" name="test_UT_ALERT_002_entry_at_30dps" file="TestScripts\test_imu_widget.py" line="162" time="0.605"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestWarnState" name="test_UT_ALERT_002_entry_at_50dps" file="TestScripts\test_imu_widget.py" line="167" time="0.611"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestWarnState" name="test_UT_ALERT_002_entry_at_99p9dps" file="TestScripts\test_imu_widget.py" line="171" time="0.605"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestWarnState" name="test_UT_ALERT_002_hold_active_at_0p5s" file="TestScripts\test_imu_widget.py" line="175" time="0.606"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestWarnState" name="test_UT_ALERT_002_hold_active_at_1p9s" file="TestScripts\test_imu_widget.py" line="181" time="0.605"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestWarnState" name="test_UT_ALERT_002_hold_expires_at_2p1s" file="TestScripts\test_imu_widget.py" line="187" time="0.607"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="TestScripts.test_imu_widget.TestWarnState" name="test_UT_ALERT_002_hold_timer_value" file="TestScripts\test_imu_widget.py" line="193" time="0.662"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+[conftest] Disconnected
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase></testsuite></testsuites>
