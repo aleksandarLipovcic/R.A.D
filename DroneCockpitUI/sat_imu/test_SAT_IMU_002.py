@@ -94,15 +94,6 @@ class TestGravityReference:
 
     def _collect_samples(self, drone_link, imu_widget, imu_sensor,
                          duration_s: float) -> dict[str, list]:
-        """Collect scaled IMU samples over duration_s seconds.
-
-        Returns a dict of lists:
-          'acc_z'   : accZ in g    (from imu_sensor.getScaledData())
-          'gyro_x'  : gyroX in °/s
-          'gyro_y'  : gyroY in °/s
-          'gyro_z'  : gyroZ in °/s
-          'widget_az': raw_az / ACCEL_SCALE  (what the widget displays)
-        """
         root, widget = imu_widget
         results: dict[str, list] = {
             "acc_z": [], "gyro_x": [], "gyro_y": [], "gyro_z": [],
@@ -111,21 +102,21 @@ class TestGravityReference:
         t0 = time.monotonic()
 
         while time.monotonic() - t0 < duration_s:
-            # Update widget with latest state (also refreshes imu_sensor internally)
             s    = drone_link.get_latest_state()
             data = s.to_dict()
             widget.update_ui(data)
             root.update_idletasks()
 
-            # Scaled values via IMUSensor C++ API
-            scaled = imu_sensor.getScaledData()
-            results["acc_z"].append(scaled.accZ)
-            results["gyro_x"].append(abs(scaled.gyroX))
-            results["gyro_y"].append(abs(scaled.gyroY))
-            results["gyro_z"].append(abs(scaled.gyroZ))
+            # FIX 1: snake_case method name matches pybind11 binding
+            # FIX 2: binding returns a dict, not an attribute object
+            #        keys are "az_g", "gx_dps", "gy_dps", "gz_dps"
+            scaled = imu_sensor.get_scaled_data()
+            results["acc_z"].append(scaled["az_g"])
+            results["gyro_x"].append(abs(scaled["gx_dps"]))
+            results["gyro_y"].append(abs(scaled["gy_dps"]))
+            results["gyro_z"].append(abs(scaled["gz_dps"]))
 
             # Widget-computed az: what the widget displays (SRS-IMU-004c)
-            # IMUWidget divides raw az by ACCEL_SCALE = 2048
             raw_az   = data.get("az", 0)
             widget_g = raw_az / widget.ACCEL_SCALE
             results["widget_az"].append(widget_g)

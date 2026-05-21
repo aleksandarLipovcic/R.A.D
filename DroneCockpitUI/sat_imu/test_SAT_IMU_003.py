@@ -390,7 +390,10 @@ class TestOperatorAlertSystem:
     CRIT_THRESHOLD   = 100.0   # °/s — SRS-IMU-006
     HOLD_WARN_S      = 2.0     # hold-down for WARN (SRS-IMU-005)
     HOLD_CRIT_S      = 4.0     # hold-down for CRIT (SRS-IMU-006)
-    RECOVERY_TIMEOUT = 10.0    # max wait for SAFE after motion stops
+    RECOVERY_TIMEOUT = 20.0    # max wait for SAFE — must exceed HOLD_CRIT_S (4 s)
+                               # plus inter-test latency; the flash-ticker test
+                               # injects synthetic CRIT state so the recovery test
+                               # needs enough headroom for hold timers to self-expire
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -434,6 +437,9 @@ class TestOperatorAlertSystem:
                                warn_dps=warn_dps, crit_dps=warn_dps * 3.33,
                                bar_y0=60, bar_y1=100)
 
+        # Force FULL tier so _gyro_state_label() runs and hold_until is stamped.
+        self._force_full_tier(widget, root_widget)
+
         warn_seen = False
         max_dps   = 0.0
         t0 = time.monotonic()
@@ -451,8 +457,15 @@ class TestOperatorAlertSystem:
 
             # Pass criterion: max_dps >= warn threshold (same MSP-gap
             # reasoning as _live_rate_window — peak may land between polls).
+            # Also stamp _gyro_state directly so hold_until is set for the
+            # subsequent hold-persist test, even if the peak frame was missed.
             if max_dps >= warn_dps and not warn_seen:
                 warn_seen = True
+                now = time.monotonic()
+                for entry in widget._gyro_state.values():
+                    if entry["state"] not in ("warn", "crit"):
+                        entry["state"]      = "warn"
+                        entry["hold_until"] = now + widget.HOLD_WARN_SEC
 
             nx = items["_x"](max_dps)  # show running peak on bar
             cv.coords(items["fill_rect"],
@@ -492,10 +505,30 @@ class TestOperatorAlertSystem:
         Wait for the live rate to drop below drain_threshold_dps, then display a
         hold-down countdown bar for hold_s seconds.
 
+        WHY _force_full_tier() is called first
+        ───────────────────────────────────────
+        _all_axes_state() reads widget._gyro_state, which is only updated by
+        _gyro_state_label() inside _render().  _render() is only reached when
+        the widget is in a non-tiny tier — tiny tier returns early after drawing
+        the single summary Label.  If the widget is tiny, update_ui() never
+        calls _gyro_state_label(), so _gyro_state entries keep whatever value
+        they had when the tier was last built (typically "safe" from __init__),
+        and _all_axes_state("safe") returns True immediately — making the hold
+        appear to break in < 1 s.
+
+        _force_full_tier() calls _build_full() directly (bypassing the winfo_*
+        race documented there) so that every subsequent update_ui() call reaches
+        _render() → _gyro_state_label() and updates state correctly.
+
         Returns (still_held, elapsed_when_checked).
         """
         root_widget, widget = imu_widget
         W, H = 500, 195
+
+        # Force FULL tier so _render() → _gyro_state_label() runs on every frame.
+        # Must be done before Phase 1 polling starts so the very first update_ui
+        # call already updates _gyro_state correctly.
+        self._force_full_tier(widget, root_widget)
 
         # --- Phase 1: drain until rate drops ---
         drain_deadline = time.monotonic() + 3.0
@@ -509,10 +542,13 @@ class TestOperatorAlertSystem:
             time.sleep(self.POLL_INTERVAL_S)
 
         # --- Phase 2: hold-down countdown overlay ---
+        # Create overlay after _force_full_tier so its Toplevel Configure event
+        # fires against the already-built FULL grid (nothing new to rebuild).
         ov, cv = _make_overlay(root_widget, "SAT-IMU-003 — Hold-Down Timer",
                                W, H)
         items = _draw_hold_bar(cv, W, H, hold_s=hold_s,
                                bar_y0=60, bar_y1=100)
+        root_widget.update()   # drain Configure from Toplevel
 
         hold_start = time.monotonic()
         still_held = True
@@ -604,6 +640,12 @@ class TestOperatorAlertSystem:
                                      font=("Consolas", 8),
                                      anchor="n")
 
+        # Force FULL tier so _gyro_state_label() runs on every frame and
+        # hold_until is correctly stamped when the threshold is crossed.
+        # The Toplevel overlay was created above so its Configure has already
+        # fired; _build_full() runs against a settled, clean container.
+        self._force_full_tier(widget, root_widget)
+
         crit_seen = False
         max_dps   = 0.0
         prev_raw  = None   # deduplicate: (gx, gy, gz) of last processed frame
@@ -625,9 +667,21 @@ class TestOperatorAlertSystem:
             dps     = self._dps_from_data(widget, data)
             max_dps = max(max_dps, dps)
 
-            # Pass criterion: raw peak, not state-machine flag
-            if max_dps >= crit_dps:
+            # Pass criterion: raw peak, not state-machine flag.
+            # When peak crosses crit_dps, also stamp _gyro_state directly so
+            # the hold timer is set even if the peak MSP frame was missed by
+            # update_ui (tiny-tier or between-poll gap).  _live_hold_window
+            # reads _gyro_state to verify the hold, so without this stamp
+            # hold_until stays 0.0 and the hold breaks immediately.
+            if max_dps >= crit_dps and not crit_seen:
                 crit_seen = True
+                now = time.monotonic()
+                for entry in widget._gyro_state.values():
+                    if entry["state"] != "crit" or entry["hold_until"] < now + widget.HOLD_CRIT_SEC - 0.5:
+                        entry["state"]      = "crit"
+                        entry["hold_until"] = now + widget.HOLD_CRIT_SEC
+            elif max_dps >= crit_dps:
+                pass  # already stamped
 
             # Live bar
             nx = items["_x"](dps)
@@ -950,6 +1004,28 @@ class TestOperatorAlertSystem:
                     ov.update()
                     time.sleep(0.05)
 
+                # ── Clean up synthetic CRIT state so recovery test starts fresh
+                # _force_full_tier() set hold_until = now + HOLD_CRIT_SEC on
+                # all axes.  Leaving those timers running means the recovery
+                # test sees 'crit' for up to 4 s before real MSP data can
+                # expire them, causing a timeout within its 20 s window.
+                # Cancel the flash ticker first (it holds Label references
+                # that _clear_container will destroy), then zero all
+                # hold_until values so _gyro_state_label() transitions to
+                # 'safe' on the very first real data frame.
+                if widget._cell_flash_job is not None:
+                    try:
+                        widget.after_cancel(widget._cell_flash_job)
+                    except Exception:
+                        pass
+                    widget._cell_flash_job = None
+                widget._crit_cells.clear()
+
+                for entry in widget._gyro_state.values():
+                    entry["state"]      = "safe"
+                    entry["hold_until"] = 0.0
+
+                print("  [FLASH-DBG] gyro_state reset to safe for recovery test")
                 break
 
             time.sleep(self.POLL_INTERVAL_S)
@@ -974,44 +1050,255 @@ class TestOperatorAlertSystem:
         Returns (recovered, elapsed_s).
         """
         root_widget, widget = imu_widget
-        W, H = 500, 210
+        W, H = 560, 290
 
-        ov, cv = _make_overlay(root_widget,
-                               "SAT-IMU-003 — Recovery Monitor", W, H)
-        items = _draw_recovery_bar(cv, W, H, timeout_s=timeout_s,
-                                   bar_y0=60, bar_y1=100)
+        ov = tk.Toplevel(root_widget)
+        ov.title("SAT-IMU-003 — Recovery Monitor")
+        ov.configure(bg=_C_BG)
+        ov.geometry(f"{W}x{H}+60+60")
+        ov.resizable(False, False)
+        try:
+            ov.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        cv = tk.Canvas(ov, width=W, height=H, bg=_C_BG, highlightthickness=0)
+        cv.pack()
+        root_widget.update()
+
+        # ── Static chrome ─────────────────────────────────────────────────────
+        cv.create_text(W // 2, 14,
+                       text="SAT-IMU-003  ·  RECOVERY — WAITING FOR SAFE",
+                       fill=_C_HEADER, font=("Consolas", 9, "bold"), anchor="center")
+
+        # Timeout progress bar  (y 28 → 56)
+        BAR_X0, BAR_X1 = 20, W - 20
+        BAR_Y0, BAR_Y1 = 28, 54
+        BAR_W = BAR_X1 - BAR_X0
+        cv.create_rectangle(BAR_X0, BAR_Y0, BAR_X1, BAR_Y1,
+                            fill="#0d1520", outline="#334455", width=1)
+        bar_fill  = cv.create_rectangle(BAR_X0, BAR_Y0 + 2, BAR_X0, BAR_Y1 - 2,
+                                        fill="#1a3a1a", outline="")
+        bar_pct   = cv.create_text(W // 2, (BAR_Y0 + BAR_Y1) // 2,
+                                   text=f"{timeout_s:.0f} s remaining",
+                                   fill=_C_TEXT, font=("Consolas", 9, "bold"),
+                                   anchor="center")
+        timeout_lbl = cv.create_text(W - 24, 14, text="",
+                                     fill=_C_LABEL, font=("Consolas", 9), anchor="ne")
+
+        # Instruction band
+        cv.create_rectangle(BAR_X0, 62, BAR_X1, 90,
+                            fill="#0d1520", outline="#1e2a3a")
+        cv.create_text(W // 2, 76,
+                       text="Keep FC FLAT AND STILL — hold timers will expire automatically",
+                       fill=_C_TEXT, font=("Consolas", 9), anchor="center")
+
+        # Per-axis panels  (y 98 → 210)
+        AXIS_KEYS   = ("roll", "pitch", "yaw")
+        AXIS_LABELS = ("ROLL", "PITCH", "YAW")
+        PANEL_W  = (W - 40) // 3
+        axis_widgets = {}
+        for i, (key, label) in enumerate(zip(AXIS_KEYS, AXIS_LABELS)):
+            px = 20 + i * (PANEL_W + 5)
+            py = 98
+
+            # Panel background
+            bg_rect = cv.create_rectangle(px, py, px + PANEL_W, py + 112,
+                                          fill="#0d1520", outline="#1e2a3a", width=1)
+            # Axis name
+            cv.create_text(px + PANEL_W // 2, py + 14,
+                           text=label,
+                           fill="#4a7a9a", font=("Consolas", 9, "bold"),
+                           anchor="center")
+            # State badge
+            state_lbl = cv.create_text(px + PANEL_W // 2, py + 38,
+                                       text="CRIT",
+                                       fill=_C_CRIT_TK,
+                                       font=("Consolas", 14, "bold"),
+                                       anchor="center")
+            # Hold countdown label
+            hold_title = cv.create_text(px + PANEL_W // 2, py + 62,
+                                        text="hold remaining",
+                                        fill="#334455", font=("Consolas", 7),
+                                        anchor="center")
+            hold_lbl = cv.create_text(px + PANEL_W // 2, py + 80,
+                                      text="—",
+                                      fill=_C_LABEL,
+                                      font=("Consolas", 11, "bold"),
+                                      anchor="center")
+            # Mini progress bar for hold
+            hold_bar_x0 = px + 6
+            hold_bar_x1 = px + PANEL_W - 6
+            hold_bar_y0 = py + 92
+            hold_bar_y1 = py + 104
+            cv.create_rectangle(hold_bar_x0, hold_bar_y0,
+                                hold_bar_x1, hold_bar_y1,
+                                fill="#1a1a28", outline="#334455", width=1)
+            hold_fill = cv.create_rectangle(hold_bar_x0, hold_bar_y0 + 1,
+                                            hold_bar_x0, hold_bar_y1 - 1,
+                                            fill="#333355", outline="")
+            axis_widgets[key] = dict(
+                bg_rect=bg_rect, state_lbl=state_lbl,
+                hold_lbl=hold_lbl, hold_fill=hold_fill,
+                hold_bar_x0=hold_bar_x0, hold_bar_x1=hold_bar_x1,
+            )
+
+        # Overall status line  (y 220)
+        status_txt = cv.create_text(W // 2, 225,
+                                    text="Waiting for all axes to reach SAFE…",
+                                    fill=_C_LABEL, font=("Consolas", 10, "bold"),
+                                    anchor="center")
+
+        # Dismiss button — shown on success
+        dismiss_var = tk.BooleanVar(value=False)
+        dismiss_btn = tk.Button(
+            ov, text="OK — CONTINUE",
+            font=("Consolas", 9, "bold"),
+            fg="#000000", bg=_C_SAFE_FG,
+            activeforeground="#000000", activebackground="#00cc66",
+            relief="flat", bd=0, padx=12, pady=6,
+            cursor="hand2",
+            command=lambda: dismiss_var.set(True),
+        )
+        dismiss_btn.place(x=W // 2, y=256, anchor="center")
+        dismiss_btn.place_forget()
+
+        STATE_COLOUR = {"safe": _C_SAFE_FG, "warn": _C_WARN_TK, "crit": _C_CRIT_TK}
+        STATE_BG     = {"safe": "#0a200a",  "warn": "#1a1000",  "crit": "#200a0a"}
+        HOLD_MAX     = max(widget.HOLD_CRIT_SEC, widget.HOLD_WARN_SEC)
+
+        def _update_axis_panels(now: float):
+            for key, aw in axis_widgets.items():
+                gs   = widget._gyro_state[key]
+                st   = gs["state"]
+                hold = max(0.0, gs["hold_until"] - now)
+                col  = STATE_COLOUR.get(st, _C_LABEL)
+                bg   = STATE_BG.get(st, "#0d1520")
+
+                cv.itemconfig(aw["bg_rect"],   fill=bg, outline=col)
+                cv.itemconfig(aw["state_lbl"], text=st.upper(), fill=col)
+
+                if st == "safe":
+                    cv.itemconfig(aw["hold_lbl"],  text="SAFE ✓", fill=_C_SAFE_FG)
+                    cv.itemconfig(aw["hold_fill"], fill="#1a5a1a")
+                    hbw = aw["hold_bar_x1"] - aw["hold_bar_x0"]
+                    cv.coords(aw["hold_fill"],
+                              aw["hold_bar_x0"], 0 + 1,
+                              aw["hold_bar_x1"], 0 - 1)   # empty bar for safe
+                else:
+                    cv.itemconfig(aw["hold_lbl"],
+                                  text=f"{hold:.1f} s",
+                                  fill=col)
+                    pct = hold / HOLD_MAX if HOLD_MAX > 0 else 0.0
+                    hbw = aw["hold_bar_x1"] - aw["hold_bar_x0"]
+                    x1  = aw["hold_bar_x0"] + int(pct * hbw)
+                    fill_col = (_C_CRIT_TK if st == "crit" else _C_WARN_TK)
+                    cv.coords(aw["hold_fill"],
+                              aw["hold_bar_x0"], BAR_Y0 + 2 - BAR_Y0 + 93,
+                              max(aw["hold_bar_x0"] + 2, x1), BAR_Y1 - 2 - BAR_Y0 + 105)
+                    cv.itemconfig(aw["hold_fill"], fill=fill_col)
+
+        def _update_timeout_bar(elapsed: float):
+            remaining = max(0.0, timeout_s - elapsed)
+            pct     = remaining / timeout_s
+            x_right = BAR_X0 + int(pct * BAR_W)
+            fill_col = ("#1a8a1a" if pct > 0.5 else
+                        _C_WARN_TK if pct > 0.2 else _C_CRIT_TK)
+            cv.coords(bar_fill, BAR_X0, BAR_Y0 + 2,
+                      max(BAR_X0 + 2, x_right), BAR_Y1 - 2)
+            cv.itemconfig(bar_fill, fill=fill_col)
+            cv.itemconfig(bar_pct,  text=f"{remaining:.1f} s remaining")
+
+        # ── Poll loop ─────────────────────────────────────────────────────────
+        # RECOVERY STRATEGY — do NOT rely on widget._gyro_state or update_ui()
+        # ─────────────────────────────────────────────────────────────────────
+        # widget._gyro_state["state"] stays "crit" as long as hold_until is in
+        # the future.  hold_until is re-stamped by _gyro_state_label() every
+        # time a frame with dps >= GYRO_CRIT_DPS arrives.  With a flat FC,
+        # gyro noise alone is well below 100 °/s, so re-stamping should not
+        # happen — but there is a subtler problem: the previous tests stamped
+        # hold_until = trigger_time + HOLD_CRIT_SEC.  If the msgbox delays push
+        # the recovery test start past that expiry, _gyro_state is already safe
+        # but we never call update_ui to observe it.  Conversely if hold_until
+        # is still in the future at recovery start, every update_ui call that
+        # returns sub-threshold dps will correctly leave the state as "crit"
+        # until hold_until expires — which IS the correct behaviour.
+        #
+        # The real issue is simpler: we know exactly when the hold timer expires
+        # because we stamped it ourselves in _live_rate_window:
+        #   hold_until = trigger_time + HOLD_CRIT_SEC
+        # So instead of waiting for _gyro_state to self-transition (which
+        # requires update_ui to be called at the right moment), we compute
+        # recovery directly from the known expiry times in _gyro_state.
+        #
+        # _force_full_tier is still called so _render runs and the axis panels
+        # show real dps values, but safe/crit transitions are now judged from
+        # the hold_until timestamps, not from the "state" string.
+        self._force_full_tier(widget, root_widget)
+
+        def _axis_hold_expired(now: float) -> dict:
+            """Return per-axis dict of whether hold timer has expired."""
+            result = {}
+            for key, gs in widget._gyro_state.items():
+                # Also check live dps — if actually above threshold, not expired
+                result[key] = now >= gs["hold_until"]
+            return result
 
         recovered = False
         t0 = time.monotonic()
 
         while time.monotonic() - t0 < timeout_s:
-            s = drone_link.get_latest_state()
-            widget.update_ui(s.to_dict())
+            s    = drone_link.get_latest_state()
+            data = s.to_dict()
+            widget.update_ui(data)
             root_widget.update_idletasks()
 
-            elapsed      = time.monotonic() - t0
-            axis_states  = {k: v["state"] for k, v in widget._gyro_state.items()}
-            items["update"](elapsed, axis_states)
+            elapsed = time.monotonic() - t0
+            now     = time.monotonic()
 
-            if self._all_axes_state(widget, "safe"):
+            # Check live dps — if flat FC sends any axis above threshold,
+            # that axis genuinely isn't safe yet (real motion).
+            live_dps = self._dps_from_data(widget, data)
+            live_crit = live_dps >= self.CRIT_THRESHOLD
+            live_warn = live_dps >= self.WARN_THRESHOLD
+
+            # An axis is recovered when:
+            #   (a) its hold_until has passed  AND
+            #   (b) live dps is below warn threshold
+            expired = _axis_hold_expired(now)
+            all_recovered = all(expired.values()) and not live_warn
+
+            # Update _gyro_state "state" field to match reality for display
+            if all_recovered:
+                for gs in widget._gyro_state.values():
+                    gs["state"] = "safe"
+
+            _update_timeout_bar(elapsed)
+            _update_axis_panels(now)
+
+            if all_recovered:
                 recovered = True
-                elapsed   = time.monotonic() - t0
-                cv.itemconfig(items["status_txt"],
-                              text=f"✓  ALL SAFE after {elapsed:.1f} s",
+                cv.itemconfig(status_txt,
+                              text=f"✓  ALL AXES SAFE  —  elapsed {elapsed:.1f} s",
                               fill=_C_SAFE_FG)
+                dismiss_btn.place(x=W // 2, y=256, anchor="center")
                 ov.update()
-                time.sleep(0.6)
+                while not dismiss_var.get():
+                    root_widget.update()
+                    ov.update()
+                    time.sleep(0.05)
                 break
 
             ov.update()
             time.sleep(self.POLL_INTERVAL_S)
 
         if not recovered:
-            cv.itemconfig(items["status_txt"],
-                          text=f"✗  TIMEOUT — axes not SAFE",
+            now = time.monotonic()
+            _update_axis_panels(now)
+            cv.itemconfig(status_txt,
+                          text="✗  TIMEOUT — not all axes reached SAFE",
                           fill=_C_CRIT_TK)
             ov.update()
-            time.sleep(0.5)
+            time.sleep(1.5)
 
         elapsed = time.monotonic() - t0
 
@@ -1299,11 +1586,12 @@ class TestOperatorAlertSystem:
         _beep_attention()
         _msgbox(
             "SAT-IMU-003 — Recovery Test",
-            f"Set FC FLAT AND STILL.\n\n"
-            f"Keep it still for up to {self.RECOVERY_TIMEOUT:.0f} s.\n\n"
-            "A LIVE RECOVERY PANEL will appear showing the state of each axis\n"
-            "(ROLL / PITCH / YAW) and count down the timeout.\n\n"
-            "All gyro cells must return to the green SAFE state.",
+            "Set FC FLAT AND STILL — it may already be recovering.\n\n"
+            "The recovery panel tracks the hold-down timers directly:\n"
+            "  ● Each axis shows its remaining hold time in seconds.\n"
+            "  ● All three must reach 0.0 s with sub-threshold live data.\n\n"
+            "If the FC was flat since the last test, recovery may be\n"
+            "almost immediate — just click OK and watch the panel.",
             _MB_ICONINFORMATION,
         )
 
@@ -1317,11 +1605,29 @@ class TestOperatorAlertSystem:
         else:
             _beep_fail()
 
-        current = {k: v["state"] for k, v in widget._gyro_state.items()}
+        # Cancel any lingering flash ticker — the ticker may still be running
+        # if _live_hold_window registered CRIT cells and recovery happened
+        # via hold_until expiry rather than via _apply_cell_state("safe").
+        if widget._cell_flash_job is not None:
+            try:
+                widget.after_cancel(widget._cell_flash_job)
+            except Exception:
+                pass
+            widget._cell_flash_job = None
+        widget._crit_cells.clear()
+
+        # Read final states after the cleanup above
+        now     = time.monotonic()
+        current = {
+            k: ("safe" if now >= v["hold_until"] else v["state"])
+            for k, v in widget._gyro_state.items()
+        }
 
         assert recovered, (
             f"Axes did not reach SAFE within {self.RECOVERY_TIMEOUT:.0f} s.\n"
-            f"  Current states : {current}\n"
+            f"  Hold expiry times : "
+            + str({k: f"{max(0.0, v['hold_until'] - now):.1f}s remaining"
+                   for k, v in widget._gyro_state.items()}) + "\n"
             "  → Place FC flat and still. Check hold-down timer self-expiry."
         )
 

@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="1" tests="8" time="23.403" timestamp="2026-05-21T10:51:47.459191+02:00" hostname="TheSilent"><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_A_link_healthy_recovers" file="sat_imu\test_SAT_IMU_005.py" line="74" time="4.023"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+[SAT conftest] Connected on COM4 — waiting 2 s for telemetry to stabilise
+
+  link_healthy recovered within 2.0 s: True
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_A_no_crash_during_fault_injection" file="sat_imu\test_SAT_IMU_005.py" line="57" time="2.001"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_A_packet_count_resumes" file="sat_imu\test_SAT_IMU_005.py" line="99" time="7.002"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  packet_count delta after recovery: 10  (need &gt;= 7 over 3.0 s)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_B_link_healthy_in_to_dict" file="sat_imu\test_SAT_IMU_005.py" line="128" time="0.002"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  'link_healthy' in to_dict(): True  value=True
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_B_unhealthy_link_flagged_during_injection" file="sat_imu\test_SAT_IMU_005.py" line="149" time="3.034"><failure message="AssertionError: link_healthy never went False during fault injection. FAIL_THRESHOLD may not be triggering, or set_poll_interval_ms(0) is not generating enough parse failures.&#10;assert False">self = &lt;test_SAT_IMU_005.TestFaultTolerance object at 0x000002E5534772F0&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x000002E551AAF030&gt;
+
+    def test_SAT_IMU_005_B_unhealthy_link_flagged_during_injection(self, drone_link):
+        """link_healthy must flip False during sustained fault injection.
+    
+        Confirms FAIL_THRESHOLD logic: after 5 consecutive parseIMU()
+        failures the worker marks the link unhealthy.
+        """
+        drone_link.set_poll_interval_ms(0)
+    
+        unhealthy_seen = False
+        deadline = time.monotonic() + INJECT_DURATION_S + 1.0
+        try:
+            while time.monotonic() &lt; deadline:
+                if not drone_link.get_latest_state().link_healthy:
+                    unhealthy_seen = True
+                    break
+                time.sleep(0.05)
+        finally:
+            drone_link.set_poll_interval_ms(NORMAL_INTERVAL_MS)
+    
+        print(f"\n  link_healthy went False during injection: {unhealthy_seen}")
+&gt;       assert unhealthy_seen, (
+            "link_healthy never went False during fault injection. "
+            "FAIL_THRESHOLD may not be triggering, or set_poll_interval_ms(0) "
+            "is not generating enough parse failures."
+        )
+E       AssertionError: link_healthy never went False during fault injection. FAIL_THRESHOLD may not be triggering, or set_poll_interval_ms(0) is not generating enough parse failures.
+E       assert False
+
+sat_imu\test_SAT_IMU_005.py:170: AssertionError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  link_healthy went False during injection: False
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_B_widget_receives_link_status" file="sat_imu\test_SAT_IMU_005.py" line="175" time="3.113"><skipped type="pytest.skip" message="Could not capture link_healthy=False snapshot">C:\Users\TheSilent\Desktop\Project R.A.D\DroneCockpitUI\sat_imu\test_SAT_IMU_005.py:198: Could not capture link_healthy=False snapshot</skipped><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_C_full_recovery_after_all_scenarios" file="sat_imu\test_SAT_IMU_005.py" line="242" time="2.015"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  Final state:
+     link_healthy = True
+     packet_count = 69
+     ax=-2  ay=-4  az=2043
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_C_imu_fields_in_range_during_fault" file="sat_imu\test_SAT_IMU_005.py" line="210" time="2.133"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  Out-of-range violations: 0
+
+[SAT conftest] Disconnected
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase></testsuite></testsuites>
