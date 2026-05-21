@@ -318,9 +318,18 @@ public:
     // call setPollIntervalMs(20) for a comfortable 50 Hz rate.
     void setPollIntervalMs(int ms) { pollIntervalMs.store(ms); }
 
+    // ── Fault injection (test use only) ──────────────────────────────────────
+    // DEF-005 rev 2: when active, sendMSP() returns {} immediately on every
+    // call, deterministically simulating a dead link without relying on serial
+    // timing side-effects.  Used by SAT-IMU-005 Scenario B.
+    // Always restore with setFailInjection(false) in test teardown.
+    // Must NOT be called from production flight code.
+    void setFailInjection(bool active) { failInjectionActive.store(active); }
+
     // ── GPS configuration via UBX passthrough ─────────────────────────────────
     GPSConfigResult applyGPSConfig(const GPSConfig& cfg);
-	// Moved to protected so the tests can access it without making it public in the header.
+
+    // Moved to protected so the tests can access it without making it public in the header.
 protected:
     bool parseIMU(const std::vector<uint8_t>& buf, DroneState& s);
 
@@ -330,6 +339,11 @@ private:
     std::thread       workerThread;
     std::atomic<bool> keepRunning;
     std::atomic<int>  pollIntervalMs;
+
+    // ── Fault injection flag (DEF-005 rev 2) ─────────────────────────────────
+    // Checked at the top of sendMSP(). Atomic so Python thread and worker
+    // thread can access it without a lock.
+    std::atomic<bool> failInjectionActive{ false };
 
     std::string portName_;          // saved for reopen after passthrough cycle
 
@@ -374,7 +388,7 @@ private:
 
     // ── Parsers — one per MSP response type ───────────────────────────────────
     bool parseStatus(const std::vector<uint8_t>& buf, DroneState& s);
-    //bool parseIMU(const std::vector<uint8_t>& buf, DroneState& s); Uncoment when not doing testing
+    //bool parseIMU(const std::vector<uint8_t>& buf, DroneState& s); // Uncomment when not doing testing
     bool parseAttitude(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseAnalog(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseDebug(const std::vector<uint8_t>& buf, DroneState& s);

@@ -487,7 +487,23 @@ PYBIND11_MODULE(DroneBackend, m) {
             py::arg("config"),
             "Send UBX CFG-GNSS/RATE/PRT/NAV5/CFG frames to the NEO-M10 via\n"
             "MSP GPS passthrough.  Returns GPSConfigResult with per-step ACK\n"
-            "status.");
+            "status.")
+        // ── DEF-005 rev 2: fault injection for SAT-IMU-005 Scenario B ────────
+        // When active, sendMSP() returns {} immediately on every call,
+        // simulating a dead link without relying on serial-timing side-effects.
+        // This deterministically increments consecutiveFails until
+        // FAIL_THRESHOLD is reached and linkHealthy flips False (~50 ms at
+        // default POLL_INTERVAL_MS = 10 ms).
+        // Scenarios A and C continue to use set_poll_interval_ms(0); only
+        // Scenario B uses this method.
+        // NEVER ship in flight builds — test use only.
+        .def("set_fail_injection", &DroneLink::setFailInjection,
+            py::arg("active"),
+            "Inject simulated link failure: sendMSP() returns {} immediately\n"
+            "on every call when active=True, regardless of FC responsiveness.\n"
+            "Used by SAT-IMU-005 Scenario B (DEF-005 rev 2).\n"
+            "Call with active=False to restore normal operation.\n"
+            "TEST USE ONLY — never enable in flight builds.");
 
     // =========================================================================
     // IMUSensor

@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="1" time="10.135" timestamp="2026-05-21T12:55:02.541591+02:00" hostname="TheSilent"><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_B_unhealthy_link_flagged_during_injection" file="sat_imu\test_SAT_IMU_005.py" line="166" time="10.055"><failure message="AssertionError: link_healthy never went False during fault injection. Waited 8.0 s (5 × ~960 ms timeout loops + margin). Possible causes:&#10;    • FC is still responding fast enough that sendMSP() never times out — FAIL_THRESHOLD is never reached.&#10;    • pollIntervalMs.store() is not being called correctly — verify set_poll_interval_ms() binding in DroneBackend.&#10;    • FAIL_THRESHOLD constant mismatch — check DroneLink.h (expected 5).&#10;assert False">self = &lt;test_SAT_IMU_005.TestFaultTolerance object at 0x000001B908D071D0&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x000001B9069DD4B0&gt;
+
+    def test_SAT_IMU_005_B_unhealthy_link_flagged_during_injection(self, drone_link):
+        """link_healthy must flip False during sustained fault injection.
+    
+        Confirms FAIL_THRESHOLD logic: after 5 consecutive parseIMU()
+        failures the worker marks the link unhealthy.
+    
+        TIMING NOTE (DEF-005):
+        set_poll_interval_ms(0) does NOT cause immediate parse failures on a
+        live USB-connected FC — the FC continues responding correctly at any
+        poll rate. What actually happens is that with no sleep between loop
+        iterations, the serial FIFO eventually falls behind and each of the
+        12 sequential sendMSP() calls blocks for its full 80 ms read timeout.
+        One complete loop therefore takes up to 12 × 80 ms = 960 ms.
+    
+        With FAIL_THRESHOLD = 5, link_healthy goes False only after 5
+        consecutive loop iterations all fail:
+            5 × 960 ms ≈ 4.8 s minimum before link_healthy = False.
+    
+        The original deadline of INJECT_DURATION_S + 1.0 = 3.0 s was shorter
+        than this minimum, so the assertion always failed.
+    
+        Fix: use _UNHEALTHY_INJECTION_DEADLINE_S = 8.0 s (module-level
+        constant), which gives 4.8 s minimum + 3.2 s margin.
+        """
+        drone_link.set_poll_interval_ms(0)
+    
+        unhealthy_seen = False
+        deadline = time.monotonic() + _UNHEALTHY_INJECTION_DEADLINE_S
+        try:
+            while time.monotonic() &lt; deadline:
+                if not drone_link.get_latest_state().link_healthy:
+                    unhealthy_seen = True
+                    break
+                time.sleep(0.05)
+        finally:
+            drone_link.set_poll_interval_ms(NORMAL_INTERVAL_MS)
+    
+        print(f"\n  link_healthy went False during injection: {unhealthy_seen}")
+&gt;       assert unhealthy_seen, (
+            "link_healthy never went False during fault injection. "
+            f"Waited {_UNHEALTHY_INJECTION_DEADLINE_S} s "
+            f"(5 × ~960 ms timeout loops + margin). "
+            "Possible causes:\n"
+            "  • FC is still responding fast enough that sendMSP() never "
+            "times out — FAIL_THRESHOLD is never reached.\n"
+            "  • pollIntervalMs.store() is not being called correctly — "
+            "verify set_poll_interval_ms() binding in DroneBackend.\n"
+            "  • FAIL_THRESHOLD constant mismatch — check DroneLink.h "
+            f"(expected {FAIL_THRESHOLD})."
+        )
+E       AssertionError: link_healthy never went False during fault injection. Waited 8.0 s (5 × ~960 ms timeout loops + margin). Possible causes:
+E           • FC is still responding fast enough that sendMSP() never times out — FAIL_THRESHOLD is never reached.
+E           • pollIntervalMs.store() is not being called correctly — verify set_poll_interval_ms() binding in DroneBackend.
+E           • FAIL_THRESHOLD constant mismatch — check DroneLink.h (expected 5).
+E       assert False
+
+sat_imu\test_SAT_IMU_005.py:205: AssertionError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+[SAT conftest] Connected on COM4 — waiting 2 s for telemetry to stabilise
+
+  link_healthy went False during injection: False
+
+[SAT conftest] Disconnected
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase></testsuite></testsuites>
