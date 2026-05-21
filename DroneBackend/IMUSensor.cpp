@@ -21,7 +21,7 @@ IMUSensor::IMUData IMUSensor::getRawData() {
 
 // ── getScaledData() ───────────────────────────────────────────────────────────
 // Converts raw counts to physical units using MPU-6500 defaults:
-//   ±4g  accel range  → divide by 8192  to get g
+//   ±4g accel range, MSP-layer: BF pre-divides by 4 → divide by 2048 to get g
 //   ±2000°/s gyro     → divide by 16.4  to get °/s
 //
 // If your Betaflight config uses a different range, adjust the constants

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="5" time="22.614" timestamp="2026-05-21T22:50:00.495558+02:00" hostname="TheSilent"><testcase classname="sat_imu.test_SAT_IMU_001.TestRealtimeIMUDisplay" name="test_SAT_IMU_001_all_keys_present" file="sat_imu\test_SAT_IMU_001.py" line="72" time="2.122"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+[SAT conftest] Connected on COM4 — waiting 2 s for telemetry to stabilise
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_001.TestRealtimeIMUDisplay" name="test_SAT_IMU_001_data_arrives_within_5s" file="sat_imu\test_SAT_IMU_001.py" line="87" time="0.002"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-001] Non-zero IMU data arrived after 0.00 s
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_001.TestRealtimeIMUDisplay" name="test_SAT_IMU_001_link_healthy_throughout" file="sat_imu\test_SAT_IMU_001.py" line="146" time="10.025"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_001.TestRealtimeIMUDisplay" name="test_SAT_IMU_001_packet_count_increases" file="sat_imu\test_SAT_IMU_001.py" line="170" time="10.005"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-001] packet_count delta: 33 over 10 s (3.30 Hz)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_001.TestRealtimeIMUDisplay" name="test_SAT_IMU_001_values_change_over_10s" file="sat_imu\test_SAT_IMU_001.py" line="112" time="0.438"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-001] IMU value change observed at t+0.21 s
+
+[SAT conftest] Disconnected
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase></testsuite></testsuites>

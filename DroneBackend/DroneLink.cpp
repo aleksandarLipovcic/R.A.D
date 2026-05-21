@@ -247,18 +247,15 @@ void DroneLink::communicationLoop() {
         --slowPollTickCounter_;
 
         // ── Health tracking ───────────────────────────────────────────────────
-        // FIXED — packetCount increments every committed loop tick.
-        // anySuccess still controls link health, but packet counting is
-        // independent — it tracks loop throughput, not IMU parse success.
         if (anySuccess) {
             consecutiveFails = 0;
             pending.linkHealthy = true;
+            pending.packetCount++;
         }
         else {
             if (++consecutiveFails >= FAIL_THRESHOLD)
                 pending.linkHealthy = false;
         }
-        pending.packetCount++;   // always — one tick = one committed state
 
         commitState(pending);
 
@@ -440,23 +437,11 @@ std::vector<uint8_t> DroneLink::readUbxResponse(HANDLE h, int timeoutMs) {
 //   a previous timeout is discarded by the header-sync logic inside the read
 //   loop (we only accept '$','M','>').  A targeted purge is still issued if
 //   we detect an unexpected header byte, so bus wedge recovery is preserved.
-//
-// DEF-005 rev 2 — fault injection gate:
-//   failInjectionActive is checked first. When True (set by the Python test
-//   via set_fail_injection()), sendMSP() returns {} immediately without
-//   touching the serial port. This deterministically causes parseIMU() to
-//   fail and consecutiveFails to increment, driving link_healthy False after
-//   FAIL_THRESHOLD ticks (~50 ms). The previous mechanism (set_poll_interval_ms(0))
-//   relied on serial FIFO starvation that no longer occurs after the purge fix.
 // =============================================================================
 
 std::vector<uint8_t> DroneLink::sendMSP(uint8_t mspID) {
-    // ── Fault injection (test use only, DEF-005 rev 2) ────────────────────────
-    // Returns {} immediately when active, bypassing all serial I/O.
-    // Controlled via setFailInjection() / DroneBackend.set_fail_injection().
-    if (failInjectionActive.load()) return {};
-
     if (hSerial == INVALID_HANDLE_VALUE) return {};
+    if (failInjectionActive.load())      return {};   // DEF-005 rev 2
 
     // ── Write request ─────────────────────────────────────────────────────────
     uint8_t req[] = { '$', 'M', '<', 0, mspID, mspID };
@@ -739,7 +724,6 @@ bool DroneLink::parseAnalog(const std::vector<uint8_t>& buf, DroneState& s) {
 
     return true;
 }
-
 // -----------------------------------------------------------------------------
 // parseDebug() — MSP_DEBUG (254)
 // Requires: set debug_mode = MAG_CALIB; save  in BF CLI
