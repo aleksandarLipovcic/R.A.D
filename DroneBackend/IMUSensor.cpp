@@ -20,9 +20,17 @@ IMUSensor::IMUData IMUSensor::getRawData() {
 }
 
 // ── getScaledData() ───────────────────────────────────────────────────────────
-// Converts raw counts to physical units using MPU-6500 defaults:
-//   ±4g accel range, MSP-layer: BF pre-divides by 4 → divide by 2048 to get g
-//   ±2000°/s gyro     → divide by 16.4  to get °/s
+// Converts raw counts to physical units using MPU-6500 / Betaflight 4.5.x defaults:
+//
+//   Accelerometer — ±16g range (INV_FSR_16G, confirmed BF 4.5.0 accgyro_mpu6500.c):
+//     Hardware sensitivity = 2048 LSB/g.
+//     Betaflight sets acc_1G = 512 × 4 = 2048 to match this range.
+//     MSP_RAW_IMU transmits accADC directly — no prescaling applied before
+//     transmission.  Effective MSP-layer sensitivity: 2048 LSB/g → ACC_SCALE = 1/2048.
+//
+//   Gyroscope — ±2000 °/s range:
+//     Hardware sensitivity = 16.4 LSB/(°/s) → GYRO_SCALE = 1/16.4.
+//     BF transmits gyro counts without prescaling (unchanged).
 //
 // If your Betaflight config uses a different range, adjust the constants
 // in IMUSensor.h (ACC_SCALE / GYRO_SCALE).
