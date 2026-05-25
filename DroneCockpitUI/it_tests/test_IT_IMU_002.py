@@ -2,7 +2,7 @@
 # test_IT_IMU_002.py  —  Scale Validation Against Known Gravity Vector
 #
 # V-Model reference: IMU Subsystem V-Model, Section 7, IT-IMU-002
-# SRS coverage:      SRS-IMU-004a (ACC_SCALE = 1/8192)
+# SRS coverage:      SRS-IMU-004a (ACC_SCALE = 1/2048)
 #
 # Pass criteria (from ITS):
 #   - mean(accZ) in [0.95, 1.05] g
