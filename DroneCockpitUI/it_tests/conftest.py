@@ -6,7 +6,7 @@
 #
 # Requires:
 #   - XFlight Hobby F405 V3 connected via USB
-#   - Betaflight 4.5.3 running (default IMU ranges: ±4g / ±2000°/s)
+#   - Betaflight 4.5.3 running (default IMU ranges: ±16g / ±2000°/s)
 #   - DroneBackend.pyd present in Release\ or Debug\ subfolder
 #
 # Run:
