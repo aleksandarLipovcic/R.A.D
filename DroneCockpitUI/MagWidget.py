@@ -1,4 +1,5 @@
 import tkinter as tk
+import tkinter.font as tkfont
 import math
 
 
@@ -24,9 +25,9 @@ class MagWidget(tk.Frame):
       All 8 points are shown: N, NE, E, SE, S, SW, W, NW.
 
     Adaptive heading font:
-      Scales to fill available box width.  Max capped lower so text never
-      overflows — empirical ratio 4.6 chars-per-pt for "000.0° E" (8 chars).
-      A size-change guard (_hdg_font_size) prevents Configure re-entry loops.
+      Measures the actual rendered text width via font.measure() so the label
+      never overflows the heading box regardless of how many characters are shown.
+      Re-measured on every Configure event AND on every heading update.
 
     Hard minimum widget size:
       The widget requests a minimum size via minsize that guarantees all three
@@ -65,14 +66,13 @@ class MagWidget(tk.Frame):
     PAD = 6   # uniform outer padding (px)
 
     # ── Heading font scaling ─────────────────────────────────────────────────
-    # String rendered in the heading box: "000.0° NW" (9 chars worst case)
-    # Empirical Consolas Bold ratio: box_width / font_pt ≈ 5.8 for 9 chars
-    _HDG_WIDTH_K  = 5.8
-    _HDG_MIN_PT   = 11
-    _HDG_MAX_PT   = 40   # capped lower than original so text never clips
+    # Worst-case string: "000.0° NW" — font is measured directly via font.measure()
+    # so these are only fallback bounds.
+    _HDG_MIN_PT   = 9
+    _HDG_MAX_PT   = 48   # upper bound; actual fit check will reduce as needed
+    _HDG_PADDING  = 20   # total horizontal padding inside the heading box (px)
 
     # ── Aviation safety: hard minimum widget dimensions ──────────────────────
-    # Enough to render: heading label + status dot + two buttons (MINI tier)
     _MIN_W = 285
     _MIN_H = 145
 
@@ -90,11 +90,9 @@ class MagWidget(tk.Frame):
         self._on_acc_cal    = on_acc_calibrate
         self._current_tier  = None
         self._tier_widgets  = {}
-        self._hdg_font_size = 0    # loop guard for adaptive font
+        self._hdg_font_size = 0    # loop guard
 
-        # Enforce aviation safety minimum — pilot must always see the 3 elements
-        self.minsize = (self._MIN_W, self._MIN_H)  # informational; caller enforces
-        # Actually configure grid weight so the frame respects its children
+        self.minsize = (self._MIN_W, self._MIN_H)
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
@@ -190,11 +188,6 @@ class MagWidget(tk.Frame):
 
     # ── MINI ──────────────────────────────────────────────────────────────────
     def _build_mini(self):
-        """
-        MINI tier — aviation safety baseline.
-        Always shows: heading degrees + cardinal (inline), status, two buttons.
-        No compass rose, no XYZ bars.
-        """
         c = self._container
         c.columnconfigure(0, weight=1)
         c.columnconfigure(1, weight=1)
@@ -202,7 +195,6 @@ class MagWidget(tk.Frame):
         c.rowconfigure(1, weight=0)
         c.rowconfigure(2, weight=0)
 
-        # ── Heading box — heading + cardinal on same row ──────────────────────
         hdg_box = tk.Frame(c, bg=self.C_HDG_BG,
                            highlightbackground=self.C_HDG_BORDER,
                            highlightthickness=2)
@@ -210,7 +202,6 @@ class MagWidget(tk.Frame):
                      sticky="ew", pady=(0, 3))
         hdg_box.columnconfigure(0, weight=1)
 
-        # Single label: "000.0° NW" — heading and cardinal inline
         hdg_val = tk.Label(hdg_box, text="---.- ---",
                            font=("Consolas", 16, "bold"),
                            fg=self.C_CRIT, bg=self.C_HDG_BG, anchor="center")
@@ -221,14 +212,12 @@ class MagWidget(tk.Frame):
         hdg_box.bind("<Configure>",
                      lambda e: self._resize_hdg_font(e.width))
 
-        # ── Status ────────────────────────────────────────────────────────────
         status = tk.Label(c, text="⬤  NO SIGNAL",
                           font=("Consolas", 8, "bold"),
                           fg=self.C_NOSIG_FG, bg=self.C_BG, anchor="center")
         status.grid(row=1, column=0, columnspan=2, pady=(0, 3))
         self._tier_widgets["status"] = status
 
-        # ── Calibration buttons — always present (aviation safety) ────────────
         mag_btn = tk.Button(
             c, text="⊕ MAG",
             font=("Consolas", 9, "bold"),
@@ -263,7 +252,6 @@ class MagWidget(tk.Frame):
         parent.rowconfigure(1, weight=0)
         parent.rowconfigure(2, weight=0)
 
-        # ── Top: heading + status ─────────────────────────────────────────────
         top = tk.Frame(parent, bg=self.C_BG)
         top.grid(row=0, column=0, sticky="nsew")
         top.columnconfigure(0, weight=1)
@@ -283,7 +271,6 @@ class MagWidget(tk.Frame):
         hdg_box.columnconfigure(0, weight=1)
         trow += 1
 
-        # Single label: degrees + cardinal inline (e.g. "089.9° E")
         hdg_val = tk.Label(hdg_box, text="---.- ---",
                            font=("Consolas", 20, "bold"),
                            fg=self.C_CRIT, bg=self.C_HDG_BG, anchor="center")
@@ -291,10 +278,13 @@ class MagWidget(tk.Frame):
         self._tier_widgets["hdg_val"] = hdg_val
         self._tier_widgets["hdg_box"] = hdg_box
 
+        # Bind to BOTH the box resize AND the parent resize so font
+        # re-measures whenever available width changes for any reason.
         hdg_box.bind("<Configure>",
                      lambda e: self._resize_hdg_font(e.width))
+        parent.bind("<Configure>",
+                    lambda e: self._trigger_hdg_resize(), add="+")
 
-        # Status
         status = tk.Label(top, text="⬤  NO SIGNAL",
                           font=("Consolas", font_status, "bold"),
                           fg=self.C_NOSIG_FG, bg=self.C_BG, anchor="center")
@@ -310,11 +300,9 @@ class MagWidget(tk.Frame):
             hint.grid(row=trow, column=0, pady=(0, 2))
             self._tier_widgets["hint"] = hint
 
-        # ── Separator ─────────────────────────────────────────────────────────
         tk.Frame(parent, bg=self.C_SEP, height=1).grid(
             row=1, column=0, sticky="ew", padx=2, pady=3)
 
-        # ── Buttons — always visible (aviation safety) ────────────────────────
         btn = tk.Frame(parent, bg=self.C_BG)
         btn.grid(row=2, column=0, sticky="ew")
         btn.columnconfigure(0, weight=1)
@@ -348,7 +336,7 @@ class MagWidget(tk.Frame):
             font=("Consolas", font_btn, "bold"),
             fg=self.C_BTN_ACC_FG, bg=self.C_BTN_ACC_BG,
             activeforeground=self.C_BG, activebackground=self.C_BTN_ACC_FG,
-            relief="flat", bd=0, padx=8, pady=9,
+            relief="flat", bd=0, padx=8, pady=10,
             cursor="hand2",
             command=self._on_acc_cal_pressed,
             state="normal" if self._on_acc_cal else "disabled")
@@ -364,30 +352,53 @@ class MagWidget(tk.Frame):
             self._tier_widgets["acc_lbl"] = acc_lbl
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Adaptive heading font
+    # Adaptive heading font  ← FIXED
     # ══════════════════════════════════════════════════════════════════════════
+
+    def _trigger_hdg_resize(self):
+        """Called when the right panel resizes — re-measure using box width."""
+        hdg_box = self._tier_widgets.get("hdg_box")
+        if hdg_box:
+            w = hdg_box.winfo_width()
+            if w > 1:
+                self._resize_hdg_font(w)
 
     def _resize_hdg_font(self, box_width: int):
         """
-        Scale heading label font so the worst-case string '000.0° NW' (9 chars,
-        Consolas Bold) fills the heading box width without clipping.
-        Uses ratio 5.8 px-per-pt (9-char Consolas Bold empirical).
+        Binary-search for the largest font size (Consolas Bold) where the
+        WORST-CASE heading string '000.0° NW' fits inside box_width minus
+        padding.  Uses font.measure() for pixel-accurate measurement so the
+        label never clips regardless of the cardinal suffix length (N vs NW).
         """
         hdg_val = self._tier_widgets.get("hdg_val")
         if not hdg_val:
             return
 
-        available = box_width - 16   # subtract padx + highlight border
-        if available < 30:
+        available = box_width - self._HDG_PADDING
+        if available < 20:
             return
 
-        size = int(available / self._HDG_WIDTH_K)
-        size = max(self._HDG_MIN_PT, min(self._HDG_MAX_PT, size))
+        # Worst-case text: 3-digit degrees + two-char cardinal e.g. "270.0° NW"
+        test_text = "270.0° NW"
 
-        if size == self._hdg_font_size:
+        # Binary search between min and max for the largest fitting size
+        lo, hi = self._HDG_MIN_PT, self._HDG_MAX_PT
+        best   = lo
+
+        while lo <= hi:
+            mid  = (lo + hi) // 2
+            font = tkfont.Font(family="Consolas", size=mid, weight="bold")
+            text_w = font.measure(test_text)
+            if text_w <= available:
+                best = mid
+                lo   = mid + 1
+            else:
+                hi   = mid - 1
+
+        if best == self._hdg_font_size:
             return
-        self._hdg_font_size = size
-        hdg_val.config(font=("Consolas", size, "bold"))
+        self._hdg_font_size = best
+        hdg_val.config(font=("Consolas", best, "bold"))
 
     # ── Bar builder helper ─────────────────────────────────────────────────
     def _build_bars_into(self, parent, start_row=0, bar_height=13):
@@ -427,7 +438,7 @@ class MagWidget(tk.Frame):
             self._resize_hdg_font(hdg_box.winfo_width())
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Compass Rose  — now includes NE / SE / SW / NW intercardinals
+    # Compass Rose
     # ══════════════════════════════════════════════════════════════════════════
 
     def _draw_rose(self):
@@ -451,7 +462,7 @@ class MagWidget(tk.Frame):
         r = max(15, min(r_from_size, r_from_bottom))
 
         f_cardinal      = max(8,  int(r * 0.17))
-        f_intercardinal = max(6,  int(r * 0.12))   # NE/SE/SW/NW — slightly smaller
+        f_intercardinal = max(6,  int(r * 0.12))
         f_numeral       = max(6,  int(r * 0.12))
         f_overlay       = max(8,  int(r * 0.15))
         f_nosig         = max(9,  int(r * 0.17))
@@ -472,7 +483,6 @@ class MagWidget(tk.Frame):
                                font=("Consolas", max(6, f_nosig - 3)))
             return
 
-        # Ticks
         tick_step = 5 if r > 70 else (10 if r > 40 else 30)
         for deg in range(0, 360, tick_step):
             is_major = (deg % 90 == 0)
@@ -499,11 +509,9 @@ class MagWidget(tk.Frame):
             iy  = cy + (r - tick_len) * math.sin(rad)
             cv.create_line(ix, iy, ox, oy, fill=tick_clr, width=tick_w)
 
-        # Degree numerals every 30°
         if r > 55:
             num_r = int(r * 0.70)
             for deg in range(30, 360, 30):
-                # Skip the 45° intercardinal positions so numerals don't clash
                 if deg % 45 == 0:
                     continue
                 rad = math.radians((deg - heading) - 90)
@@ -513,7 +521,6 @@ class MagWidget(tk.Frame):
                                fill="#2a5a7a",
                                font=("Consolas", f_numeral))
 
-        # ── Cardinal labels: N E S W (larger) ────────────────────────────────
         label_r = int(r * 0.72)
         for hdg_fixed, letter in [(0, "N"), (90, "E"), (180, "S"), (270, "W")]:
             rad   = math.radians((hdg_fixed - heading) - 90)
@@ -523,7 +530,6 @@ class MagWidget(tk.Frame):
             cv.create_text(lx, ly, text=letter, fill=color,
                            font=("Consolas", f_cardinal, "bold"))
 
-        # ── Intercardinal labels: NE SE SW NW (smaller, only if rose is big) ─
         if r > 50:
             inter_r = int(r * 0.68)
             for hdg_fixed, label in [(45, "NE"), (135, "SE"),
@@ -534,7 +540,6 @@ class MagWidget(tk.Frame):
                 cv.create_text(lx, ly, text=label, fill="#3a7a9a",
                                font=("Consolas", f_intercardinal))
 
-        # Lubber-line triangle (fixed at top, never rotates)
         tip_y  = cy - r + 2
         base_y = cy - r + max(7, int(r * 0.20))
         half_w = max(3, int(r * 0.07))
@@ -544,7 +549,6 @@ class MagWidget(tk.Frame):
             cx,          tip_y,
             fill=self.C_LUBBER, outline="#b09000", width=1)
 
-        # Heading needle
         ptr_r = int(r * 0.55)
         arrow = (max(4, int(r * 0.10)),
                  max(5, int(r * 0.12)),
@@ -553,12 +557,10 @@ class MagWidget(tk.Frame):
                        fill=self.C_LUBBER, width=2,
                        arrow=tk.LAST, arrowshape=arrow)
 
-        # Centre dot
         dot = max(2, int(r * 0.05))
         cv.create_oval(cx - dot, cy - dot, cx + dot, cy + dot,
                        fill=self.C_LUBBER, outline=self.C_ROSE_BG, width=1)
 
-        # Digital heading overlay — bottom of rose
         ov_y  = cy + int(r * 0.76)
         ov_hw = int(r * 0.46)
         ov_hh = max(9, int(r * 0.16))
@@ -572,11 +574,10 @@ class MagWidget(tk.Frame):
                        font=("Consolas", f_overlay, "bold"))
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Readout widget update — heading + cardinal on one line
+    # Readout widget update
     # ══════════════════════════════════════════════════════════════════════════
 
     def _cardinal_for(self, hdg_norm: float) -> str:
-        """Return the nearest 8-point cardinal for the given heading."""
         nearest = min(self.CARDINALS.keys(),
                       key=lambda k: abs((k - hdg_norm + 180) % 360 - 180))
         return self.CARDINALS[nearest]
@@ -596,16 +597,24 @@ class MagWidget(tk.Frame):
             return
 
         if hint:
-            hint.config(fg=self.C_BG)   # invisible when valid
+            hint.config(fg=self.C_BG)
 
         hdg_norm = heading % 360.0
         cardinal = self._cardinal_for(hdg_norm)
-
-        # Inline format: "089.9° E" or "315.0° NW"
         hdg_text = f"{hdg_norm:05.1f}° {cardinal}"
 
         if hdg_val:
             hdg_val.config(text=hdg_text, fg=self.C_SAFE)
+            # Re-measure font fit whenever text content changes (cardinal
+            # length changes between single-char "N" and two-char "NW" etc.)
+            hdg_box = self._tier_widgets.get("hdg_box")
+            if hdg_box:
+                w = hdg_box.winfo_width()
+                if w > 1:
+                    # Force re-check even if size didn't change — text did
+                    self._hdg_font_size = 0
+                    self._resize_hdg_font(w)
+
         if status:
             status.config(text="⬤  LOCK", fg=self.C_GREEN)
 
@@ -739,3 +748,40 @@ class MagWidget(tk.Frame):
                     else "⊕  CAL GYRO")
             if acc_lbl:
                 acc_lbl.config(text="")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Quick demo / test harness
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    root = tk.Tk()
+    root.title("MagWidget — resize test")
+    root.geometry("720x320")
+    root.configure(bg="#0a0a10")
+    root.minsize(285, 145)
+
+    widget = MagWidget(
+        root,
+        on_mag_calibrate=lambda: print("MAG CAL triggered"),
+        on_acc_calibrate=lambda: print("ACC CAL triggered"),
+    )
+    widget.pack(fill="both", expand=True)
+
+    # Cycle through all 8 headings to stress-test label sizing
+    headings = [0, 27.5, 45, 90, 135, 139.1, 180, 225, 270, 315, 359.9]
+    idx = [0]
+
+    def next_heading():
+        h = headings[idx[0] % len(headings)]
+        idx[0] += 1
+        widget.update_mag({
+            "mag_valid":       True,
+            "mag_heading_deg": h,
+            "mag_x":           int(500 * math.cos(math.radians(h))),
+            "mag_y":           int(500 * math.sin(math.radians(h))),
+            "mag_z":           -650,
+        })
+        root.after(1200, next_heading)
+
+    root.after(300, next_heading)
+    root.mainloop()

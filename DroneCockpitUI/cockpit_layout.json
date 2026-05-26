@@ -1,6 +1,6 @@
 {
   "geometry": "1536x793+-11+31",
-  "locked": false,
+  "locked": true,
   "panels": {
     "imu": {
       "x": 1006,
@@ -10,10 +10,10 @@
       "visible": true
     },
     "mag": {
-      "x": 904,
-      "y": 248,
-      "w": 523,
-      "h": 440,
+      "x": 1006,
+      "y": 500,
+      "w": 521,
+      "h": 241,
       "visible": true
     },
     "adi": {
