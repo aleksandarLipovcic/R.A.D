@@ -78,6 +78,9 @@
     <Compile Include="TestScripts\gps_sv_reader.py">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="TestScripts\mag_calibration_tool.py">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="TestScripts\msp_probe.py">
       <SubType>Code</SubType>
     </Compile>
