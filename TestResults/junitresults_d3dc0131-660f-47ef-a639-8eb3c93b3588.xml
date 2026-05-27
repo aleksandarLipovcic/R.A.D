@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="2" skipped="0" tests="6" time="65.043" timestamp="2026-05-21T10:39:45.598330+02:00" hostname="TheSilent"><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_crit_alert_triggers" file="sat_imu\test_SAT_IMU_003.py" line="1314" time="12.737"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+[SAT conftest] Connected on COM4 — waiting 2 s for telemetry to stabilise
+
+  [SAT-003 CRIT] seen=True  max=132.0 °/s
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_crit_flash_ticker_active" file="sat_imu\test_SAT_IMU_003.py" line="1371" time="9.841"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [FLASH-DBG] _force_full_tier → tier='full'  axes=['roll', 'pitch', 'yaw']  ok=True
+  [FLASH-DBG] tier='full'  axes=3  crit_cells=3  job='after#7'  ok=True
+  [FLASH-DBG] gyro_state reset to safe for recovery test
+
+  [SAT-003 FLASH] crit=True  ticker=True  job=None
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_crit_hold_persists" file="sat_imu\test_SAT_IMU_003.py" line="1417" time="14.159"><failure message="AssertionError: CRIT dropped to SAFE after only 0.64 s.&#10;    Required hold : ≥ 4.0 s (SRS-IMU-006)&#10;    → Check hold_until timer in widget._gyro_state_label().&#10;assert False">self = &lt;test_SAT_IMU_003.TestOperatorAlertSystem object at 0x00000221CC977530&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x00000221CCA1E9B0&gt;
+imu_widget = (&lt;tkinter.Tk object .&gt;, &lt;IMUWidget.IMUWidget object .!imuwidget&gt;)
+
+    def test_SAT_IMU_003_crit_hold_persists(self, drone_link, imu_widget):
+        """CRIT hold must persist ≥ 4 s after the rate drops (SRS-IMU-006)."""
+        root, widget = imu_widget
+    
+        # Step 1 — trigger CRIT via live rate bar
+        _beep_attention()
+        _beep_attention()
+        _msgbox(
+            "SAT-IMU-003 — CRIT Hold Test (1/2)",
+            f"Rotate FC VERY RAPIDLY, then SET IT FLAT.\n\n"
+            f"You have {self.MOTION_WINDOW_S:.0f} seconds after clicking OK.\n\n"
+            "A LIVE RATE BAR will appear — snap the FC past the red CRIT line,\n"
+            "then set it flat and still immediately.",
+            _MB_ICONWARNING,
+        )
+    
+        triggered, _ = self._live_rate_window(
+            drone_link, imu_widget,
+            duration_s=self.MOTION_WINDOW_S,
+            warn_dps=self.WARN_THRESHOLD,
+            crit_dps=self.CRIT_THRESHOLD,
+        )
+    
+        if not triggered:
+            pytest.skip("Could not trigger CRIT — rotate more forcefully.")
+    
+        # Step 2 — hold-down countdown overlay
+        _msgbox(
+            "SAT-IMU-003 — CRIT Hold Test (2/2)",
+            "CRIT triggered!\n\n"
+            "SET the FC FLAT AND STILL and click OK.\n\n"
+            f"A countdown bar will track the {self.HOLD_CRIT_S:.0f} s hold-down.\n"
+            "The red flashing indicator must stay on for the full duration.",
+            _MB_ICONINFORMATION,
+        )
+    
+        still_held, elapsed = self._live_hold_window(
+            drone_link, imu_widget,
+            hold_s=self.HOLD_CRIT_S,
+            drain_threshold_dps=self.CRIT_THRESHOLD,
+        )
+    
+        if still_held:
+            _beep_success()
+        else:
+            _beep_fail()
+    
+        print(f"\n  [SAT-003 CRIT HOLD] held={still_held}  "
+              f"elapsed={elapsed:.2f} s  (need ≥ {self.HOLD_CRIT_S:.1f} s)")
+    
+&gt;       assert still_held, (
+            f"CRIT dropped to SAFE after only {elapsed:.2f} s.\n"
+            f"  Required hold : ≥ {self.HOLD_CRIT_S:.1f} s (SRS-IMU-006)\n"
+            "  → Check hold_until timer in widget._gyro_state_label()."
+        )
+E       AssertionError: CRIT dropped to SAFE after only 0.64 s.
+E           Required hold : ≥ 4.0 s (SRS-IMU-006)
+E           → Check hold_until timer in widget._gyro_state_label().
+E       assert False
+
+sat_imu\test_SAT_IMU_003.py:1468: AssertionError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-003 CRIT HOLD] held=False  elapsed=0.64 s  (need ≥ 4.0 s)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_recovery_to_safe" file="sat_imu\test_SAT_IMU_003.py" line="1473" time="9.077"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_warn_alert_triggers" file="sat_imu\test_SAT_IMU_003.py" line="1212" time="8.289"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-003 WARN] seen=True  max=32.1 °/s  GYRO_SCALE=16.4
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_warn_hold_persists" file="sat_imu\test_SAT_IMU_003.py" line="1253" time="10.798"><failure message="AssertionError: WARN state dropped to SAFE after only 0.65 s.&#10;    Required hold : ≥ 2.0 s (SRS-IMU-005)&#10;    → Check hold_until timer in widget._gyro_state_label().&#10;assert False">self = &lt;test_SAT_IMU_003.TestOperatorAlertSystem object at 0x00000221CCABD590&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x00000221CCA1E9B0&gt;
+imu_widget = (&lt;tkinter.Tk object .&gt;, &lt;IMUWidget.IMUWidget object .!imuwidget&gt;)
+
+    def test_SAT_IMU_003_warn_hold_persists(self, drone_link, imu_widget):
+        """WARN hold must persist ≥ 2 s after the rate drops (SRS-IMU-005).
+    
+        Procedure: trigger WARN, then set FC flat. The amber state must remain
+        for the full 2 s hold-down period even with sub-threshold live data.
+        """
+        root, widget = imu_widget
+    
+        # Step 1 — trigger WARN via live bar
+        _beep_attention()
+        _msgbox(
+            "SAT-IMU-003 — WARN Hold Test (1/2)",
+            f"Tilt FC briefly (~45 °/s), then SET IT FLAT immediately.\n\n"
+            f"You have {self.MOTION_WINDOW_S:.0f} seconds after clicking OK.\n\n"
+            "A LIVE RATE BAR will appear — cross the amber WARN line, then "
+            "put the FC down flat.",
+            _MB_ICONWARNING,
+        )
+    
+        triggered, _ = self._live_warn_window(
+            drone_link, imu_widget,
+            duration_s=self.MOTION_WINDOW_S,
+            warn_dps=self.WARN_THRESHOLD,
+        )
+    
+        if not triggered:
+            pytest.skip(
+                "Could not trigger WARN — rotate faster. "
+                "(Test skipped so remainder of suite can continue.)"
+            )
+    
+        # Step 2 — hold-down countdown overlay
+        _msgbox(
+            "SAT-IMU-003 — WARN Hold Test (2/2)",
+            "WARN triggered!\n\n"
+            "Now SET the FC FLAT AND STILL and click OK.\n\n"
+            f"A countdown bar will show the {self.HOLD_WARN_S:.0f} s hold-down "
+            "timer.  The amber indicator must stay on for the full duration.",
+            _MB_ICONINFORMATION,
+        )
+    
+        still_held, elapsed = self._live_hold_window(
+            drone_link, imu_widget,
+            hold_s=self.HOLD_WARN_S,
+            drain_threshold_dps=self.WARN_THRESHOLD,
+        )
+    
+        if still_held:
+            _beep_success()
+        else:
+            _beep_fail()
+    
+        print(f"\n  [SAT-003 WARN HOLD] held={still_held}  "
+              f"elapsed={elapsed:.2f} s  (need ≥ {self.HOLD_WARN_S:.1f} s)")
+    
+&gt;       assert still_held, (
+            f"WARN state dropped to SAFE after only {elapsed:.2f} s.\n"
+            f"  Required hold : ≥ {self.HOLD_WARN_S:.1f} s (SRS-IMU-005)\n"
+            "  → Check hold_until timer in widget._gyro_state_label()."
+        )
+E       AssertionError: WARN state dropped to SAFE after only 0.65 s.
+E           Required hold : ≥ 2.0 s (SRS-IMU-005)
+E           → Check hold_until timer in widget._gyro_state_label().
+E       assert False
+
+sat_imu\test_SAT_IMU_003.py:1309: AssertionError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-003 WARN HOLD] held=False  elapsed=0.65 s  (need ≥ 2.0 s)
+
+[SAT conftest] Disconnected
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase></testsuite></testsuites>

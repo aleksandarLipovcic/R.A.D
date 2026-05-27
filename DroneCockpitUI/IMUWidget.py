@@ -133,10 +133,12 @@ class IMUWidget(tk.Frame):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _start_cell_flash(self):
-        """Start the shared cell-flash ticker if not already running."""
         if self._cell_flash_job is not None:
             return
-        self._cell_flash_ticker()
+        try:
+            self._cell_flash_ticker()
+        except tk.TclError:
+            self._cell_flash_job = None
 
     def _cell_flash_ticker(self):
         """Toggle all CRIT cells between phase-A and phase-B every _FLASH_MS."""
@@ -148,16 +150,19 @@ class IMUWidget(tk.Frame):
             try:
                 lbl.config(bg=bg)
             except tk.TclError:
-                dead.append(lbl)   # widget was destroyed during tier rebuild
+                dead.append(lbl)
 
         for lbl in dead:
             self._crit_cells.pop(lbl, None)
 
         if self._crit_cells:
-            self._cell_flash_job = self.after(self._FLASH_MS,
-                                              self._cell_flash_ticker)
+            try:
+                self._cell_flash_job = self.after(self._FLASH_MS,
+                                                  self._cell_flash_ticker)
+            except tk.TclError:
+                self._cell_flash_job = None
         else:
-            self._cell_flash_job = None   # nothing left to flash — stop ticker
+            self._cell_flash_job = None
 
     def _register_crit(self, lbl: tk.Label):
         if lbl not in self._crit_cells:
@@ -534,13 +539,32 @@ class IMUWidget(tk.Frame):
         self._flash_on = not self._flash_on
         btn = self._tier_widgets.get("adj_btn")
         if btn:
-            if self._flash_on:
-                btn.config(bg=self.C_BTN_FLASH_A, fg="#ffffff",
-                           text="⚠  ADJUST HEADING")
-            else:
-                btn.config(bg=self.C_BTN_FLASH_B, fg="#FF9999",
-                           text="⚠  ADJUST HEADING")
-        self._flash_job = self.after(500, self._do_flash)
+            # FIX: wrap btn.config() in try/except tk.TclError.
+            # Without this, if a flash job fires on a widget that has been
+            # partially torn down (e.g. during test teardown), the TclError
+            # propagates through Tkinter's report_callback_exception() handler
+            # instead of the normal Python exception path, bypassing any
+            # surrounding try/except and failing whichever pytest test is
+            # currently cleaning up.
+            try:
+                if self._flash_on:
+                    btn.config(bg=self.C_BTN_FLASH_A, fg="#ffffff",
+                               text="⚠  ADJUST HEADING")
+                else:
+                    btn.config(bg=self.C_BTN_FLASH_B, fg="#FF9999",
+                               text="⚠  ADJUST HEADING")
+            except tk.TclError:
+                # Widget is gone — stop flashing silently.
+                self._flashing   = False
+                self._flash_job  = None
+                return
+
+        # FIX: same guard on the reschedule call.
+        try:
+            self._flash_job = self.after(500, self._do_flash)
+        except tk.TclError:
+            self._flash_job = None
+            self._flashing  = False
 
     # ══════════════════════════════════════════════════════════════════════════
     # Public update
@@ -687,7 +711,9 @@ class IMUWidget(tk.Frame):
             s["state"]      = "crit"
             s["hold_until"] = now + self.HOLD_CRIT_SEC
         elif abs_dps >= self.GYRO_WARN_DPS:
-            if s["state"] != "crit":
+            if s["state"] == "crit" and now < s["hold_until"]:
+                pass  # CRIT hold active — suppress downgrade to WARN
+            else:
                 s["state"]      = "warn"
                 s["hold_until"] = now + self.HOLD_WARN_SEC
         else:
@@ -743,3 +769,16 @@ class IMUWidget(tk.Frame):
         priority = {self.C_CRIT_BG_A: 2, self.C_WARN_BG: 1,
                     self.C_SAFE_FG: 0, self.C_NEUTRAL: 0}
         return max(colors, key=lambda c: priority.get(c, 0))
+
+    def destroy(self):
+        # Cancel all pending after() jobs before Tkinter destroys the widget
+        for job in [self._cell_flash_job, self._flash_job]:
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+        self._cell_flash_job = None
+        self._flash_job      = None
+        self._crit_cells.clear()
+        super().destroy()

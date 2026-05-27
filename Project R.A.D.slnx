@@ -12,4 +12,5 @@
     <Platform Project="AnyCPU" />
     <Build Project="false" />
   </Project>
+  <Project Path="IMUTests/IMUTests.vcxproj" Id="3351c50c-11f2-4dec-b422-243d53ae1f0f" />
 </Solution>

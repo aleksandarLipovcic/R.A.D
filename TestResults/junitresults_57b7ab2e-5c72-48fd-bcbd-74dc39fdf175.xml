@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="3" time="38.442" timestamp="2026-05-21T11:14:01.238003+02:00" hostname="TheSilent"><testcase classname="sat_imu.test_SAT_IMU_004.TestEndToEndLatency" name="test_SAT_IMU_004_latency_report" file="sat_imu\test_SAT_IMU_004.py" line="97" time="13.979"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+[SAT conftest] Connected on COM4 — waiting 2 s for telemetry to stabilise
+
+  ── SAT-IMU-004 Latency Report ─────────────────────────
+  Percentile         ms   Pass?
+  ----------------------------------
+  P50             15.04  &lt; 30 ✓
+  P75             29.23  
+  P90             31.58  
+  P95             31.90  &lt; 200 ✓
+  P99             36.53  
+  min              4.52
+  max             36.56
+  samples          1000
+  ──────────────────────────────────────────────────────
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_004.TestEndToEndLatency" name="test_SAT_IMU_004_p50_under_30ms" file="sat_imu\test_SAT_IMU_004.py" line="86" time="12.099"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  samples : 1000
+  P50     : 14.40 ms  (need &lt; 30.0)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_004.TestEndToEndLatency" name="test_SAT_IMU_004_p95_under_200ms" file="sat_imu\test_SAT_IMU_004.py" line="75" time="12.344"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  samples : 1000
+  P95     : 31.63 ms  (need &lt; 200.0)
+
+[SAT conftest] Disconnected
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase></testsuite></testsuites>

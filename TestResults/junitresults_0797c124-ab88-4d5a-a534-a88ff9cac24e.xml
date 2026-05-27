@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="1" tests="1" time="4.207" timestamp="2026-05-21T22:53:52.411606+02:00" hostname="TheSilent"><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_B_widget_receives_link_status" file="sat_imu\test_SAT_IMU_005.py" line="228" time="4.189"><skipped type="pytest.skip" message="Could not capture link_healthy=False snapshot within 2.0 s — set_fail_injection() may not be wired up correctly in DroneLink.cpp or DroneBackend pybind11 binding.">C:\Users\TheSilent\Desktop\Project R.A.D\DroneCockpitUI\sat_imu\test_SAT_IMU_005.py:251: Could not capture link_healthy=False snapshot within 2.0 s — set_fail_injection() may not be wired up correctly in DroneLink.cpp or DroneBackend pybind11 binding.</skipped><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+[SAT conftest] Connected on COM4 — waiting 2 s for telemetry to stabilise
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+[SAT conftest] Connected on COM4 — waiting 2 s for telemetry to stabilise
+
+[SAT conftest] Disconnected
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase></testsuite></testsuites>

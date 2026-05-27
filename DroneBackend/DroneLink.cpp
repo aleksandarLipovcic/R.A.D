@@ -441,6 +441,7 @@ std::vector<uint8_t> DroneLink::readUbxResponse(HANDLE h, int timeoutMs) {
 
 std::vector<uint8_t> DroneLink::sendMSP(uint8_t mspID) {
     if (hSerial == INVALID_HANDLE_VALUE) return {};
+    if (failInjectionActive.load())      return {};   // DEF-005 rev 2
 
     // ── Write request ─────────────────────────────────────────────────────────
     uint8_t req[] = { '$', 'M', '<', 0, mspID, mspID };

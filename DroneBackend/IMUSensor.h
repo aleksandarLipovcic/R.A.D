@@ -11,24 +11,37 @@ public:
     };
 
     // ── Physical units ────────────────────────────────────────────────────────
-    // MPU-6500 defaults used by Betaflight:
-    //   Accel:  ±4g  range  → LSB/g  = 8192
-    //   Gyro:   ±2000°/s    → LSB/°/s = 16.4
+    // MPU-6500 at ±16g (INV_FSR_16G — confirmed BF 4.5.0 accgyro_mpu6500.c):
+    //   Hardware sensitivity = 2048 LSB/g.
+    //   Betaflight acc_1G = 512 × 4 = 2048, matching this range directly.
+    //   MSP_RAW_IMU transmits accADC without any prescaling — the effective
+    //   MSP-layer sensitivity is therefore 2048 LSB/g.
+    //   ACC_SCALE = 1/2048 converts MSP counts to g.
+    //
+    // GYRO_SCALE is unaffected — BF transmits gyro counts without prescaling.
+    //   MPU-6500 at ±2000 °/s → hardware sensitivity = 16.4 LSB/(°/s).
+    //   GYRO_SCALE = 1/16.4 converts MSP counts to °/s.
+    //
+    // IMUWidget uses ACCEL_SCALE = 2048 for the same reason.
     struct IMUScaled {
-        float accX, accY, accZ;   // g
+        float accX, accY, accZ;     // g
         float gyroX, gyroY, gyroZ;  // degrees / second
     };
 
     IMUSensor(DroneLink* hub);
 
-    // Non-blocking — reads latest snapshot from the background thread
     IMUData   getRawData();
     IMUScaled getScaledData();
 
 private:
     DroneLink* drone;
 
-    // Scale factors — adjust here if FC accel/gyro range differs
-    static constexpr float ACC_SCALE = 1.0f / 8192.0f;  // counts → g
-    static constexpr float GYRO_SCALE = 1.0f / 16.4f;    // counts → °/s
+    // FIX (DEF-002): was 1/8192 (assumed ±4g hardware range, 8192 LSB/g).
+    // BF 4.5.x initialises MPU-6500 at ±16g (INV_FSR_16G); hardware
+    // sensitivity at that range is 2048 LSB/g directly, with no BF-side
+    // prescaling before MSP transmission.  Correct MSP-layer divisor: 2048.
+    // Matches IMUWidget.ACCEL_SCALE = 2048 and fixes the 4× under-read
+    // observed in IT-IMU-002.
+    static constexpr float ACC_SCALE = 1.0f / 2048.0f;  // MSP counts → g
+    static constexpr float GYRO_SCALE = 1.0f / 16.4f;    // MSP counts → °/s  (unchanged)
 };

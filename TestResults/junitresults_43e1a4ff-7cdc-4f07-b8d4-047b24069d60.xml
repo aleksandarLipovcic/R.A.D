@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="2" skipped="0" tests="2" time="19.573" timestamp="2026-05-20T23:28:56.889952+02:00" hostname="TheSilent"><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_crit_flash_ticker_active" file="sat_imu\test_SAT_IMU_003.py" line="982" time="11.200"><failure message="AssertionError: CRIT entered but _cell_flash_job is None after 600 ms.&#10;    → Check _register_crit() → _start_cell_flash() call chain.&#10;    → Confirm root.update() (not update_idletasks()) is called after CRIT is set.&#10;assert False">self = &lt;test_SAT_IMU_003.TestOperatorAlertSystem object at 0x000002165F3490F0&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x000002165CEC61B0&gt;
+imu_widget = (&lt;tkinter.Tk object .&gt;, &lt;IMUWidget.IMUWidget object .!imuwidget&gt;)
+
+    def test_SAT_IMU_003_crit_flash_ticker_active(self, drone_link, imu_widget):
+        """Flash ticker must be active during CRIT state (SRS-IMU-006a).
+    
+        A live overlay mirrors the CRIT flash state — the overlay itself pulses
+        red when the ticker job is confirmed active, giving the operator
+        immediate visual confirmation that _register_crit() fired correctly.
+        """
+        root, widget = imu_widget
+    
+        _beep_attention()
+        _beep_attention()
+        _msgbox(
+            "SAT-IMU-003 — Flash Ticker Test",
+            f"Rotate the FC VERY RAPIDLY to trigger CRIT.\n\n"
+            f"You have {self.MOTION_WINDOW_S:.0f} seconds after clicking OK.\n\n"
+            "A LIVE OVERLAY will appear showing whether the flash ticker\n"
+            "(_cell_flash_job) is active — it will pulse red on capture.",
+            _MB_ICONWARNING,
+        )
+    
+        crit_triggered, ticker_confirmed = self._live_flash_window(
+            drone_link, imu_widget,
+            duration_s=self.MOTION_WINDOW_S,
+        )
+    
+        if ticker_confirmed:
+            _beep_success()
+        elif not crit_triggered:
+            _beep_fail()
+    
+        print(f"\n  [SAT-003 FLASH] crit={crit_triggered}  "
+              f"ticker={ticker_confirmed}  job={widget._cell_flash_job}")
+    
+        if not crit_triggered:
+            pytest.fail(
+                f"CRIT not reached — cannot verify flash ticker.\n"
+                f"  Rotate more forcefully (≥ {self.CRIT_THRESHOLD:.0f} °/s)."
+            )
+    
+&gt;       assert ticker_confirmed, (
+            "CRIT entered but _cell_flash_job is None after 600 ms.\n"
+            "  → Check _register_crit() → _start_cell_flash() call chain.\n"
+            "  → Confirm root.update() (not update_idletasks()) is called "
+            "after CRIT is set."
+        )
+E       AssertionError: CRIT entered but _cell_flash_job is None after 600 ms.
+E           → Check _register_crit() → _start_cell_flash() call chain.
+E           → Confirm root.update() (not update_idletasks()) is called after CRIT is set.
+E       assert False
+
+sat_imu\test_SAT_IMU_003.py:1022: AssertionError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+[SAT conftest] Connected on COM4 — waiting 2 s for telemetry to stabilise
+
+  [SAT-003 FLASH] crit=True  ticker=False  job=None
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_warn_alert_triggers" file="sat_imu\test_SAT_IMU_003.py" line="823" time="8.261"><failure message="AssertionError: WARN state never entered after 5 s.&#10;    Max rate seen     : 83.0 °/s&#10;    WARN threshold    : 30 °/s&#10;    widget.GYRO_SCALE : 16.4&#10;    → Rotate more briskly. Target a visible snap of ~45 °/s.&#10;assert False">self = &lt;test_SAT_IMU_003.TestOperatorAlertSystem object at 0x000002165F263C50&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x000002165CEC61B0&gt;
+imu_widget = (&lt;tkinter.Tk object .&gt;, &lt;IMUWidget.IMUWidget object .!imuwidget&gt;)
+
+    def test_SAT_IMU_003_warn_alert_triggers(self, drone_link, imu_widget):
+        """WARN state must be entered when gyro reads ≥ 30 °/s (SRS-IMU-005).
+    
+        Operator: rotate FC briskly (~45 °/s on any axis) within the window.
+        Target raw count: ≥ 492 counts on any gyro axis (492 / 16.4 = 30 °/s).
+        """
+        root, widget = imu_widget
+    
+        _beep_attention()
+        _msgbox(
+            "SAT-IMU-003 — WARN Test",
+            f"Rotate the FC BRISKLY (~45 °/s) on ANY axis.\n\n"
+            f"You have {self.MOTION_WINDOW_S:.0f} seconds after clicking OK.\n\n"
+            f"Target: ≥ {self.WARN_THRESHOLD:.0f} °/s on any axis.\n\n"
+            f"(Raw gyro target: ≥ {int(self.WARN_THRESHOLD * widget.GYRO_SCALE)} counts)\n\n"
+            "A LIVE RATE BAR will appear — watch it cross the amber WARN line.",
+            _MB_ICONWARNING,
+        )
+    
+        warn_seen, max_dps = self._live_warn_window(
+            drone_link, imu_widget,
+            duration_s=self.MOTION_WINDOW_S,
+            warn_dps=self.WARN_THRESHOLD,
+        )
+    
+        if warn_seen:
+            _beep_success()
+        else:
+            _beep_fail()
+    
+        print(f"\n  [SAT-003 WARN] seen={warn_seen}  max={max_dps:.1f} °/s  "
+              f"GYRO_SCALE={widget.GYRO_SCALE}")
+    
+&gt;       assert warn_seen, (
+            f"WARN state never entered after {self.MOTION_WINDOW_S:.0f} s.\n"
+            f"  Max rate seen     : {max_dps:.1f} °/s\n"
+            f"  WARN threshold    : {self.WARN_THRESHOLD:.0f} °/s\n"
+            f"  widget.GYRO_SCALE : {widget.GYRO_SCALE}\n"
+            "  → Rotate more briskly. Target a visible snap of ~45 °/s."
+        )
+E       AssertionError: WARN state never entered after 5 s.
+E           Max rate seen     : 83.0 °/s
+E           WARN threshold    : 30 °/s
+E           widget.GYRO_SCALE : 16.4
+E           → Rotate more briskly. Target a visible snap of ~45 °/s.
+E       assert False
+
+sat_imu\test_SAT_IMU_003.py:857: AssertionError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-003 WARN] seen=False  max=83.0 °/s  GYRO_SCALE=16.4
+
+[SAT conftest] Disconnected
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase></testsuite></testsuites>

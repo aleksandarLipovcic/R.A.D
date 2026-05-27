@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="5" time="50.254" timestamp="2026-05-21T17:12:40.468399+02:00" hostname="TheSilent"><testcase classname="sat_imu.test_SAT_IMU_002.TestGravityReference" name="test_SAT_IMU_002_accZ_mean_in_range" file="sat_imu\test_SAT_IMU_002.py" line="168" time="12.130"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+[SAT conftest] Connected on COM4 — waiting 2 s for telemetry to stabilise
+
+  [SAT-002] accZ  mean=1.0009 g  n=98  range=[0.95, 1.05] g
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_002.TestGravityReference" name="test_SAT_IMU_002_accZ_std_within_noise_floor" file="sat_imu\test_SAT_IMU_002.py" line="195" time="10.003"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-002] accZ  std=0.00114 g  (limit &lt; 0.01 g)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_002.TestGravityReference" name="test_SAT_IMU_002_gyro_at_rest" file="sat_imu\test_SAT_IMU_002.py" line="214" time="10.102"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-002] gyroX  mean |rate| = 0.101 °/s  (limit ≤ 2.0 °/s)
+
+  [SAT-002] gyroY  mean |rate| = 0.068 °/s  (limit ≤ 2.0 °/s)
+
+  [SAT-002] gyroZ  mean |rate| = 0.063 °/s  (limit ≤ 2.0 °/s)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_002.TestGravityReference" name="test_SAT_IMU_002_setup_prompt" file="sat_imu\test_SAT_IMU_002.py" line="141" time="7.932"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-002] Stabilising for 5 s...
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_002.TestGravityReference" name="test_SAT_IMU_002_widget_az_matches_sensor" file="sat_imu\test_SAT_IMU_002.py" line="244" time="10.063"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-002] sensor accZ = 1.0002 g  widget az = 1.0002 g  delta = 0.00000 g
+
+[SAT conftest] Disconnected
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase></testsuite></testsuites>

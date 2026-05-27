@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="6" time="73.258" timestamp="2026-05-21T11:14:52.839692+02:00" hostname="TheSilent"><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_crit_alert_triggers" file="sat_imu\test_SAT_IMU_003.py" line="1370" time="9.681"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+[SAT conftest] Connected on COM4 — waiting 2 s for telemetry to stabilise
+
+  [FLASH-DBG] _force_full_tier → tier='full'  axes=['roll', 'pitch', 'yaw']  ok=True
+
+  [SAT-003 CRIT] seen=True  max=118.8 °/s
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_crit_flash_ticker_active" file="sat_imu\test_SAT_IMU_003.py" line="1427" time="8.098"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [FLASH-DBG] _force_full_tier → tier='full'  axes=['roll', 'pitch', 'yaw']  ok=True
+  [FLASH-DBG] tier='full'  axes=3  crit_cells=3  job='after#7'  ok=True
+  [FLASH-DBG] gyro_state reset to safe for recovery test
+
+  [SAT-003 FLASH] crit=True  ticker=True  job=None
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_crit_hold_persists" file="sat_imu\test_SAT_IMU_003.py" line="1473" time="15.055"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [FLASH-DBG] _force_full_tier → tier='full'  axes=['roll', 'pitch', 'yaw']  ok=True
+
+  [FLASH-DBG] _force_full_tier → tier='full'  axes=['roll', 'pitch', 'yaw']  ok=True
+
+  [SAT-003 CRIT HOLD] held=True  elapsed=4.51 s  (need ≥ 4.0 s)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_recovery_to_safe" file="sat_imu\test_SAT_IMU_003.py" line="1529" time="26.119"><failure message="AssertionError: Axes did not reach SAFE within 20 s.&#10;    Current states : {'roll': 'crit', 'pitch': 'crit', 'yaw': 'crit'}&#10;    → Place FC flat and still. Check hold-down timer self-expiry.&#10;assert False">self = &lt;test_SAT_IMU_003.TestOperatorAlertSystem object at 0x0000021FE78246B0&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x0000021FE5D5DBF0&gt;
+imu_widget = (&lt;tkinter.Tk object .&gt;, &lt;IMUWidget.IMUWidget object .!imuwidget&gt;)
+
+    def test_SAT_IMU_003_recovery_to_safe(self, drone_link, imu_widget):
+        """All axes must return to SAFE and flash ticker must stop (SRS-IMU-006a).
+    
+        Per-axis state indicators and an elapsed-time bar give the operator a
+        clear view of which axes are still in WARN/CRIT and how much time
+        remains before the test times out.
+        """
+        root, widget = imu_widget
+    
+        _beep_attention()
+        _msgbox(
+            "SAT-IMU-003 — Recovery Test",
+            f"Set FC FLAT AND STILL.\n\n"
+            f"Keep it still for up to {self.RECOVERY_TIMEOUT:.0f} s.\n\n"
+            "A LIVE RECOVERY PANEL will appear showing the state of each axis\n"
+            "(ROLL / PITCH / YAW) and count down the timeout.\n\n"
+            "All gyro cells must return to the green SAFE state.",
+            _MB_ICONINFORMATION,
+        )
+    
+        recovered, elapsed = self._live_recovery_window(
+            drone_link, imu_widget,
+            timeout_s=self.RECOVERY_TIMEOUT,
+        )
+    
+        if recovered:
+            _beep_success()
+        else:
+            _beep_fail()
+    
+        current = {k: v["state"] for k, v in widget._gyro_state.items()}
+    
+&gt;       assert recovered, (
+            f"Axes did not reach SAFE within {self.RECOVERY_TIMEOUT:.0f} s.\n"
+            f"  Current states : {current}\n"
+            "  → Place FC flat and still. Check hold-down timer self-expiry."
+        )
+E       AssertionError: Axes did not reach SAFE within 20 s.
+E           Current states : {'roll': 'crit', 'pitch': 'crit', 'yaw': 'crit'}
+E           → Place FC flat and still. Check hold-down timer self-expiry.
+E       assert False
+
+sat_imu\test_SAT_IMU_003.py:1562: AssertionError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [FLASH-DBG] _force_full_tier → tier='full'  axes=['roll', 'pitch', 'yaw']  ok=True
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_warn_alert_triggers" file="sat_imu\test_SAT_IMU_003.py" line="1268" time="7.034"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [FLASH-DBG] _force_full_tier → tier='full'  axes=['roll', 'pitch', 'yaw']  ok=True
+
+  [SAT-003 WARN] seen=True  max=39.9 °/s  GYRO_SCALE=16.4
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_warn_hold_persists" file="sat_imu\test_SAT_IMU_003.py" line="1309" time="7.162"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [FLASH-DBG] _force_full_tier → tier='full'  axes=['roll', 'pitch', 'yaw']  ok=True
+
+  [FLASH-DBG] _force_full_tier → tier='full'  axes=['roll', 'pitch', 'yaw']  ok=True
+
+  [SAT-003 WARN HOLD] held=True  elapsed=2.52 s  (need ≥ 2.0 s)
+
+[SAT conftest] Disconnected
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase></testsuite></testsuites>

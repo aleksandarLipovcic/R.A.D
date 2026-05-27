@@ -1,0 +1,208 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="4" skipped="0" tests="4" time="20.427" timestamp="2026-05-20T21:29:44.871221+02:00" hostname="TheSilent"><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_crit_alert_triggers" file="sat_imu\test_SAT_IMU_003.py" line="183" time="7.147"><failure message="AssertionError: CRIT state never entered after 5.0 s. Max rate seen: 205.4 °/s (need ≥ 100.0 °/s). Rotate the FC more forcefully.&#10;assert False">self = &lt;test_SAT_IMU_003.TestOperatorAlertSystem object at 0x000002198F606650&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x000002198F5486F0&gt;
+imu_widget = (&lt;tkinter.Tk object .&gt;, &lt;IMUWidget.IMUWidget object .!imuwidget&gt;)
+
+    def test_SAT_IMU_003_crit_alert_triggers(self, drone_link, imu_widget):
+        """CRIT state must be entered when gyro reads ≥ 100 °/s.
+    
+        Operator: rotate FC very rapidly (~120 °/s) when prompted.
+        The flash ticker must be active (_cell_flash_job not None).
+        """
+        root, widget = imu_widget
+    
+        print(f"\n  [SAT-003 CRIT] ► Rotate FC RAPIDLY (~120 °/s). "
+              f"You have {self.MOTION_WINDOW_S:.0f} s ◄")
+    
+        crit_seen = False
+        max_dps   = 0.0
+        t0 = time.monotonic()
+    
+        while time.monotonic() - t0 &lt; self.MOTION_WINDOW_S:
+            s    = drone_link.get_latest_state()
+            data = s.to_dict()
+            widget.update_ui(data)
+            root.update_idletasks()
+    
+            gs  = widget.GYRO_SCALE
+            dps = max(abs(data.get("gx",0))/gs, abs(data.get("gy",0))/gs,
+                      abs(data.get("gz",0))/gs)
+            max_dps = max(max_dps, dps)
+    
+            if self._any_axis_state(widget, "crit"):
+                crit_seen = True
+                print(f"  CRIT entered at t+{time.monotonic()-t0:.1f}s "
+                      f"(max {max_dps:.1f} °/s)")
+                break
+            time.sleep(self.POLL_INTERVAL_S)
+    
+        print(f"  Max gyro rate observed: {max_dps:.1f} °/s")
+&gt;       assert crit_seen, (
+            f"CRIT state never entered after {self.MOTION_WINDOW_S} s. "
+            f"Max rate seen: {max_dps:.1f} °/s (need ≥ {self.CRIT_THRESHOLD} °/s). "
+            "Rotate the FC more forcefully."
+        )
+E       AssertionError: CRIT state never entered after 5.0 s. Max rate seen: 205.4 °/s (need ≥ 100.0 °/s). Rotate the FC more forcefully.
+E       assert False
+
+sat_imu\test_SAT_IMU_003.py:218: AssertionError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+[SAT conftest] Connected on COM4 — waiting 2 s for telemetry to stabilise
+
+  [SAT-003 CRIT] ► Rotate FC RAPIDLY (~120 °/s). You have 5 s ◄
+  Max gyro rate observed: 205.4 °/s
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_crit_flash_ticker_active" file="sat_imu\test_SAT_IMU_003.py" line="223" time="5.040"><failure message="AssertionError: Flash ticker (_cell_flash_job) was None during CRIT state. The _register_crit() → _start_cell_flash() chain has a defect.&#10;assert False">self = &lt;test_SAT_IMU_003.TestOperatorAlertSystem object at 0x000002198F6068B0&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x000002198F5486F0&gt;
+imu_widget = (&lt;tkinter.Tk object .&gt;, &lt;IMUWidget.IMUWidget object .!imuwidget&gt;)
+
+    def test_SAT_IMU_003_crit_flash_ticker_active(self, drone_link, imu_widget):
+        """Flash ticker must be active (_cell_flash_job not None) during CRIT.
+    
+        Validates SRS-IMU-006a at system level — the shared flash ticker
+        that drives 500 ms cadence must start when a CRIT cell is registered.
+        """
+        root, widget = imu_widget
+    
+        print(f"\n  [SAT-003 FLASH] ► Rotate FC rapidly to trigger CRIT. "
+              f"You have {self.MOTION_WINDOW_S:.0f} s ◄")
+    
+        ticker_confirmed = False
+        t0 = time.monotonic()
+    
+        while time.monotonic() - t0 &lt; self.MOTION_WINDOW_S:
+            s = drone_link.get_latest_state()
+            widget.update_ui(s.to_dict())
+            root.update_idletasks()
+    
+            if self._any_axis_state(widget, "crit"):
+                # Give ticker one cycle to start (up to 600 ms)
+                deadline = time.monotonic() + 0.6
+                while time.monotonic() &lt; deadline:
+                    root.update()
+                    if widget._cell_flash_job is not None:
+                        ticker_confirmed = True
+                        break
+                    time.sleep(0.05)
+                break
+            time.sleep(self.POLL_INTERVAL_S)
+    
+        print(f"  Flash ticker active: {ticker_confirmed}  "
+              f"job={widget._cell_flash_job}")
+&gt;       assert ticker_confirmed, (
+            "Flash ticker (_cell_flash_job) was None during CRIT state. "
+            "The _register_crit() → _start_cell_flash() chain has a defect."
+        )
+E       AssertionError: Flash ticker (_cell_flash_job) was None during CRIT state. The _register_crit() → _start_cell_flash() chain has a defect.
+E       assert False
+
+sat_imu\test_SAT_IMU_003.py:257: AssertionError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-003 FLASH] ► Rotate FC rapidly to trigger CRIT. You have 5 s ◄
+  Flash ticker active: False  job=None
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_warn_alert_triggers" file="sat_imu\test_SAT_IMU_003.py" line="96" time="5.036"><failure message="AssertionError: WARN state never entered after 5.0 s. Max rate seen: 80.1 °/s (need ≥ 30.0 °/s). Rotate the FC more briskly.&#10;assert False">self = &lt;test_SAT_IMU_003.TestOperatorAlertSystem object at 0x000002198F621950&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x000002198F5486F0&gt;
+imu_widget = (&lt;tkinter.Tk object .&gt;, &lt;IMUWidget.IMUWidget object .!imuwidget&gt;)
+
+    def test_SAT_IMU_003_warn_alert_triggers(self, drone_link, imu_widget):
+        """WARN state must be entered when gyro reads ≥ 30 °/s.
+    
+        Operator: rotate FC briskly (~45 °/s) on any axis when prompted.
+        The test waits up to 5 s for the WARN state to appear.
+        """
+        root, widget = imu_widget
+    
+        print(f"\n  [SAT-003 WARN] ► Rotate FC briskly (~45 °/s) on any axis. "
+              f"You have {self.MOTION_WINDOW_S:.0f} s ◄")
+    
+        warn_seen  = False
+        max_dps    = 0.0
+        t0 = time.monotonic()
+    
+        while time.monotonic() - t0 &lt; self.MOTION_WINDOW_S:
+            s    = drone_link.get_latest_state()
+            data = s.to_dict()
+            widget.update_ui(data)
+            root.update_idletasks()
+    
+            gs = widget.GYRO_SCALE
+            dps = max(abs(data.get("gx",0))/gs, abs(data.get("gy",0))/gs,
+                      abs(data.get("gz",0))/gs)
+            max_dps = max(max_dps, dps)
+    
+            if self._any_axis_state(widget, "warn") or \
+               self._any_axis_state(widget, "crit"):
+                warn_seen = True
+                print(f"  Alert state entered at t+{time.monotonic()-t0:.1f}s "
+                      f"(max {max_dps:.1f} °/s)")
+                break
+            time.sleep(self.POLL_INTERVAL_S)
+    
+        print(f"  Max gyro rate observed: {max_dps:.1f} °/s")
+&gt;       assert warn_seen, (
+            f"WARN state never entered after {self.MOTION_WINDOW_S} s. "
+            f"Max rate seen: {max_dps:.1f} °/s (need ≥ {self.WARN_THRESHOLD} °/s). "
+            "Rotate the FC more briskly."
+        )
+E       AssertionError: WARN state never entered after 5.0 s. Max rate seen: 80.1 °/s (need ≥ 30.0 °/s). Rotate the FC more briskly.
+E       assert False
+
+sat_imu\test_SAT_IMU_003.py:132: AssertionError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-003 WARN] ► Rotate FC briskly (~45 °/s) on any axis. You have 5 s ◄
+  Max gyro rate observed: 80.1 °/s
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_B_unhealthy_link_flagged_during_injection" file="sat_imu\test_SAT_IMU_005.py" line="149" time="3.111"><failure message="AssertionError: link_healthy never went False during fault injection. FAIL_THRESHOLD may not be triggering, or set_poll_interval_ms(0) is not generating enough parse failures.&#10;assert False">self = &lt;test_SAT_IMU_005.TestFaultTolerance object at 0x000002198F5B7530&gt;
+drone_link = &lt;DroneBackend.DroneLink object at 0x000002198F5486F0&gt;
+
+    def test_SAT_IMU_005_B_unhealthy_link_flagged_during_injection(self, drone_link):
+        """link_healthy must flip False during sustained fault injection.
+    
+        Confirms FAIL_THRESHOLD logic: after 5 consecutive parseIMU()
+        failures the worker marks the link unhealthy.
+        """
+        drone_link.set_poll_interval_ms(0)
+    
+        unhealthy_seen = False
+        deadline = time.monotonic() + INJECT_DURATION_S + 1.0
+        try:
+            while time.monotonic() &lt; deadline:
+                if not drone_link.get_latest_state().link_healthy:
+                    unhealthy_seen = True
+                    break
+                time.sleep(0.05)
+        finally:
+            drone_link.set_poll_interval_ms(NORMAL_INTERVAL_MS)
+    
+        print(f"\n  link_healthy went False during injection: {unhealthy_seen}")
+&gt;       assert unhealthy_seen, (
+            "link_healthy never went False during fault injection. "
+            "FAIL_THRESHOLD may not be triggering, or set_poll_interval_ms(0) "
+            "is not generating enough parse failures."
+        )
+E       AssertionError: link_healthy never went False during fault injection. FAIL_THRESHOLD may not be triggering, or set_poll_interval_ms(0) is not generating enough parse failures.
+E       assert False
+
+sat_imu\test_SAT_IMU_005.py:170: AssertionError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  link_healthy went False during injection: False
+
+[SAT conftest] Disconnected
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase></testsuite></testsuites>
