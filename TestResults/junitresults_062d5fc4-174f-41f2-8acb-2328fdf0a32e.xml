@@ -1,0 +1,249 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="27" time="179.993" timestamp="2026-05-27T22:34:24.117167+02:00" hostname="TheSilent"><testcase classname="sat_imu.test_SAT_IMU_001.TestRealtimeIMUDisplay" name="test_SAT_IMU_001_all_keys_present" file="sat_imu\test_SAT_IMU_001.py" line="72" time="2.117"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+[SAT conftest] Connected on COM4 — waiting 2 s for telemetry to stabilise
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_001.TestRealtimeIMUDisplay" name="test_SAT_IMU_001_data_arrives_within_5s" file="sat_imu\test_SAT_IMU_001.py" line="87" time="0.003"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-001] Non-zero IMU data arrived after 0.00 s
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_001.TestRealtimeIMUDisplay" name="test_SAT_IMU_001_link_healthy_throughout" file="sat_imu\test_SAT_IMU_001.py" line="146" time="10.019"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_001.TestRealtimeIMUDisplay" name="test_SAT_IMU_001_packet_count_increases" file="sat_imu\test_SAT_IMU_001.py" line="170" time="10.004"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-001] packet_count delta: 33 over 10 s (3.30 Hz)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_001.TestRealtimeIMUDisplay" name="test_SAT_IMU_001_values_change_over_10s" file="sat_imu\test_SAT_IMU_001.py" line="112" time="0.261"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-001] IMU value change observed at t+0.26 s
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_002.TestGravityReference" name="test_SAT_IMU_002_accZ_mean_in_range" file="sat_imu\test_SAT_IMU_002.py" line="168" time="10.002"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-002] accZ  mean=0.9979 g  n=98  range=[0.95, 1.05] g
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_002.TestGravityReference" name="test_SAT_IMU_002_accZ_std_within_noise_floor" file="sat_imu\test_SAT_IMU_002.py" line="195" time="10.006"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-002] accZ  std=0.00116 g  (limit &lt; 0.01 g)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_002.TestGravityReference" name="test_SAT_IMU_002_gyro_at_rest" file="sat_imu\test_SAT_IMU_002.py" line="214" time="10.026"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-002] gyroX  mean |rate| = 0.126 °/s  (limit ≤ 2.0 °/s)
+
+  [SAT-002] gyroY  mean |rate| = 0.250 °/s  (limit ≤ 2.0 °/s)
+
+  [SAT-002] gyroZ  mean |rate| = 0.187 °/s  (limit ≤ 2.0 °/s)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_002.TestGravityReference" name="test_SAT_IMU_002_setup_prompt" file="sat_imu\test_SAT_IMU_002.py" line="141" time="9.447"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-002] Stabilising for 5 s...
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_002.TestGravityReference" name="test_SAT_IMU_002_widget_az_matches_sensor" file="sat_imu\test_SAT_IMU_002.py" line="244" time="10.021"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [SAT-002] sensor accZ = 0.9985 g  widget az = 0.9985 g  delta = 0.00000 g
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_crit_alert_triggers" file="sat_imu\test_SAT_IMU_003.py" line="1417" time="9.474"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [FLASH-DBG] _force_full_tier → tier='full'  axes=['roll', 'pitch', 'yaw']  ok=True
+
+  [SAT-003 CRIT] seen=True  max=190.9 °/s
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_crit_flash_ticker_active" file="sat_imu\test_SAT_IMU_003.py" line="1474" time="8.889"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [FLASH-DBG] _force_full_tier → tier='full'  axes=['roll', 'pitch', 'yaw']  ok=True
+  [FLASH-DBG] tier='full'  axes=3  crit_cells=3  job='after#10'  ok=True
+  [FLASH-DBG] gyro_state reset to safe for recovery test
+
+  [SAT-003 FLASH] crit=True  ticker=True  job=None
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_crit_hold_persists" file="sat_imu\test_SAT_IMU_003.py" line="1520" time="14.847"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [FLASH-DBG] _force_full_tier → tier='full'  axes=['roll', 'pitch', 'yaw']  ok=True
+
+  [FLASH-DBG] _force_full_tier → tier='full'  axes=['roll', 'pitch', 'yaw']  ok=True
+
+  [SAT-003 CRIT HOLD] held=True  elapsed=4.51 s  (need ≥ 4.0 s)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_recovery_to_safe" file="sat_imu\test_SAT_IMU_003.py" line="1576" time="7.086"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [FLASH-DBG] _force_full_tier → tier='full'  axes=['roll', 'pitch', 'yaw']  ok=True
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_warn_alert_triggers" file="sat_imu\test_SAT_IMU_003.py" line="1315" time="6.990"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [FLASH-DBG] _force_full_tier → tier='full'  axes=['roll', 'pitch', 'yaw']  ok=True
+
+  [SAT-003 WARN] seen=True  max=34.8 °/s  GYRO_SCALE=16.4
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_003.TestOperatorAlertSystem" name="test_SAT_IMU_003_warn_hold_persists" file="sat_imu\test_SAT_IMU_003.py" line="1356" time="9.495"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  [FLASH-DBG] _force_full_tier → tier='full'  axes=['roll', 'pitch', 'yaw']  ok=True
+
+  [FLASH-DBG] _force_full_tier → tier='full'  axes=['roll', 'pitch', 'yaw']  ok=True
+
+  [SAT-003 WARN HOLD] held=True  elapsed=2.51 s  (need ≥ 2.0 s)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_004.TestEndToEndLatency" name="test_SAT_IMU_004_latency_report" file="sat_imu\test_SAT_IMU_004.py" line="97" time="12.048"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  ── SAT-IMU-004 Latency Report ─────────────────────────
+  Percentile         ms   Pass?
+  ----------------------------------
+  P50             14.36  &lt; 30 ✓
+  P75             27.19  
+  P90             31.34  
+  P95             31.71  &lt; 200 ✓
+  P99             32.23  
+  min              3.52
+  max             32.41
+  samples          1000
+  ──────────────────────────────────────────────────────
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_004.TestEndToEndLatency" name="test_SAT_IMU_004_p50_under_30ms" file="sat_imu\test_SAT_IMU_004.py" line="86" time="12.037"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  samples : 1000
+  P50     : 20.86 ms  (need &lt; 30.0)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_004.TestEndToEndLatency" name="test_SAT_IMU_004_p95_under_200ms" file="sat_imu\test_SAT_IMU_004.py" line="75" time="11.997"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  samples : 1000
+  P95     : 31.02 ms  (need &lt; 200.0)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_A_link_healthy_recovers" file="sat_imu\test_SAT_IMU_005.py" line="99" time="2.002"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  link_healthy recovered within 2.0 s: True
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_A_no_crash_during_fault_injection" file="sat_imu\test_SAT_IMU_005.py" line="82" time="2.001"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_A_packet_count_resumes" file="sat_imu\test_SAT_IMU_005.py" line="124" time="7.003"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  packet_count delta after recovery: 10  (need &gt;= 7 over 3.0 s)
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_B_link_healthy_in_to_dict" file="sat_imu\test_SAT_IMU_005.py" line="153" time="0.002"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  'link_healthy' in to_dict(): True  value=True
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_B_unhealthy_link_flagged_during_injection" file="sat_imu\test_SAT_IMU_005.py" line="174" time="0.102"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  link_healthy went False during injection: True
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_B_widget_receives_link_status" file="sat_imu\test_SAT_IMU_005.py" line="228" time="0.002"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_C_full_recovery_after_all_scenarios" file="sat_imu\test_SAT_IMU_005.py" line="300" time="2.003"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  Final state:
+     link_healthy = True
+     packet_count = 586
+     ax=-8  ay=-1  az=2046
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="sat_imu.test_SAT_IMU_005.TestFaultTolerance" name="test_SAT_IMU_005_C_imu_fields_in_range_during_fault" file="sat_imu\test_SAT_IMU_005.py" line="268" time="2.015"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+  Out-of-range violations: 0
+
+[SAT conftest] Disconnected
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase></testsuite></testsuites>
