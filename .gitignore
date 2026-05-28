@@ -18,3 +18,8 @@ env/
 # YOLO/Machine Learning weights (they are too big for GitHub)
 *.pt
 *.onnx
+
+# Test results
+TestResults/
+IMUTests/
+**/junitresults_*.xml
