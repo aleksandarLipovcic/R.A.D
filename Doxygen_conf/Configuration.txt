@@ -1,0 +1,1 @@
+The configuration for doxygen including the filter to get the coments displayed in the documentation 
