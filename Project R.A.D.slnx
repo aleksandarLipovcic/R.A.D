@@ -7,11 +7,8 @@
   <Folder Name="/Solution Items/">
     <File Path=".gitattributes" />
     <File Path=".gitignore" />
-    <File Path="00_START_HERE_COMPLETION_SUMMARY - Copy.md" />
     <File Path="00_START_HERE_COMPLETION_SUMMARY.md" />
-    <File Path="API_TELEMETRY_DOCUMENTATION - Copy.md" />
     <File Path="API_TELEMETRY_DOCUMENTATION.md" />
-    <File Path="ARCHITECTURE_DIAGRAMS - Copy.md" />
     <File Path="ARCHITECTURE_DIAGRAMS.md" />
     <File Path="ARCHITECTURE_DOCUMENTATION.md" />
     <File Path="CODE_EXAMPLES_DEBUGGING.md" />
