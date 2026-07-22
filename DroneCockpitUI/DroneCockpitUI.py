@@ -5,7 +5,8 @@ Free-form floating instrument panel layout with responsive widgets
 and panel visibility control.
 
 Toolbar:
-  [Status]  [Panels ▾]  [⟳ Reset Layout]  [🔓 Save & Lock Layout]
+  [Status]  [Layouts ▾]  [Layout: <name>]  [Panels ▾]  [↺ Revert to Saved]
+  [⟳ Factory Default]  [🔓 Save & Lock Layout]
 
 Architecture
 ------------
@@ -30,14 +31,21 @@ FIXES vs previous version
   2. Z-order now works correctly via lift() / lower().
   3. Click-to-front on any panel interaction.
   4. Telemetry offloaded to TelemetryWorker background thread.
+  5. Multi-profile layout system: any number of named layouts can be
+     saved, previewed, loaded, renamed, or deleted independently, and
+     on-screen changes can be reverted to the last-saved version of the
+     active profile without discarding it (see LayoutStore /
+     LayoutManagerDialog below).
 """
 
 import sys
 import os
 import json
 from pathlib import Path
+from typing import Optional
 
 import tkinter as tk
+from tkinter import simpledialog, messagebox
 
 from telemetry_worker import TelemetryWorker
 
@@ -84,7 +92,15 @@ SNAP_PX        = 14
 SNAP_COLOR     = "#00d4ff"
 GUIDE_DASH     = (4, 3)
 
-_LAYOUT_FILE = Path(script_dir) / "cockpit_layout.json"
+# ── Layout persistence ────────────────────────────────────────────────────────
+#   cockpit_layouts.json holds *all* named profiles + which one is active.
+#   cockpit_layout.json (singular) is the old single-profile file; if the
+#   new file doesn't exist yet but the old one does, it's migrated
+#   automatically into a profile called "Default" the first time the app
+#   runs after this update, so no existing layout is lost.
+_LAYOUTS_FILE         = Path(script_dir) / "cockpit_layouts.json"
+_LEGACY_LAYOUT_FILE   = Path(script_dir) / "cockpit_layout.json"
+_DEFAULT_PROFILE_NAME = "Default"
 
 # ── Per-widget throttle divisors (frames between updates) ────────────────────
 #   1 = every Tk pump cycle, 3 = every third, etc.
@@ -118,6 +134,96 @@ _PANEL_LABELS = {
     "fc_status": "FC Status — Armed / Mode / Sensors",
     "arming":    "Arming Diagnostics",
 }
+
+
+# ── Tooltip ──────────────────────────────────────────────────────────────────
+
+class _Tooltip:
+    """
+    Lightweight hover tooltip for compact, icon-only widgets.
+
+    Shows a small borderless popup near the widget after a short hover
+    delay; hides on mouse-leave or click. Attach with `_Tooltip(widget,
+    "explanation")`. Call `.set_text(...)` afterwards to update the text
+    for widgets whose meaning changes at runtime (e.g. a lock toggle).
+    """
+
+    _DELAY_MS = 450
+
+    def __init__(self, widget: tk.Widget, text: str):
+        self._widget = widget
+        self._text = text
+        self._after_id = None
+        self._tip = None
+        widget.bind("<Enter>", self._schedule, add=True)
+        widget.bind("<Leave>", self._hide, add=True)
+        widget.bind("<ButtonPress>", self._hide, add=True)
+
+    def set_text(self, text: str) -> None:
+        self._text = text
+
+    def _schedule(self, event=None):
+        self._cancel_pending()
+        self._after_id = self._widget.after(self._DELAY_MS, self._show)
+
+    def _cancel_pending(self):
+        if self._after_id is not None:
+            try:
+                self._widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _show(self):
+        self._after_id = None
+        if self._tip is not None or not self._text:
+            return
+        x = self._widget.winfo_rootx() + self._widget.winfo_width() // 2
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 6
+        self._tip = tk.Toplevel(self._widget)
+        self._tip.wm_overrideredirect(True)
+        try:
+            self._tip.attributes("-topmost", True)
+        except Exception:
+            pass
+        frame = tk.Frame(self._tip, bg="#00d4ff", padx=1, pady=1)
+        frame.pack()
+        tk.Label(
+            frame, text=self._text,
+            bg="#0f1428", fg="#dce6fa",
+            font=("Consolas", 8), padx=8, pady=5,
+            justify="left", wraplength=260,
+        ).pack()
+        self._tip.update_idletasks()
+        tip_w = self._tip.winfo_width()
+        tip_h = self._tip.winfo_height()
+
+        # Clamp so the tooltip stays fully inside the toplevel window that
+        # owns this widget (this is what was missing before — the popup
+        # used to be positioned purely relative to the widget, so it could
+        # spill past the edge of the application window). Falls back to
+        # flipping above the widget if there isn't room below.
+        owner = self._widget.winfo_toplevel()
+        bounds_x0 = owner.winfo_rootx()
+        bounds_y0 = owner.winfo_rooty()
+        bounds_x1 = bounds_x0 + owner.winfo_width()
+        bounds_y1 = bounds_y0 + owner.winfo_height()
+
+        tip_x = x - tip_w // 2
+        tip_x = max(bounds_x0 + 2, min(tip_x, bounds_x1 - tip_w - 2))
+
+        tip_y = y
+        if tip_y + tip_h > bounds_y1 - 2:
+            tip_y = self._widget.winfo_rooty() - tip_h - 6
+        tip_y = max(bounds_y0 + 2, min(tip_y, bounds_y1 - tip_h - 2))
+
+        self._tip.wm_geometry(f"+{tip_x}+{tip_y}")
+
+    def _hide(self, event=None):
+        self._cancel_pending()
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
 
 
 # ── DraggablePanel ─────────────────────────────────────────────────────────────
@@ -492,6 +598,398 @@ class DraggablePanel(tk.Frame):
         self._ws.itemconfigure(self._item, state="hidden")
 
 
+# ── LayoutStore ─────────────────────────────────────────────────────────────
+
+class LayoutStore:
+    """
+    Persists *multiple* named layout profiles to a single JSON file, instead
+    of the old one-file-one-layout scheme.
+
+    On-disk format (cockpit_layouts.json):
+        {
+          "active_profile": "Default",
+          "profiles": {
+            "<name>": {
+                "geometry": "1400x960+20+20",
+                "locked": false,
+                "panels": {
+                    "<panel_name>": {"x":.., "y":.., "w":.., "h":.., "visible":..},
+                    ...
+                }
+            },
+            ...
+          }
+        }
+
+    If the new file doesn't exist yet but a legacy single-profile
+    cockpit_layout.json does, it is transparently imported as a profile
+    named "Default" the first time the app starts — nothing is lost.
+    """
+
+    def __init__(self, path: Path, legacy_path: Optional[Path] = None):
+        self._path = path
+        self._legacy_path = legacy_path
+        self._data = self._load()
+
+    # ---- disk I/O ------------------------------------------------------
+
+    def _load(self) -> dict:
+        if self._path.exists():
+            try:
+                with open(self._path) as fh:
+                    data = json.load(fh)
+                if data.get("profiles"):
+                    return data
+            except Exception as e:
+                print(f"[LayoutStore] load failed: {e}")
+
+        if self._legacy_path and self._legacy_path.exists():
+            try:
+                with open(self._legacy_path) as fh:
+                    legacy = json.load(fh)
+                print(f"[LayoutStore] migrating legacy layout file "
+                      f"→ profile '{_DEFAULT_PROFILE_NAME}'")
+                return {
+                    "active_profile": _DEFAULT_PROFILE_NAME,
+                    "profiles": {_DEFAULT_PROFILE_NAME: legacy},
+                }
+            except Exception as e:
+                print(f"[LayoutStore] legacy migration failed: {e}")
+
+        return {"active_profile": _DEFAULT_PROFILE_NAME, "profiles": {}}
+
+    def save(self) -> None:
+        try:
+            with open(self._path, "w") as fh:
+                json.dump(self._data, fh, indent=2)
+            print(f"[LayoutStore] saved → {self._path}")
+        except Exception as e:
+            print(f"[LayoutStore] save failed: {e}")
+
+    # ---- profile access --------------------------------------------------
+
+    def has_any(self) -> bool:
+        return bool(self._data.get("profiles"))
+
+    def profile_names(self) -> list:
+        return sorted(self._data.get("profiles", {}).keys())
+
+    def get_profile(self, name: str) -> Optional[dict]:
+        return self._data.get("profiles", {}).get(name)
+
+    def active_name(self) -> str:
+        return self._data.get("active_profile", _DEFAULT_PROFILE_NAME)
+
+    def set_active(self, name: str) -> None:
+        self._data["active_profile"] = name
+        self.save()
+
+    def upsert_profile(self, name: str, snapshot: dict, make_active: bool = True) -> None:
+        self._data.setdefault("profiles", {})[name] = snapshot
+        if make_active:
+            self._data["active_profile"] = name
+        self.save()
+
+    def delete_profile(self, name: str) -> None:
+        self._data.get("profiles", {}).pop(name, None)
+        if self._data.get("active_profile") == name:
+            remaining = self.profile_names()
+            self._data["active_profile"] = remaining[0] if remaining else _DEFAULT_PROFILE_NAME
+        self.save()
+
+    def rename_profile(self, old: str, new: str) -> None:
+        profiles = self._data.get("profiles", {})
+        if old not in profiles or old == new:
+            return
+        profiles[new] = profiles.pop(old)
+        if self._data.get("active_profile") == old:
+            self._data["active_profile"] = new
+        self.save()
+
+
+# ── Layout preview + manager dialog ─────────────────────────────────────────
+
+class _LayoutPreviewCanvas(tk.Canvas):
+    """Small read-only rendition of a saved profile's panel geometry."""
+
+    _PW, _PH = 260, 170  # preview canvas pixel size
+
+    def __init__(self, master, **kwargs):
+        super().__init__(master, width=self._PW, height=self._PH,
+                         bg="#0a0a14", highlightthickness=1,
+                         highlightbackground="#2a3a5a", **kwargs)
+
+    def render(self, profile: Optional[dict]) -> None:
+        self.delete("all")
+        if not profile:
+            self.create_text(self._PW // 2, self._PH // 2,
+                             text="No profile selected",
+                             fill="#445566", font=("Consolas", 9))
+            return
+
+        panels = profile.get("panels", {})
+        if not panels:
+            self.create_text(self._PW // 2, self._PH // 2,
+                             text="(empty layout)",
+                             fill="#445566", font=("Consolas", 9))
+            return
+
+        max_x = max(p["x"] + p["w"] for p in panels.values())
+        max_y = max(p["y"] + p["h"] for p in panels.values())
+        margin = 10
+        scale = min(
+            (self._PW - 2 * margin) / max(max_x, 1),
+            (self._PH - 2 * margin) / max(max_y, 1),
+        )
+
+        for name, geo in panels.items():
+            visible = geo.get("visible", True)
+            x0 = margin + geo["x"] * scale
+            y0 = margin + geo["y"] * scale
+            x1 = x0 + geo["w"] * scale
+            y1 = y0 + geo["h"] * scale
+            fill = "#16213e" if visible else "#141420"
+            outline = "#00d4ff" if visible else "#333344"
+            self.create_rectangle(x0, y0, x1, y1, fill=fill, outline=outline)
+            label = _PANEL_LABELS.get(name, name)
+            if (x1 - x0) > 20 and (y1 - y0) > 10:
+                self.create_text(
+                    (x0 + x1) / 2, (y0 + y1) / 2,
+                    text=label, fill=("#5588aa" if visible else "#3a3a4a"),
+                    font=("Consolas", 6), width=max(10, x1 - x0 - 4),
+                )
+
+        lock_txt = "🔒 locked" if profile.get("locked") else "🔓 unlocked"
+        self.create_text(margin, self._PH - 6, anchor="w",
+                         text=lock_txt, fill="#5a6a8a", font=("Consolas", 7))
+
+
+class LayoutManagerDialog(tk.Toplevel):
+    """
+    Lists every saved layout profile with a live preview, plus controls to
+    load / save / rename / delete profiles. This is the "preview before you
+    commit" surface — selecting a profile in the list only updates the
+    preview; nothing is applied to the real workspace until "Load" is
+    pressed.
+    """
+
+    def __init__(self, master, store: LayoutStore, on_load, on_save_current_as, on_overwrite):
+        super().__init__(master, bg="#0f0f1a")
+        self.title("Layout Profiles")
+        self.transient(master)
+
+        self._store = store
+        self._on_load = on_load
+        self._on_save_current_as = on_save_current_as
+        self._on_overwrite = on_overwrite
+
+        # Build the widgets *before* fixing the window's size. Sizing the
+        # Toplevel first (e.g. self.geometry("540x400") right after
+        # creation, followed by resizable(False, False)) locks the window
+        # to whatever the WM guessed at creation time — before the
+        # listbox, preview canvas, and action buttons had actually been
+        # packed. That's why the dialog could render clipped down to just
+        # the listbox, with the preview and every load/save/rename/delete
+        # control invisible off to the right. Building first, then forcing
+        # an idle-task pass, ensures every widget's real requested size is
+        # known before the window is locked to a fixed size.
+        self._build_ui()
+        self.update_idletasks()
+        self.minsize(560, 420)
+        self.geometry("620x440")
+        self.resizable(True, True)
+
+        self._refresh_list(select=self._store.active_name())
+
+        self.grab_set()
+
+    # ---- UI construction ---------------------------------------------------
+
+    def _build_ui(self):
+        left = tk.Frame(self, bg="#0f0f1a")
+        left.pack(side="left", fill="y", padx=(10, 6), pady=10)
+
+        tk.Label(left, text="Saved Layouts", bg="#0f0f1a", fg="#00d4ff",
+                 font=("Consolas", 10, "bold")).pack(anchor="w")
+
+        self._listbox = tk.Listbox(
+            left, width=26, height=15,
+            bg="#0a0a14", fg="#c0d0f0",
+            selectbackground="#1e3060", selectforeground="#ffffff",
+            highlightthickness=1, highlightbackground="#2a3a5a",
+            font=("Consolas", 9), activestyle="none",
+        )
+        self._listbox.pack(fill="y")
+        self._listbox.bind("<<ListboxSelect>>", self._on_select)
+        self._listbox.bind("<Double-Button-1>", lambda e: self._load_selected())
+        self._listbox.bind("<Delete>", lambda e: self._delete_selected())
+        self._listbox.bind("<ButtonPress-3>", self._show_row_context_menu)
+
+        right = tk.Frame(self, bg="#0f0f1a")
+        right.pack(side="left", fill="both", expand=True, padx=(6, 10), pady=10)
+
+        self._name_lbl = tk.Label(right, text="—", bg="#0f0f1a", fg="#ffffff",
+                                  font=("Consolas", 10, "bold"))
+        self._name_lbl.pack(anchor="w")
+
+        self._preview = _LayoutPreviewCanvas(right)
+        self._preview.pack(pady=(6, 10))
+
+        btn_row1 = tk.Frame(right, bg="#0f0f1a")
+        btn_row1.pack(fill="x", pady=(0, 4))
+        self._mkbtn(btn_row1, "▶  Load", self._load_selected, "#00d4ff").pack(side="left", padx=(0, 6))
+        self._mkbtn(btn_row1, "Overwrite w/ Current", self._overwrite_selected).pack(side="left", padx=(0, 6))
+
+        btn_row2 = tk.Frame(right, bg="#0f0f1a")
+        btn_row2.pack(fill="x", pady=(0, 4))
+        self._mkbtn(btn_row2, "Rename…", self._rename_selected).pack(side="left", padx=(0, 6))
+        self._mkbtn(btn_row2, "Delete", self._delete_selected, "#ff5566").pack(side="left", padx=(0, 6))
+
+        sep = tk.Frame(right, bg="#2a3a5a", height=1)
+        sep.pack(fill="x", pady=10)
+
+        self._mkbtn(right, "💾  Save Current Layout As New Profile…",
+                    self._save_current_as).pack(fill="x")
+
+        tk.Button(right, text="Close", command=self.destroy,
+                 font=("Consolas", 9), bg="#1a1a2e", fg="#8899aa",
+                 relief="raised", bd=1, cursor="hand2",
+                 activebackground="#252540").pack(side="bottom", anchor="e", pady=(14, 0))
+
+    def _mkbtn(self, parent, text, command, fg="#a0b8d8"):
+        return tk.Button(parent, text=text, command=command,
+                         font=("Consolas", 9), bg="#162040", fg=fg,
+                         activebackground="#1e3060", activeforeground="#ffffff",
+                         relief="raised", bd=1, padx=8, pady=3, cursor="hand2")
+
+    # ---- data plumbing -------------------------------------------------
+
+    def _refresh_list(self, select: Optional[str] = None):
+        self._listbox.delete(0, "end")
+        names = self._store.profile_names()
+        active = self._store.active_name()
+        for n in names:
+            label = f"●  {n}" if n == active else f"    {n}"
+            self._listbox.insert("end", label)
+
+        if select and select in names:
+            idx = names.index(select)
+        elif names:
+            idx = 0
+        else:
+            idx = None
+
+        if idx is not None:
+            self._listbox.selection_set(idx)
+            self._listbox.see(idx)
+            self._show_preview(names[idx])
+        else:
+            self._show_preview(None)
+
+    def _selected_name(self) -> Optional[str]:
+        sel = self._listbox.curselection()
+        if not sel:
+            return None
+        return self._store.profile_names()[sel[0]]
+
+    def _show_preview(self, name: Optional[str]):
+        self._name_lbl.config(text=name or "—")
+        self._preview.render(self._store.get_profile(name) if name else None)
+
+    def _on_select(self, event=None):
+        self._show_preview(self._selected_name())
+
+    def _show_row_context_menu(self, event):
+        """Right-click menu on a listbox row: select it under the cursor
+        first, then offer the same actions as the buttons on the right."""
+        idx = self._listbox.nearest(event.y)
+        if idx < 0 or idx >= self._listbox.size():
+            return
+        self._listbox.selection_clear(0, "end")
+        self._listbox.selection_set(idx)
+        self._show_preview(self._selected_name())
+
+        menu = tk.Menu(self, tearoff=0,
+                       bg="#0f1428", fg="#c0d0f0",
+                       activebackground="#1e3060", activeforeground="#ffffff",
+                       font=("Consolas", 9), bd=1, relief="solid")
+        menu.add_command(label="  ▶  Load", command=self._load_selected)
+        menu.add_command(label="  Overwrite w/ Current", command=self._overwrite_selected)
+        menu.add_separator()
+        menu.add_command(label="  Rename…", command=self._rename_selected)
+        menu.add_command(label="  Delete", command=self._delete_selected)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    # ---- actions ---------------------------------------------------------
+
+    def _load_selected(self):
+        name = self._selected_name()
+        if not name:
+            return
+        self._on_load(name)
+        self._refresh_list(select=name)
+
+    def _overwrite_selected(self):
+        name = self._selected_name()
+        if not name:
+            return
+        if not messagebox.askyesno(
+            "Overwrite Layout",
+            f"Overwrite saved profile '{name}' with the current on-screen layout?",
+            parent=self,
+        ):
+            return
+        self._on_overwrite(name)
+        self._refresh_list(select=name)
+
+    def _rename_selected(self):
+        name = self._selected_name()
+        if not name:
+            return
+        new_name = simpledialog.askstring(
+            "Rename Layout", "New name:", initialvalue=name, parent=self)
+        if not new_name or new_name == name:
+            return
+        if new_name in self._store.profile_names():
+            messagebox.showerror("Name in use",
+                                 f"A profile named '{new_name}' already exists.",
+                                 parent=self)
+            return
+        self._store.rename_profile(name, new_name)
+        self._refresh_list(select=new_name)
+
+    def _delete_selected(self):
+        name = self._selected_name()
+        if not name:
+            return
+        if len(self._store.profile_names()) <= 1:
+            messagebox.showwarning("Can't Delete",
+                                   "At least one layout profile must remain.",
+                                   parent=self)
+            return
+        if not messagebox.askyesno("Delete Layout",
+                                   f"Delete saved profile '{name}'? This cannot be undone.",
+                                   parent=self):
+            return
+        self._store.delete_profile(name)
+        self._refresh_list()
+
+    def _save_current_as(self):
+        new_name = simpledialog.askstring("Save Layout", "Profile name:", parent=self)
+        if not new_name:
+            return
+        if new_name in self._store.profile_names():
+            if not messagebox.askyesno("Overwrite Existing?",
+                                       f"'{new_name}' already exists. Overwrite it?",
+                                       parent=self):
+                return
+        self._on_save_current_as(new_name)
+        self._refresh_list(select=new_name)
+
+
 # ── Application ───────────────────────────────────────────────────────────────
 
 class DroneCockpitApp:
@@ -515,9 +1013,19 @@ class DroneCockpitApp:
         # Per-widget frame counters for throttling
         self._frame_counters: dict[str, int] = {k: 0 for k in _THROTTLE}
 
-        self._layout = self._load_layout()
+        # widget -> _Tooltip, so dynamic buttons (e.g. the lock toggle) can
+        # update their hover text at runtime
+        self._tooltips: dict[tk.Widget, _Tooltip] = {}
+
+        # ── Multi-profile layout persistence ─────────────────────────────────
+        self._layout_store = LayoutStore(_LAYOUTS_FILE, _LEGACY_LAYOUT_FILE)
+        if not self._layout_store.has_any():
+            self._layout_store.upsert_profile(_DEFAULT_PROFILE_NAME, self._default_snapshot())
+
         self._setup_ui()
-        self._apply_layout()
+        self._apply_layout(self._layout_store.get_profile(self._layout_store.active_name())
+                            or self._default_snapshot())
+        self._refresh_active_layout_label()
 
         # ── Background telemetry worker ────────────────────────────────────
         # Starts after UI is built so widgets exist before first frame arrives.
@@ -530,15 +1038,17 @@ class DroneCockpitApp:
     # Layout persistence
     # =========================================================================
 
-    def _load_layout(self) -> dict:
-        try:
-            with open(_LAYOUT_FILE) as fh:
-                return json.load(fh)
-        except Exception:
-            return {}
+    def _default_snapshot(self) -> dict:
+        """Factory-default layout, used to seed the very first profile."""
+        return {
+            "geometry": None,
+            "locked": False,
+            "panels": {name: dict(geo) for name, geo in _DEFAULT_PANELS.items()},
+        }
 
-    def _save_layout(self) -> None:
-        layout = {
+    def _current_snapshot(self) -> dict:
+        """Capture the on-screen state (geometry, lock, all panel rects)."""
+        return {
             "geometry": self.root.geometry(),
             "locked":   self._locked_ref[0],
             "panels": {
@@ -549,15 +1059,15 @@ class DroneCockpitApp:
                 for name, panel in self._panels.items()
             },
         }
-        try:
-            with open(_LAYOUT_FILE, "w") as fh:
-                json.dump(layout, fh, indent=2)
-            print(f"[Layout] saved → {_LAYOUT_FILE}")
-        except Exception as e:
-            print(f"[Layout] save failed: {e}")
 
-    def _apply_layout(self) -> None:
-        geom = self._layout.get("geometry")
+    def _persist_active(self) -> None:
+        """Write the current on-screen layout back into the active profile."""
+        self._layout_store.upsert_profile(self._layout_store.active_name(),
+                                          self._current_snapshot())
+
+    def _apply_layout(self, layout: dict) -> None:
+        """Push a saved profile's geometry/visibility/lock state onto the UI."""
+        geom = layout.get("geometry")
         if geom:
             try:
                 self.root.geometry(geom)
@@ -568,7 +1078,7 @@ class DroneCockpitApp:
             sh = self.root.winfo_screenheight()
             self.root.geometry(f"{min(1400, sw-40)}x{min(960, sh-60)}+20+20")
 
-        saved_panels = self._layout.get("panels", {})
+        saved_panels = layout.get("panels", {})
         for name, panel in self._panels.items():
             geo = saved_panels.get(name)
             if not geo or "x" not in geo:
@@ -580,10 +1090,9 @@ class DroneCockpitApp:
             self._vis_vars[name].set(vis)
             panel.show() if vis else panel.hide()
 
-        if self._layout.get("locked", False):
-            self._locked_ref[0] = True
-            self._lock_btn.config(text="🔒 Locked",
-                                  relief="sunken", bg="#1a2a1a", fg="#00ff88")
+        locked = layout.get("locked", False)
+        self._locked_ref[0] = locked
+        self._update_lock_button(locked)
 
         self.root.after_idle(self._clamp_all_panels)
 
@@ -622,17 +1131,29 @@ class DroneCockpitApp:
     # Lock / Unlock
     # =========================================================================
 
+    def _update_lock_button(self, locked: bool) -> None:
+        """Set the lock icon, colors, and tooltip text to match state."""
+        if locked:
+            self._lock_btn.config(text="🔒", relief="sunken",
+                                  bg="#1a2a1a", fg="#00ff88")
+            tip = "Locked — click to unlock and allow panels to be moved/resized again"
+        else:
+            self._lock_btn.config(text="🔓", relief="raised",
+                                  bg="#162040", fg="#00d4ff")
+            tip = ("Save & Lock Layout — saves the current layout and locks "
+                   "panels from being dragged or resized")
+        if self._lock_btn in self._tooltips:
+            self._tooltips[self._lock_btn].set_text(tip)
+
     def _toggle_lock(self) -> None:
         self._locked_ref[0] = not self._locked_ref[0]
-        if self._locked_ref[0]:
-            self._lock_btn.config(text="🔒 Locked",
-                                  relief="sunken", bg="#1a2a1a", fg="#00ff88")
-        else:
-            self._lock_btn.config(text="🔓 Save & Lock Layout",
-                                  relief="raised", bg="#162040", fg="#00d4ff")
-        self._save_layout()
+        self._update_lock_button(self._locked_ref[0])
+        self._persist_active()
 
     def _reset_layout(self) -> None:
+        """Snap panels back to the hardcoded factory defaults (in-memory
+        only — does NOT touch any saved profile). Use 'Revert to Saved' to
+        undo unsaved changes to the active profile instead."""
         if self._locked_ref[0]:
             return
         for name, panel in self._panels.items():
@@ -640,6 +1161,105 @@ class DroneCockpitApp:
             if geo:
                 panel.set_geometry(geo["x"], geo["y"], geo["w"], geo["h"])
         self.root.after_idle(self._clamp_all_panels)
+
+    def _revert_to_saved(self) -> None:
+        """Discard unsaved on-screen changes by reloading the active
+        profile's last-saved state from disk."""
+        active = self._layout_store.active_name()
+        profile = self._layout_store.get_profile(active)
+        if profile:
+            self._apply_layout(profile)
+
+    # =========================================================================
+    # Layout profiles (multi-loadout management)
+    # =========================================================================
+
+    def _refresh_active_layout_label(self) -> None:
+        self._active_layout_lbl.config(text=f"Layout: {self._layout_store.active_name()}")
+
+    def _open_layout_manager(self) -> None:
+        LayoutManagerDialog(
+            self.root, self._layout_store,
+            on_load=self._load_profile,
+            on_save_current_as=self._save_current_as_profile,
+            on_overwrite=self._overwrite_profile,
+        )
+
+    def _load_profile(self, name: str) -> None:
+        profile = self._layout_store.get_profile(name)
+        if profile is None:
+            return
+        self._apply_layout(profile)
+        self._layout_store.set_active(name)
+        self._refresh_active_layout_label()
+
+    def _save_current_as_profile(self, name: str) -> None:
+        self._layout_store.upsert_profile(name, self._current_snapshot(), make_active=True)
+        self._refresh_active_layout_label()
+
+    def _overwrite_profile(self, name: str) -> None:
+        active = self._layout_store.active_name()
+        self._layout_store.upsert_profile(name, self._current_snapshot(),
+                                          make_active=(name == active))
+        self._refresh_active_layout_label()
+
+    def _show_layouts_menu(self) -> None:
+        menu_kw = dict(bg="#0f1428", fg="#c0d0f0",
+                       activebackground="#1e3060", activeforeground="#ffffff",
+                       font=("Consolas", 10), bd=1, relief="solid")
+        menu = tk.Menu(self.root, tearoff=0, **menu_kw)
+        active = self._layout_store.active_name()
+        names = self._layout_store.profile_names()
+
+        for name in names:
+            prefix = "●  " if name == active else "    "
+            # Each profile is a cascade so Load and Delete are both reachable
+            # right from the toolbar, without opening the manager dialog.
+            sub = tk.Menu(menu, tearoff=0, **menu_kw)
+            sub.add_command(label="▶  Load", command=lambda n=name: self._load_profile(n))
+            sub.add_command(label="🗑  Delete",
+                            command=lambda n=name: self._quick_delete_profile(n))
+            menu.add_cascade(label=f"{prefix}{name}", menu=sub)
+
+        menu.add_separator()
+        menu.add_command(label="  🔎  Preview & Manage…", command=self._open_layout_manager)
+        menu.add_command(label="  💾  Save Current As New…", command=self._prompt_save_current_as)
+
+        btn = self._layouts_btn
+        x = btn.winfo_rootx()
+        y = btn.winfo_rooty() + btn.winfo_height()
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _prompt_save_current_as(self) -> None:
+        name = simpledialog.askstring("Save Layout", "Profile name:", parent=self.root)
+        if not name:
+            return
+        if name in self._layout_store.profile_names():
+            if not messagebox.askyesno("Overwrite Existing?",
+                                       f"'{name}' already exists. Overwrite it?"):
+                return
+        self._save_current_as_profile(name)
+
+    def _quick_delete_profile(self, name: str) -> None:
+        if len(self._layout_store.profile_names()) <= 1:
+            messagebox.showwarning("Can't Delete",
+                                   "At least one layout profile must remain.")
+            return
+        if not messagebox.askyesno("Delete Layout",
+                                   f"Delete saved profile '{name}'? This cannot be undone."):
+            return
+        was_active = (name == self._layout_store.active_name())
+        self._layout_store.delete_profile(name)
+        self._refresh_active_layout_label()
+        # If we just deleted the profile that was on-screen, load whatever
+        # is now active so the label and workspace stay in sync.
+        if was_active:
+            new_active = self._layout_store.get_profile(self._layout_store.active_name())
+            if new_active:
+                self._apply_layout(new_active)
 
     # =========================================================================
     # Panel visibility
@@ -710,6 +1330,31 @@ class DroneCockpitApp:
     # UI setup
     # =========================================================================
 
+    def _mk_icon_btn(self, parent, icon: str, command, tooltip: str,
+                      fg: str = "#a0b8d8", active_fg: str = "#ffffff",
+                      label: str = "") -> tk.Button:
+        """Build a toolbar button: an icon by itself, or an icon plus a
+        short text label (for the Layouts/Panels dropdowns, so their
+        purpose is obvious without needing the tooltip). Flat relief plus
+        a hover highlight give it a more modern, less boxy feel than the
+        old fixed 'raised' icon buttons."""
+        base_bg  = "#162040"
+        hover_bg = "#1c2c54"
+        btn = tk.Button(
+            parent, text=(f"{icon}  {label}" if label else icon), command=command,
+            font=("Segoe UI", 10) if label else ("Segoe UI Emoji", 11),
+            width=0 if label else 3,
+            relief="flat", padx=10 if label else 2, pady=4 if label else 2,
+            bg=base_bg, fg=fg,
+            activebackground="#1e3060", activeforeground=active_fg,
+            cursor="hand2", bd=0,
+            highlightthickness=1, highlightbackground="#26365a",
+        )
+        btn.bind("<Enter>", lambda e, b=btn: b.config(bg=hover_bg, highlightbackground="#3a6ab0"))
+        btn.bind("<Leave>", lambda e, b=btn: b.config(bg=base_bg, highlightbackground="#26365a"))
+        self._tooltips[btn] = _Tooltip(btn, tooltip)
+        return btn
+
     def _setup_ui(self) -> None:
 
         # ── Toolbar ───────────────────────────────────────────────────────────
@@ -723,44 +1368,62 @@ class DroneCockpitApp:
         )
         self.status_label.pack(side="left", padx=(0, 16))
 
-        self._panels_btn = tk.Button(
-            toolbar, text="Panels ▾",
-            command=self._show_panels_menu,
+        # Icon-only buttons throughout — mixing wide unicode glyphs with
+        # long labels was causing Tkinter to mis-size/clip buttons on some
+        # platforms. Every icon button gets a hover tooltip instead.
+
+        self._layouts_btn = self._mk_icon_btn(
+            toolbar, "🗂", self._show_layouts_menu,
+            "Layouts — switch, preview, save, rename or delete panel-layout profiles",
+            label="Layouts ▾",
+        )
+        self._layouts_btn.pack(side="left", padx=(0, 8))
+
+        self._active_layout_lbl = tk.Label(
+            toolbar, text="",
+            fg="#66aadd", bg="#13203a",
             font=("Consolas", 9, "bold"),
-            relief="raised", padx=10, pady=4,
-            bg="#162040", fg="#a0b8d8",
-            activebackground="#1e3060", activeforeground="#ffffff",
-            cursor="hand2", bd=1,
+            padx=8, pady=3,
+            highlightthickness=1, highlightbackground="#2a4a76",
+        )
+        self._active_layout_lbl.pack(side="left", padx=(0, 16))
+
+        self._panels_btn = self._mk_icon_btn(
+            toolbar, "🧩", self._show_panels_menu,
+            "Panels — show or hide individual instrument panels",
+            label="Panels ▾",
         )
         self._panels_btn.pack(side="left", padx=(0, 6))
 
-        tk.Label(
-            toolbar,
-            text="Drag title bars to move  •  Click any panel to bring to front  •  Right-click title for snap & z-order",
-            fg="#446688", bg="#0d0d1a",
-            font=("Consolas", 8),
-        ).pack(side="left")
+        info_btn = self._mk_icon_btn(
+            toolbar, "ℹ", None,
+            "Drag a panel's title bar to move it.\n"
+            "Click any panel to bring it to front.\n"
+            "Right-click a title bar for snap-to and z-order options.",
+        )
+        info_btn.pack(side="left")
 
-        self._lock_btn = tk.Button(
-            toolbar, text="🔓 Save & Lock Layout",
-            command=self._toggle_lock,
-            font=("Consolas", 9, "bold"),
-            relief="raised", padx=10, pady=4,
-            bg="#162040", fg="#00d4ff",
-            activebackground="#1e3060", activeforeground="#00ffff",
-            cursor="hand2", bd=1,
+        self._lock_btn = self._mk_icon_btn(
+            toolbar, "🔓", self._toggle_lock,
+            "Save & Lock Layout — saves the current layout and locks panels "
+            "from being dragged or resized",
+            fg="#00d4ff", active_fg="#00ffff",
         )
         self._lock_btn.pack(side="right", padx=(6, 0))
 
-        tk.Button(
-            toolbar, text="⟳ Reset Layout",
-            command=self._reset_layout,
-            font=("Consolas", 9),
-            relief="raised", padx=8, pady=4,
-            bg="#1a1a2e", fg="#8899aa",
-            activebackground="#252540",
-            cursor="hand2", bd=1,
-        ).pack(side="right", padx=(6, 0))
+        self._reset_btn = self._mk_icon_btn(
+            toolbar, "🏭", self._reset_layout,
+            "Factory Default — reset all panels to the built-in default "
+            "positions (does not touch any saved layout)",
+        )
+        self._reset_btn.pack(side="right", padx=(6, 0))
+
+        self._revert_btn = self._mk_icon_btn(
+            toolbar, "↺", self._revert_to_saved,
+            "Revert to Saved — discard unsaved changes and reload the "
+            "active layout's last-saved state",
+        )
+        self._revert_btn.pack(side="right", padx=(6, 0))
 
         # ── Workspace canvas ──────────────────────────────────────────────────
         self._workspace = tk.Canvas(
@@ -967,7 +1630,7 @@ class DroneCockpitApp:
     # =========================================================================
 
     def shutdown(self) -> None:
-        self._save_layout()
+        self._persist_active()
         if self._update_job is not None:
             self.root.after_cancel(self._update_job)
         self._worker.stop()
