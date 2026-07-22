@@ -710,36 +710,60 @@ class LayoutStore:
 # ── Layout preview + manager dialog ─────────────────────────────────────────
 
 class _LayoutPreviewCanvas(tk.Canvas):
-    """Small read-only rendition of a saved profile's panel geometry."""
+    """Read-only rendition of a saved profile's panel geometry.
 
-    _PW, _PH = 260, 170  # preview canvas pixel size
+    Sizes and re-renders itself relative to whatever space it's actually
+    given, so growing the Layout Profiles window (or its preview pane)
+    enlarges the preview — and its labels — instead of leaving it pinned
+    at a small fixed pixel size that becomes unreadable.
+    """
+
+    _MIN_W, _MIN_H = 260, 170  # floor size so it's never unusably tiny
 
     def __init__(self, master, **kwargs):
-        super().__init__(master, width=self._PW, height=self._PH,
+        super().__init__(master, width=self._MIN_W, height=self._MIN_H,
                          bg="#0a0a14", highlightthickness=1,
                          highlightbackground="#2a3a5a", **kwargs)
+        self._last_profile: Optional[dict] = None
+        self.bind("<Configure>", self._on_resize)
+
+    def _on_resize(self, event=None) -> None:
+        # Re-render at the new size whenever the canvas is stretched.
+        self.render(self._last_profile)
 
     def render(self, profile: Optional[dict]) -> None:
+        self._last_profile = profile
         self.delete("all")
+
+        pw = max(self.winfo_width(), self._MIN_W)
+        ph = max(self.winfo_height(), self._MIN_H)
+
         if not profile:
-            self.create_text(self._PW // 2, self._PH // 2,
+            self.create_text(pw // 2, ph // 2,
                              text="No profile selected",
                              fill="#445566", font=("Consolas", 9))
             return
 
         panels = profile.get("panels", {})
         if not panels:
-            self.create_text(self._PW // 2, self._PH // 2,
+            self.create_text(pw // 2, ph // 2,
                              text="(empty layout)",
                              fill="#445566", font=("Consolas", 9))
             return
 
+        # Scale factor relative to the floor size — used to grow label
+        # font sizes proportionally as the canvas gets bigger, instead of
+        # keeping text fixed at a size that's only readable when small.
+        size_ratio = min(pw / self._MIN_W, ph / self._MIN_H)
+        label_font_px = max(6, min(13, round(6 * size_ratio)))
+        lock_font_px  = max(7, min(12, round(7 * size_ratio)))
+
         max_x = max(p["x"] + p["w"] for p in panels.values())
         max_y = max(p["y"] + p["h"] for p in panels.values())
-        margin = 10
+        margin = max(10, round(10 * size_ratio))
         scale = min(
-            (self._PW - 2 * margin) / max(max_x, 1),
-            (self._PH - 2 * margin) / max(max_y, 1),
+            (pw - 2 * margin) / max(max_x, 1),
+            (ph - 2 * margin) / max(max_y, 1),
         )
 
         for name, geo in panels.items():
@@ -756,12 +780,13 @@ class _LayoutPreviewCanvas(tk.Canvas):
                 self.create_text(
                     (x0 + x1) / 2, (y0 + y1) / 2,
                     text=label, fill=("#5588aa" if visible else "#3a3a4a"),
-                    font=("Consolas", 6), width=max(10, x1 - x0 - 4),
+                    font=("Consolas", label_font_px), width=max(10, x1 - x0 - 4),
                 )
 
         lock_txt = "🔒 locked" if profile.get("locked") else "🔓 unlocked"
-        self.create_text(margin, self._PH - 6, anchor="w",
-                         text=lock_txt, fill="#5a6a8a", font=("Consolas", 7))
+        self.create_text(margin, ph - margin // 2 - lock_font_px,
+                         anchor="w",
+                         text=lock_txt, fill="#5a6a8a", font=("Consolas", lock_font_px))
 
 
 class LayoutManagerDialog(tk.Toplevel):
@@ -832,29 +857,37 @@ class LayoutManagerDialog(tk.Toplevel):
                                   font=("Consolas", 10, "bold"))
         self._name_lbl.pack(anchor="w")
 
-        self._preview = _LayoutPreviewCanvas(right)
-        self._preview.pack(pady=(6, 10))
-
-        btn_row1 = tk.Frame(right, bg="#0f0f1a")
-        btn_row1.pack(fill="x", pady=(0, 4))
-        self._mkbtn(btn_row1, "▶  Load", self._load_selected, "#00d4ff").pack(side="left", padx=(0, 6))
-        self._mkbtn(btn_row1, "Overwrite w/ Current", self._overwrite_selected).pack(side="left", padx=(0, 6))
-
-        btn_row2 = tk.Frame(right, bg="#0f0f1a")
-        btn_row2.pack(fill="x", pady=(0, 4))
-        self._mkbtn(btn_row2, "Rename…", self._rename_selected).pack(side="left", padx=(0, 6))
-        self._mkbtn(btn_row2, "Delete", self._delete_selected, "#ff5566").pack(side="left", padx=(0, 6))
-
-        sep = tk.Frame(right, bg="#2a3a5a", height=1)
-        sep.pack(fill="x", pady=10)
-
-        self._mkbtn(right, "💾  Save Current Layout As New Profile…",
-                    self._save_current_as).pack(fill="x")
+        # Everything below is packed to the *bottom* first, in the order it
+        # should appear (bottom-most first), so each reserves its own fixed
+        # slice of space. The preview canvas is packed last with
+        # fill="both", expand=True — it then claims whatever vertical space
+        # is left between the name label and these, so growing the dialog
+        # actually grows the preview (and, via _LayoutPreviewCanvas, its
+        # text) instead of leaving it pinned at a small fixed size.
 
         tk.Button(right, text="Close", command=self.destroy,
                  font=("Consolas", 9), bg="#1a1a2e", fg="#8899aa",
                  relief="raised", bd=1, cursor="hand2",
-                 activebackground="#252540").pack(side="bottom", anchor="e", pady=(14, 0))
+                 activebackground="#252540").pack(side="bottom", anchor="e", pady=(10, 0))
+
+        self._mkbtn(right, "💾  Save Current Layout As New Profile…",
+                    self._save_current_as).pack(side="bottom", fill="x")
+
+        sep = tk.Frame(right, bg="#2a3a5a", height=1)
+        sep.pack(side="bottom", fill="x", pady=10)
+
+        btn_row2 = tk.Frame(right, bg="#0f0f1a")
+        btn_row2.pack(side="bottom", fill="x", pady=(0, 4))
+        self._mkbtn(btn_row2, "Rename…", self._rename_selected).pack(side="left", padx=(0, 6))
+        self._mkbtn(btn_row2, "Delete", self._delete_selected, "#ff5566").pack(side="left", padx=(0, 6))
+
+        btn_row1 = tk.Frame(right, bg="#0f0f1a")
+        btn_row1.pack(side="bottom", fill="x", pady=(6, 4))
+        self._mkbtn(btn_row1, "▶  Load", self._load_selected, "#00d4ff").pack(side="left", padx=(0, 6))
+        self._mkbtn(btn_row1, "Overwrite w/ Current", self._overwrite_selected).pack(side="left", padx=(0, 6))
+
+        self._preview = _LayoutPreviewCanvas(right)
+        self._preview.pack(side="top", fill="both", expand=True, pady=(6, 6))
 
     def _mkbtn(self, parent, text, command, fg="#a0b8d8"):
         return tk.Button(parent, text=text, command=command,
