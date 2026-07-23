@@ -30,6 +30,9 @@
     <ClInclude Include="GPSneoM10.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="VideoLink.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="DroneLink.cpp">
@@ -48,6 +51,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="GPSneoM10.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="VideoLink.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

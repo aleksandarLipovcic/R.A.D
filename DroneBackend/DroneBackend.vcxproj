@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -108,12 +108,13 @@
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\Include;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\pybind11\include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\opencv\build\include;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\Include;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\pybind11\include</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\libs</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>C:\opencv\build\x64\vc16\lib;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\libs</AdditionalLibraryDirectories>
+      <AdditionalDependencies>C:\opencv\build\x64\vc16\lib\opencv_world4120d.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -129,6 +130,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>C:\opencv\build\x64\vc16\lib\opencv_world4120.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -137,6 +139,7 @@
     <ClInclude Include="GPSneoM10.h" />
     <ClInclude Include="IMUSensor.h" />
     <ClInclude Include="MagQMC5883L.h" />
+    <ClInclude Include="VideoLink.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="DroneLink.cpp" />
@@ -145,6 +148,7 @@
     <ClCompile Include="Bindings.cpp" />
     <ClCompile Include="BaroBMP280.cpp" />
     <ClCompile Include="MagQMC5883L.cpp" />
+    <ClCompile Include="VideoLink.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

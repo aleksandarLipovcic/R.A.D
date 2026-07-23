@@ -1,14 +1,40 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <pybind11/numpy.h>
+#include <cstring>
 #include "DroneLink.h"
 #include "IMUSensor.h"
 #include "GPSNeoM10.h"
+#include "VideoLink.h"
 
 namespace py = pybind11;
 using namespace pybind11::literals;
 
+// =============================================================================
+// matToNumpy()
+//
+// Converts a cv::Mat (BGR8, HxWx3) into a numpy array owned by Python.
+// The memcpy here is unavoidable: cv::Mat's underlying buffer isn't
+// guaranteed to outlive the Python-side object once we cross the pybind11
+// boundary, so we hand numpy its own memory rather than aliasing the
+// cv::Mat's buffer. This is the one intentional copy in the whole path
+// (capture -> latestFrame is a header swap, latestFrame -> here is the
+// copy, here -> PhotoImage in Tk is unavoidable on the Python side too).
+// =============================================================================
+
+static py::array_t<uint8_t> matToNumpy(const cv::Mat& mat) {
+    if (mat.empty())
+        return py::array_t<uint8_t>();
+
+    cv::Mat contiguous = mat.isContinuous() ? mat : mat.clone();
+    py::array_t<uint8_t> result({ contiguous.rows, contiguous.cols, contiguous.channels() });
+    std::memcpy(result.mutable_data(), contiguous.data,
+        contiguous.total() * contiguous.elemSize());
+    return result;
+}
+
 PYBIND11_MODULE(DroneBackend, m) {
-    m.doc() = "Project R.A.D -- threaded drone telemetry backend (GCS edition)";
+    m.doc() = "Project R.A.D -- threaded drone telemetry + video backend (GCS edition)";
 
     // =========================================================================
     // GPSReading
@@ -236,16 +262,6 @@ PYBIND11_MODULE(DroneBackend, m) {
         //
         // KEY NAME CONTRACT — every key here must match what the Python widgets
         // actually read via data.get("key_name"). Mismatches cause silent zeros.
-        //
-        // FIXED vs original bindings:
-        //   "battery_v"         → "battery_voltage"   (FCStatusWidget, ArmingWidget)
-        //   "battery_current_a" → "battery_current"   (FCStatusWidget)
-        //   battery_state int   → "battery_state" str (FCStatusWidget reads string)
-        //   motor_values list   → motor_1_us…motor_4_us individual keys (both widgets)
-        //   rc_channels list    → rc_roll/pitch/throttle/yaw/arm individual keys
-        //                         (FCStatusWidget)
-        //   [MISSING]           → "rc_link_quality"   (ArmingWidget, FCStatusWidget)
-        //                         derived from rssi: rssi is 0-255, widgets expect 0-100
         // =====================================================================
         .def("to_dict", [](const DroneState& s) {
 
@@ -255,48 +271,28 @@ PYBIND11_MODULE(DroneBackend, m) {
             sv_list.append(py::cast(sv));
 
         // ── Motor values (fixed 8-element list, AND individual named keys)
-        // FCStatusWidget / ArmingWidget read motor_1_us … motor_4_us.
-        // to_dict() previously only exported a "motor_values" list —
-        // the individual keys were never emitted, so all motor widgets
-        // showed "—" and the arming check reported NO MOTOR DATA.
         py::list motor_vals;
         for (int i = 0; i < MAX_MOTORS; ++i)
             motor_vals.append(s.motorValues[i]);
 
         // ── RC channels (variable length list, AND individual named keys)
-        // FCStatusWidget reads rc_roll, rc_pitch, rc_throttle, rc_yaw, rc_arm.
-        // RadioMaster Pocket / CRSF layout (MODE 2):
-        //   [0]=Roll [1]=Pitch [2]=Throttle [3]=Yaw [4]=ARM switch
         py::list rc_ch;
         for (int i = 0; i < s.rcChannelCount; ++i)
             rc_ch.append(s.rcChannels[i]);
 
-        // Helper: safely read an RC channel by index (0 if not present)
         auto rc = [&](int idx) -> uint16_t {
             return (idx < s.rcChannelCount) ? s.rcChannels[idx] : 0;
             };
 
-        // ── RC link quality
-        // DroneState has no dedicated link-quality field — the backend
-        // receives RSSI from MSP_ANALOG (0-255 raw). Widgets expect 0-100.
-        // Scale: quality = rssi * 100 / 255, clamped to 0-100.
-        // When rssi == 0 (no link / not yet received) emit -1 so widgets
-        // display "NO SIGNAL" rather than "0%".
         int rc_link_quality;
         if (s.rssi == 0) {
-            rc_link_quality = -1;   // no signal — widget shows "NO SIGNAL"
+            rc_link_quality = -1;
         }
         else {
             rc_link_quality = static_cast<int>(
                 static_cast<unsigned>(s.rssi) * 100u / 255u);
         }
 
-        // ── Battery state string
-        // FCStatusWidget reads battery_state as a string
-        // ("OK"|"WARNING"|"CRITICAL"|"UNKNOWN").
-        // The original to_dict() emitted battery_state as a raw integer
-        // and battery_state_str as the string — but the widget only reads
-        // the plain "battery_state" key and calls .upper() on it.
         const char* batt_state_str = "INIT";
         switch (s.batteryState) {
         case BatteryState::OK:          batt_state_str = "OK";          break;
@@ -317,9 +313,7 @@ PYBIND11_MODULE(DroneBackend, m) {
             "yaw_deg"_a = static_cast<float>(s.yaw),
 
             // ── Power — MSP_ANALOG (110) ──────────────────────────────────
-            // FIX: was "battery_v" — widgets read "battery_voltage"
             "battery_voltage"_a = s.batteryVoltage,
-            // FIX: was "battery_current_a" — widgets read "battery_current"
             "battery_current"_a = s.batteryCurrent,
             "battery_mah_drawn"_a = s.batteryMahDrawn,
             "rssi"_a = s.rssi,
@@ -328,9 +322,7 @@ PYBIND11_MODULE(DroneBackend, m) {
             "battery_cell_count"_a = s.batteryCellCount,
             "battery_capacity_mah"_a = s.batteryCapacityMah,
             "battery_percentage"_a = s.batteryPercentage,
-            // FIX: was int — FCStatusWidget reads string and calls .upper()
             "battery_state"_a = batt_state_str,
-            // Keep integer version under a distinct key for callers that want it
             "battery_state_int"_a = static_cast<uint8_t>(s.batteryState),
 
             // ── Barometer ─────────────────────────────────────────────────
@@ -358,7 +350,6 @@ PYBIND11_MODULE(DroneBackend, m) {
             "flight_mode_flags"_a = s.flightModeFlags,
             "flight_mode_name"_a = s.flightModeName,
             "sensor_status"_a = s.sensorStatus,
-            // Individual sensor-present helpers (avoids bitmask math in Python)
             "sensor_acc_present"_a = (s.sensorStatus & (1u << 0)) != 0,
             "sensor_baro_present"_a = (s.sensorStatus & (1u << 1)) != 0,
             "sensor_mag_present"_a = (s.sensorStatus & (1u << 2)) != 0,
@@ -374,42 +365,30 @@ PYBIND11_MODULE(DroneBackend, m) {
             "arming_disable_str"_a = s.armingDisableStr,
 
             // ── Motor outputs — MSP_MOTOR (104) ───────────────────────────
-            // FIX: previously only "motor_values" list was emitted.
-            // FCStatusWidget and ArmingWidget read individual keys motor_1_us … motor_4_us.
-            "motor_values"_a = motor_vals,      // list kept for other consumers
+            "motor_values"_a = motor_vals,
             "motor_count"_a = s.motorCount,
             "motor_1_us"_a = static_cast<int>(s.motorValues[0]),
             "motor_2_us"_a = static_cast<int>(s.motorValues[1]),
             "motor_3_us"_a = static_cast<int>(s.motorValues[2]),
             "motor_4_us"_a = static_cast<int>(s.motorValues[3]),
-            // Extra motors for hexacopter/octocopter support
             "motor_5_us"_a = static_cast<int>(s.motorValues[4]),
             "motor_6_us"_a = static_cast<int>(s.motorValues[5]),
             "motor_7_us"_a = static_cast<int>(s.motorValues[6]),
             "motor_8_us"_a = static_cast<int>(s.motorValues[7]),
 
             // ── RC channels — MSP_RC (105) ────────────────────────────────
-            // FIX: previously only "rc_channels" list was emitted.
-            // FCStatusWidget reads individual named keys per CRSF layout:
-            //   [0]=Roll [1]=Pitch [2]=Throttle [3]=Yaw [4]=ARM
-            "rc_channels"_a = rc_ch,         // list kept for other consumers
+            "rc_channels"_a = rc_ch,
             "rc_channel_count"_a = s.rcChannelCount,
             "rc_roll"_a = static_cast<int>(rc(0)),
             "rc_pitch"_a = static_cast<int>(rc(1)),
             "rc_throttle"_a = static_cast<int>(rc(2)),
             "rc_yaw"_a = static_cast<int>(rc(3)),
             "rc_arm"_a = static_cast<int>(rc(4)),
-            // AUX channels preserved for flight mode switches etc.
             "rc_aux1"_a = static_cast<int>(rc(5)),
             "rc_aux2"_a = static_cast<int>(rc(6)),
             "rc_aux3"_a = static_cast<int>(rc(7)),
 
             // ── RC link quality ───────────────────────────────────────────
-            // FIX: was entirely missing from to_dict().
-            // ArmingWidget._check_rc_link() and FCStatusWidget both read
-            // "rc_link_quality" as an integer 0-100 (-1 = no signal).
-            // Derived from RSSI (MSP_ANALOG rssi field, 0-255 raw):
-            //   quality = rssi * 100 / 255  (-1 when rssi == 0)
             "rc_link_quality"_a = rc_link_quality,
 
             // ── GPS — MSP_RAW_GPS (106) ───────────────────────────────────
@@ -426,10 +405,8 @@ PYBIND11_MODULE(DroneBackend, m) {
             "gps_hdop"_a = s.gps.hdop * 0.01,
             "gps_raw_valid"_a = s.gps.rawValid,
             "gps_position_usable"_a = s.gps.positionUsable,
-            // Raw units for GPSWidget internals
             "gps_ground_speed_cms"_a = static_cast<int>(s.gps.groundSpeedMs),
             "gps_ground_course"_a = static_cast<int>(s.gps.groundCourse),
-            // ArmingWidget reads gps_fix and gps_num_sats (short forms)
             "gps_fix"_a = s.gps.positionUsable,
             "gps_num_sats"_a = s.gps.numSat,
 
@@ -488,21 +465,10 @@ PYBIND11_MODULE(DroneBackend, m) {
             "Send UBX CFG-GNSS/RATE/PRT/NAV5/CFG frames to the NEO-M10 via\n"
             "MSP GPS passthrough.  Returns GPSConfigResult with per-step ACK\n"
             "status.")
-        // ── DEF-005 rev 2: fault injection for SAT-IMU-005 Scenario B ────────
-        // When active, sendMSP() returns {} immediately on every call,
-        // simulating a dead link without relying on serial-timing side-effects.
-        // This deterministically increments consecutiveFails until
-        // FAIL_THRESHOLD is reached and linkHealthy flips False (~50 ms at
-        // default POLL_INTERVAL_MS = 10 ms).
-        // Scenarios A and C continue to use set_poll_interval_ms(0); only
-        // Scenario B uses this method.
-        // NEVER ship in flight builds — test use only.
         .def("set_fail_injection", &DroneLink::setFailInjection,
             py::arg("active"),
             "Inject simulated link failure: sendMSP() returns {} immediately\n"
             "on every call when active=True, regardless of FC responsiveness.\n"
-            "Used by SAT-IMU-005 Scenario B (DEF-005 rev 2).\n"
-            "Call with active=False to restore normal operation.\n"
             "TEST USE ONLY — never enable in flight builds.");
 
     // =========================================================================
@@ -524,6 +490,46 @@ PYBIND11_MODULE(DroneBackend, m) {
             "gx_dps"_a = d.gyroX, "gy_dps"_a = d.gyroY, "gz_dps"_a = d.gyroZ
         );
             }, "Scaled data: accel in g, gyro in deg/s.");
+
+    // =========================================================================
+    // CaptureDeviceInfo
+    // =========================================================================
+    py::class_<CaptureDeviceInfo>(m, "CaptureDeviceInfo")
+        .def_readonly("index", &CaptureDeviceInfo::index)
+        .def_readonly("name", &CaptureDeviceInfo::name);
+
+    // =========================================================================
+    // VideoLink
+    //
+    // Independent of DroneLink -- the FPV analog capture dongle is a
+    // separate USB device from the flight controller's serial link, so it
+    // gets its own class, its own thread, and its own connect/disconnect
+    // lifecycle. Frames cross the pybind11 boundary as (H,W,3) uint8 BGR
+    // numpy arrays via get_latest_frame().
+    // =========================================================================
+    py::class_<VideoLink>(m, "VideoLink")
+        .def(py::init<>())
+        .def_static("enumerate_devices", &VideoLink::enumerateDevices,
+            "List available video capture devices (index + friendly name).")
+        .def("connect_auto", &VideoLink::connectAuto,
+            "Auto-detect the FPV capture dongle, skipping devices that look "
+            "like the laptop's built-in webcam. Blocking -- call from a "
+            "background thread on the Python side.")
+        .def("connect", &VideoLink::connect, py::arg("device_index"),
+            "Open a specific capture device by index (see enumerate_devices).")
+        .def("disconnect", &VideoLink::disconnect,
+            "Stop the capture thread and release the device.")
+        .def("is_connected", &VideoLink::isConnected)
+        .def("get_latest_frame", [](VideoLink& v) { return matToNumpy(v.getLatestFrame()); },
+            "Latest frame as an (H, W, 3) uint8 BGR numpy array. Empty "
+            "array if nothing has been captured yet.")
+        .def("get_frame_count", &VideoLink::getFrameCount)
+        .def("get_measured_fps", &VideoLink::getMeasuredFps,
+            "Capture-thread FPS, measured over a rolling ~1s window.")
+        .def("get_device_name", &VideoLink::getDeviceName)
+        .def("set_preferred_resolution", &VideoLink::setPreferredResolution,
+            py::arg("width"), py::arg("height"),
+            "Must be called before connect()/connect_auto() to take effect.");
 
     // =========================================================================
     // Free functions

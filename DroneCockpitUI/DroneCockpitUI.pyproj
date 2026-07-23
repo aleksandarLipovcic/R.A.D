@@ -51,6 +51,8 @@
     <Compile Include="MagWidget.py">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="FPVWidget.py" />
+    <Compile Include="video_worker.py" />
     <Compile Include="sat_imu\conftest.py">
       <SubType>Code</SubType>
     </Compile>

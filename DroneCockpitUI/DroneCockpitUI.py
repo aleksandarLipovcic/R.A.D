@@ -16,12 +16,16 @@ Architecture
     • feeds the resulting dict to each widget
     • handles all Tk/UI events
 
-  This keeps the main thread free for redraws, drag, resize, and
-  z-order changes — eliminating the lag seen when lifting/lowering
-  panels while a heavy widget was blocking the update loop.
+  FPV video capture runs entirely independently: VideoLink owns a C++
+  capture thread (USB/analog dongle -> cv::Mat, MJPG, buffer size 1 for
+  minimum latency) that is fully decoupled from the 100 Hz MSP telemetry
+  loop. VideoWorker just polls VideoLink for the freshest decoded frame
+  at UI-relevant rate; the Tk thread only ever touches the latest frame,
+  never a queue, so there is no backlog to catch up on if a frame is late.
 
   Widget refresh rates are throttled independently:
     • IMU / Baro / FC Status / Arming / Mag  →  every frame  (~50 Hz)
+    • FPV video                              →  every frame  (~50 Hz, capped further by capture fps)
     • 3-D attitude view                      →  every 3rd frame (~17 Hz)
     • GPS (heaviest — map redraws)            →  every 5th frame (~10 Hz)
 
@@ -36,11 +40,25 @@ FIXES vs previous version
      on-screen changes can be reverted to the last-saved version of the
      active profile without discarding it (see LayoutStore /
      LayoutManagerDialog below).
+  6. FPV live video panel: VideoLink/VideoWorker/FPVWidget wired in as a
+     fully independent capture pipeline (own thread, own connect/retry
+     loop) so a dropped or slow-to-appear capture device never blocks or
+     is blocked by flight telemetry.
+  7. DroneBackend.pyd DLL resolution fixed: previously only the backend's
+     own output folder was registered with os.add_dll_directory(), so the
+     loader could find DroneBackend.pyd itself but not its transitive
+     dependency opencv_world4120d.dll (Python 3.8+ no longer falls back to
+     searching PATH for extension-module dependencies). The OpenCV bin
+     folder is now registered too, which is what was causing
+     "ImportError: DLL load failed while importing DroneBackend: The
+     specified module could not be found." See _register_dll_directories()
+     below.
 """
 
 import sys
 import os
 import json
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -48,6 +66,7 @@ import tkinter as tk
 from tkinter import simpledialog, messagebox
 
 from telemetry_worker import TelemetryWorker
+from video_worker      import VideoWorker
 
 from IMUWidget      import IMUWidget
 from Drone3DView    import Drone3DView
@@ -56,17 +75,46 @@ from MagWidget      import MagWidget
 from GPSWidget      import GPSWidget
 from FCStatusWidget import FCStatusWidget
 from ArmingWidget   import ArmingWidget
+from FPVWidget      import FPVWidget
 
 # ── Path configuration ────────────────────────────────────────────────────────
 script_dir   = os.path.dirname(os.path.abspath(__file__))
 backend_path = os.path.abspath(os.path.join(script_dir, '..', 'x64', 'Debug'))
 sys.path.append(backend_path)
 
-if hasattr(os, 'add_dll_directory'):
-    try:
-        os.add_dll_directory(backend_path)
-    except Exception as e:
-        print(f"[DroneBackend] DLL directory notice: {e}")
+# DroneBackend.pyd is a native pybind11 extension module. On Python 3.8+,
+# the DLL loader used to import extension modules does NOT search PATH for
+# the module's own transitive dependencies -- it only searches directories
+# explicitly registered via os.add_dll_directory() (plus the folder the
+# .pyd itself lives in). DroneBackend.pyd depends on opencv_world4120d.dll,
+# so OpenCV's bin folder has to be registered here too, or import fails
+# with a generic "DLL load failed" error that doesn't name the missing
+# dependency.
+#
+# EDIT THIS to match your local OpenCV install location if it differs.
+OPENCV_BIN_DIR = r"C:\opencv\build\x64\vc16\bin"
+
+
+def _register_dll_directories() -> None:
+    """Register every folder DroneBackend.pyd needs its dependencies
+    resolved from. Safe to call on any platform/Python version -- no-ops
+    if os.add_dll_directory doesn't exist (non-Windows / old Python) or if
+    a given folder doesn't exist on this machine."""
+    if not hasattr(os, "add_dll_directory"):
+        return
+
+    for candidate in (backend_path, OPENCV_BIN_DIR):
+        if not os.path.isdir(candidate):
+            print(f"[DroneBackend] DLL directory notice: "
+                  f"'{candidate}' does not exist, skipping")
+            continue
+        try:
+            os.add_dll_directory(candidate)
+        except Exception as e:
+            print(f"[DroneBackend] DLL directory notice: {e}")
+
+
+_register_dll_directories()
 
 import DroneBackend
 
@@ -78,6 +126,11 @@ import DroneBackend
 #
 UI_REFRESH_MS  = 20          # ~50 Hz Tk pump — keeps UI snappy
 RECONNECT_MS   = 2000
+
+# FPV capture: how often VideoWorker pulls the latest decoded frame from
+# VideoLink. This is independent of the Tk pump and of MSP telemetry.
+VIDEO_POLL_HZ  = 60
+VIDEO_PROBE_RETRY_MS = 3000   # how often to retry connect_auto() if no device found yet
 
 BG_WORKSPACE   = "#1a1a2e"
 PANEL_BG       = "#0f0f1a"
@@ -110,6 +163,7 @@ _THROTTLE = {
     "fc_status": 1,
     "arming":    1,
     "mag":       1,
+    "fpv":       1,   # video panel — full rate, capped further by actual capture fps
     "adi":       3,   # 3-D canvas — heavy redraw, 17 Hz is plenty
     "gps":       5,   # map widget — heaviest, 10 Hz is plenty
 }
@@ -120,9 +174,10 @@ _DEFAULT_PANELS = {
     "mag":       {"x":  10, "y": 280, "w": 460, "h": 210, "visible": True},
     "adi":       {"x": 480, "y":  10, "w": 450, "h": 430, "visible": True},
     "baro":      {"x": 940, "y":  10, "w": 220, "h": 430, "visible": True},
-    "gps":       {"x":  10, "y": 500, "w": 700, "h": 300, "visible": True},
+    "gps":       {"x":  10, "y": 780, "w": 700, "h": 300, "visible": True},
     "fc_status": {"x":  10, "y":  10, "w": 440, "h": 140, "visible": True},
     "arming":    {"x":  10, "y": 160, "w": 440, "h": 300, "visible": True},
+    "fpv":       {"x": 480, "y": 450, "w": 480, "h": 320, "visible": True},
 }
 
 _PANEL_LABELS = {
@@ -133,6 +188,7 @@ _PANEL_LABELS = {
     "gps":       "GPS Navigation",
     "fc_status": "FC Status — Armed / Mode / Sensors",
     "arming":    "Arming Diagnostics",
+    "fpv":       "FPV Feed — Live Capture",
 }
 
 
@@ -1065,7 +1121,44 @@ class DroneCockpitApp:
         self._worker = TelemetryWorker(self.hub)
         self._worker.set_yaw_trim(self._yaw_trim)
 
+        # ── Background video (FPV) worker ────────────────────────────────────
+        # Deliberately independent of the telemetry link/worker: the FPV
+        # capture dongle is a different USB device with its own lifecycle,
+        # so it gets its own connect/retry loop rather than being gated on
+        # (or gating) the flight-controller serial connection.
+        self.video_link = DroneBackend.VideoLink()
+        self._video_worker = VideoWorker(self.video_link, poll_hz=VIDEO_POLL_HZ)
+        self._video_worker.start()
+        self._video_connect_job = None
+        self._start_video_autoconnect()
+
         self._auto_connect()   # connects hub, then starts worker + pump
+
+    # =========================================================================
+    # FPV video connection
+    # =========================================================================
+
+    def _start_video_autoconnect(self) -> None:
+        """
+        VideoLink.connect_auto() is blocking (it opens and probes candidate
+        devices), so it always runs on a background Python thread — never
+        on the Tk thread. If no device is found yet, this reschedules
+        itself so a dongle plugged in mid-session still gets picked up.
+        """
+        def _probe():
+            ok = False
+            try:
+                ok = self.video_link.connect_auto()
+            except Exception as e:
+                print(f"[VideoLink] connect_auto() error: {e}")
+            if not ok:
+                # Retry later from the Tk thread (after() is not thread-safe
+                # to call directly from here in all Tk builds, so hop back
+                # via root.after with a zero delay is avoided — instead we
+                # just schedule the same probe again from this same thread).
+                self.root.after(VIDEO_PROBE_RETRY_MS, self._start_video_autoconnect)
+
+        threading.Thread(target=_probe, daemon=True).start()
 
     # =========================================================================
     # Layout persistence
@@ -1518,6 +1611,11 @@ class DroneCockpitApp:
         self.arming_view = ArmingWidget(p.content)
         self.arming_view.pack(fill="both", expand=True)
 
+        # ── FPV Video ─────────────────────────────────────────────────────────
+        p = _panel("fpv", "FPV  —  Live Video Feed")
+        self.fpv_view = FPVWidget(p.content)
+        self.fpv_view.pack(fill="both", expand=True)
+
     # ── Grid + resize handler ─────────────────────────────────────────────────
 
     def _on_workspace_resize(self, event=None) -> None:
@@ -1581,6 +1679,16 @@ class DroneCockpitApp:
     def _update_loop(self) -> None:
         self._update_job = None
 
+        # ── FPV video — independent of telemetry connection state ────────────
+        # This runs every pump tick regardless of whether the flight
+        # controller link is up, connecting, or degraded: video shouldn't
+        # freeze just because MSP telemetry hiccuped.
+        if self._frame_counters["fpv"] >= _THROTTLE["fpv"]:
+            self._frame_counters["fpv"] = 0
+            frame, fps = self._video_worker.get_frame()
+            self.fpv_view.update_fpv(frame, fps, self._video_worker.get_device_name())
+        self._frame_counters["fpv"] += 1
+
         # ── Connection health check ───────────────────────────────────────────
         # The worker monitors the backend independently; we just check its flag.
         if not self._worker.is_connected:
@@ -1617,6 +1725,8 @@ class DroneCockpitApp:
         # (GPS map, 3-D view) at a fraction — without stalling the Tk thread.
         #
         for key in self._frame_counters:
+            if key == "fpv":
+                continue   # already handled above, independent of telemetry
             self._frame_counters[key] += 1
 
         # ── Fast widgets — update every frame ────────────────────────────────
@@ -1668,6 +1778,8 @@ class DroneCockpitApp:
             self.root.after_cancel(self._update_job)
         self._worker.stop()
         self.hub.disconnect()
+        self._video_worker.stop()
+        self.video_link.disconnect()
         self.root.destroy()
 
 
