@@ -64,6 +64,17 @@ FIXES vs previous version
      "ImportError: DLL load failed while importing DroneBackend: The
      specified module could not be found." See _register_dll_directories()
      below.
+  8. Native FPV render-window Z-order / visibility now tracked explicitly.
+     The FPV video is a native Win32 child HWND that VideoLink paints into
+     directly from C++ (see FPVWidget.attach()) -- Tk's lift()/lower() only
+     reorders Tk's own widget tree, so it never touched that HWND, which
+     is why the live video used to appear to "punch through" on top of
+     unrelated Tk panels regardless of click-to-front order. Every place
+     that changes a Tk panel's raised/lowered/visible state now also fires
+     a matching VideoLink.raise_window()/lower_window()/show_window()/
+     hide_window() call (see DroneCockpitApp._on_panel_zorder /
+     _on_panel_visibility) so the native window's OS-level stacking always
+     matches what's on screen.
 """
 
 import sys
@@ -310,6 +321,8 @@ class DraggablePanel(tk.Frame):
                  x: int, y: int, w: int, h: int,
                  locked_ref: list,
                  all_panels_ref: dict,
+                 on_zorder=None,
+                 on_visibility=None,
                  **kwargs):
         super().__init__(workspace, bg=PANEL_BG,
                          highlightthickness=1,
@@ -324,6 +337,20 @@ class DraggablePanel(tk.Frame):
         self._drag_y        = 0
         self._guide_lines   = []
         self._z_raised      = False
+
+        # Optional callbacks so the owning app can keep anything that
+        # lives *outside* Tk's widget tree (e.g. a native child HWND
+        # painted into by a different thread/process boundary, such as
+        # the FPV render window) in sync with this panel's raised/lowered
+        # and shown/hidden state. Tk's lift()/lower()/itemconfigure only
+        # reorder/toggle Tk's own widgets -- they have no effect on a
+        # foreign HWND, so without an explicit hook like this, a native
+        # child window keeps whatever OS-level Z-order/visibility it had
+        # regardless of what the user does with the Tk panels around it.
+        #   on_zorder(name: str, raised: bool)
+        #   on_visibility(name: str, visible: bool)
+        self._on_zorder     = on_zorder
+        self._on_visibility = on_visibility
 
         self._item = workspace.create_window(x, y, anchor="nw",
                                              window=self, width=w, height=h)
@@ -395,6 +422,8 @@ class DraggablePanel(tk.Frame):
     def raise_panel(self):
         self.lift()
         self._ws.tag_raise(self._item)
+        if self._on_zorder is not None:
+            self._on_zorder(self._name, True)
 
     def lower_panel(self):
         self.lower()
@@ -402,6 +431,8 @@ class DraggablePanel(tk.Frame):
             self._ws.tag_raise("grid")
         except Exception:
             pass
+        if self._on_zorder is not None:
+            self._on_zorder(self._name, False)
 
     def _z_btn_click(self, event):
         self._z_raised = not self._z_raised
@@ -666,9 +697,13 @@ class DraggablePanel(tk.Frame):
     def show(self):
         self._ws.itemconfigure(self._item, state="normal")
         self.raise_panel()
+        if self._on_visibility is not None:
+            self._on_visibility(self._name, True)
 
     def hide(self):
         self._ws.itemconfigure(self._item, state="hidden")
+        if self._on_visibility is not None:
+            self._on_visibility(self._name, False)
 
 
 # ── LayoutStore ─────────────────────────────────────────────────────────────
@@ -1156,7 +1191,66 @@ class DroneCockpitApp:
         # connect()/connect_auto() succeeds and frames start arriving.
         self.fpv_view.attach(self.video_link)
 
+        # The native FPV render window sits entirely outside Tk's widget
+        # tree, so nothing about it is touched by raise_panel()/lower_panel()
+        # or show()/hide() on the "fpv" DraggablePanel by default. Push it
+        # to the bottom of the OS Z-order right away -- it'll only get
+        # raised again if/when the FPV panel itself is brought to front
+        # (see _on_panel_zorder, wired into every DraggablePanel via the
+        # on_zorder/on_visibility callbacks passed in _panel() below).
+        try:
+            self.video_link.lower_window()
+        except Exception:
+            pass
+
         self._auto_connect()   # connects hub, then starts worker + pump
+
+    # =========================================================================
+    # Native FPV window sync — keeps VideoLink's off-Tk render HWND's
+    # OS-level Z-order/visibility matching whatever the Tk panels are doing.
+    # =========================================================================
+
+    def _on_panel_zorder(self, name: str, raised: bool) -> None:
+        """
+        Fired by any DraggablePanel's raise_panel()/lower_panel(). Tk's
+        lift()/lower() only reorders Tk's own widgets, so without this the
+        native FPV HWND stays pinned wherever Windows put it when it was
+        created (typically the top of the parent's Z-order) regardless of
+        which Tk panel the user actually brought to front -- which is what
+        made the live video appear to bleed over unrelated panels.
+
+        Rule: the native window should be at the bottom of the stack
+        except while the FPV panel itself is the one on top.
+        """
+        video_link = getattr(self, "video_link", None)
+        if video_link is None:
+            return
+        try:
+            if name == "fpv":
+                video_link.raise_window() if raised else video_link.lower_window()
+            elif raised:
+                # Some other panel just came to front -- make sure the
+                # native window isn't sitting above it.
+                video_link.lower_window()
+        except Exception as e:
+            print(f"[VideoLink] window z-order sync failed: {e}")
+
+    def _on_panel_visibility(self, name: str, visible: bool) -> None:
+        """
+        Fired by DraggablePanel.show()/hide(). DraggablePanel.hide() only
+        hides the *canvas item* (a Tk-level concept) -- it has no effect on
+        a foreign HWND embedded inside it, so without this the native FPV
+        window kept rendering even while its panel was toggled off.
+        """
+        if name != "fpv":
+            return
+        video_link = getattr(self, "video_link", None)
+        if video_link is None:
+            return
+        try:
+            video_link.show_window() if visible else video_link.hide_window()
+        except Exception as e:
+            print(f"[VideoLink] window visibility sync failed: {e}")
 
     # =========================================================================
     # FPV video connection
@@ -1591,6 +1685,8 @@ class DroneCockpitApp:
                 x=geo["x"], y=geo["y"], w=geo["w"], h=geo["h"],
                 locked_ref=self._locked_ref,
                 all_panels_ref=self._panels,
+                on_zorder=self._on_panel_zorder,
+                on_visibility=self._on_panel_visibility,
             )
             self._panels[name] = p
             return p

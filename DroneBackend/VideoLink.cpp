@@ -173,11 +173,17 @@ void VideoLink::createRenderWindow(HWND parent, int x, int y, int w, int h) {
         classRegistered = true;
     }
 
+    // WS_CLIPSIBLINGS is required so this window clips correctly against
+    // its Tk-owned sibling HWNDs once Z-order between them is meaningful
+    // (see raiseWindow()/lowerWindow() below). Without it, overlapping
+    // regions between this window and a sibling can paint incorrectly
+    // even after Z-order itself is fixed.
     HWND hwnd = CreateWindowExW(
-        0, clsName, L"", WS_CHILD | WS_VISIBLE,
+        0, clsName, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
         x, y, w, h, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
 
     renderHwnd_.store(hwnd);
+    windowVisible_.store(true);
 }
 
 void VideoLink::attachToWindow(intptr_t parentHwnd, int x, int y, int w, int h) {
@@ -197,7 +203,56 @@ void VideoLink::detachWindow() {
         DestroyWindow(hwnd);
 }
 
+// =============================================================================
+// Native window Z-order / visibility control
+// =============================================================================
+//
+// This render window is a plain Win32 child HWND with no relationship to
+// Tk's widget tree, so Tk's lift()/lower() never touch it and it stays
+// wherever Windows last put it in the parent's Z-order (by default, the
+// top -- newly created child windows are inserted there). These four
+// calls are the explicit bridge the Python side uses to keep this
+// window's actual OS-level stacking/visibility matching the Tk panel
+// that hosts it.
+
+void VideoLink::raiseWindow() {
+    HWND hwnd = renderHwnd_.load();
+    if (hwnd) {
+        SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+}
+
+void VideoLink::lowerWindow() {
+    HWND hwnd = renderHwnd_.load();
+    if (hwnd) {
+        SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+}
+
+void VideoLink::showWindow() {
+    HWND hwnd = renderHwnd_.load();
+    windowVisible_.store(true);
+    if (hwnd)
+        ShowWindow(hwnd, SW_SHOW);
+}
+
+void VideoLink::hideWindow() {
+    HWND hwnd = renderHwnd_.load();
+    windowVisible_.store(false);
+    if (hwnd)
+        ShowWindow(hwnd, SW_HIDE);
+}
+
 void VideoLink::paintFrame(const cv::Mat& frame) {
+    // Skip the blit entirely while the panel is hidden -- there's no
+    // point spending a GetDC/StretchDIBits/ReleaseDC round trip on a
+    // window Windows isn't compositing anyway, and this also guarantees
+    // the window can never appear to "come back" mid-frame while hidden.
+    if (!windowVisible_.load())
+        return;
+
     HWND hwnd = renderHwnd_.load();
     if (!hwnd || frame.empty())
         return;

@@ -59,6 +59,30 @@ public:
     void detachWindow();
     bool isWindowAttached() const { return renderHwnd_.load() != nullptr; }
 
+    // ── Native window Z-order / visibility control ──────────────────────
+    //
+    // The render window created by attachToWindow() is a genuine Win32
+    // child HWND that lives entirely outside Tk's widget tree. Tk's own
+    // lift()/lower()/tag_raise() calls (and itemconfigure(state=...))
+    // only ever reorder/toggle Tk's own widgets against each other --
+    // they have no way to touch a foreign HWND, and Windows leaves a
+    // newly created child window pinned at the top of its parent's
+    // Z-order until something explicitly repositions it. Without an
+    // explicit hook, that means the render window can end up permanently
+    // stacked above every other panel regardless of which Tk panel the
+    // user clicks to bring to front -- the live video appears to "punch
+    // through" panels that never even touch pixel data.
+    //
+    // These four calls let the Python side keep this window's OS-level
+    // stacking/visibility in sync with whatever it's doing to the
+    // corresponding Tk panel (see DroneCockpitApp._on_panel_zorder /
+    // _on_panel_visibility on the Python side).
+    void raiseWindow();
+    void lowerWindow();
+    void showWindow();
+    void hideWindow();
+    bool isWindowVisible() const { return windowVisible_.load(); }
+
 private:
     cv::VideoCapture cap;
     std::thread captureThread;
@@ -75,6 +99,11 @@ private:
     // and read from the capture thread (paintFrame) every frame, so it's
     // an atomic rather than plain HWND.
     std::atomic<HWND> renderHwnd_{ nullptr };
+
+    // windowVisible_ mirrors the last showWindow()/hideWindow() call so
+    // paintFrame() can skip the GDI blit entirely while the panel is
+    // hidden, instead of continuing to draw into an invisible window.
+    std::atomic<bool> windowVisible_{ true };
 
     void captureLoop();
     static bool looksLikeIntegratedWebcam(const std::string& name);
