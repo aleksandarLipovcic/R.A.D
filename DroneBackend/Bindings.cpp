@@ -21,7 +21,7 @@ using namespace pybind11::literals;
 // (capture -> latestFrame is a header swap, latestFrame -> here is the
 // copy, here -> PhotoImage in Tk is unavoidable on the Python side too).
 //
-// NOTE: this path is now only used by get_latest_frame() -- e.g. for
+// NOTE: this path is only used by get_latest_frame() -- e.g. for
 // post-flight recording/YOLO post-processing. The live FPV display no
 // longer goes through here at all; it's painted directly by VideoLink
 // onto a native child window via attach_to_window()/paintFrame(), so it
@@ -524,6 +524,19 @@ PYBIND11_MODULE(DroneBackend, m) {
     //      thread itself and never cross into Python at all, eliminating
     //      the numpy/PIL/Tk PhotoImage overhead that was the source of
     //      the extra latency versus OBS.
+    //
+    // raise_window() / lower_window() / show_window() / hide_window() --
+    // ADDED. These were previously missing from the bindings even though
+    // main.py's DroneCockpitApp._on_panel_zorder/_on_panel_visibility
+    // already called them -- every call was throwing AttributeError
+    // ("'DroneBackend.VideoLink' object has no attribute 'raise_window'"),
+    // which was silently swallowed by a try/except and printed to the
+    // console. Because of that, the native render window's OS-level
+    // Z-order/visibility was never actually being kept in sync with the
+    // Tk panels around it, which is also why the live video appeared to
+    // bleed over/"spill" onto unrelated panels whenever a panel was
+    // dragged, resized, or brought to front -- both symptoms share this
+    // one root cause.
     // =========================================================================
     py::class_<VideoLink>(m, "VideoLink")
         .def(py::init<>())
@@ -563,7 +576,25 @@ PYBIND11_MODULE(DroneBackend, m) {
         .def("detach_window", &VideoLink::detachWindow,
             "Destroy the attached render window. Safe to call even if none "
             "is currently attached.")
-        .def("is_window_attached", &VideoLink::isWindowAttached);
+        .def("is_window_attached", &VideoLink::isWindowAttached)
+        .def("raise_window", &VideoLink::raiseWindow,
+            "Bring the attached native render window to the top of the "
+            "OS Z-order among its siblings (SetWindowPos w/ HWND_TOP). "
+            "Called whenever the FPV Tk panel is brought to front.")
+        .def("lower_window", &VideoLink::lowerWindow,
+            "Send the attached native render window to the bottom of the "
+            "OS Z-order among its siblings (SetWindowPos w/ HWND_BOTTOM). "
+            "Called whenever a different Tk panel is brought to front, so "
+            "the video never sits above panels the user just raised.")
+        .def("show_window", &VideoLink::showWindow,
+            "Show the attached native render window (ShowWindow SW_SHOW). "
+            "Called when the FPV Tk panel is toggled visible.")
+        .def("hide_window", &VideoLink::hideWindow,
+            "Hide the attached native render window (ShowWindow SW_HIDE). "
+            "Called when the FPV Tk panel is toggled hidden -- without "
+            "this, the native window kept rendering even while its Tk "
+            "panel was hidden, since hiding a Tk canvas item has no "
+            "effect on a foreign HWND.");
 
     // =========================================================================
     // Free functions
