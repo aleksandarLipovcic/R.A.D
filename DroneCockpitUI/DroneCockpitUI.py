@@ -16,16 +16,22 @@ Architecture
     • feeds the resulting dict to each widget
     • handles all Tk/UI events
 
-  FPV video capture runs entirely independently: VideoLink owns a C++
-  capture thread (USB/analog dongle -> cv::Mat, MJPG, buffer size 1 for
-  minimum latency) that is fully decoupled from the 100 Hz MSP telemetry
-  loop. VideoWorker just polls VideoLink for the freshest decoded frame
-  at UI-relevant rate; the Tk thread only ever touches the latest frame,
-  never a queue, so there is no backlog to catch up on if a frame is late.
+  FPV video capture AND display run entirely independently of Tk.
+  VideoLink owns a C++ capture thread (USB/analog dongle -> cv::Mat,
+  MJPG, buffer size 1 for minimum latency) that is fully decoupled from
+  the 100 Hz MSP telemetry loop. Critically, that same capture thread
+  also paints each decoded frame directly into a native Win32 child
+  window (see FPVWidget.attach()) -- live video pixels never cross the
+  pybind11 boundary, never touch numpy/PIL, and never go through a Tk
+  PhotoImage. VideoWorker only polls VideoLink's cheap atomic status
+  fields (connected / fps / device name) for the small text overlay bar;
+  it no longer fetches frame data at all.
 
   Widget refresh rates are throttled independently:
     • IMU / Baro / FC Status / Arming / Mag  →  every frame  (~50 Hz)
-    • FPV video                              →  every frame  (~50 Hz, capped further by capture fps)
+    • FPV status/FPS text                    →  every 5th frame (~10 Hz; video itself
+                                                 is painted natively, entirely outside
+                                                 this pump)
     • 3-D attitude view                      →  every 3rd frame (~17 Hz)
     • GPS (heaviest — map redraws)            →  every 5th frame (~10 Hz)
 
@@ -40,10 +46,15 @@ FIXES vs previous version
      on-screen changes can be reverted to the last-saved version of the
      active profile without discarding it (see LayoutStore /
      LayoutManagerDialog below).
-  6. FPV live video panel: VideoLink/VideoWorker/FPVWidget wired in as a
-     fully independent capture pipeline (own thread, own connect/retry
-     loop) so a dropped or slow-to-appear capture device never blocks or
-     is blocked by flight telemetry.
+  6. FPV live video panel: VideoLink now paints decoded frames directly
+     into a native child window hosted by FPVWidget, instead of pushing
+     pixel data through Python/Tk every frame. This eliminates the
+     numpy-array marshal, PIL resize, and Tk PhotoImage churn that were
+     the main source of the extra latency versus reference tools like
+     OBS. VideoWorker's job shrank accordingly -- it only polls cheap
+     status fields now. Capture itself is still fully independent (own
+     thread, own connect/retry loop) so a dropped or slow-to-appear
+     capture device never blocks or is blocked by flight telemetry.
   7. DroneBackend.pyd DLL resolution fixed: previously only the backend's
      own output folder was registered with os.add_dll_directory(), so the
      loader could find DroneBackend.pyd itself but not its transitive
@@ -127,9 +138,13 @@ import DroneBackend
 UI_REFRESH_MS  = 20          # ~50 Hz Tk pump — keeps UI snappy
 RECONNECT_MS   = 2000
 
-# FPV capture: how often VideoWorker pulls the latest decoded frame from
-# VideoLink. This is independent of the Tk pump and of MSP telemetry.
-VIDEO_POLL_HZ  = 60
+# FPV status polling: how often VideoWorker checks VideoLink's cheap
+# atomic status fields (connected / fps / device name) for the overlay
+# bar. Live video itself is painted directly by VideoLink into a native
+# window (see FPVWidget.attach()) and never touches this poll loop or the
+# Tk thread at all -- this cadence only needs to be fast enough for a
+# readable FPS counter, not fast enough for smooth video.
+VIDEO_POLL_HZ  = 15
 VIDEO_PROBE_RETRY_MS = 3000   # how often to retry connect_auto() if no device found yet
 
 BG_WORKSPACE   = "#1a1a2e"
@@ -163,7 +178,9 @@ _THROTTLE = {
     "fc_status": 1,
     "arming":    1,
     "mag":       1,
-    "fpv":       1,   # video panel — full rate, capped further by actual capture fps
+    "fpv":       5,   # status/FPS text only now — video itself is painted natively
+                       # by VideoLink outside the Tk pump entirely, so this just
+                       # needs to be readable (~10 Hz at a 20 ms pump), not fast
     "adi":       3,   # 3-D canvas — heavy redraw, 17 Hz is plenty
     "gps":       5,   # map widget — heaviest, 10 Hz is plenty
 }
@@ -1132,6 +1149,13 @@ class DroneCockpitApp:
         self._video_connect_job = None
         self._start_video_autoconnect()
 
+        # Hand the FPV panel's native window handle to VideoLink so the C++
+        # capture thread can start painting frames directly into it. This
+        # is safe to do before a capture device is actually connected --
+        # VideoLink simply won't paint anything into the window until
+        # connect()/connect_auto() succeeds and frames start arriving.
+        self.fpv_view.attach(self.video_link)
+
         self._auto_connect()   # connects hub, then starts worker + pump
 
     # =========================================================================
@@ -1679,14 +1703,17 @@ class DroneCockpitApp:
     def _update_loop(self) -> None:
         self._update_job = None
 
-        # ── FPV video — independent of telemetry connection state ────────────
-        # This runs every pump tick regardless of whether the flight
-        # controller link is up, connecting, or degraded: video shouldn't
-        # freeze just because MSP telemetry hiccuped.
+        # ── FPV status/FPS text — independent of telemetry connection state ──
+        # This runs every pump tick's throttle check regardless of whether
+        # the flight controller link is up, connecting, or degraded: the
+        # video panel shouldn't blank out just because MSP telemetry
+        # hiccuped. Note this only updates the small text overlay now --
+        # the actual video pixels are painted directly by VideoLink into a
+        # native window and never pass through this loop at all.
         if self._frame_counters["fpv"] >= _THROTTLE["fpv"]:
             self._frame_counters["fpv"] = 0
-            frame, fps = self._video_worker.get_frame()
-            self.fpv_view.update_fpv(frame, fps, self._video_worker.get_device_name())
+            connected, fps, device_name = self._video_worker.get_status()
+            self.fpv_view.update_status(connected, fps, device_name)
         self._frame_counters["fpv"] += 1
 
         # ── Connection health check ───────────────────────────────────────────
@@ -1779,6 +1806,7 @@ class DroneCockpitApp:
         self._worker.stop()
         self.hub.disconnect()
         self._video_worker.stop()
+        self.fpv_view.detach()
         self.video_link.disconnect()
         self.root.destroy()
 

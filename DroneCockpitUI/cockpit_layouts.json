@@ -57,7 +57,7 @@
       }
     },
     "test": {
-      "geometry": "1536x793+-122+56",
+      "geometry": "1536x793+-47+42",
       "locked": false,
       "panels": {
         "imu": {
@@ -107,6 +107,13 @@
           "y": 387,
           "w": 440,
           "h": 300,
+          "visible": true
+        },
+        "fpv": {
+          "x": 565,
+          "y": 57,
+          "w": 890,
+          "h": 520,
           "visible": true
         }
       }

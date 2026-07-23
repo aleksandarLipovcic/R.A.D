@@ -6,6 +6,15 @@
 #include <string>
 #include <vector>
 
+// Windows native window handle for direct-to-window rendering.
+// Forward-declared instead of including <windows.h> here to keep this
+// header light for translation units that don't need Win32 types --
+// only VideoLink.cpp needs the full Windows.h.
+#ifndef HWND
+struct HWND__;
+typedef HWND__* HWND;
+#endif
+
 struct CaptureDeviceInfo {
     int index;
     std::string name;
@@ -36,6 +45,20 @@ public:
 
     void setPreferredResolution(int w, int h) { prefW = w; prefH = h; }
 
+    // ── Native direct-to-window rendering ───────────────────────────────
+    //
+    // Attaches a child GDI render window under parentHwnd (a Tk frame's
+    // HWND, obtained via widget.winfo_id() on the Python side) and paints
+    // every captured frame straight into it from the capture thread --
+    // no pybind11 marshaling, no numpy, no Tk PhotoImage for the live
+    // feed. getLatestFrame() remains available and unaffected for
+    // anything else (e.g. recording) that still needs frame data in
+    // Python.
+    void attachToWindow(intptr_t parentHwnd, int x, int y, int w, int h);
+    void resizeWindow(int w, int h);
+    void detachWindow();
+    bool isWindowAttached() const { return renderHwnd_.load() != nullptr; }
+
 private:
     cv::VideoCapture cap;
     std::thread captureThread;
@@ -48,6 +71,14 @@ private:
     std::string deviceName_;
     int prefW = 720, prefH = 480;
 
+    // renderHwnd_ is written from the Python/Tk thread (attach/detach)
+    // and read from the capture thread (paintFrame) every frame, so it's
+    // an atomic rather than plain HWND.
+    std::atomic<HWND> renderHwnd_{ nullptr };
+
     void captureLoop();
     static bool looksLikeIntegratedWebcam(const std::string& name);
+
+    void createRenderWindow(HWND parent, int x, int y, int w, int h);
+    void paintFrame(const cv::Mat& frame);
 };

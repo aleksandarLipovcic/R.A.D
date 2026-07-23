@@ -1,10 +1,21 @@
 """
-video_worker.py — Background FPV capture-poll thread
-======================================================
-VideoLink's capture loop already runs at the device's native rate inside
-C++, on its own thread. This worker's only job is bringing the freshest
-frame across the pybind11 boundary at a rate the UI can consume, so the Tk
-main thread never blocks on a capture call.
+video_worker.py — Background FPV status-poll thread
+=======================================================
+The live video frames themselves no longer cross into Python at all --
+VideoLink paints them directly into a native window from its own C++
+capture thread (see FPVWidget.attach()). This worker's only remaining job
+is polling VideoLink's cheap, atomic status fields (connected / fps /
+device name) at a steady rate off the Tk thread, so the UI pump never has
+to call into VideoLink directly.
+
+Deliberately does NOT call get_latest_frame() any more: that call clones
+a full frame under a mutex shared with the capture thread, which is
+wasted work (and needless lock contention with the thing painting the
+video) now that nothing here does anything with the pixels. If you need
+frame data in Python for something else -- e.g. the post-flight
+recording / YOLO post-processing pipeline -- call
+video_link.get_latest_frame() directly from wherever that pipeline
+lives; don't route it through this worker.
 """
 
 import threading
@@ -12,11 +23,10 @@ import time
 
 
 class VideoWorker:
-    def __init__(self, video_link, poll_hz: int = 60):
+    def __init__(self, video_link, poll_hz: int = 15):
         self._link = video_link
         self._interval = 1.0 / poll_hz
         self._lock = threading.Lock()
-        self._latest_frame = None      # (H,W,3) BGR numpy array, or None
         self._latest_fps = 0.0
         self._device_name = ""
         self._running = False
@@ -38,19 +48,14 @@ class VideoWorker:
             connected = self._link.is_connected()
             self.is_connected = connected
             if connected:
-                frame = self._link.get_latest_frame()
-                if frame is not None and frame.size > 0:
-                    with self._lock:
-                        self._latest_frame = frame
-                        self._latest_fps = self._link.get_measured_fps()
-                        self._device_name = self._link.get_device_name()
+                fps = self._link.get_measured_fps()
+                name = self._link.get_device_name()
+                with self._lock:
+                    self._latest_fps = fps
+                    self._device_name = name
             time.sleep(self._interval)
 
-    def get_frame(self):
-        """Non-blocking. Returns (frame_or_None, fps)."""
+    def get_status(self):
+        """Non-blocking. Returns (connected, fps, device_name)."""
         with self._lock:
-            return self._latest_frame, self._latest_fps
-
-    def get_device_name(self) -> str:
-        with self._lock:
-            return self._device_name
+            return self.is_connected, self._latest_fps, self._device_name

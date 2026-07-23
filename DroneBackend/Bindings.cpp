@@ -20,6 +20,12 @@ using namespace pybind11::literals;
 // cv::Mat's buffer. This is the one intentional copy in the whole path
 // (capture -> latestFrame is a header swap, latestFrame -> here is the
 // copy, here -> PhotoImage in Tk is unavoidable on the Python side too).
+//
+// NOTE: this path is now only used by get_latest_frame() -- e.g. for
+// post-flight recording/YOLO post-processing. The live FPV display no
+// longer goes through here at all; it's painted directly by VideoLink
+// onto a native child window via attach_to_window()/paintFrame(), so it
+// never crosses into Python/numpy/Tk in the first place.
 // =============================================================================
 
 static py::array_t<uint8_t> matToNumpy(const cv::Mat& mat) {
@@ -504,8 +510,20 @@ PYBIND11_MODULE(DroneBackend, m) {
     // Independent of DroneLink -- the FPV analog capture dongle is a
     // separate USB device from the flight controller's serial link, so it
     // gets its own class, its own thread, and its own connect/disconnect
-    // lifecycle. Frames cross the pybind11 boundary as (H,W,3) uint8 BGR
-    // numpy arrays via get_latest_frame().
+    // lifecycle.
+    //
+    // Two independent output paths:
+    //   1. get_latest_frame() -- frames cross the pybind11 boundary as
+    //      (H,W,3) uint8 BGR numpy arrays. Used for anything that needs
+    //      pixel data in Python (e.g. post-flight recording / YOLO
+    //      post-processing).
+    //   2. attach_to_window()/resize_window()/detach_window() -- native
+    //      GDI rendering straight into a Win32 child window (typically a
+    //      Tk widget's HWND via winfo_id()). This is the path the live
+    //      FPV display should use: frames are painted by the capture
+    //      thread itself and never cross into Python at all, eliminating
+    //      the numpy/PIL/Tk PhotoImage overhead that was the source of
+    //      the extra latency versus OBS.
     // =========================================================================
     py::class_<VideoLink>(m, "VideoLink")
         .def(py::init<>())
@@ -522,14 +540,30 @@ PYBIND11_MODULE(DroneBackend, m) {
         .def("is_connected", &VideoLink::isConnected)
         .def("get_latest_frame", [](VideoLink& v) { return matToNumpy(v.getLatestFrame()); },
             "Latest frame as an (H, W, 3) uint8 BGR numpy array. Empty "
-            "array if nothing has been captured yet.")
+            "array if nothing has been captured yet. Not used by the live "
+            "display path -- see attach_to_window().")
         .def("get_frame_count", &VideoLink::getFrameCount)
         .def("get_measured_fps", &VideoLink::getMeasuredFps,
             "Capture-thread FPS, measured over a rolling ~1s window.")
         .def("get_device_name", &VideoLink::getDeviceName)
         .def("set_preferred_resolution", &VideoLink::setPreferredResolution,
             py::arg("width"), py::arg("height"),
-            "Must be called before connect()/connect_auto() to take effect.");
+            "Must be called before connect()/connect_auto() to take effect.")
+        .def("attach_to_window", &VideoLink::attachToWindow,
+            py::arg("parent_hwnd"), py::arg("x"), py::arg("y"),
+            py::arg("w"), py::arg("h"),
+            "Reparent a native GDI render window under parent_hwnd (a Tk "
+            "widget's winfo_id()) and start painting captured frames "
+            "directly into it, bypassing Python entirely for display. "
+            "Safe to call again to move/recreate the render window; any "
+            "previously attached window is destroyed first.")
+        .def("resize_window", &VideoLink::resizeWindow,
+            py::arg("w"), py::arg("h"),
+            "Resize the attached render window. Call on Tk <Configure>.")
+        .def("detach_window", &VideoLink::detachWindow,
+            "Destroy the attached render window. Safe to call even if none "
+            "is currently attached.")
+        .def("is_window_attached", &VideoLink::isWindowAttached);
 
     // =========================================================================
     // Free functions

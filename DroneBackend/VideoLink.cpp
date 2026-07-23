@@ -7,6 +7,7 @@
 // Media Foundation device enumeration (Windows-native device names +
 // friendly indices -- this is what actually lets us tell "USB capture
 // dongle" apart from "Integrated Webcam" before we ever open anything).
+#include <windows.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -16,7 +17,10 @@
 #pragma comment(lib, "mfuuid.lib")
 
 VideoLink::VideoLink() {}
-VideoLink::~VideoLink() { disconnect(); }
+VideoLink::~VideoLink() {
+    disconnect();
+    detachWindow();
+}
 
 // =============================================================================
 // enumerateDevices()
@@ -91,8 +95,6 @@ bool VideoLink::connectAuto() {
         if (!looksLikeIntegratedWebcam(d.name))
             candidates.push_back(d);
 
-    // Fall back to trying everything if filtering removed all devices --
-    // better to land on the laptop webcam than to refuse to connect at all.
     if (candidates.empty())
         candidates = devices;
 
@@ -144,6 +146,97 @@ void VideoLink::disconnect() {
 }
 
 // =============================================================================
+// Native window rendering
+// =============================================================================
+
+static LRESULT CALLBACK VideoLinkWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    // We paint from the capture thread via GetDC() outside of WM_PAINT,
+    // so this proc just needs to suppress the default background erase
+    // (which would otherwise cause visible flicker between frames) and
+    // defer everything else to Windows' default handling.
+    if (msg == WM_ERASEBKGND)
+        return 1;
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+void VideoLink::createRenderWindow(HWND parent, int x, int y, int w, int h) {
+    static bool classRegistered = false;
+    static const wchar_t* clsName = L"VideoLinkRenderWnd";
+
+    if (!classRegistered) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = VideoLinkWndProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = clsName;
+        wc.hbrBackground = nullptr;   // we own all painting
+        RegisterClassW(&wc);
+        classRegistered = true;
+    }
+
+    HWND hwnd = CreateWindowExW(
+        0, clsName, L"", WS_CHILD | WS_VISIBLE,
+        x, y, w, h, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+
+    renderHwnd_.store(hwnd);
+}
+
+void VideoLink::attachToWindow(intptr_t parentHwnd, int x, int y, int w, int h) {
+    detachWindow();   // clean up any previous render window first
+    createRenderWindow(reinterpret_cast<HWND>(parentHwnd), x, y, w, h);
+}
+
+void VideoLink::resizeWindow(int w, int h) {
+    HWND hwnd = renderHwnd_.load();
+    if (hwnd)
+        SetWindowPos(hwnd, nullptr, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
+}
+
+void VideoLink::detachWindow() {
+    HWND hwnd = renderHwnd_.exchange(nullptr);
+    if (hwnd)
+        DestroyWindow(hwnd);
+}
+
+void VideoLink::paintFrame(const cv::Mat& frame) {
+    HWND hwnd = renderHwnd_.load();
+    if (!hwnd || frame.empty())
+        return;
+
+    RECT rc;
+    if (!GetClientRect(hwnd, &rc))
+        return;
+    int destW = rc.right - rc.left;
+    int destH = rc.bottom - rc.top;
+    if (destW <= 0 || destH <= 0)
+        return;
+
+    // cv::Mat from cv::VideoCapture is BGR8 -- GDI's DIB_RGB_COLORS with
+    // biBitCount=24 expects BGR byte order too, so no channel swap needed.
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = frame.cols;
+    bmi.bmiHeader.biHeight = -frame.rows;   // negative = top-down DIB
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 24;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    HDC hdc = GetDC(hwnd);
+    if (!hdc)
+        return;
+    SetStretchBltMode(hdc, HALFTONE);
+    // HALFTONE mode ignores the brush origin unless it's set explicitly --
+    // omitting this line is a common source of a 1px vertical misalignment.
+    SetBrushOrgEx(hdc, 0, 0, nullptr);
+
+    StretchDIBits(hdc,
+        0, 0, destW, destH,
+        0, 0, frame.cols, frame.rows,
+        frame.data, &bmi, DIB_RGB_COLORS, SRCCOPY);
+
+    ReleaseDC(hwnd, hdc);
+}
+
+// =============================================================================
 // captureLoop()  —  runs on its own thread, decoupled entirely from Python
 // =============================================================================
 
@@ -154,18 +247,20 @@ void VideoLink::captureLoop() {
     while (keepRunning.load()) {
         cv::Mat frame;
         if (!cap.read(frame) || frame.empty()) {
-            // Don't spin the CPU on a dropped USB frame, but keep the
-            // retry window short -- signal can come back within a few ms.
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
 
         {
             std::lock_guard<std::mutex> lock(frameMutex);
-            latestFrame = frame;   // header swap -- underlying buffer is a
-            // fresh allocation from cap.read(), so
-            // this is safe without an extra clone here
+            latestFrame = frame;   // header swap -- see original comment
         }
+
+        // Paint directly to the native window, if one is attached. This
+        // runs on the capture thread itself -- the frame that was just
+        // decoded is on screen within one StretchDIBits call, with no
+        // Python/Tk round trip and no extra clone.
+        paintFrame(frame);
 
         frameCount.fetch_add(1);
         ++framesInWindow;
@@ -184,5 +279,5 @@ void VideoLink::captureLoop() {
 
 cv::Mat VideoLink::getLatestFrame() {
     std::lock_guard<std::mutex> lock(frameMutex);
-    return latestFrame.clone();   // caller gets an independent copy across the pybind boundary
+    return latestFrame.clone();
 }
