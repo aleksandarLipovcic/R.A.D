@@ -42,7 +42,40 @@ namespace {
     // itself generate additional warning spam -- this keeps retries
     // frequent enough to feel instant to the pilot when the dongle is
     // replugged, without hammering the driver in between.
-    constexpr int kReconnectIntervalMs = 400;
+    constexpr int kReconnectIntervalMs = 300;
+
+    // ── "No drone video" idle-frame detection ──────────────────────────
+    //
+    // How much of a frame must be close to that frame's own mean color
+    // for it to be treated as an idle/blank capture-card pattern rather
+    // than real video. This is a dominant-color-fraction test rather
+    // than raw stddev specifically so it still works when the flight
+    // controller's OSD chip is overlaying text on a blank background
+    // (no camera signal) -- the OSD text only covers a small fraction
+    // of pixels, so the frame is still mostly one color even though it
+    // isn't perfectly flat.
+    //
+    // NOT calibrated against real hardware output -- tune this against
+    // your actual capture card's idle pattern. Temporarily log the
+    // computed fraction in frameLooksIdle() to see real numbers, then
+    // adjust kIdleDominantColorFraction/kIdleColorMatchTolerance so real
+    // video reliably stays below threshold and the idle screen reliably
+    // stays above it.
+    constexpr double kIdleDominantColorFraction = 0.85;
+    // Per-channel distance (0-255) from the frame's mean color within
+    // which a sampled pixel still counts as "matching" the dominant
+    // color for the fraction above.
+    constexpr int kIdleColorMatchTolerance = 14;
+    // Sample every Nth pixel in each dimension instead of every pixel --
+    // this runs once per captured frame on the capture thread, so it
+    // needs to stay cheap. Stride 6 on a 720x480 frame is ~9600 samples,
+    // well under a millisecond.
+    constexpr int kIdleSampleStride = 6;
+    // Consecutive idle/live frames required before flipping state, to
+    // avoid flapping the UI on a single unlucky frame (e.g. a genuinely
+    // dark real scene, or one corrupted frame).
+    constexpr int kIdleFramesToConfirm = 12;  // ~150-200ms at 60fps
+    constexpr int kLiveFramesToConfirm = 3;   // recover fast once video returns
 
     // Number of consecutive good frames required at connect() time
     // before we declare the link genuinely stable and start the
@@ -137,6 +170,38 @@ bool VideoLink::looksLikeIntegratedWebcam(const std::string& name) {
     return false;
 }
 
+/*static*/
+bool VideoLink::frameLooksIdle(const cv::Mat& frame) {
+    if (frame.empty() || frame.channels() != 3)
+        return false;
+
+    cv::Scalar meanVal = cv::mean(frame);
+    const int mB = static_cast<int>(meanVal[0]);
+    const int mG = static_cast<int>(meanVal[1]);
+    const int mR = static_cast<int>(meanVal[2]);
+
+    long matched = 0, sampled = 0;
+    for (int y = 0; y < frame.rows; y += kIdleSampleStride) {
+        const uint8_t* row = frame.ptr<uint8_t>(y);
+        for (int x = 0; x < frame.cols; x += kIdleSampleStride) {
+            const uint8_t* px = row + static_cast<size_t>(x) * 3;
+            if (std::abs(static_cast<int>(px[0]) - mB) <= kIdleColorMatchTolerance &&
+                std::abs(static_cast<int>(px[1]) - mG) <= kIdleColorMatchTolerance &&
+                std::abs(static_cast<int>(px[2]) - mR) <= kIdleColorMatchTolerance) {
+                ++matched;
+            }
+            ++sampled;
+        }
+    }
+    if (sampled == 0)
+        return false;
+
+    // Uncomment while tuning against real hardware:
+    // std::cout << "[VideoLink] idle-fraction=" << (double)matched / sampled << std::endl;
+
+    return (static_cast<double>(matched) / sampled) >= kIdleDominantColorFraction;
+}
+
 // =============================================================================
 // connectAuto() / connect()
 // =============================================================================
@@ -206,6 +271,19 @@ bool VideoLink::connect(int deviceIndex) {
         }
         if (i + 1 < kStableFramesRequired)
             std::this_thread::sleep_for(std::chrono::milliseconds(kStableFrameSpacingMs));
+    }
+
+    // Cache the friendly name for this device index so tryReconnect()
+    // can re-locate it by name after a replug (the index isn't
+    // guaranteed to stay the same). connectAuto() already sets this
+    // after connect() returns, but connect() can also be called
+    // directly (e.g. from a device-picker UI), so resolve it here too
+    // rather than leaving deviceName_ stale/empty in that path.
+    for (auto& d : enumerateDevices()) {
+        if (d.index == deviceIndex) {
+            deviceName_ = d.name;
+            break;
+        }
     }
 
     connected.store(true);
@@ -395,6 +473,31 @@ void VideoLink::paintFrame(const cv::Mat& frame) {
         0, 0, destW, destH,
         0, 0, frame.cols, frame.rows,
         frame.data, &bmi, DIB_RGB_COLORS, SRCCOPY);
+
+    // ── "No drone video" warning banner ─────────────────────────────
+    // Frames ARE flowing (this is the normal-streaming path, called
+    // every frame), so unlike paintNoSignalFrame() -- which paints once
+    // and stays because the capture thread stops calling paintFrame()
+    // entirely -- this has to be redrawn on top every single frame or
+    // the next StretchDIBits above would immediately erase it. Drawn as
+    // a strip rather than a full-frame fill so the underlying idle
+    // pattern stays visible underneath for diagnostic purposes.
+    if (linkState_.load() == LinkState::NoVideoInput) {
+        RECT banner = rc;
+        banner.bottom = banner.top + (std::min)(32, destH);
+        static HBRUSH warnBrush = CreateSolidBrush(RGB(180, 90, 0));
+        FillRect(hdc, &banner, warnBrush);
+
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, RGB(255, 255, 255));
+        HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        HFONT oldFont = (HFONT)SelectObject(hdc, font);
+
+        const wchar_t* msg = L"NO DRONE VIDEO -- CHECK VTX / ANTENNA / CAMERA";
+        DrawTextW(hdc, msg, -1, &banner, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        SelectObject(hdc, oldFont);
+    }
 }
 
 // =============================================================================
@@ -433,6 +536,35 @@ void VideoLink::paintNoSignalFrame() {
 bool VideoLink::tryReconnect() {
     if (lastDeviceIndex_ < 0)
         return false;
+
+    // Cheaply confirm the device is actually enumerated by Windows right
+    // now, and re-resolve its current index by friendly name, BEFORE
+    // ever calling the expensive cap.open(). enumerateDevices() is pure
+    // Media Foundation metadata -- it never opens a capture pipeline --
+    // so it's orders of magnitude cheaper than cap.open() failing.
+    //
+    // This is the fix for multi-second real-world recovery times despite
+    // a 300ms retry interval: previously every retry called cap.open()
+    // against a device that might not exist at all, and MSMF's own
+    // internal timeout while it fails to build a source reader is what
+    // was actually eating the time between the retry interval ticks.
+    // Skipping straight to "not present, don't even try" when the
+    // enumeration comes back empty avoids that cost entirely, and
+    // catches the device the moment it reappears. It also transparently
+    // handles the index changing on replug, which a fixed lastDeviceIndex_
+    // retry would otherwise silently fail against forever.
+    if (!deviceName_.empty()) {
+        int resolvedIndex = -1;
+        for (auto& d : enumerateDevices()) {
+            if (d.name == deviceName_) {
+                resolvedIndex = d.index;
+                break;
+            }
+        }
+        if (resolvedIndex < 0)
+            return false;   // not currently present -- don't attempt open()
+        lastDeviceIndex_ = resolvedIndex;
+    }
 
     cap.release();
 
@@ -475,6 +607,8 @@ void VideoLink::captureLoop() {
     uint64_t framesInWindow = 0;
     int consecutiveFailures = 0;
     auto lastReconnectAttempt = std::chrono::steady_clock::time_point{};
+    int idleStreak = 0;
+    int liveStreak = 0;
 
     while (keepRunning.load()) {
         // ── Recovery mode: a prior connection dropped, cap is dead ────
@@ -496,6 +630,8 @@ void VideoLink::captureLoop() {
                 std::cout << "[VideoLink] signal recovered on device "
                     << lastDeviceIndex_ << std::endl;
                 consecutiveFailures = 0;
+                idleStreak = 0;
+                liveStreak = 0;
                 connected.store(true);
                 linkState_.store(LinkState::Connected);
                 fpsWindowStart = std::chrono::steady_clock::now();
@@ -545,6 +681,35 @@ void VideoLink::captureLoop() {
         }
         lastFrameTimeMs_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
+
+        // ── "No drone video" detection ──────────────────────────────
+        // The USB link is fine (we just read a frame successfully), but
+        // it may be the capture card's own idle/blank pattern rather
+        // than real video -- see LinkState::NoVideoInput in the header.
+        // Only flips state between Connected and NoVideoInput; leaves
+        // Disconnected/Searching/SignalLost alone (those are handled by
+        // the read-failure branch above, not here).
+        if (frameLooksIdle(frame)) {
+            ++idleStreak;
+            liveStreak = 0;
+            if (idleStreak == kIdleFramesToConfirm &&
+                linkState_.load() == LinkState::Connected) {
+                std::cout << "[VideoLink] capture card connected but no "
+                    "drone video detected (idle/blank frame) on device "
+                    << lastDeviceIndex_ << std::endl;
+                linkState_.store(LinkState::NoVideoInput);
+            }
+        }
+        else {
+            ++liveStreak;
+            idleStreak = 0;
+            if (liveStreak == kLiveFramesToConfirm &&
+                linkState_.load() == LinkState::NoVideoInput) {
+                std::cout << "[VideoLink] drone video acquired on device "
+                    << lastDeviceIndex_ << std::endl;
+                linkState_.store(LinkState::Connected);
+            }
+        }
 
         // Paint directly to the native window, if one is attached. This
         // runs on the capture thread itself -- the frame that was just

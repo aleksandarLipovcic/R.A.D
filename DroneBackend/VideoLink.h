@@ -34,14 +34,26 @@ struct CaptureDeviceInfo {
 //                   was called explicitly. Capture thread is not running.
 //   Searching    -> connectAuto()/connect() is probing devices, trying
 //                   to get the very first frame.
-//   Connected    -> frames are actively flowing.
+//   Connected    -> frames are actively flowing and look like real video.
 //   SignalLost   -> a previously-working connection stopped delivering
-//                   frames (device unplugged, driver fault, etc). The
-//                   capture thread is still alive and retrying
-//                   cap.open() in the background; no Python action is
+//                   frames entirely (device unplugged, driver fault,
+//                   etc). The capture thread is still alive and
+//                   retrying in the background; no Python action is
 //                   needed to trigger recovery, only to reflect the
 //                   state in the UI.
-enum class LinkState { Disconnected, Searching, Connected, SignalLost };
+//   NoVideoInput -> the USB capture card itself is fine and still
+//                   delivering frames at its normal rate, but the
+//                   frames are the card's own idle/blank pattern
+//                   rather than real video from the drone -- e.g. the
+//                   analog RX has no signal, or the drone's OSD chip
+//                   is overlaying text on a blank background because
+//                   its camera input is dead. This is invisible to
+//                   SignalLost (cap.read() keeps succeeding) and is
+//                   instead detected from frame content -- see
+//                   frameLooksIdle() in the .cpp. A warning banner is
+//                   painted directly onto the native render window
+//                   while in this state (see paintFrame()).
+enum class LinkState { Disconnected, Searching, Connected, SignalLost, NoVideoInput };
 
 class VideoLink {
 public:
@@ -51,7 +63,10 @@ public:
     // Enumerate all video capture devices visible to Windows (Media
     // Foundation), with their friendly names -- e.g. "USB Video Device",
     // "Integrated Webcam", etc. Index order matches what OpenCV's
-    // CAP_MSMF backend expects for VideoCapture(index).
+    // CAP_MSMF backend expects for VideoCapture(index). Cheap -- this is
+    // metadata-only, it never opens a capture pipeline, so it's also
+    // used by tryReconnect() as a fast pre-check before attempting the
+    // much more expensive cap.open().
     static std::vector<CaptureDeviceInfo> enumerateDevices();
 
     // Tries every enumerated device that doesn't look like a built-in
@@ -161,7 +176,10 @@ private:
     // Device index used by the current/most recent connect(), so the
     // capture thread's own reconnect-on-signal-loss logic knows which
     // index to retry without any help from Python. Set in connect();
-    // read only from the capture thread.
+    // read only from the capture thread. tryReconnect() re-resolves
+    // this from deviceName_ on every attempt, since the OS-assigned
+    // index for a given physical device is not guaranteed to stay the
+    // same across a USB replug.
     int lastDeviceIndex_ = -1;
 
     // renderHwnd_ is written from the Python/Tk thread (attach/detach)
@@ -186,6 +204,13 @@ private:
     void captureLoop();
     static bool looksLikeIntegratedWebcam(const std::string& name);
 
+    // Heuristic "is this frame an idle/blank capture-card pattern rather
+    // than real video" check -- see LinkState::NoVideoInput above and
+    // the implementation in the .cpp for the sampling/tolerance details
+    // and tuning notes. Runs once per captured frame on the capture
+    // thread, so it's deliberately cheap (sampled, not per-pixel).
+    static bool frameLooksIdle(const cv::Mat& frame);
+
     void createRenderWindow(HWND parent, int x, int y, int w, int h);
     void paintFrame(const cv::Mat& frame);
 
@@ -197,8 +222,10 @@ private:
     // nothing else will refresh it while no frames are flowing).
     void paintNoSignalFrame();
 
-    // Attempts to re-open lastDeviceIndex_ and read one frame. Returns
-    // true and leaves cap opened/streaming on success. Called from
-    // captureLoop() while linkState_ == SignalLost.
+    // Attempts to re-open the current capture device and read one frame.
+    // Returns true and leaves cap opened/streaming on success. Called
+    // from captureLoop() while linkState_ == SignalLost. Re-resolves the
+    // device index from deviceName_ via enumerateDevices() on every call
+    // -- see lastDeviceIndex_ and the .cpp for why.
     bool tryReconnect();
 };
