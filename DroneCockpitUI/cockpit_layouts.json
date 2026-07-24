@@ -1,5 +1,5 @@
 {
-  "active_profile": "VideoLoad",
+  "active_profile": "test3",
   "profiles": {
     "Default": {
       "geometry": "1536x793+-11+31",
@@ -131,9 +131,9 @@
         },
         "mag": {
           "x": 385,
-          "y": 569,
-          "w": 798,
-          "h": 177,
+          "y": 551,
+          "w": 801,
+          "h": 193,
           "visible": true
         },
         "adi": {
@@ -175,7 +175,131 @@
           "x": 385,
           "y": 1,
           "w": 798,
+          "h": 546,
+          "visible": true
+        }
+      }
+    },
+    "test 1": {
+      "geometry": "1536x793+-47+42",
+      "locked": false,
+      "panels": {
+        "imu": {
+          "x": 1185,
+          "y": 435,
+          "w": 341,
+          "h": 307,
+          "visible": true
+        },
+        "mag": {
+          "x": 385,
+          "y": 569,
+          "w": 798,
+          "h": 177,
+          "visible": true
+        },
+        "adi": {
+          "x": 1305,
+          "y": 2,
+          "w": 223,
+          "h": 430,
+          "visible": true
+        },
+        "baro": {
+          "x": 1185,
+          "y": 2,
+          "w": 120,
+          "h": 430,
+          "visible": true
+        },
+        "gps": {
+          "x": 0,
+          "y": 264,
+          "w": 382,
+          "h": 481,
+          "visible": true
+        },
+        "fc_status": {
+          "x": 0,
+          "y": 2,
+          "w": 382,
+          "h": 262,
+          "visible": true
+        },
+        "arming": {
+          "x": 88,
+          "y": 205,
+          "w": 440,
+          "h": 300,
+          "visible": false
+        },
+        "fpv": {
+          "x": 254,
+          "y": 57,
+          "w": 798,
           "h": 577,
+          "visible": true
+        }
+      }
+    },
+    "test3": {
+      "geometry": "1536x793+-47+42",
+      "locked": true,
+      "panels": {
+        "imu": {
+          "x": 1185,
+          "y": 435,
+          "w": 341,
+          "h": 307,
+          "visible": true
+        },
+        "mag": {
+          "x": 385,
+          "y": 551,
+          "w": 801,
+          "h": 193,
+          "visible": true
+        },
+        "adi": {
+          "x": 1305,
+          "y": 2,
+          "w": 223,
+          "h": 430,
+          "visible": true
+        },
+        "baro": {
+          "x": 1185,
+          "y": 2,
+          "w": 120,
+          "h": 430,
+          "visible": true
+        },
+        "gps": {
+          "x": 0,
+          "y": 264,
+          "w": 382,
+          "h": 481,
+          "visible": true
+        },
+        "fc_status": {
+          "x": 0,
+          "y": 2,
+          "w": 382,
+          "h": 262,
+          "visible": true
+        },
+        "arming": {
+          "x": 88,
+          "y": 205,
+          "w": 440,
+          "h": 300,
+          "visible": false
+        },
+        "fpv": {
+          "x": 385,
+          "y": 1,
+          "w": 798,
+          "h": 546,
           "visible": true
         }
       }

@@ -75,6 +75,13 @@ FIXES vs previous version
      hide_window() call (see DroneCockpitApp._on_panel_zorder /
      _on_panel_visibility) so the native window's OS-level stacking always
      matches what's on screen.
+  9. Layout-preview dialog no longer draws panels that are hidden in the
+     profile being previewed. Previously every panel that had ever been
+     part of a profile was drawn (dimmed if hidden), using whatever rect
+     it last had on screen -- often a stale/default position that had
+     nothing to do with the panels actually shown in that profile, and
+     which also skewed the preview's scale factor. See
+     _LayoutPreviewCanvas.render() below.
 """
 
 import sys
@@ -824,6 +831,14 @@ class _LayoutPreviewCanvas(tk.Canvas):
     given, so growing the Layout Profiles window (or its preview pane)
     enlarges the preview — and its labels — instead of leaving it pinned
     at a small fixed pixel size that becomes unreadable.
+
+    Only panels that are *visible* in the profile being previewed are
+    drawn. A panel that's toggled off still has a saved rect in the
+    profile (often a stale one from before it was hidden, or its original
+    default position), but since it isn't shown in the real workspace, it
+    has no business appearing in the preview either -- and letting it into
+    the bounds calculation used to skew/shrink the preview to fit panels
+    that were never actually visible.
     """
 
     _MIN_W, _MIN_H = 260, 170  # floor size so it's never unusably tiny
@@ -852,10 +867,25 @@ class _LayoutPreviewCanvas(tk.Canvas):
                              fill="#445566", font=("Consolas", 9))
             return
 
-        panels = profile.get("panels", {})
-        if not panels:
+        all_panels = profile.get("panels", {})
+
+        # Filter down to only the panels actually visible in this profile
+        # *before* anything else (bounds calc, drawing) touches them --
+        # this is the fix. Previously every panel that had ever been part
+        # of the profile was drawn (dimmed if hidden) using whatever rect
+        # it last had, which routinely didn't reflect the real workspace
+        # and also skewed the scale factor used to fit the preview.
+        panels = {n: g for n, g in all_panels.items() if g.get("visible", True)}
+
+        if not all_panels:
             self.create_text(pw // 2, ph // 2,
                              text="(empty layout)",
+                             fill="#445566", font=("Consolas", 9))
+            return
+
+        if not panels:
+            self.create_text(pw // 2, ph // 2,
+                             text="(no visible panels)",
                              fill="#445566", font=("Consolas", 9))
             return
 
@@ -875,19 +905,16 @@ class _LayoutPreviewCanvas(tk.Canvas):
         )
 
         for name, geo in panels.items():
-            visible = geo.get("visible", True)
             x0 = margin + geo["x"] * scale
             y0 = margin + geo["y"] * scale
             x1 = x0 + geo["w"] * scale
             y1 = y0 + geo["h"] * scale
-            fill = "#16213e" if visible else "#141420"
-            outline = "#00d4ff" if visible else "#333344"
-            self.create_rectangle(x0, y0, x1, y1, fill=fill, outline=outline)
+            self.create_rectangle(x0, y0, x1, y1, fill="#16213e", outline="#00d4ff")
             label = _PANEL_LABELS.get(name, name)
             if (x1 - x0) > 20 and (y1 - y0) > 10:
                 self.create_text(
                     (x0 + x1) / 2, (y0 + y1) / 2,
-                    text=label, fill=("#5588aa" if visible else "#3a3a4a"),
+                    text=label, fill="#5588aa",
                     font=("Consolas", label_font_px), width=max(10, x1 - x0 - 4),
                 )
 

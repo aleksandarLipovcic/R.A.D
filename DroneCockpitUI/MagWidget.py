@@ -8,30 +8,47 @@ class MagWidget(tk.Frame):
     QMC5883L Magnetometer display widget — aviation-standard, fully responsive.
 
     AVIATION SAFETY INVARIANTS (never broken regardless of window size):
-      ① Heading readout (degrees) is always visible.
+      ① Heading readout (degrees) is always fully visible, never clipped.
       ② Lock/signal status indicator is always visible.
-      ③ Both calibration buttons are always accessible.
-      The widget enforces a hard minimum size so all three are always present.
+      ③ Both calibration buttons are always fully accessible/clickable.
+      The widget enforces a hard minimum size so all three are always present
+      and none of them ever overlaps or crops another.
 
-    Layout tiers (progressive enhancement):
-      MINI    (h<145 or w<285)  Heading + cardinal inline + status + two buttons.
-                                No rose, no XYZ bars.
-      COMPACT (h<225 or w<455)  Small rose (left) + Heading/status/buttons (right).
-                                No XYZ bars.
-      FULL    (anything larger) Larger rose + Heading + Buttons + XYZ bars.
+    Layout tiers (progressive enhancement, chosen from available w/h):
+      FULL     Rose + heading/status/buttons column + raw XYZ bars.
+               (plenty of both width and height)
+      COMPACT  Rose + heading/status/buttons column, no bars.
+               (decent width and height, not enough room for bars)
+      SIDE     No rose. Heading box on the LEFT, buttons stacked
+               vertically on the RIGHT. Used when the panel is wide but
+               short -- putting the heading box beside the buttons
+               (instead of on top of them) means neither has to fight
+               the other for vertical space.
+      MINI     No rose. Heading box on top, both buttons in a row below.
+               The fallback for small panels -- this is the tier the hard
+               minimum size (_MIN_W/_MIN_H) is sized to guarantee fits.
 
-    Cardinal direction:
-      Displayed inline with the heading (same row), not in a separate row below.
-      All 8 points are shown: N, NE, E, SE, S, SW, W, NW.
+    Heading box sizing (this is the fix for the box overflowing/cropping):
+      In every tier, the heading box's row/column is given weight=1 while
+      the status/hint/button rows are given weight=0 with an explicit
+      minsize. That means the heading box only ever gets whatever space is
+      LEFT OVER after the status text and both buttons have already
+      claimed their guaranteed minimum space -- so a bigger heading font
+      can never push the buttons out of view or off screen.
+      grid_propagate(False) is set on the heading box itself so it never
+      grows past the size its row/column assigns it, no matter how large
+      a font is requested for it -- previously the box sized itself to
+      fit its own label, so a large font could make it demand more room
+      than the panel actually had, and the excess simply got clipped by
+      whichever ancestor's size actually was fixed (this is what caused
+      the cropped "188.3° S" readout).
 
     Adaptive heading font:
-      Measures the actual rendered text width via font.measure() so the label
-      never overflows the heading box regardless of how many characters are shown.
-      Re-measured on every Configure event AND on every heading update.
-
-    Hard minimum widget size:
-      The widget requests a minimum size via minsize that guarantees all three
-      safety-critical elements are always rendered.
+      Binary-searches for the largest font size (Consolas Bold) where the
+      worst-case string "270.0° NW" fits inside the heading box's ACTUAL
+      assigned width *and* height (both are measured now -- previously
+      only width was checked, which is what let the text overflow
+      vertically even when it technically fit horizontally).
     """
 
     # ── Cockpit colour palette ───────────────────────────────────────────────
@@ -66,15 +83,56 @@ class MagWidget(tk.Frame):
     PAD = 6   # uniform outer padding (px)
 
     # ── Heading font scaling ─────────────────────────────────────────────────
-    # Worst-case string: "000.0° NW" — font is measured directly via font.measure()
-    # so these are only fallback bounds.
-    _HDG_MIN_PT   = 9
-    _HDG_MAX_PT   = 48   # upper bound; actual fit check will reduce as needed
-    _HDG_PADDING  = 20   # total horizontal padding inside the heading box (px)
+    # Worst-case string: "270.0° NW" — font is measured directly via
+    # font.measure()/font.metrics() against the box's ACTUAL assigned size,
+    # so these are just the search bounds, not the fit itself.
+    _HDG_MIN_PT = 9
+    _HDG_MAX_PT = 48
+    _HDG_PAD_X  = 22   # total horizontal padding+border inside the heading box (px)
+    _HDG_PAD_Y  = 18   # total vertical padding+border inside the heading box (px)
+
+    # ── Rose side-gutter heading (the fix for wasted space beside the compass) ──
+    # The rose is circular and height-bound, so a wide-but-not-tall window
+    # leaves blank canvas to either side of it that was previously unused.
+    # When that gutter is wide enough to be worth using, we draw a big
+    # heading readout directly in it, right next to the compass, and hide
+    # the smaller duplicate box in the side panel so there's one prominent
+    # number, not two. Below this threshold everything reverts exactly to
+    # the original layout (small box in the side panel, nothing beside the
+    # rose) -- so narrower/shorter windows are completely unaffected.
+    _GUTTER_MIN_PX   = 130
+    _SIDE_HDG_MAX_PT = 64
+    # Fixed visual gap between the rose's circle and the side heading box,
+    # and between the compass and its "combined group" and the canvas edges.
+    _SIDE_HDG_GAP_PX = 28
+
+    # ── Aviation safety: guaranteed minimum space for the non-negotiable
+    #    elements. The heading box only ever gets what's left over after
+    #    these have taken their share, so it can never crowd them out.
+    _STATUS_MINSIZE  = 16
+    _HINT_MINSIZE    = 20
+    _LABEL_MINSIZE   = 14
+    _HDG_ROW_MINSIZE = 30
+    _BTN_ROW_MINSIZE = 34   # buttons side-by-side (mini)
+    _BTN_COL_MINSIZE = 34   # each button when stacked (side tier)
 
     # ── Aviation safety: hard minimum widget dimensions ──────────────────────
+    # Sized so the MINI tier -- the most cramped layout -- always has room
+    # for the heading box, the status indicator, and both buttons without
+    # any of them clipping.
     _MIN_W = 285
     _MIN_H = 145
+
+    # ── Tier breakpoints ──────────────────────────────────────────────────────
+    # COMPACT's floor is set to the same size that used to be MINI's floor
+    # in the old two-tier version, so the rose keeps showing in every case
+    # it used to -- SIDE only takes over for windows shorter than that,
+    # which previously had no rose either (they were forced into MINI).
+    # SIDE is a strict improvement over the old behaviour, never a regression.
+    _FULL_W, _FULL_H       = 455, 225
+    _COMPACT_W, _COMPACT_H = 285, 145
+    _SIDE_MIN_W            = 340   # SIDE only kicks in when short on height
+                                    # but there's enough width to go sideways
 
     # All 8 cardinal & intercardinal points
     CARDINALS = {
@@ -91,8 +149,21 @@ class MagWidget(tk.Frame):
         self._current_tier  = None
         self._tier_widgets  = {}
         self._hdg_font_size = 0    # loop guard
+        self._side_heading_active = False   # is the rose currently showing
+                                             # its own big side heading?
 
-        self.minsize = (self._MIN_W, self._MIN_H)
+        # NOTE: previously this was `self.minsize = (self._MIN_W, self._MIN_H)`,
+        # which does nothing — tk.Frame has no .minsize attribute/method (that
+        # belongs to Tk/Toplevel), so it silently failed to protect anything.
+        # The actual fix: tell Tk this frame's own natural (requested) size is
+        # _MIN_W x _MIN_H, and freeze it there with grid_propagate(False) so
+        # nothing internal can shrink that request. A widget's requested size
+        # is what a parent grid/pack layout treats as its floor — so whatever
+        # container this is placed in (sticky="nsew", weight>0) can still grow
+        # it larger, but can never give it less than this floor.
+        self.configure(width=self._MIN_W, height=self._MIN_H)
+        self.grid_propagate(False)
+
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
@@ -116,11 +187,13 @@ class MagWidget(tk.Frame):
         self._redraw_dynamic()
 
     def _classify(self, w, h):
-        if h < 145 or w < 285:
-            return "mini"
-        if h < 225 or w < 455:
+        if w >= self._FULL_W and h >= self._FULL_H:
+            return "full"
+        if w >= self._COMPACT_W and h >= self._COMPACT_H:
             return "compact"
-        return "full"
+        if w >= self._SIDE_MIN_W and h < self._COMPACT_H:
+            return "side"
+        return "mini"
 
     # ══════════════════════════════════════════════════════════════════════════
     # Tier builders
@@ -131,6 +204,7 @@ class MagWidget(tk.Frame):
             widget.destroy()
         self._tier_widgets  = {}
         self._hdg_font_size = 0
+        self._side_heading_active = False
         for i in range(10):
             self._container.columnconfigure(i, weight=0, minsize=0)
             self._container.rowconfigure(i,    weight=0, minsize=0)
@@ -139,15 +213,38 @@ class MagWidget(tk.Frame):
         self._clear_container()
         {"full": self._build_full,
          "compact": self._build_compact,
+         "side": self._build_side,
          "mini": self._build_mini}[tier]()
+
+    # ── shared: a self-contained heading box that never grows past the
+    #    cell its parent's layout assigns it (see class docstring) ───────────
+    def _make_hdg_box(self, parent, font_size):
+        box = tk.Frame(parent, bg=self.C_HDG_BG,
+                       highlightbackground=self.C_HDG_BORDER,
+                       highlightthickness=2)
+        box.grid_propagate(False)
+        box.columnconfigure(0, weight=1)
+        box.rowconfigure(0, weight=1)
+
+        val = tk.Label(box, text="---.- ---",
+                       font=("Consolas", font_size, "bold"),
+                       fg=self.C_CRIT, bg=self.C_HDG_BG, anchor="center")
+        val.grid(row=0, column=0, sticky="nsew", padx=8, pady=6)
+
+        box.bind("<Configure>",
+                lambda e: self._resize_hdg_font(e.width, e.height))
+
+        self._tier_widgets["hdg_val"] = val
+        self._tier_widgets["hdg_box"] = box
+        return box
 
     # ── FULL ─────────────────────────────────────────────────────────────────
     def _build_full(self):
         c = self._container
-        c.columnconfigure(0, weight=3)
-        c.columnconfigure(1, weight=2, minsize=200)
+        c.columnconfigure(0, weight=2)
+        c.columnconfigure(1, weight=2, minsize=230)
         c.rowconfigure(0, weight=1)
-        c.rowconfigure(1, weight=0)
+        c.rowconfigure(1, weight=0, minsize=54)
 
         rose_cv = tk.Canvas(c, bg=self.C_BG, highlightthickness=0)
         rose_cv.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=(0, 4))
@@ -186,31 +283,76 @@ class MagWidget(tk.Frame):
         self._build_right_panel(right, font_card=9, font_status=8,
                                 font_btn=8, tier="compact")
 
+    # ── SIDE (wide but short: heading box beside the buttons) ─────────────────
+    def _build_side(self):
+        """
+        Used when there's enough width to put the heading box and the
+        buttons next to each other, but not enough height to comfortably
+        stack the heading on top of them (see FULL/COMPACT). Putting them
+        side by side means the heading box can use the full available
+        height for its font without pushing the buttons off screen, and
+        the buttons get a guaranteed minimum height regardless of how
+        short the panel gets (down to the hard minimum).
+        """
+        c = self._container
+        c.columnconfigure(0, weight=3, minsize=140)
+        c.columnconfigure(1, weight=2, minsize=110)
+        c.rowconfigure(0, weight=1)
+
+        left = tk.Frame(c, bg=self.C_BG)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(0, weight=1, minsize=self._HDG_ROW_MINSIZE)  # heading — flexible
+        left.rowconfigure(1, weight=0, minsize=self._STATUS_MINSIZE)
+
+        hdg_box = self._make_hdg_box(left, font_size=16)
+        hdg_box.grid(row=0, column=0, sticky="nsew")
+
+        status = tk.Label(left, text="⬤  NO SIGNAL",
+                          font=("Consolas", 8, "bold"),
+                          fg=self.C_NOSIG_FG, bg=self.C_BG, anchor="center")
+        status.grid(row=1, column=0, pady=(2, 0))
+        self._tier_widgets["status"] = status
+
+        right = tk.Frame(c, bg=self.C_BG)
+        right.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(0, weight=1, minsize=self._BTN_COL_MINSIZE)
+        right.rowconfigure(1, weight=1, minsize=self._BTN_COL_MINSIZE)
+
+        mag_btn = tk.Button(
+            right, text="⊕ CAL MAG",
+            font=("Consolas", 9, "bold"),
+            fg=self.C_BTN_MAG_FG, bg=self.C_BTN_MAG_BG,
+            activeforeground=self.C_BG, activebackground=self.C_BTN_MAG_FG,
+            relief="flat", bd=0, cursor="hand2",
+            command=self._on_mag_cal_pressed,
+            state="normal" if self._on_mag_cal else "disabled")
+        mag_btn.grid(row=0, column=0, sticky="nsew", pady=(0, 2))
+        self._tier_widgets["mag_btn"] = mag_btn
+
+        acc_btn = tk.Button(
+            right, text="⊕ CAL GYRO",
+            font=("Consolas", 9, "bold"),
+            fg=self.C_BTN_ACC_FG, bg=self.C_BTN_ACC_BG,
+            activeforeground=self.C_BG, activebackground=self.C_BTN_ACC_FG,
+            relief="flat", bd=0, cursor="hand2",
+            command=self._on_acc_cal_pressed,
+            state="normal" if self._on_acc_cal else "disabled")
+        acc_btn.grid(row=1, column=0, sticky="nsew", pady=(2, 0))
+        self._tier_widgets["acc_btn"] = acc_btn
+
     # ── MINI ──────────────────────────────────────────────────────────────────
     def _build_mini(self):
         c = self._container
         c.columnconfigure(0, weight=1)
         c.columnconfigure(1, weight=1)
-        c.rowconfigure(0, weight=0)
-        c.rowconfigure(1, weight=0)
-        c.rowconfigure(2, weight=0)
+        c.rowconfigure(0, weight=1, minsize=self._HDG_ROW_MINSIZE)   # heading — flexible
+        c.rowconfigure(1, weight=0, minsize=self._STATUS_MINSIZE)
+        c.rowconfigure(2, weight=0, minsize=self._BTN_ROW_MINSIZE)
 
-        hdg_box = tk.Frame(c, bg=self.C_HDG_BG,
-                           highlightbackground=self.C_HDG_BORDER,
-                           highlightthickness=2)
-        hdg_box.grid(row=0, column=0, columnspan=2,
-                     sticky="ew", pady=(0, 3))
-        hdg_box.columnconfigure(0, weight=1)
-
-        hdg_val = tk.Label(hdg_box, text="---.- ---",
-                           font=("Consolas", 16, "bold"),
-                           fg=self.C_CRIT, bg=self.C_HDG_BG, anchor="center")
-        hdg_val.grid(row=0, column=0, sticky="ew", padx=6, pady=4)
-        self._tier_widgets["hdg_val"] = hdg_val
-        self._tier_widgets["hdg_box"] = hdg_box
-
-        hdg_box.bind("<Configure>",
-                     lambda e: self._resize_hdg_font(e.width))
+        hdg_box = self._make_hdg_box(c, font_size=16)
+        hdg_box.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(0, 3))
 
         status = tk.Label(c, text="⬤  NO SIGNAL",
                           font=("Consolas", 8, "bold"),
@@ -219,38 +361,43 @@ class MagWidget(tk.Frame):
         self._tier_widgets["status"] = status
 
         mag_btn = tk.Button(
-            c, text="⊕ MAG",
+            c, text="⊕ CAL MAG",
             font=("Consolas", 9, "bold"),
             fg=self.C_BTN_MAG_FG, bg=self.C_BTN_MAG_BG,
             activeforeground=self.C_BG, activebackground=self.C_BTN_MAG_FG,
-            relief="flat", bd=0, padx=4, pady=10,
-            cursor="hand2",
+            relief="flat", bd=0, padx=4, cursor="hand2",
             command=self._on_mag_cal_pressed,
             state="normal" if self._on_mag_cal else "disabled")
-        mag_btn.grid(row=2, column=0, sticky="ew", padx=(0, 2))
+        mag_btn.grid(row=2, column=0, sticky="nsew", padx=(0, 2))
         self._tier_widgets["mag_btn"] = mag_btn
 
         acc_btn = tk.Button(
-            c, text="⊕ GYRO",
+            c, text="⊕ CAL GYRO",
             font=("Consolas", 9, "bold"),
             fg=self.C_BTN_ACC_FG, bg=self.C_BTN_ACC_BG,
             activeforeground=self.C_BG, activebackground=self.C_BTN_ACC_FG,
-            relief="flat", bd=0, padx=4, pady=10,
-            cursor="hand2",
+            relief="flat", bd=0, padx=4, cursor="hand2",
             command=self._on_acc_cal_pressed,
             state="normal" if self._on_acc_cal else "disabled")
-        acc_btn.grid(row=2, column=1, sticky="ew", padx=(2, 0))
+        acc_btn.grid(row=2, column=1, sticky="nsew", padx=(2, 0))
         self._tier_widgets["acc_btn"] = acc_btn
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Shared right panel
+    # Shared right panel (FULL / COMPACT)
     # ══════════════════════════════════════════════════════════════════════════
 
     def _build_right_panel(self, parent, font_card, font_status, font_btn, tier):
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(0, weight=1)
-        parent.rowconfigure(1, weight=0)
-        parent.rowconfigure(2, weight=0)
+        # Both the heading area and the button area are weighted now (not
+        # weight=0/content-driven), so when the panel is given more room
+        # than its minimum, that extra room is actually used — growing the
+        # heading font and enlarging the buttons into bigger, more prominent
+        # tap targets — instead of sitting at minimum size with the leftover
+        # space going unused (which is what made things look small/cramped
+        # even in a large window).
+        parent.rowconfigure(0, weight=3)   # top (label/heading/status/hint) — flexible
+        parent.rowconfigure(1, weight=0)   # separator — fixed, thin
+        parent.rowconfigure(2, weight=2)   # buttons — flexible, grows too
 
         top = tk.Frame(parent, bg=self.C_BG)
         top.grid(row=0, column=0, sticky="nsew")
@@ -258,53 +405,65 @@ class MagWidget(tk.Frame):
 
         trow = 0
         if tier == "full":
-            tk.Label(top, text="MAGNETIC HEADING",
+            label_row = trow
+            top.rowconfigure(label_row, weight=0, minsize=self._LABEL_MINSIZE)
+            hdg_label = tk.Label(top, text="MAGNETIC HEADING",
                      font=("Consolas", 7, "bold"),
                      fg=self.C_LABEL, bg=self.C_BG,
-                     ).grid(row=trow, column=0, pady=(2, 2))
+                     )
+            hdg_label.grid(row=label_row, column=0, pady=(2, 2))
+            self._tier_widgets["hdg_label"]     = hdg_label
+            self._tier_widgets["hdg_label_row"] = label_row
             trow += 1
 
-        hdg_box = tk.Frame(top, bg=self.C_HDG_BG,
-                           highlightbackground=self.C_HDG_BORDER,
-                           highlightthickness=2)
-        hdg_box.grid(row=trow, column=0, sticky="ew", ipady=3)
-        hdg_box.columnconfigure(0, weight=1)
+        # The heading row is the ONLY flexible row in `top` -- it gets
+        # whatever's left after the label/status/hint rows (all fixed,
+        # weight=0) have taken their guaranteed minimum. That leftover
+        # amount is what _resize_hdg_font() fits the font to, so growing
+        # the font can never encroach on the other rows.
+        hdg_row = trow
+        top.rowconfigure(hdg_row, weight=1, minsize=self._HDG_ROW_MINSIZE)
+        hdg_box = self._make_hdg_box(top, font_size=20)
+        hdg_box.grid(row=hdg_row, column=0, sticky="nsew")
+        # Keep refs so the rose can hide this box (and reclaim its row) when
+        # there's enough gutter space beside the compass to show a bigger,
+        # more prominent heading readout right next to it instead -- see
+        # _apply_side_heading_state().
+        self._tier_widgets["hdg_panel"]     = top
+        self._tier_widgets["hdg_row"]       = hdg_row
         trow += 1
 
-        hdg_val = tk.Label(hdg_box, text="---.- ---",
-                           font=("Consolas", 20, "bold"),
-                           fg=self.C_CRIT, bg=self.C_HDG_BG, anchor="center")
-        hdg_val.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
-        self._tier_widgets["hdg_val"] = hdg_val
-        self._tier_widgets["hdg_box"] = hdg_box
-
-        # Bind to BOTH the box resize AND the parent resize so font
-        # re-measures whenever available width changes for any reason.
-        hdg_box.bind("<Configure>",
-                     lambda e: self._resize_hdg_font(e.width))
+        # Re-measure whenever the box itself resizes AND whenever the
+        # surrounding panel resizes (covers layout passes that change the
+        # box's assigned size without the box itself firing Configure).
         parent.bind("<Configure>",
                     lambda e: self._trigger_hdg_resize(), add="+")
 
+        status_row = trow
+        top.rowconfigure(status_row, weight=0, minsize=self._STATUS_MINSIZE)
         status = tk.Label(top, text="⬤  NO SIGNAL",
                           font=("Consolas", font_status, "bold"),
                           fg=self.C_NOSIG_FG, bg=self.C_BG, anchor="center")
-        status.grid(row=trow, column=0, pady=(5, 2))
+        status.grid(row=status_row, column=0, pady=(5, 2))
         self._tier_widgets["status"] = status
         trow += 1
 
         if tier == "full":
+            hint_row = trow
+            top.rowconfigure(hint_row, weight=0, minsize=self._HINT_MINSIZE)
             hint = tk.Label(top,
                             text="Set debug_mode = MAG_CALIB\nin Betaflight CLI",
                             font=("Consolas", 7),
                             fg=self.C_HINT, bg=self.C_BG, justify="center")
-            hint.grid(row=trow, column=0, pady=(0, 2))
+            hint.grid(row=hint_row, column=0, pady=(0, 2))
             self._tier_widgets["hint"] = hint
 
         tk.Frame(parent, bg=self.C_SEP, height=1).grid(
             row=1, column=0, sticky="ew", padx=2, pady=3)
 
         btn = tk.Frame(parent, bg=self.C_BG)
-        btn.grid(row=2, column=0, sticky="ew")
+        btn.grid(row=2, column=0, sticky="nsew")
+        parent.rowconfigure(2, weight=2, minsize=self._BTN_ROW_MINSIZE * 2)
         btn.columnconfigure(0, weight=1)
 
         brow = 0
@@ -319,13 +478,15 @@ class MagWidget(tk.Frame):
             cursor="hand2",
             command=self._on_mag_cal_pressed,
             state="normal" if self._on_mag_cal else "disabled")
-        mag_btn.grid(row=brow, column=0, sticky="ew", pady=(0, 2))
+        btn.rowconfigure(brow, weight=1, minsize=self._BTN_ROW_MINSIZE)
+        mag_btn.grid(row=brow, column=0, sticky="nsew", pady=(0, 2))
         self._tier_widgets["mag_btn"] = mag_btn
         brow += 1
 
         if tier == "full":
             mag_lbl = tk.Label(btn, text="", font=("Consolas", 7),
                                fg=self.C_WARN, bg=self.C_BG, justify="center")
+            btn.rowconfigure(brow, weight=0)
             mag_lbl.grid(row=brow, column=0)
             self._tier_widgets["mag_lbl"] = mag_lbl
             brow += 1
@@ -340,7 +501,8 @@ class MagWidget(tk.Frame):
             cursor="hand2",
             command=self._on_acc_cal_pressed,
             state="normal" if self._on_acc_cal else "disabled")
-        acc_btn.grid(row=brow, column=0, sticky="ew", pady=(0, 2))
+        btn.rowconfigure(brow, weight=1, minsize=self._BTN_ROW_MINSIZE)
+        acc_btn.grid(row=brow, column=0, sticky="nsew", pady=(0, 2))
         self._tier_widgets["acc_btn"] = acc_btn
         brow += 1
 
@@ -348,40 +510,51 @@ class MagWidget(tk.Frame):
             acc_lbl = tk.Label(btn, text="", font=("Consolas", 7),
                                fg=self.C_BTN_ACC_FG, bg=self.C_BG,
                                justify="center")
+            btn.rowconfigure(brow, weight=0)
             acc_lbl.grid(row=brow, column=0)
             self._tier_widgets["acc_lbl"] = acc_lbl
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Adaptive heading font  ← FIXED
+    # Adaptive heading font  ← FIXED (width AND height, bounded box)
     # ══════════════════════════════════════════════════════════════════════════
 
     def _trigger_hdg_resize(self):
-        """Called when the right panel resizes — re-measure using box width."""
+        """Called when the surrounding panel resizes — re-measure using the
+        heading box's own current assigned size."""
         hdg_box = self._tier_widgets.get("hdg_box")
         if hdg_box:
             w = hdg_box.winfo_width()
-            if w > 1:
-                self._resize_hdg_font(w)
+            h = hdg_box.winfo_height()
+            if w > 1 and h > 1:
+                self._resize_hdg_font(w, h)
 
-    def _resize_hdg_font(self, box_width: int):
+    def _resize_hdg_font(self, box_width: int, box_height: int):
         """
         Binary-search for the largest font size (Consolas Bold) where the
-        WORST-CASE heading string '000.0° NW' fits inside box_width minus
-        padding.  Uses font.measure() for pixel-accurate measurement so the
-        label never clips regardless of the cardinal suffix length (N vs NW).
+        WORST-CASE heading string '270.0° NW' fits inside the heading box's
+        *actual assigned* width AND height, minus padding. Because the box
+        has grid_propagate(False) and only ever receives whatever space its
+        row/column allocates it (see _make_hdg_box and the weight layout in
+        each tier builder), that assigned size can never itself grow to
+        chase the font -- so a fit found here is guaranteed to render
+        without clipping, in either dimension.
         """
         hdg_val = self._tier_widgets.get("hdg_val")
         if not hdg_val:
             return
 
-        available = box_width - self._HDG_PADDING
-        if available < 20:
+        available_w = box_width  - self._HDG_PAD_X
+        available_h = box_height - self._HDG_PAD_Y
+        if available_w < 20 or available_h < 10:
             return
 
         # Worst-case text: 3-digit degrees + two-char cardinal e.g. "270.0° NW"
         test_text = "270.0° NW"
 
-        # Binary search between min and max for the largest fitting size
+        # Binary search between min and max for the largest fitting size,
+        # checking BOTH dimensions -- previously only width was checked,
+        # which let a font be chosen that fit horizontally but was taller
+        # than the box, so it overflowed vertically and got clipped.
         lo, hi = self._HDG_MIN_PT, self._HDG_MAX_PT
         best   = lo
 
@@ -389,7 +562,8 @@ class MagWidget(tk.Frame):
             mid  = (lo + hi) // 2
             font = tkfont.Font(family="Consolas", size=mid, weight="bold")
             text_w = font.measure(test_text)
-            if text_w <= available:
+            text_h = font.metrics("linespace")
+            if text_w <= available_w and text_h <= available_h:
                 best = mid
                 lo   = mid + 1
             else:
@@ -433,9 +607,7 @@ class MagWidget(tk.Frame):
     def _redraw_dynamic(self):
         self._draw_rose()
         self._update_readout_widgets(self._last_heading, self._valid)
-        hdg_box = self._tier_widgets.get("hdg_box")
-        if hdg_box:
-            self._resize_hdg_font(hdg_box.winfo_width())
+        self._trigger_hdg_resize()
 
     # ══════════════════════════════════════════════════════════════════════════
     # Compass Rose
@@ -454,7 +626,6 @@ class MagWidget(tk.Frame):
 
         heading = self._last_heading
         valid   = self._valid
-        cx = W // 2
         cy = H // 2
 
         r_from_size   = min(W, H) // 2 - 5
@@ -467,13 +638,14 @@ class MagWidget(tk.Frame):
         f_overlay       = max(8,  int(r * 0.15))
         f_nosig         = max(9,  int(r * 0.17))
 
-        cv.create_oval(cx - r, cy - r, cx + r, cy + r,
-                       fill=self.C_ROSE_BG, outline=self.C_ROSE_RING, width=2)
-        r2 = int(r * 0.88)
-        cv.create_oval(cx - r2, cy - r2, cx + r2, cy + r2,
-                       fill="", outline="#152535", width=1)
-
         if not valid:
+            cx = W // 2
+            self._apply_side_heading_state(False)
+            cv.create_oval(cx - r, cy - r, cx + r, cy + r,
+                           fill=self.C_ROSE_BG, outline=self.C_ROSE_RING, width=2)
+            r2 = int(r * 0.88)
+            cv.create_oval(cx - r2, cy - r2, cx + r2, cy + r2,
+                           fill="", outline="#152535", width=1)
             cv.create_text(cx, cy - int(r * 0.12), text="NO SIG",
                            fill=self.C_NOSIG_FG,
                            font=("Consolas", f_nosig, "bold"))
@@ -482,6 +654,36 @@ class MagWidget(tk.Frame):
                                fill=self.C_HINT,
                                font=("Consolas", max(6, f_nosig - 3)))
             return
+
+        # ── Decide, BEFORE drawing anything, whether the side-gutter
+        # heading readout will be shown, and if so how wide it needs to
+        # be -- so the compass and the heading box can be centered as a
+        # single group (with a fixed gap between them) rather than the
+        # compass sitting dead-center and the box being tacked onto
+        # whatever space happened to be left on one side.
+        gutter_estimate = int(W / 2 - r) - 14
+        side_active = gutter_estimate >= self._GUTTER_MIN_PX
+
+        box_w = box_h = best_font = 0
+        if side_active:
+            best_font, box_w, box_h = self._compute_side_heading_layout(
+                gutter_estimate, r, H)
+            if box_w <= 0:
+                side_active = False
+
+        if side_active:
+            group_w = 2 * r + self._SIDE_HDG_GAP_PX + box_w
+            cx = int((W - group_w) / 2) + r
+        else:
+            cx = W // 2
+
+        self._apply_side_heading_state(side_active)
+
+        cv.create_oval(cx - r, cy - r, cx + r, cy + r,
+                       fill=self.C_ROSE_BG, outline=self.C_ROSE_RING, width=2)
+        r2 = int(r * 0.88)
+        cv.create_oval(cx - r2, cy - r2, cx + r2, cy + r2,
+                       fill="", outline="#152535", width=1)
 
         tick_step = 5 if r > 70 else (10 if r > 40 else 30)
         for deg in range(0, 360, tick_step):
@@ -561,17 +763,115 @@ class MagWidget(tk.Frame):
         cv.create_oval(cx - dot, cy - dot, cx + dot, cy + dot,
                        fill=self.C_LUBBER, outline=self.C_ROSE_BG, width=1)
 
-        ov_y  = cy + int(r * 0.76)
-        ov_hw = int(r * 0.46)
-        ov_hh = max(9, int(r * 0.16))
-        cv.create_rectangle(cx - ov_hw, ov_y - ov_hh,
-                             cx + ov_hw, ov_y + ov_hh,
+        if side_active:
+            x_c = cx + r + self._SIDE_HDG_GAP_PX + box_w / 2
+            self._draw_side_heading_box(cv, x_c, cy, box_w, box_h,
+                                        best_font, heading, valid=True)
+        else:
+            ov_y  = cy + int(r * 0.76)
+            ov_hw = int(r * 0.46)
+            ov_hh = max(9, int(r * 0.16))
+            cv.create_rectangle(cx - ov_hw, ov_y - ov_hh,
+                                 cx + ov_hw, ov_y + ov_hh,
+                                 fill=self.C_HDG_BG,
+                                 outline=self.C_HDG_BORDER, width=1)
+            cv.create_text(cx, ov_y,
+                           text=f"{heading % 360:05.1f}°",
+                           fill=self.C_SAFE,
+                           font=("Consolas", f_overlay, "bold"))
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Rose side-gutter heading — uses the blank space beside a height-bound
+    # compass rose to show ONE big, prominent heading readout right next to
+    # it, instead of a small duplicate tucked in the side panel.
+    #
+    # Sizing and drawing are split into two steps: _compute_side_heading_layout()
+    # figures out how big the box/font need to be *before* the rose itself is
+    # drawn, so the caller can center the compass+box pair as a single group
+    # (with a fixed gap between them) rather than drawing the compass
+    # dead-center first and bolting the box onto whatever space is left on
+    # one side.
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _compute_side_heading_layout(self, gutter_px, r, H):
+        """Binary-search the largest font (bounded by the worst-case string
+        '270.0° NW') that fits in the estimated gutter, and return
+        (font_size, box_w, box_h). Returns (0, 0, 0) if there isn't enough
+        room to bother."""
+        avail_w = gutter_px - 6
+        avail_h = min(H - 16, max(40, int(r * 1.6)))
+        if avail_w < 30 or avail_h < 20:
+            return 0, 0, 0
+
+        test_text = "270.0° NW"
+        lo, hi = self._HDG_MIN_PT, self._SIDE_HDG_MAX_PT
+        best = lo
+        while lo <= hi:
+            mid  = (lo + hi) // 2
+            font = tkfont.Font(family="Consolas", size=mid, weight="bold")
+            if font.measure(test_text) <= avail_w and \
+               font.metrics("linespace") <= avail_h:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        box_w = avail_w + 16
+        box_h = min(avail_h + 16, H - 6)
+        return best, box_w, box_h
+
+    def _draw_side_heading_box(self, cv, x_c, y_c, box_w, box_h, font_size,
+                               heading, valid):
+        """Draw the large digital heading readout box, pre-sized by
+        _compute_side_heading_layout(), centered at (x_c, y_c)."""
+        cv.create_rectangle(x_c - box_w / 2, y_c - box_h / 2,
+                             x_c + box_w / 2, y_c + box_h / 2,
                              fill=self.C_HDG_BG,
-                             outline=self.C_HDG_BORDER, width=1)
-        cv.create_text(cx, ov_y,
-                       text=f"{heading % 360:05.1f}°",
-                       fill=self.C_SAFE,
-                       font=("Consolas", f_overlay, "bold"))
+                             outline=self.C_HDG_BORDER, width=2)
+
+        if valid:
+            hdg_norm = heading % 360.0
+            cardinal = self._cardinal_for(hdg_norm)
+            text = f"{hdg_norm:05.1f}° {cardinal}"
+            color = self.C_SAFE
+        else:
+            text  = "---.- ---"
+            color = self.C_CRIT
+
+        cv.create_text(x_c, y_c, text=text, fill=color,
+                       font=("Consolas", font_size, "bold"))
+
+    def _apply_side_heading_state(self, active: bool):
+        """Show/hide the side panel's own (smaller) heading box + label in
+        favor of the rose's big side readout, and reclaim its row so status
+        and the calibration buttons get to use the freed vertical space too.
+        No-op in tiers that don't have a side panel (mini/side have no rose,
+        so this is simply never triggered for them)."""
+        if active == self._side_heading_active:
+            return
+        self._side_heading_active = active
+
+        panel   = self._tier_widgets.get("hdg_panel")
+        hdg_box = self._tier_widgets.get("hdg_box")
+        hdg_row = self._tier_widgets.get("hdg_row")
+        if panel is None or hdg_box is None or hdg_row is None:
+            return
+
+        label     = self._tier_widgets.get("hdg_label")
+        label_row = self._tier_widgets.get("hdg_label_row")
+
+        if active:
+            hdg_box.grid_remove()
+            panel.rowconfigure(hdg_row, weight=0, minsize=0)
+            if label is not None:
+                label.grid_remove()
+                panel.rowconfigure(label_row, weight=0, minsize=0)
+        else:
+            hdg_box.grid(row=hdg_row, column=0, sticky="nsew")
+            panel.rowconfigure(hdg_row, weight=1, minsize=self._HDG_ROW_MINSIZE)
+            if label is not None:
+                label.grid(row=label_row, column=0, pady=(2, 2))
+                panel.rowconfigure(label_row, weight=0, minsize=self._LABEL_MINSIZE)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Readout widget update
@@ -610,10 +910,11 @@ class MagWidget(tk.Frame):
             hdg_box = self._tier_widgets.get("hdg_box")
             if hdg_box:
                 w = hdg_box.winfo_width()
-                if w > 1:
+                h = hdg_box.winfo_height()
+                if w > 1 and h > 1:
                     # Force re-check even if size didn't change — text did
                     self._hdg_font_size = 0
-                    self._resize_hdg_font(w)
+                    self._resize_hdg_font(w, h)
 
         if status:
             status.config(text="⬤  LOCK", fg=self.C_GREEN)
