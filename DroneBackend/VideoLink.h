@@ -6,13 +6,17 @@
 #include <string>
 #include <vector>
 
-// Windows native window handle for direct-to-window rendering.
+// Windows native window/DC handles for direct-to-window rendering.
 // Forward-declared instead of including <windows.h> here to keep this
 // header light for translation units that don't need Win32 types --
 // only VideoLink.cpp needs the full Windows.h.
 #ifndef HWND
 struct HWND__;
 typedef HWND__* HWND;
+#endif
+#ifndef HDC
+struct HDC__;
+typedef HDC__* HDC;
 #endif
 
 struct CaptureDeviceInfo {
@@ -45,6 +49,13 @@ public:
 
     void setPreferredResolution(int w, int h) { prefW = w; prefH = h; }
 
+    // Requested capture frame rate, applied via CAP_PROP_FPS on connect().
+    // Left unset, most UVC capture dongles/backends silently negotiate a
+    // lower default (often 30 fps) even when they support more -- this is
+    // a hint, not a guarantee; the device may clamp it to whatever mode it
+    // actually supports at the requested resolution.
+    void setPreferredFps(double fps) { prefFps = fps; }
+
     // ── Native direct-to-window rendering ───────────────────────────────
     //
     // Attaches a child GDI render window under parentHwnd (a Tk frame's
@@ -76,7 +87,10 @@ public:
     // These four calls let the Python side keep this window's OS-level
     // stacking/visibility in sync with whatever it's doing to the
     // corresponding Tk panel (see DroneCockpitApp._on_panel_zorder /
-    // _on_panel_visibility on the Python side).
+    // _on_panel_visibility on the Python side). Make sure they're
+    // exposed in the pybind11 module -- if they're missing there, the
+    // sync becomes a silent no-op on the Python side and the window gets
+    // stuck at its default (topmost) Z-order.
     void raiseWindow();
     void lowerWindow();
     void showWindow();
@@ -94,11 +108,21 @@ private:
     std::atomic<double> measuredFps{ 0.0 };
     std::string deviceName_;
     int prefW = 720, prefH = 480;
+    double prefFps = 60.0;   // requested via CAP_PROP_FPS in connect()
 
     // renderHwnd_ is written from the Python/Tk thread (attach/detach)
     // and read from the capture thread (paintFrame) every frame, so it's
     // an atomic rather than plain HWND.
     std::atomic<HWND> renderHwnd_{ nullptr };
+
+    // renderHdc_ is a single DC acquired once (via GetDC, right after the
+    // window is created with CS_OWNDC) and reused for every subsequent
+    // StretchDIBits call, instead of paying a GetDC/ReleaseDC round trip
+    // per frame. CS_OWNDC guarantees this DC stays valid and exclusively
+    // ours for the lifetime of the window, so caching it is safe. It is
+    // released exactly once, in detachWindow(), before the window itself
+    // is destroyed.
+    std::atomic<HDC> renderHdc_{ nullptr };
 
     // windowVisible_ mirrors the last showWindow()/hideWindow() call so
     // paintFrame() can skip the GDI blit entirely while the panel is

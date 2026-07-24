@@ -123,6 +123,12 @@ bool VideoLink::connect(int deviceIndex) {
     cap.set(cv::CAP_PROP_FRAME_HEIGHT, prefH);
     cap.set(cv::CAP_PROP_BUFFERSIZE, 1);   // no internal queue -- always freshest frame
     cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+    // Ask for the highest frame rate we care about. Most backends/devices
+    // will silently clamp this to whatever mode they actually support at
+    // the requested resolution, so it's safe to just ask high -- but
+    // without asking at all, several UVC dongles default to 30 fps even
+    // when a 60 fps mode exists at the same resolution.
+    cap.set(cv::CAP_PROP_FPS, prefFps);
 
     cv::Mat testFrame;
     if (!cap.read(testFrame) || testFrame.empty()) {
@@ -150,10 +156,11 @@ void VideoLink::disconnect() {
 // =============================================================================
 
 static LRESULT CALLBACK VideoLinkWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    // We paint from the capture thread via GetDC() outside of WM_PAINT,
-    // so this proc just needs to suppress the default background erase
-    // (which would otherwise cause visible flicker between frames) and
-    // defer everything else to Windows' default handling.
+    // We paint from the capture thread via a cached DC outside of
+    // WM_PAINT, so this proc just needs to suppress the default
+    // background erase (which would otherwise cause visible flicker
+    // between frames) and defer everything else to Windows' default
+    // handling.
     if (msg == WM_ERASEBKGND)
         return 1;
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -169,6 +176,13 @@ void VideoLink::createRenderWindow(HWND parent, int x, int y, int w, int h) {
         wc.hInstance = GetModuleHandleW(nullptr);
         wc.lpszClassName = clsName;
         wc.hbrBackground = nullptr;   // we own all painting
+        // CS_OWNDC gives this window a private, persistent device context
+        // instead of one borrowed from a shared DC cache on every
+        // GetDC()/ReleaseDC() pair. That lets us acquire the DC exactly
+        // once below and reuse it for every frame's StretchDIBits call,
+        // instead of paying that acquire/release cost 30-60+ times a
+        // second.
+        wc.style = CS_OWNDC;
         RegisterClassW(&wc);
         classRegistered = true;
     }
@@ -184,6 +198,25 @@ void VideoLink::createRenderWindow(HWND parent, int x, int y, int w, int h) {
 
     renderHwnd_.store(hwnd);
     windowVisible_.store(true);
+
+    if (hwnd) {
+        HDC hdc = GetDC(hwnd);
+        if (hdc) {
+            // COLORONCOLOR is a cheap nearest-neighbor-ish stretch filter.
+            // HALFTONE (the previous mode) does per-pixel area averaging
+            // for higher quality, but it's dramatically more expensive --
+            // for a live low-latency feed the extra smoothing isn't worth
+            // the CPU time, and skipping it is what keeps the capture
+            // thread able to keep pace with the device's native frame
+            // rate instead of the blit itself becoming the bottleneck.
+            // COLORONCOLOR also doesn't need SetBrushOrgEx to avoid the
+            // sub-pixel misalignment HALFTONE is prone to, so that call
+            // is gone too. Set once here since the mode doesn't change
+            // per frame.
+            SetStretchBltMode(hdc, COLORONCOLOR);
+        }
+        renderHdc_.store(hdc);
+    }
 }
 
 void VideoLink::attachToWindow(intptr_t parentHwnd, int x, int y, int w, int h) {
@@ -199,6 +232,9 @@ void VideoLink::resizeWindow(int w, int h) {
 
 void VideoLink::detachWindow() {
     HWND hwnd = renderHwnd_.exchange(nullptr);
+    HDC hdc = renderHdc_.exchange(nullptr);
+    if (hdc && hwnd)
+        ReleaseDC(hwnd, hdc);
     if (hwnd)
         DestroyWindow(hwnd);
 }
@@ -247,14 +283,15 @@ void VideoLink::hideWindow() {
 
 void VideoLink::paintFrame(const cv::Mat& frame) {
     // Skip the blit entirely while the panel is hidden -- there's no
-    // point spending a GetDC/StretchDIBits/ReleaseDC round trip on a
-    // window Windows isn't compositing anyway, and this also guarantees
-    // the window can never appear to "come back" mid-frame while hidden.
+    // point spending a StretchDIBits round trip on a window Windows
+    // isn't compositing anyway, and this also guarantees the window can
+    // never appear to "come back" mid-frame while hidden.
     if (!windowVisible_.load())
         return;
 
     HWND hwnd = renderHwnd_.load();
-    if (!hwnd || frame.empty())
+    HDC hdc = renderHdc_.load();
+    if (!hwnd || !hdc || frame.empty())
         return;
 
     RECT rc;
@@ -275,20 +312,13 @@ void VideoLink::paintFrame(const cv::Mat& frame) {
     bmi.bmiHeader.biBitCount = 24;
     bmi.bmiHeader.biCompression = BI_RGB;
 
-    HDC hdc = GetDC(hwnd);
-    if (!hdc)
-        return;
-    SetStretchBltMode(hdc, HALFTONE);
-    // HALFTONE mode ignores the brush origin unless it's set explicitly --
-    // omitting this line is a common source of a 1px vertical misalignment.
-    SetBrushOrgEx(hdc, 0, 0, nullptr);
-
+    // hdc is the window's own cached, persistent DC (CS_OWNDC, acquired
+    // once in createRenderWindow) -- no GetDC()/ReleaseDC() per frame,
+    // and the stretch mode was already set once when the DC was acquired.
     StretchDIBits(hdc,
         0, 0, destW, destH,
         0, 0, frame.cols, frame.rows,
         frame.data, &bmi, DIB_RGB_COLORS, SRCCOPY);
-
-    ReleaseDC(hwnd, hdc);
 }
 
 // =============================================================================
@@ -296,6 +326,16 @@ void VideoLink::paintFrame(const cv::Mat& frame) {
 // =============================================================================
 
 void VideoLink::captureLoop() {
+    // Nudge the OS scheduler to favor this thread. The capture thread's
+    // job is read-decode-blit in a tight loop; if it gets pre-empted for
+    // long stretches by the Tk pump or other background threads, frames
+    // queue up in the device/driver instead of being drained immediately,
+    // which is exactly the kind of latency BUFFERSIZE=1 is meant to
+    // avoid. ABOVE_NORMAL is a conservative bump that reduces scheduling
+    // jitter without risking starving the rest of the app the way
+    // THREAD_PRIORITY_TIME_CRITICAL could on a loaded system.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
     auto fpsWindowStart = std::chrono::steady_clock::now();
     uint64_t framesInWindow = 0;
 
