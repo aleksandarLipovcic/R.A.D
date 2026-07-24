@@ -5,6 +5,7 @@
 #include <atomic>
 #include <string>
 #include <vector>
+#include <cstdint>
 
 // Windows native window/DC handles for direct-to-window rendering.
 // Forward-declared instead of including <windows.h> here to keep this
@@ -24,6 +25,24 @@ struct CaptureDeviceInfo {
     std::string name;
 };
 
+// Link state as seen by the capture thread. Python polls this (via
+// getLinkState()) to decide whether to show the live feed or a
+// "SIGNAL LOST" overlay -- see getMsSinceLastFrame() below for the
+// independent fallback check.
+//
+//   Disconnected -> no connect() has succeeded yet, or disconnect()
+//                   was called explicitly. Capture thread is not running.
+//   Searching    -> connectAuto()/connect() is probing devices, trying
+//                   to get the very first frame.
+//   Connected    -> frames are actively flowing.
+//   SignalLost   -> a previously-working connection stopped delivering
+//                   frames (device unplugged, driver fault, etc). The
+//                   capture thread is still alive and retrying
+//                   cap.open() in the background; no Python action is
+//                   needed to trigger recovery, only to reflect the
+//                   state in the UI.
+enum class LinkState { Disconnected, Searching, Connected, SignalLost };
+
 class VideoLink {
 public:
     VideoLink();
@@ -41,6 +60,20 @@ public:
     bool connect(int deviceIndex);
     void disconnect();
     bool isConnected() const { return connected.load(); }
+
+    // ── Signal-loss detection ────────────────────────────────────────
+    //
+    // isConnected() alone isn't enough for a pilot-facing UI: it used to
+    // never go false when the device dropped mid-stream, because the
+    // capture loop just kept retrying cap.read() forever without
+    // updating any externally-visible state. getLinkState() is the
+    // authoritative state; getMsSinceLastFrame() is a second,
+    // independent signal Python can use as a fallback staleness check
+    // even if a future change ever leaves the state machine wrong --
+    // for a video feed that's a drone pilot's eyes, it's worth having
+    // both rather than relying on a single flag.
+    LinkState getLinkState() const { return linkState_.load(); }
+    uint64_t getMsSinceLastFrame() const;
 
     cv::Mat getLatestFrame();
     uint64_t getFrameCount() const { return frameCount.load(); }
@@ -91,6 +124,12 @@ public:
     // exposed in the pybind11 module -- if they're missing there, the
     // sync becomes a silent no-op on the Python side and the window gets
     // stuck at its default (topmost) Z-order.
+    //
+    // The same window is also how a signal-loss indication reaches the
+    // screen at the C++ level (see paintNoSignalFrame in the .cpp) --
+    // raiseWindow()/hideWindow() remain the right tool for a Python-side
+    // "SIGNAL LOST" panel drawn in Tk above this HWND, if you want a
+    // second, UI-toolkit-level indicator in addition to the in-window one.
     void raiseWindow();
     void lowerWindow();
     void showWindow();
@@ -109,6 +148,21 @@ private:
     std::string deviceName_;
     int prefW = 720, prefH = 480;
     double prefFps = 60.0;   // requested via CAP_PROP_FPS in connect()
+
+    // Link state machine driven entirely by captureLoop(). See LinkState
+    // above for the meaning of each value.
+    std::atomic<LinkState> linkState_{ LinkState::Disconnected };
+
+    // Epoch milliseconds (steady_clock) of the last successfully decoded
+    // frame. 0 means "never received a frame". Read by
+    // getMsSinceLastFrame(), written only from the capture thread.
+    std::atomic<int64_t> lastFrameTimeMs_{ 0 };
+
+    // Device index used by the current/most recent connect(), so the
+    // capture thread's own reconnect-on-signal-loss logic knows which
+    // index to retry without any help from Python. Set in connect();
+    // read only from the capture thread.
+    int lastDeviceIndex_ = -1;
 
     // renderHwnd_ is written from the Python/Tk thread (attach/detach)
     // and read from the capture thread (paintFrame) every frame, so it's
@@ -134,4 +188,17 @@ private:
 
     void createRenderWindow(HWND parent, int x, int y, int w, int h);
     void paintFrame(const cv::Mat& frame);
+
+    // Paints a solid indicator + "NO SIGNAL" text directly into the
+    // render window from the capture thread, at the moment linkState_
+    // transitions to SignalLost (and again on each reconnect attempt,
+    // in case the window got covered/uncovered by another app in the
+    // meantime -- this window doesn't implement WM_PAINT repainting, so
+    // nothing else will refresh it while no frames are flowing).
+    void paintNoSignalFrame();
+
+    // Attempts to re-open lastDeviceIndex_ and read one frame. Returns
+    // true and leaves cap opened/streaming on success. Called from
+    // captureLoop() while linkState_ == SignalLost.
+    bool tryReconnect();
 };

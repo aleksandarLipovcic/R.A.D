@@ -4,6 +4,17 @@
 #include <algorithm>
 #include <cctype>
 
+// Silences OpenCV's own internal MSMF/DSHOW logger (the
+// "OnReadSample() is called with error status", "can't grab frame",
+// "backend is generally available but can't be used to capture by
+// index" lines). These come straight from OpenCV on every failed
+// cap.read()/cap.open() call, completely independent of anything we
+// print ourselves -- during a SignalLost recovery loop (tryReconnect()
+// retried every kReconnectIntervalMs) that alone was enough to flood
+// the console for as long as the dongle stayed disconnected, drowning
+// out our own single-line state-transition logs below.
+#include <opencv2/core/utils/logger.hpp>
+
 // Media Foundation device enumeration (Windows-native device names +
 // friendly indices -- this is what actually lets us tell "USB capture
 // dongle" apart from "Integrated Webcam" before we ever open anything).
@@ -16,7 +27,50 @@
 #pragma comment(lib, "mfreadwrite.lib")
 #pragma comment(lib, "mfuuid.lib")
 
-VideoLink::VideoLink() {}
+namespace {
+    // Number of consecutive failed cap.read() calls before we declare
+    // the signal lost. At the loop's 5ms failure-path sleep, this is
+    // roughly 75-100ms of real signal dropout before we react -- long
+    // enough to ride out a single dropped USB packet without flapping
+    // the UI, short enough that a genuine disconnect is caught almost
+    // immediately.
+    constexpr int kFailuresBeforeSignalLost = 15;
+
+    // Minimum spacing between cap.open() retry attempts while the
+    // signal is lost. Calling cap.open() in a tight loop against a
+    // vanished device is wasted CPU and, on some MSMF backends, can
+    // itself generate additional warning spam -- this keeps retries
+    // frequent enough to feel instant to the pilot when the dongle is
+    // replugged, without hammering the driver in between.
+    constexpr int kReconnectIntervalMs = 400;
+
+    // Number of consecutive good frames required at connect() time
+    // before we declare the link genuinely stable and start the
+    // capture thread. A single successful read is not proof the
+    // stream is actually flowing -- some MSMF devices/drivers hand
+    // back one valid frame from a half-initialized pipeline and then
+    // immediately fail for the next several hundred ms to a few
+    // seconds while D3D11 acceleration / the source reader finishes
+    // spinning up. Without this check, connect() reports success,
+    // the UI shows "connected", and the pilot is staring at a black
+    // window while the capture thread silently churns through
+    // kFailuresBeforeSignalLost failures and drops into the slower
+    // SignalLost/tryReconnect() recovery path instead. Catching it
+    // here means a not-actually-ready device just fails connect()
+    // outright, so the (much faster) top-level connectAuto()/connect()
+    // retry is what handles it instead of a multi-second SignalLost
+    // stall.
+    constexpr int kStableFramesRequired = 3;
+    constexpr int kStableFrameSpacingMs = 15;
+}
+
+VideoLink::VideoLink() {
+    static bool logLevelSet = false;
+    if (!logLevelSet) {
+        cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_SILENT);
+        logLevelSet = true;
+    }
+}
 VideoLink::~VideoLink() {
     disconnect();
     detachWindow();
@@ -88,6 +142,8 @@ bool VideoLink::looksLikeIntegratedWebcam(const std::string& name) {
 // =============================================================================
 
 bool VideoLink::connectAuto() {
+    linkState_.store(LinkState::Searching);
+
     auto devices = enumerateDevices();
 
     std::vector<CaptureDeviceInfo> candidates;
@@ -107,17 +163,24 @@ bool VideoLink::connectAuto() {
             return true;
         }
     }
+
+    linkState_.store(LinkState::Disconnected);
     return false;
 }
 
 bool VideoLink::connect(int deviceIndex) {
     disconnect();
 
+    linkState_.store(LinkState::Searching);
+    lastDeviceIndex_ = deviceIndex;
+
     cap.open(deviceIndex, cv::CAP_MSMF);
     if (!cap.isOpened())
         cap.open(deviceIndex, cv::CAP_DSHOW);   // fallback backend
-    if (!cap.isOpened())
+    if (!cap.isOpened()) {
+        linkState_.store(LinkState::Disconnected);
         return false;
+    }
 
     cap.set(cv::CAP_PROP_FRAME_WIDTH, prefW);
     cap.set(cv::CAP_PROP_FRAME_HEIGHT, prefH);
@@ -130,14 +193,26 @@ bool VideoLink::connect(int deviceIndex) {
     // when a 60 fps mode exists at the same resolution.
     cap.set(cv::CAP_PROP_FPS, prefFps);
 
+    // A single successful read() here isn't sufficient proof the stream
+    // is actually stable -- see kStableFramesRequired above. Require a
+    // short run of consecutive good frames before declaring connect()
+    // successful and starting the capture thread.
     cv::Mat testFrame;
-    if (!cap.read(testFrame) || testFrame.empty()) {
-        cap.release();
-        return false;
+    for (int i = 0; i < kStableFramesRequired; ++i) {
+        if (!cap.read(testFrame) || testFrame.empty()) {
+            cap.release();
+            linkState_.store(LinkState::Disconnected);
+            return false;
+        }
+        if (i + 1 < kStableFramesRequired)
+            std::this_thread::sleep_for(std::chrono::milliseconds(kStableFrameSpacingMs));
     }
 
     connected.store(true);
     keepRunning.store(true);
+    linkState_.store(LinkState::Connected);
+    lastFrameTimeMs_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
     captureThread = std::thread(&VideoLink::captureLoop, this);
     return true;
 }
@@ -149,6 +224,7 @@ void VideoLink::disconnect() {
     if (cap.isOpened())
         cap.release();
     connected.store(false);
+    linkState_.store(LinkState::Disconnected);
 }
 
 // =============================================================================
@@ -322,6 +398,65 @@ void VideoLink::paintFrame(const cv::Mat& frame) {
 }
 
 // =============================================================================
+// Signal-loss indicator + reconnect
+// =============================================================================
+
+void VideoLink::paintNoSignalFrame() {
+    // Bypasses the windowVisible_ check on purpose: if the panel is
+    // hidden, showWindow()/hideWindow() (driven by Python) already
+    // governs whether anything is on screen at all -- painting here
+    // just makes sure that *when* it becomes visible again, it shows
+    // "NO SIGNAL" rather than the last live frame.
+    HWND hwnd = renderHwnd_.load();
+    HDC hdc = renderHdc_.load();
+    if (!hwnd || !hdc)
+        return;
+
+    RECT rc;
+    if (!GetClientRect(hwnd, &rc))
+        return;
+
+    static HBRUSH noSignalBrush = CreateSolidBrush(RGB(90, 0, 0));
+    FillRect(hdc, &rc, noSignalBrush);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(255, 255, 255));
+    HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HFONT oldFont = (HFONT)SelectObject(hdc, font);
+
+    const wchar_t* msg = L"NO SIGNAL";
+    DrawTextW(hdc, msg, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    SelectObject(hdc, oldFont);
+}
+
+bool VideoLink::tryReconnect() {
+    if (lastDeviceIndex_ < 0)
+        return false;
+
+    cap.release();
+
+    bool opened = cap.open(lastDeviceIndex_, cv::CAP_MSMF);
+    if (!opened)
+        opened = cap.open(lastDeviceIndex_, cv::CAP_DSHOW);
+    if (!opened)
+        return false;
+
+    cap.set(cv::CAP_PROP_FRAME_WIDTH, prefW);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, prefH);
+    cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+    cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+    cap.set(cv::CAP_PROP_FPS, prefFps);
+
+    cv::Mat probe;
+    if (!cap.read(probe) || probe.empty()) {
+        cap.release();
+        return false;
+    }
+    return true;
+}
+
+// =============================================================================
 // captureLoop()  —  runs on its own thread, decoupled entirely from Python
 // =============================================================================
 
@@ -338,18 +473,78 @@ void VideoLink::captureLoop() {
 
     auto fpsWindowStart = std::chrono::steady_clock::now();
     uint64_t framesInWindow = 0;
+    int consecutiveFailures = 0;
+    auto lastReconnectAttempt = std::chrono::steady_clock::time_point{};
 
     while (keepRunning.load()) {
+        // ── Recovery mode: a prior connection dropped, cap is dead ────
+        // We stay in this branch, retrying at kReconnectIntervalMs,
+        // until either a new frame comes through or keepRunning goes
+        // false (explicit disconnect()).
+        if (linkState_.load() == LinkState::SignalLost) {
+            auto now = std::chrono::steady_clock::now();
+            auto sinceLastAttempt = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - lastReconnectAttempt).count();
+
+            if (sinceLastAttempt < kReconnectIntervalMs) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                continue;
+            }
+            lastReconnectAttempt = now;
+
+            if (tryReconnect()) {
+                std::cout << "[VideoLink] signal recovered on device "
+                    << lastDeviceIndex_ << std::endl;
+                consecutiveFailures = 0;
+                connected.store(true);
+                linkState_.store(LinkState::Connected);
+                fpsWindowStart = std::chrono::steady_clock::now();
+                framesInWindow = 0;
+            }
+            else {
+                // Still gone -- repaint the indicator in case the window
+                // was covered/uncovered by another app since the last
+                // attempt (this window has no WM_PAINT repaint path, so
+                // nothing else will refresh it while no frames flow).
+                paintNoSignalFrame();
+            }
+            continue;
+        }
+
+        // ── Normal streaming ──────────────────────────────────────────
         cv::Mat frame;
         if (!cap.read(frame) || frame.empty()) {
+            if (consecutiveFailures == 0) {
+                // Log the transition once, not on every failed grab --
+                // this is the fix for the endless
+                // "can't grab frame" console spam.
+                std::cout << "[VideoLink] grab failures starting on device "
+                    << lastDeviceIndex_ << ", monitoring..." << std::endl;
+            }
+            ++consecutiveFailures;
+
+            if (consecutiveFailures >= kFailuresBeforeSignalLost) {
+                std::cout << "[VideoLink] signal lost on device "
+                    << lastDeviceIndex_ << " after " << consecutiveFailures
+                    << " consecutive failed grabs -- entering recovery mode"
+                    << std::endl;
+                connected.store(false);
+                linkState_.store(LinkState::SignalLost);
+                cap.release();
+                paintNoSignalFrame();
+                lastReconnectAttempt = std::chrono::steady_clock::now();
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
+        consecutiveFailures = 0;
 
         {
             std::lock_guard<std::mutex> lock(frameMutex);
             latestFrame = frame;   // header swap -- see original comment
         }
+        lastFrameTimeMs_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
 
         // Paint directly to the native window, if one is attached. This
         // runs on the capture thread itself -- the frame that was just
@@ -370,9 +565,19 @@ void VideoLink::captureLoop() {
         }
     }
     connected.store(false);
+    linkState_.store(LinkState::Disconnected);
 }
 
 cv::Mat VideoLink::getLatestFrame() {
     std::lock_guard<std::mutex> lock(frameMutex);
     return latestFrame.clone();
+}
+
+uint64_t VideoLink::getMsSinceLastFrame() const {
+    int64_t last = lastFrameTimeMs_.load();
+    if (last == 0)
+        return UINT64_MAX;   // never received a frame yet
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    return static_cast<uint64_t>(now - last);
 }
