@@ -3,22 +3,23 @@
 #include <iostream>
 #include <algorithm>
 #include <cctype>
+#include <mutex>
 
 // Silences OpenCV's own internal MSMF/DSHOW logger (the
 // "OnReadSample() is called with error status", "can't grab frame",
 // "backend is generally available but can't be used to capture by
 // index" lines). These come straight from OpenCV on every failed
 // cap.read()/cap.open() call, completely independent of anything we
-// print ourselves -- during a SignalLost recovery loop (tryReconnect()
-// retried every kReconnectIntervalMs) that alone was enough to flood
-// the console for as long as the dongle stayed disconnected, drowning
-// out our own single-line state-transition logs below.
+// print ourselves -- during recovery it alone was enough to flood the
+// console for as long as the dongle stayed disconnected, drowning out
+// our own single-line state-transition logs below.
 #include <opencv2/core/utils/logger.hpp>
 
 // Media Foundation device enumeration (Windows-native device names +
 // friendly indices -- this is what actually lets us tell "USB capture
 // dongle" apart from "Integrated Webcam" before we ever open anything).
 #include <windows.h>
+#include <dbt.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -26,6 +27,7 @@
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfreadwrite.lib")
 #pragma comment(lib, "mfuuid.lib")
+#pragma comment(lib, "user32.lib")
 
 namespace {
     // Number of consecutive failed cap.read() calls before we declare
@@ -36,12 +38,12 @@ namespace {
     // immediately.
     constexpr int kFailuresBeforeSignalLost = 15;
 
-    // Minimum spacing between cap.open() retry attempts while the
-    // signal is lost. Calling cap.open() in a tight loop against a
-    // vanished device is wasted CPU and, on some MSMF backends, can
-    // itself generate additional warning spam -- this keeps retries
-    // frequent enough to feel instant to the pilot when the dongle is
-    // replugged, without hammering the driver in between.
+    // Fallback polling interval while SignalLost, used only when the
+    // OS device-arrival notification doesn't fire (e.g. some other
+    // process ate the notification, or the specific hardware doesn't
+    // surface a clean arrival event for some reason). With the arrival
+    // notification in place this is a safety net, not the primary
+    // recovery path, so it no longer needs to be aggressive.
     constexpr int kReconnectIntervalMs = 300;
 
     // ── "No drone video" idle-frame detection ──────────────────────────
@@ -55,13 +57,23 @@ namespace {
     // of pixels, so the frame is still mostly one color even though it
     // isn't perfectly flat.
     //
-    // NOT calibrated against real hardware output -- tune this against
+    // Two thresholds, not one, deliberately -- a single threshold meant
+    // a frame whose fraction hovered right around it (e.g. OSD telemetry
+    // digits changing frame to frame on the idle card's background)
+    // could flip NoVideoInput on and off every few frames, which is
+    // exactly what a flickering warning box looks like. With hysteresis,
+    // entering NoVideoInput requires clearly-idle frames (>= enter) and
+    // leaving it requires clearly-NOT-idle frames (< exit); anything
+    // in between the two doesn't count as progress in either direction,
+    // so a borderline frame can't undo an in-progress transition.
+    //
+    // NOT calibrated against real hardware output -- tune these against
     // your actual capture card's idle pattern. Temporarily log the
-    // computed fraction in frameLooksIdle() to see real numbers, then
-    // adjust kIdleDominantColorFraction/kIdleColorMatchTolerance so real
-    // video reliably stays below threshold and the idle screen reliably
-    // stays above it.
-    constexpr double kIdleDominantColorFraction = 0.85;
+    // computed fraction from idleColorFraction() to see real numbers,
+    // then adjust so real video reliably stays well below kIdleExitFraction
+    // and the idle screen reliably stays well above kIdleEnterFraction.
+    constexpr double kIdleEnterFraction = 0.85;
+    constexpr double kIdleExitFraction = 0.65;
     // Per-channel distance (0-255) from the frame's mean color within
     // which a sampled pixel still counts as "matching" the dominant
     // color for the fraction above.
@@ -73,9 +85,17 @@ namespace {
     constexpr int kIdleSampleStride = 6;
     // Consecutive idle/live frames required before flipping state, to
     // avoid flapping the UI on a single unlucky frame (e.g. a genuinely
-    // dark real scene, or one corrupted frame).
-    constexpr int kIdleFramesToConfirm = 12;  // ~150-200ms at 60fps
-    constexpr int kLiveFramesToConfirm = 3;   // recover fast once video returns
+    // dark real scene, or one corrupted frame). Leaving NoVideoInput
+    // requires a notably longer sustained run than entering it -- a
+    // pilot briefly seeing a stale "no video" banner linger for an
+    // extra fraction of a second after real video resumes is a much
+    // smaller problem than the banner flickering in and out.
+    constexpr int kIdleFramesToConfirm = 15;  // ~250ms at 60fps
+    constexpr int kLiveFramesToConfirm = 25;  // ~400ms at 60fps
+    // Minimum time between two consecutive Connected<->NoVideoInput
+    // flips, as a second, time-based (not just frame-count-based) guard
+    // against rapid toggling.
+    constexpr int kStateChangeCooldownMs = 500;
 
     // Number of consecutive good frames required at connect() time
     // before we declare the link genuinely stable and start the
@@ -87,14 +107,52 @@ namespace {
     // spinning up. Without this check, connect() reports success,
     // the UI shows "connected", and the pilot is staring at a black
     // window while the capture thread silently churns through
-    // kFailuresBeforeSignalLost failures and drops into the slower
-    // SignalLost/tryReconnect() recovery path instead. Catching it
-    // here means a not-actually-ready device just fails connect()
-    // outright, so the (much faster) top-level connectAuto()/connect()
-    // retry is what handles it instead of a multi-second SignalLost
-    // stall.
+    // kFailuresBeforeSignalLost failures and drops into recovery
+    // instead. Catching it here means a not-actually-ready device
+    // just fails connect() outright, so the (much faster) top-level
+    // connectAuto()/connect() retry handles it instead of a
+    // multi-second SignalLost stall.
     constexpr int kStableFramesRequired = 3;
     constexpr int kStableFrameSpacingMs = 15;
+
+    // Device-interface class GUID for video capture devices
+    // (KSCATEGORY_VIDEO_INPUT_DEVICE). Defined here as a raw GUID
+    // literal instead of pulling in ks.h/ksmedia.h (and the
+    // INITGUID/DEFINE_GUID machinery that comes with it), purely to
+    // avoid any risk of colliding with a differently-configured
+    // definition elsewhere in the app. This is what we register for
+    // via RegisterDeviceNotification so the OS tells us immediately
+    // when a capture-class USB device is plugged back in, instead of
+    // us having to poll for it -- the same mechanism OBS and other
+    // capture software use for near-instant reconnects.
+    constexpr GUID kVideoInputDeviceGuid = {
+        0xa799a800, 0xa46d, 0x11d0, { 0xa1, 0x8c, 0x00, 0xa0, 0x24, 0x02, 0xdd, 0xff }
+    };
+}
+
+// =============================================================================
+// Device-arrival notification window (free function, anonymous namespace)
+// =============================================================================
+//
+// Deliberately NOT a VideoLink member function -- WNDPROC has a fixed
+// Win32 callback signature, and keeping it as a free function here
+// means VideoLink.h never has to know about HWND/UINT/WPARAM/LPARAM at
+// all. It reaches back into the owning VideoLink instance (stashed in
+// GWLP_USERDATA right after the window is created) only through the
+// public, trivial signalDeviceArrival() setter.
+namespace {
+    LRESULT CALLBACK DeviceNotifyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+        if (msg == WM_DEVICECHANGE) {
+            if (wParam == DBT_DEVICEARRIVAL) {
+                auto* self = reinterpret_cast<VideoLink*>(
+                    GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+                if (self)
+                    self->signalDeviceArrival();
+            }
+            return TRUE;
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
 }
 
 VideoLink::VideoLink() {
@@ -103,10 +161,101 @@ VideoLink::VideoLink() {
         cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_SILENT);
         logLevelSet = true;
     }
+    startDeviceNotifications();
 }
 VideoLink::~VideoLink() {
+    stopDeviceNotifications();
     disconnect();
     detachWindow();
+}
+
+void VideoLink::signalDeviceArrival() {
+    deviceArrivalSignal_.store(true);
+}
+
+// =============================================================================
+// Device-arrival notification thread
+// =============================================================================
+
+void VideoLink::startDeviceNotifications() {
+    if (notifyThread_.joinable())
+        return;   // already running
+
+    notifyThreadReady_.store(false);
+    notifyThread_ = std::thread(&VideoLink::notifyThreadMain, this);
+
+    // Wait briefly for the notification window/registration to actually
+    // be up before returning, so a connect() called immediately after
+    // construction can't race the notification system coming online.
+    for (int i = 0; i < 100 && !notifyThreadReady_.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+}
+
+void VideoLink::stopDeviceNotifications() {
+    if (!notifyThread_.joinable())
+        return;
+
+    unsigned long tid = notifyThreadId_.load();
+    if (tid != 0)
+        PostThreadMessageW(tid, WM_QUIT, 0, 0);
+    notifyThread_.join();
+}
+
+void VideoLink::notifyThreadMain() {
+    // Message-only window (HWND_MESSAGE parent): never visible, never
+    // needs to pump paint/activation messages, but still receives
+    // WM_DEVICECHANGE just fine since RegisterDeviceNotification
+    // delivers directly to the HWND we register -- it's a targeted
+    // message, not a broadcast that requires a "real" top-level window.
+    static bool classRegistered = false;
+    static const wchar_t* clsName = L"VideoLinkDeviceNotifyWnd";
+    if (!classRegistered) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = DeviceNotifyWndProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = clsName;
+        RegisterClassW(&wc);
+        classRegistered = true;
+    }
+
+    HWND hwnd = CreateWindowExW(
+        0, clsName, L"", 0, 0, 0, 0, 0,
+        HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+
+    if (!hwnd) {
+        // Couldn't create the notification window -- fall back silently
+        // to poll-only recovery (captureLoop()'s kReconnectIntervalMs
+        // timer still works regardless). Still have to flag ready so
+        // stopDeviceNotifications() doesn't spin waiting forever.
+        notifyThreadReady_.store(true);
+        return;
+    }
+
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+
+    DEV_BROADCAST_DEVICEINTERFACE_W filter = {};
+    filter.dbcc_size = sizeof(filter);
+    filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+    filter.dbcc_classguid = kVideoInputDeviceGuid;
+
+    HDEVNOTIFY hDevNotify = RegisterDeviceNotificationW(
+        hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
+    // hDevNotify may come back null on failure -- if so we still run the
+    // message loop (harmless) and just never get WM_DEVICECHANGE, so
+    // recovery quietly falls back to polling only.
+
+    notifyThreadId_.store(GetCurrentThreadId());
+    notifyThreadReady_.store(true);
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (hDevNotify)
+        UnregisterDeviceNotification(hDevNotify);
+    DestroyWindow(hwnd);
 }
 
 // =============================================================================
@@ -117,8 +266,18 @@ VideoLink::~VideoLink() {
 std::vector<CaptureDeviceInfo> VideoLink::enumerateDevices() {
     std::vector<CaptureDeviceInfo> result;
 
-    HRESULT hr = MFStartup(MF_VERSION);
-    if (FAILED(hr)) return result;
+    // Media Foundation is started exactly once for the process lifetime
+    // instead of on every call. MFStartup()/MFShutdown() is itself a
+    // non-trivial cost (well beyond just opening a capture pipeline),
+    // and this used to run on EVERY enumerateDevices() call -- including
+    // every single reconnect-recovery poll -- which was a large part of
+    // why recovery could take many seconds even with a short retry
+    // interval. Never calling MFShutdown() leaks nothing meaningful
+    // (it's released at process exit); this mirrors how OBS and other
+    // long-running capture apps keep MF initialized for their whole
+    // lifetime rather than repeatedly tearing it down.
+    static std::once_flag mfInitFlag;
+    std::call_once(mfInitFlag, []() { MFStartup(MF_VERSION); });
 
     IMFAttributes* pAttributes = nullptr;
     if (SUCCEEDED(MFCreateAttributes(&pAttributes, 1))) {
@@ -150,7 +309,6 @@ std::vector<CaptureDeviceInfo> VideoLink::enumerateDevices() {
         pAttributes->Release();
     }
 
-    MFShutdown();
     return result;
 }
 
@@ -171,9 +329,9 @@ bool VideoLink::looksLikeIntegratedWebcam(const std::string& name) {
 }
 
 /*static*/
-bool VideoLink::frameLooksIdle(const cv::Mat& frame) {
+double VideoLink::idleColorFraction(const cv::Mat& frame) {
     if (frame.empty() || frame.channels() != 3)
-        return false;
+        return 0.0;
 
     cv::Scalar meanVal = cv::mean(frame);
     const int mB = static_cast<int>(meanVal[0]);
@@ -194,12 +352,12 @@ bool VideoLink::frameLooksIdle(const cv::Mat& frame) {
         }
     }
     if (sampled == 0)
-        return false;
+        return 0.0;
 
     // Uncomment while tuning against real hardware:
     // std::cout << "[VideoLink] idle-fraction=" << (double)matched / sampled << std::endl;
 
-    return (static_cast<double>(matched) / sampled) >= kIdleDominantColorFraction;
+    return static_cast<double>(matched) / sampled;
 }
 
 // =============================================================================
@@ -391,6 +549,15 @@ void VideoLink::detachWindow() {
         ReleaseDC(hwnd, hdc);
     if (hwnd)
         DestroyWindow(hwnd);
+
+    HDC backDc = backBufferDc_.exchange(nullptr);
+    HBITMAP backBmp = backBufferBmp_.exchange(nullptr);
+    if (backBmp)
+        DeleteObject(backBmp);
+    if (backDc)
+        DeleteDC(backDc);
+    backBufferW_.store(0);
+    backBufferH_.store(0);
 }
 
 // =============================================================================
@@ -456,6 +623,58 @@ void VideoLink::paintFrame(const cv::Mat& frame) {
     if (destW <= 0 || destH <= 0)
         return;
 
+    // ── Off-screen back buffer ───────────────────────────────────────
+    // Composite background + banner into an off-screen memory DC first,
+    // then copy the finished result to the screen with one BitBlt --
+    // see backBufferDc_ in the header for why this matters (fixes the
+    // "box appears to flicker between one line and two lines" symptom,
+    // which was actually the screen sampling a partially-drawn window,
+    // not the warning state itself flapping).
+    HDC backDc = backBufferDc_.load();
+    HBITMAP backBmp = backBufferBmp_.load();
+    if (!backDc || !backBmp || backBufferW_.load() != destW || backBufferH_.load() != destH) {
+        if (backBmp) {
+            DeleteObject(backBmp);
+            backBmp = nullptr;
+        }
+        if (backDc) {
+            DeleteDC(backDc);
+            backDc = nullptr;
+        }
+
+        backDc = CreateCompatibleDC(hdc);
+        if (backDc) {
+            backBmp = CreateCompatibleBitmap(hdc, destW, destH);
+            if (backBmp) {
+                SelectObject(backDc, backBmp);
+                SetStretchBltMode(backDc, COLORONCOLOR);
+            }
+            else {
+                DeleteDC(backDc);
+                backDc = nullptr;
+            }
+        }
+
+        backBufferDc_.store(backDc);
+        backBufferBmp_.store(backBmp);
+        backBufferW_.store(destW);
+        backBufferH_.store(destH);
+    }
+
+    if (!backDc || !backBmp) {
+        // Off-screen buffer failed to allocate (should be rare) --
+        // fall back to drawing straight to the window DC rather than
+        // dropping the frame. Tearing risk returns in this fallback
+        // case only.
+        paintFrameDirect(hdc, destW, destH, frame);
+        return;
+    }
+
+    paintFrameDirect(backDc, destW, destH, frame);
+    BitBlt(hdc, 0, 0, destW, destH, backDc, 0, 0, SRCCOPY);
+}
+
+void VideoLink::paintFrameDirect(HDC targetHdc, int destW, int destH, const cv::Mat& frame) {
     // cv::Mat from cv::VideoCapture is BGR8 -- GDI's DIB_RGB_COLORS with
     // biBitCount=24 expects BGR byte order too, so no channel swap needed.
     BITMAPINFO bmi = {};
@@ -466,37 +685,92 @@ void VideoLink::paintFrame(const cv::Mat& frame) {
     bmi.bmiHeader.biBitCount = 24;
     bmi.bmiHeader.biCompression = BI_RGB;
 
-    // hdc is the window's own cached, persistent DC (CS_OWNDC, acquired
-    // once in createRenderWindow) -- no GetDC()/ReleaseDC() per frame,
-    // and the stretch mode was already set once when the DC was acquired.
-    StretchDIBits(hdc,
+    StretchDIBits(targetHdc,
         0, 0, destW, destH,
         0, 0, frame.cols, frame.rows,
         frame.data, &bmi, DIB_RGB_COLORS, SRCCOPY);
 
     // ── "No drone video" warning banner ─────────────────────────────
-    // Frames ARE flowing (this is the normal-streaming path, called
-    // every frame), so unlike paintNoSignalFrame() -- which paints once
-    // and stays because the capture thread stops calling paintFrame()
-    // entirely -- this has to be redrawn on top every single frame or
-    // the next StretchDIBits above would immediately erase it. Drawn as
-    // a strip rather than a full-frame fill so the underlying idle
-    // pattern stays visible underneath for diagnostic purposes.
+    // The box is sized FROM the actual measured text extent (via
+    // DT_CALCRECT), not the other way around -- previously the box size
+    // was picked first (as a fraction of the panel) and the font size
+    // derived from that, which meant at some panel sizes the two-line
+    // message needed more vertical room than the box had, and
+    // DrawTextW's default rect-clipping silently cut the second line off
+    // entirely. Measuring first guarantees the box is always big enough
+    // to hold the whole message.
     if (linkState_.load() == LinkState::NoVideoInput) {
-        RECT banner = rc;
-        banner.bottom = banner.top + (std::min)(32, destH);
-        static HBRUSH warnBrush = CreateSolidBrush(RGB(180, 90, 0));
-        FillRect(hdc, &banner, warnBrush);
+        SetBkMode(targetHdc, TRANSPARENT);
+        SetTextColor(targetHdc, RGB(255, 255, 255));
 
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, RGB(255, 255, 255));
-        HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-        HFONT oldFont = (HFONT)SelectObject(hdc, font);
+        // Font size is scaled off the panel height directly (not off a
+        // box height that hasn't been decided yet), clamped to a
+        // sensible legible range. Cached and only rebuilt when it
+        // actually changes (e.g. panel resize) to avoid GDI object
+        // churn every frame at 60fps.
+        static HFONT cachedFont = nullptr;
+        static int cachedFontHeight = 0;
+        int fontHeight = -((std::max)(16, (std::min)(34, destH / 16)));
+        if (!cachedFont || cachedFontHeight != fontHeight) {
+            if (cachedFont)
+                DeleteObject(cachedFont);
+            cachedFont = CreateFontW(
+                fontHeight, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+            cachedFontHeight = fontHeight;
+        }
+        HGDIOBJ oldFont = SelectObject(targetHdc, cachedFont);
 
-        const wchar_t* msg = L"NO DRONE VIDEO -- CHECK VTX / ANTENNA / CAMERA";
-        DrawTextW(hdc, msg, -1, &banner, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        const wchar_t* msg = L"NO DRONE VIDEO\nCHECK VTX / ANTENNA / CAMERA";
+        const int paddingX = 26, paddingY = 20;
 
-        SelectObject(hdc, oldFont);
+        // Cap the wrap width at 72% of the panel (matches the previous
+        // visual proportions) so the box doesn't stretch edge-to-edge
+        // on wide panels, then measure the real height that text needs
+        // at that width and this font.
+        int wrapWidth = (std::max)(static_cast<int>(destW * 0.72) - paddingX * 2, 160);
+        RECT calcRect = { 0, 0, wrapWidth, 0 };
+        DrawTextW(targetHdc, msg, -1, &calcRect, DT_CENTER | DT_WORDBREAK | DT_CALCRECT);
+        int textW = calcRect.right - calcRect.left;
+        int textH = calcRect.bottom - calcRect.top;
+
+        int boxW = (std::min)(textW + paddingX * 2, destW - 20);
+        int boxH = (std::min)(textH + paddingY * 2, destH - 20);
+        boxW = (std::max)(boxW, 160);
+        boxH = (std::max)(boxH, 50);
+
+        RECT box;
+        box.left = (destW - boxW) / 2;
+        box.right = box.left + boxW;
+        box.top = (destH - boxH) / 2;
+        box.bottom = box.top + boxH;
+
+        static HBRUSH warnBrush = CreateSolidBrush(RGB(190, 95, 0));
+        FillRect(targetHdc, &box, warnBrush);
+
+        // Border makes the box read as a distinct overlay rather than
+        // blending into whatever idle background is behind it.
+        HGDIOBJ oldBrush = SelectObject(targetHdc, GetStockObject(NULL_BRUSH));
+        HPEN borderPen = CreatePen(PS_SOLID, 3, RGB(255, 200, 120));
+        HGDIOBJ oldPen = SelectObject(targetHdc, borderPen);
+        Rectangle(targetHdc, box.left, box.top, box.right, box.bottom);
+        SelectObject(targetHdc, oldPen);
+        SelectObject(targetHdc, oldBrush);
+        DeleteObject(borderPen);
+
+        RECT textRect;
+        textRect.left = box.left + (boxW - textW) / 2;
+        textRect.right = textRect.left + textW;
+        textRect.top = box.top + (boxH - textH) / 2;
+        textRect.bottom = textRect.top + textH;
+        // DT_NOCLIP as a belt-and-suspenders safety net: even if the
+        // measured size is ever off by a pixel or two (font hinting,
+        // DPI rounding), the message stays fully visible instead of
+        // silently losing a line the way the old fixed-box version did.
+        DrawTextW(targetHdc, msg, -1, &textRect, DT_CENTER | DT_WORDBREAK | DT_NOCLIP);
+
+        SelectObject(targetHdc, oldFont);
     }
 }
 
@@ -541,18 +815,12 @@ bool VideoLink::tryReconnect() {
     // now, and re-resolve its current index by friendly name, BEFORE
     // ever calling the expensive cap.open(). enumerateDevices() is pure
     // Media Foundation metadata -- it never opens a capture pipeline --
-    // so it's orders of magnitude cheaper than cap.open() failing.
+    // and with MFStartup() now only paid once per process (see
+    // enumerateDevices()) this is genuinely cheap on every retry.
     //
-    // This is the fix for multi-second real-world recovery times despite
-    // a 300ms retry interval: previously every retry called cap.open()
-    // against a device that might not exist at all, and MSMF's own
-    // internal timeout while it fails to build a source reader is what
-    // was actually eating the time between the retry interval ticks.
-    // Skipping straight to "not present, don't even try" when the
-    // enumeration comes back empty avoids that cost entirely, and
-    // catches the device the moment it reappears. It also transparently
-    // handles the index changing on replug, which a fixed lastDeviceIndex_
-    // retry would otherwise silently fail against forever.
+    // Also transparently handles the device's index changing on replug,
+    // which a fixed lastDeviceIndex_ retry would otherwise silently fail
+    // against forever.
     if (!deviceName_.empty()) {
         int resolvedIndex = -1;
         for (auto& d : enumerateDevices()) {
@@ -609,18 +877,28 @@ void VideoLink::captureLoop() {
     auto lastReconnectAttempt = std::chrono::steady_clock::time_point{};
     int idleStreak = 0;
     int liveStreak = 0;
+    // Deliberately default-constructed (== epoch, far in the past) so
+    // the very first NoVideoInput transition isn't blocked by the
+    // cooldown -- see kStateChangeCooldownMs.
+    auto lastNoVideoStateChange = std::chrono::steady_clock::time_point{};
 
     while (keepRunning.load()) {
         // ── Recovery mode: a prior connection dropped, cap is dead ────
-        // We stay in this branch, retrying at kReconnectIntervalMs,
-        // until either a new frame comes through or keepRunning goes
-        // false (explicit disconnect()).
+        // We retry either when the poll interval elapses, OR the instant
+        // deviceArrivalSignal_ is set by the OS notification thread --
+        // whichever comes first. The polling interval is now purely a
+        // fallback safety net; the notification is what gets real-world
+        // recovery time down from "up to several seconds of polling
+        // against a not-yet-open()able device" to "as soon as Windows
+        // says the device exists again", matching OBS-style near-instant
+        // reconnects.
         if (linkState_.load() == LinkState::SignalLost) {
+            bool arrivalSignaled = deviceArrivalSignal_.exchange(false);
             auto now = std::chrono::steady_clock::now();
             auto sinceLastAttempt = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - lastReconnectAttempt).count();
 
-            if (sinceLastAttempt < kReconnectIntervalMs) {
+            if (!arrivalSignaled && sinceLastAttempt < kReconnectIntervalMs) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 continue;
             }
@@ -632,6 +910,7 @@ void VideoLink::captureLoop() {
                 consecutiveFailures = 0;
                 idleStreak = 0;
                 liveStreak = 0;
+                lastNoVideoStateChange = std::chrono::steady_clock::now();
                 connected.store(true);
                 linkState_.store(LinkState::Connected);
                 fpsWindowStart = std::chrono::steady_clock::now();
@@ -666,6 +945,7 @@ void VideoLink::captureLoop() {
                     << std::endl;
                 connected.store(false);
                 linkState_.store(LinkState::SignalLost);
+                deviceArrivalSignal_.store(false);   // discard any stale signal
                 cap.release();
                 paintNoSignalFrame();
                 lastReconnectAttempt = std::chrono::steady_clock::now();
@@ -689,25 +969,61 @@ void VideoLink::captureLoop() {
         // Only flips state between Connected and NoVideoInput; leaves
         // Disconnected/Searching/SignalLost alone (those are handled by
         // the read-failure branch above, not here).
-        if (frameLooksIdle(frame)) {
-            ++idleStreak;
-            liveStreak = 0;
-            if (idleStreak == kIdleFramesToConfirm &&
-                linkState_.load() == LinkState::Connected) {
-                std::cout << "[VideoLink] capture card connected but no "
-                    "drone video detected (idle/blank frame) on device "
-                    << lastDeviceIndex_ << std::endl;
-                linkState_.store(LinkState::NoVideoInput);
+        //
+        // Hysteresis (see kIdleEnterFraction/kIdleExitFraction) plus a
+        // minimum dwell time between flips (kStateChangeCooldownMs) is
+        // what fixes the warning box flickering on borderline frames --
+        // a single threshold meant a frame right at the boundary (e.g.
+        // OSD telemetry digits changing on the idle background) could
+        // toggle the state every few frames.
+        {
+            double frac = idleColorFraction(frame);
+            LinkState curState = linkState_.load();
+            auto nowTs = std::chrono::steady_clock::now();
+            auto sinceStateChange = std::chrono::duration_cast<std::chrono::milliseconds>(
+                nowTs - lastNoVideoStateChange).count();
+
+            if (curState == LinkState::Connected) {
+                if (frac >= kIdleEnterFraction) {
+                    ++idleStreak;
+                    liveStreak = 0;
+                }
+                else {
+                    idleStreak = 0;
+                }
+                if (idleStreak >= kIdleFramesToConfirm &&
+                    sinceStateChange >= kStateChangeCooldownMs) {
+                    std::cout << "[VideoLink] capture card connected but no "
+                        "drone video detected (idle/blank frame) on device "
+                        << lastDeviceIndex_ << std::endl;
+                    linkState_.store(LinkState::NoVideoInput);
+                    lastNoVideoStateChange = nowTs;
+                    idleStreak = 0;
+                }
             }
-        }
-        else {
-            ++liveStreak;
-            idleStreak = 0;
-            if (liveStreak == kLiveFramesToConfirm &&
-                linkState_.load() == LinkState::NoVideoInput) {
-                std::cout << "[VideoLink] drone video acquired on device "
-                    << lastDeviceIndex_ << std::endl;
-                linkState_.store(LinkState::Connected);
+            else if (curState == LinkState::NoVideoInput) {
+                if (frac < kIdleExitFraction) {
+                    ++liveStreak;
+                    idleStreak = 0;
+                }
+                else {
+                    liveStreak = 0;
+                }
+                if (liveStreak >= kLiveFramesToConfirm &&
+                    sinceStateChange >= kStateChangeCooldownMs) {
+                    std::cout << "[VideoLink] drone video acquired on device "
+                        << lastDeviceIndex_ << std::endl;
+                    linkState_.store(LinkState::Connected);
+                    lastNoVideoStateChange = nowTs;
+                    liveStreak = 0;
+                }
+            }
+            else {
+                // Disconnected/Searching/SignalLost -- not our concern
+                // here, just keep the streaks from carrying stale state
+                // into whichever of Connected/NoVideoInput comes next.
+                idleStreak = 0;
+                liveStreak = 0;
             }
         }
 

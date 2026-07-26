@@ -19,6 +19,10 @@ typedef HWND__* HWND;
 struct HDC__;
 typedef HDC__* HDC;
 #endif
+#ifndef HBITMAP
+struct HBITMAP__;
+typedef HBITMAP__* HBITMAP;
+#endif
 
 struct CaptureDeviceInfo {
     int index;
@@ -38,9 +42,12 @@ struct CaptureDeviceInfo {
 //   SignalLost   -> a previously-working connection stopped delivering
 //                   frames entirely (device unplugged, driver fault,
 //                   etc). The capture thread is still alive and
-//                   retrying in the background; no Python action is
-//                   needed to trigger recovery, only to reflect the
-//                   state in the UI.
+//                   retrying in the background -- both on a polling
+//                   timer AND immediately whenever Windows reports the
+//                   capture device has been plugged back in (see
+//                   signalDeviceArrival() / notifyThreadMain() in the
+//                   .cpp). No Python action is needed to trigger
+//                   recovery, only to reflect the state in the UI.
 //   NoVideoInput -> the USB capture card itself is fine and still
 //                   delivering frames at its normal rate, but the
 //                   frames are the card's own idle/blank pattern
@@ -50,7 +57,7 @@ struct CaptureDeviceInfo {
 //                   its camera input is dead. This is invisible to
 //                   SignalLost (cap.read() keeps succeeding) and is
 //                   instead detected from frame content -- see
-//                   frameLooksIdle() in the .cpp. A warning banner is
+//                   idleColorFraction() in the .cpp. A warning banner is
 //                   painted directly onto the native render window
 //                   while in this state (see paintFrame()).
 enum class LinkState { Disconnected, Searching, Connected, SignalLost, NoVideoInput };
@@ -64,9 +71,11 @@ public:
     // Foundation), with their friendly names -- e.g. "USB Video Device",
     // "Integrated Webcam", etc. Index order matches what OpenCV's
     // CAP_MSMF backend expects for VideoCapture(index). Cheap -- this is
-    // metadata-only, it never opens a capture pipeline, so it's also
-    // used by tryReconnect() as a fast pre-check before attempting the
-    // much more expensive cap.open().
+    // metadata-only, it never opens a capture pipeline. Media Foundation
+    // itself is started exactly once per process (see the .cpp) rather
+    // than on every call, since MFStartup()/MFShutdown() is itself a
+    // non-trivial cost that was previously being paid on every single
+    // reconnect-recovery poll.
     static std::vector<CaptureDeviceInfo> enumerateDevices();
 
     // Tries every enumerated device that doesn't look like a built-in
@@ -151,6 +160,15 @@ public:
     void hideWindow();
     bool isWindowVisible() const { return windowVisible_.load(); }
 
+    // Called by the OS device-notification window (see notifyThreadMain
+    // in the .cpp) the instant Windows reports a capture-class USB
+    // device has been plugged back in. Not intended to be called from
+    // Python/application code -- it just flags captureLoop()'s
+    // SignalLost branch to retry immediately instead of waiting out its
+    // poll interval, the same technique OBS and other capture software
+    // use to get near-instant reconnects instead of relying on polling.
+    void signalDeviceArrival();
+
 private:
     cv::VideoCapture cap;
     std::thread captureThread;
@@ -201,18 +219,74 @@ private:
     // hidden, instead of continuing to draw into an invisible window.
     std::atomic<bool> windowVisible_{ true };
 
+    // ── Off-screen back buffer ──────────────────────────────────────
+    //
+    // paintFrame() composites the background video frame plus the
+    // NoVideoInput warning box/border/text into this off-screen memory
+    // DC first, then copies the finished result to the visible window
+    // with a single BitBlt. Without this, those were several separate
+    // GDI calls straight onto the visible window DC with nothing
+    // keeping them atomic with respect to the monitor's refresh -- the
+    // screen (or a screen capture) could sample the window mid-sequence,
+    // e.g. after the box/border landed but before the second line of
+    // text had been emitted, which is what produced the box appearing
+    // to flicker between showing one line and two. Created lazily
+    // in paintFrame() (capture thread only) and recreated whenever the
+    // window's size changes; torn down in detachWindow().
+    std::atomic<HDC> backBufferDc_{ nullptr };
+    std::atomic<HBITMAP> backBufferBmp_{ nullptr };
+    std::atomic<int> backBufferW_{ 0 };
+    std::atomic<int> backBufferH_{ 0 };
+
+    // ── OS device-arrival notification ──────────────────────────────
+    //
+    // A dedicated hidden message-only window + thread that registers
+    // for Windows' capture-device-interface arrival notifications
+    // (RegisterDeviceNotification / WM_DEVICECHANGE), running for the
+    // entire lifetime of the VideoLink object -- not tied to any one
+    // connect() session -- so a replug is caught the instant Windows
+    // reports it, whether or not we happen to be mid-recovery at that
+    // moment. See notifyThreadMain() in the .cpp for the implementation;
+    // it's kept out of this header entirely to avoid pulling Win32
+    // window-message types into a header other translation units include.
+    std::thread notifyThread_;
+    std::atomic<bool> deviceArrivalSignal_{ false };
+    std::atomic<bool> notifyThreadReady_{ false };
+    std::atomic<unsigned long> notifyThreadId_{ 0 };
+
+    void startDeviceNotifications();
+    void stopDeviceNotifications();
+    void notifyThreadMain();
+
     void captureLoop();
     static bool looksLikeIntegratedWebcam(const std::string& name);
 
-    // Heuristic "is this frame an idle/blank capture-card pattern rather
-    // than real video" check -- see LinkState::NoVideoInput above and
-    // the implementation in the .cpp for the sampling/tolerance details
-    // and tuning notes. Runs once per captured frame on the capture
-    // thread, so it's deliberately cheap (sampled, not per-pixel).
-    static bool frameLooksIdle(const cv::Mat& frame);
+    // Fraction (0.0-1.0) of sampled frame pixels that fall within
+    // kIdleColorMatchTolerance of the frame's own mean color -- a rough
+    // "how uniform/blank does this frame look" measure. See
+    // LinkState::NoVideoInput above. Runs once per captured frame on the
+    // capture thread, so it's deliberately cheap (sampled, not
+    // per-pixel).
+    //
+    // Returns a continuous fraction rather than a bool specifically so
+    // captureLoop() can apply two different thresholds (stricter to
+    // enter NoVideoInput, more lenient required to leave it) -- that
+    // hysteresis is what stops a frame landing in the ambiguous band
+    // between them (e.g. from OSD telemetry digits changing on an
+    // otherwise-blank background) from flipping the warning on and off
+    // rapidly.
+    static double idleColorFraction(const cv::Mat& frame);
 
     void createRenderWindow(HWND parent, int x, int y, int w, int h);
     void paintFrame(const cv::Mat& frame);
+
+    // The actual background-blit + NoVideoInput-banner drawing, factored
+    // out so it can target either the off-screen back buffer (the
+    // normal path) or the window DC directly (fallback if the back
+    // buffer ever fails to allocate). See backBufferDc_ above for why
+    // this is composited off-screen rather than drawn straight to the
+    // window.
+    void paintFrameDirect(HDC targetHdc, int destW, int destH, const cv::Mat& frame);
 
     // Paints a solid indicator + "NO SIGNAL" text directly into the
     // render window from the capture thread, at the moment linkState_
