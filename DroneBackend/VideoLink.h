@@ -323,4 +323,4 @@ private:
     // indefinitely; on timeout this returns false and both threads are
     // detached to finish in the background.
     bool openBestBackend(int deviceIndex, int timeoutMs);
-};
+}; //Update for git
