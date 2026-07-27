@@ -243,7 +243,7 @@
       }
     },
     "test3": {
-      "geometry": "1536x793+-8+0",
+      "geometry": "1535x784+-8+0",
       "locked": true,
       "panels": {
         "imu": {
