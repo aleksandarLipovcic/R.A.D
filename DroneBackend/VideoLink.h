@@ -302,4 +302,25 @@ private:
     // device index from deviceName_ via enumerateDevices() on every call
     // -- see lastDeviceIndex_ and the .cpp for why.
     bool tryReconnect();
-};
+
+    // Opens deviceIndex by racing cv::CAP_MSMF and cv::CAP_DSHOW against
+    // each other on separate threads and adopting whichever succeeds
+    // first into the `cap` member. Used by both connect() and
+    // tryReconnect() instead of the old "try MSMF, then fall back to
+    // DSHOW only if MSMF fails outright" sequence -- that sequence was
+    // fine when MSMF opened quickly, but investigation showed MSMF's
+    // cap.open() can take 5+ seconds on some driver/replug combinations
+    // even though it eventually succeeds, which blocked recovery for the
+    // full duration since DSHOW was never even attempted in that case.
+    // Racing means whichever backend is actually fast *for this specific
+    // attempt, on this specific hardware* wins, with no need to guess or
+    // hard-code a preference. The losing thread is detached rather than
+    // joined -- it never touches the `cap` member (each thread opens its
+    // own local cv::VideoCapture), so letting it finish and destruct on
+    // its own thread costs nothing and, critically, doesn't block this
+    // call on a backend that might still take several more seconds to
+    // return. Bounded by timeoutMs so a hung backend can't stall recovery
+    // indefinitely; on timeout this returns false and both threads are
+    // detached to finish in the background.
+    bool openBestBackend(int deviceIndex, int timeoutMs);
+}; //Update for git
