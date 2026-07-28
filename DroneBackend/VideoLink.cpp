@@ -53,27 +53,31 @@ namespace {
 
     // Unlike FOURCC, the FPS request MIGHT be load-bearing: it's
     // possible this dongle defaults to a lower fps (commonly 30) and
-    // only reaches 60fps because we ask for it. The log we have so far
-    // only shows the *after* state, not what happens if we never ask.
-    // Default is false (i.e. keep setting FPS, unchanged behavior).
-    // Flip to true, rebuild, and check the "actual negotiated format"
-    // line still reports "@ 60.0002fps" -- if it does, this ~700ms is
-    // free to cut too; if it drops to 30fps, leave this false.
-    constexpr bool kSkipFpsSet = false;
+    // only reaches 60fps because we ask for it. Two runs so far (with
+    // FPS still being requested) show the negotiated fps landing on
+    // 60.0002 every time -- consistent with 60fps being this dongle's
+    // native/default mode rather than something our request is
+    // actually causing. Set to true here to test that directly: after
+    // rebuilding, confirm the "actual negotiated format" log line still
+    // reports "@ 60.0002fps". If it does, this ~700ms is free to cut
+    // for good. If it drops to 30fps instead, flip this back to false.
+    constexpr bool kSkipFpsSet = true;
 
-    // Alternate connect path: pass width/height/buffersize as params
-    // directly into cap.open(index, backend, params) instead of as
-    // separate sequential cap.set() calls. DSHOW appears to batch
+    // Alternate connect path: pass width/height/buffersize(/fps) as
+    // params directly into cap.open(index, backend, params) instead of
+    // as separate sequential cap.set() calls. DSHOW appears to batch
     // pending format changes and only commit/rebuild the graph once it
     // has enough info to do so (that's the likely reason WIDTH took 0ms
     // but HEIGHT took ~700ms in the log -- HEIGHT was the call that
     // actually triggered the graph rebuild). Passing everything at
     // open() may collapse that into a single graph build instead of
-    // multiple. Default false = keep the existing sequential cap.set()
-    // behavior, which is well-understood and already logged in detail.
-    // Flip to true to try the collapsed path; compare total connect()/
-    // reconnect() time either way.
-    constexpr bool kUseParamsAtOpen = false;
+    // two. Set to true here for this round of testing -- compare the
+    // new "cap.open(CAP_DSHOW) took Nms" line against the OLD combined
+    // "cap.open() + property cap.set() calls" total from prior runs to
+    // see whether it actually collapsed into one rebuild or just moved
+    // the cost around. Flip back to false to return to the known-good
+    // sequential-set behavior if this doesn't help on this hardware.
+    constexpr bool kUseParamsAtOpen = true;
 
     // Wall-clock "HH:MM:SS.mmm" timestamp prefix for every log line, so
     // connect/disconnect/reconnect events across the whole lifecycle can
