@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <cctype>
 #include <mutex>
-#include <memory>
 
 // Silences OpenCV's own internal MSMF/DSHOW logger (the
 // "OnReadSample() is called with error status", "can't grab frame",
@@ -31,13 +30,100 @@
 #pragma comment(lib, "user32.lib")
 
 namespace {
+    // Wall-clock "HH:MM:SS.mmm" timestamp prefix for every log line, so
+    // connect/disconnect/reconnect events across the whole lifecycle can
+    // be correlated against real time (and against when you physically
+    // pulled/replugged the cable) instead of only against
+    // elapsedMs()-since-some-earlier-call-in-this-function numbers,
+    // which don't tell you anything about gaps *between* calls or about
+    // what happened on a different thread in between.
+    std::string nowStr() {
+        using namespace std::chrono;
+        auto now = system_clock::now();
+        auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
+        std::time_t t = system_clock::to_time_t(now);
+        std::tm tmBuf{};
+        localtime_s(&tmBuf, &t);
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03lld",
+            tmBuf.tm_hour, tmBuf.tm_min, tmBuf.tm_sec,
+            static_cast<long long>(ms.count()));
+        return std::string(buf);
+    }
+
+    // Human-readable LinkState name for transition logging (e.g.
+    // "Connected -> SignalLost"), so the log itself narrates the state
+    // machine instead of you having to infer it from which message
+    // happened to print.
+    const char* linkStateName(LinkState s) {
+        switch (s) {
+        case LinkState::Disconnected: return "Disconnected";
+        case LinkState::Searching: return "Searching";
+        case LinkState::Connected: return "Connected";
+        case LinkState::SignalLost: return "SignalLost";
+        case LinkState::NoVideoInput: return "NoVideoInput";
+        }
+        return "?";
+    }
+
+    // Logs a state transition with both old and new state names, and
+    // performs the store -- use this instead of calling
+    // linkState_.store() directly so every transition is guaranteed to
+    // be visible in the log, not just the ones someone remembered to
+    // hand-annotate with a std::cout line.
+    void setLinkState(std::atomic<LinkState>& stateVar, LinkState newState, const char* why) {
+        LinkState old = stateVar.load();
+        if (old == newState)
+            return;
+        std::cout << "[" << nowStr() << "] [VideoLink] STATE " << linkStateName(old)
+            << " -> " << linkStateName(newState) << "  (" << why << ")" << std::endl;
+        stateVar.store(newState);
+    }
+
     // Number of consecutive failed cap.read() calls before we declare
     // the signal lost. At the loop's 5ms failure-path sleep, this is
     // roughly 75-100ms of real signal dropout before we react -- long
     // enough to ride out a single dropped USB packet without flapping
     // the UI, short enough that a genuine disconnect is caught almost
     // immediately.
+    //
+    // NOTE: this streak count is diagnostic/secondary now -- see
+    // kSignalLostTimeoutMs below. On unplug, DSHOW can intermittently
+    // hand back a stale cached "successful" read mid-teardown, which
+    // resets a pure consecutive-failure counter to 0 before it ever
+    // reaches this threshold. That's what produced the endless
+    // "grab failures starting... monitoring" loop that never actually
+    // declared SignalLost. The time-based check is what actually
+    // guards against that; this constant still gates the fast path for
+    // a clean, uninterrupted failure run.
     constexpr int kFailuresBeforeSignalLost = 15;
+
+    // Time-based signal-loss trigger, driven off lastFrameTimeMs_
+    // (which only advances on a genuinely successful, non-empty read).
+    // Unlike kFailuresBeforeSignalLost, this can't be reset by a single
+    // stray "successful" read landing in the middle of a real dropout --
+    // it only resets when a frame that actually decoded successfully
+    // comes in. Set a bit above the failure-count path's own ~75-100ms
+    // budget (see comment above) so ordinary single-packet blips still
+    // ride it out untouched, but a real disconnect is still caught
+    // quickly.
+    constexpr int64_t kSignalLostTimeoutMs = 250;
+
+    // Threshold for treating a "successful" cap.read() as dead anyway.
+    // Confirmed by logging: on this hardware, after a physical unplug,
+    // DSHOW's dying filter graph doesn't reliably make cap.read() return
+    // false at all -- it keeps returning true with a stale/cached frame,
+    // just gated behind an internal ~1000ms stall per call (consistent
+    // with some internal DirectShow timeout). Since that failure mode
+    // never enters the `!readOk` branch, kSignalLostTimeoutMs above never
+    // even gets evaluated for it, and the link can be dead indefinitely
+    // while still reporting Connected/NoVideoInput with a frozen frame.
+    // A single legitimate frame at any supported capture rate (15-60fps)
+    // should never take anywhere near this long, so treat any read this
+    // slow as a dead link regardless of its boolean result, and route it
+    // through the same failure-counting/time-based SignalLost path as a
+    // genuine read failure instead of accepting the stale frame as live.
+    constexpr int64_t kStalledReadMs = 300;
 
     // Fallback polling interval while SignalLost, used only when the
     // OS device-arrival notification doesn't fire (e.g. some other
@@ -152,23 +238,8 @@ namespace {
     // openable, so a short fast-retry burst right after the signal
     // catches that moment much sooner than waiting out the steady-state
     // poll interval.
-    constexpr int kBurstReconnectIntervalMs = 50;
+    constexpr int kBurstReconnectIntervalMs = 100;
     constexpr int kPostArrivalBurstMs = 4000;
-
-    // Ceiling for openBestBackend()'s MSMF-vs-DSHOW race (see below). Set
-    // comfortably above the worst single-backend cap.open() time observed
-    // during investigation (~5.2s for MSMF on reconnect) so a genuinely
-    // slow-but-eventually-successful backend still has room to win if the
-    // other one fails outright, while a truly hung backend can't stall
-    // recovery forever. Tighten this once you've logged a few real races
-    // on your hardware and know the actual worst-case winner time.
-    constexpr int kBackendOpenTimeoutMs = 8000;
-
-    // How often openBestBackend() polls the two racing threads for a
-    // result. Small relative to the backend open times themselves (tens
-    // to thousands of ms), so this adds negligible latency to whichever
-    // backend wins.
-    constexpr int kBackendRacePollIntervalMs = 5;
 
     // Small helper used by connect()/tryReconnect()'s step-by-step
     // timing logs -- returns milliseconds since `from`.
@@ -299,7 +370,7 @@ void VideoLink::notifyThreadMain() {
     // fast reconnect has a working OS signal to rely on at all, or is
     // silently falling all the way back to plain polling for this
     // particular system/hardware.
-    std::cout << "[VideoLink] device arrival notifications: video-class="
+    std::cout << "[" << nowStr() << "] [VideoLink] device arrival notifications: video-class="
         << (hVideoNotify ? "ok" : "FAILED") << ", usb-class="
         << (hUsbNotify ? "ok" : "FAILED") << std::endl;
 
@@ -434,7 +505,7 @@ double VideoLink::idleColorFraction(const cv::Mat& frame) {
         return 0.0;
 
     // Uncomment while tuning against real hardware:
-    // std::cout << "[VideoLink] idle-fraction=" << (double)matched / sampled << std::endl;
+    // std::cout << "[" << nowStr() << "] [VideoLink] idle-fraction=" << (double)matched / sampled << std::endl;
 
     return static_cast<double>(matched) / sampled;
 }
@@ -444,7 +515,8 @@ double VideoLink::idleColorFraction(const cv::Mat& frame) {
 // =============================================================================
 
 bool VideoLink::connectAuto() {
-    linkState_.store(LinkState::Searching);
+    std::cout << "[" << nowStr() << "] [VideoLink] connectAuto() called" << std::endl;
+    setLinkState(linkState_, LinkState::Searching, "connectAuto start");
 
     auto devices = enumerateDevices();
 
@@ -457,68 +529,36 @@ bool VideoLink::connectAuto() {
         candidates = devices;
 
     for (auto& d : candidates) {
-        std::cout << "[VideoLink] trying capture device [" << d.index << "] "
+        std::cout << "[" << nowStr() << "] [VideoLink] trying capture device [" << d.index << "] "
             << d.name << std::endl;
         if (connect(d.index)) {
             deviceName_ = d.name;
-            std::cout << "[VideoLink] connected: " << d.name << std::endl;
+            std::cout << "[" << nowStr() << "] [VideoLink] connected: " << d.name << std::endl;
             return true;
         }
     }
 
-    linkState_.store(LinkState::Disconnected);
+    std::cout << "[" << nowStr() << "] [VideoLink] connectAuto() exhausted all "
+        << candidates.size() << " candidate device(s), none connected" << std::endl;
+    setLinkState(linkState_, LinkState::Disconnected, "connectAuto: no candidate connected");
     return false;
-}
-
-// ── Backend race (openBestBackend) ───────────────────────────────────
-//
-// Result slot for one backend's attempt to open a device, shared between
-// the racing thread that runs it and openBestBackend() which polls it.
-// The local cv::VideoCapture lives entirely inside the thread that opens
-// it until/unless that thread turns out to be the winner -- the loser's
-// capture object is simply destroyed when its thread function returns
-// (whether that's before or after openBestBackend() has already moved
-// on), so there's no cleanup openBestBackend() needs to do on a losing
-// attempt beyond detaching the thread.
-namespace {
-    struct BackendOpenAttempt {
-        std::atomic<bool> done{ false };
-        std::atomic<bool> success{ false };
-        std::unique_ptr<cv::VideoCapture> capture;
-        long long ms = 0;
-    };
-
-    void raceOpenBackend(std::shared_ptr<BackendOpenAttempt> result, int deviceIndex, int backend) {
-        auto t0 = std::chrono::steady_clock::now();
-        auto localCap = std::make_unique<cv::VideoCapture>();
-        bool opened = localCap->open(deviceIndex, backend);
-        result->ms = elapsedMs(t0);
-        if (opened) {
-            result->capture = std::move(localCap);
-            result->success.store(true);
-        }
-        // success/capture are both written before done -- openBestBackend()
-        // only ever reads capture after observing done && success on the
-        // same result object, so it always sees a fully-populated capture.
-        result->done.store(true);
-    }
 }
 
 // Applies the standard set of capture properties (resolution, buffer
 // size, FOURCC, FPS) to whichever cv::VideoCapture is passed in, timing
 // each property individually rather than as one lumped block. This is
-// shared by connect() and tryReconnect() so both paths report identical,
-// directly-comparable per-property timings -- see the class-level
-// comment in VideoLink.h / the investigation notes for why the previous
-// single "property cap.set() calls took Nms" number wasn't enough to
-// tell whether FOURCC, resolution, or something else was the actual
-// cost driver.
+// shared by connect() and tryReconnect() so both paths report
+// identical, directly-comparable per-property timings -- see the
+// class-level comment in VideoLink.h / the investigation notes for why
+// the previous single "property cap.set() calls took Nms" number
+// wasn't enough to tell whether FOURCC, resolution, or something else
+// was the actual cost driver.
 namespace {
     void applyCaptureProperties(cv::VideoCapture& cap, int prefW, int prefH, double prefFps) {
         auto timeIt = [](const char* label, auto&& fn) {
             auto t0 = std::chrono::steady_clock::now();
             fn();
-            std::cout << "[VideoLink]     set " << label << " took "
+            std::cout << "[" << nowStr() << "] [VideoLink]     set " << label << " took "
                 << elapsedMs(t0) << "ms" << std::endl;
             };
 
@@ -534,93 +574,104 @@ namespace {
         timeIt("FOURCC(MJPG)", [&] { cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G')); });
         timeIt("FPS", [&] { cap.set(cv::CAP_PROP_FPS, prefFps); });
     }
-}
 
-bool VideoLink::openBestBackend(int deviceIndex, int timeoutMs) {
-    auto msmfResult = std::make_shared<BackendOpenAttempt>();
-    auto dshowResult = std::make_shared<BackendOpenAttempt>();
+    // Every cap.set() call above is only a *request* -- the backend/
+    // driver is free to silently ignore it and negotiate something else
+    // entirely (different FOURCC, different resolution, different
+    // color format) if the device doesn't actually support what we
+    // asked for. This reads back what was ACTUALLY negotiated so we can
+    // compare it against what another app (e.g. OBS) ends up using for
+    // the same physical device -- a FOURCC or resolution mismatch here
+    // is a strong, concrete lead for a color-rendering difference
+    // between the two apps, rather than guessing at gamma/colorspace
+    // theories with no data to back them.
+    void logActualNegotiatedFormat(cv::VideoCapture& cap, const char* context) {
+        int fourccInt = static_cast<int>(cap.get(cv::CAP_PROP_FOURCC));
+        char fourccStr[5] = {
+            static_cast<char>(fourccInt & 0xFF),
+            static_cast<char>((fourccInt >> 8) & 0xFF),
+            static_cast<char>((fourccInt >> 16) & 0xFF),
+            static_cast<char>((fourccInt >> 24) & 0xFF),
+            '\0'
+        };
+        double w = cap.get(cv::CAP_PROP_FRAME_WIDTH);
+        double h = cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+        double fps = cap.get(cv::CAP_PROP_FPS);
+        double convertRgb = cap.get(cv::CAP_PROP_CONVERT_RGB);
+        std::cout << "[" << nowStr() << "] [VideoLink]   " << context
+            << ": actual negotiated format -- FOURCC=\"" << fourccStr
+            << "\" (0x" << std::hex << fourccInt << std::dec << ")"
+            << " " << w << "x" << h << " @ " << fps << "fps"
+            << ", CONVERT_RGB=" << convertRgb << std::endl;
+    }
 
-    std::thread msmfThread(raceOpenBackend, msmfResult, deviceIndex, static_cast<int>(cv::CAP_MSMF));
-    std::thread dshowThread(raceOpenBackend, dshowResult, deviceIndex, static_cast<int>(cv::CAP_DSHOW));
+    // ── Backend order: DSHOW first, MSMF fallback ───────────────────
+    //
+    // An earlier version of this function raced CAP_MSMF and CAP_DSHOW
+    // against each other concurrently (separate threads, each opening
+    // its own cv::VideoCapture on the same device index) to dodge
+    // MSMF's 5+ second cap.open() on this hardware. That backfired: the
+    // loser was detached rather than cancelled -- cv::VideoCapture::
+    // open() has no cancellation hook -- so for up to ~5s after every
+    // connect, a second backend was still holding (or trying to grab)
+    // the SAME physical device while the winner was actively streaming.
+    // That's consistent with what testing showed: FPS dropping from 60
+    // to 30 (bandwidth/negotiation contention between the two opens),
+    // and reconnect breaking entirely after a replug (an MSMF
+    // cap.open() has no timeout and can hang indefinitely if the device
+    // disappears mid-open, and a hung/half-initialized MSMF source can
+    // leave the capture-class interface unable to be reopened by
+    // anything until that call unblocks -- which it may never do
+    // against a device that's gone).
+    //
+    // Fix: never have two backends holding the device at once. DSHOW
+    // reliably opens this device in ~300-400ms (see the earlier
+    // connect()/tryReconnect() timing logs), so there's no real need to
+    // race it against MSMF -- just try DSHOW first and only fall back
+    // to MSMF if DSHOW fails outright. Same "try A, fall back to B on
+    // failure" shape the original code had (MSMF first, DSHOW
+    // fallback), just with the order swapped to match which backend is
+    // actually fast and reliable here, and it guarantees strictly
+    // sequential, single-owner device access at all times.
+    bool openPreferDshow(cv::VideoCapture& cap, int deviceIndex) {
+        auto tDshow = std::chrono::steady_clock::now();
+        bool opened = cap.open(deviceIndex, cv::CAP_DSHOW);
+        std::cout << "[" << nowStr() << "] [VideoLink]     cap.open(CAP_DSHOW) took "
+            << elapsedMs(tDshow) << "ms, result=" << opened << std::endl;
 
-    auto raceStart = std::chrono::steady_clock::now();
-    std::shared_ptr<BackendOpenAttempt> winner;
-    const char* winnerLabel = nullptr;
-
-    while (elapsedMs(raceStart) < timeoutMs) {
-        if (msmfResult->done.load() && msmfResult->success.load()) {
-            winner = msmfResult;
-            winnerLabel = "MSMF";
-            break;
+        if (!opened) {
+            auto tMsmf = std::chrono::steady_clock::now();
+            opened = cap.open(deviceIndex, cv::CAP_MSMF);
+            std::cout << "[" << nowStr() << "] [VideoLink]     cap.open(CAP_MSMF) took "
+                << elapsedMs(tMsmf) << "ms, result=" << opened << std::endl;
         }
-        if (dshowResult->done.load() && dshowResult->success.load()) {
-            winner = dshowResult;
-            winnerLabel = "DSHOW";
-            break;
-        }
-        if (msmfResult->done.load() && dshowResult->done.load())
-            break;   // both finished, neither opened successfully
-        std::this_thread::sleep_for(std::chrono::milliseconds(kBackendRacePollIntervalMs));
+        return opened;
     }
-
-    if (!winner) {
-        // Timed out, or both backends finished and failed. Either way,
-        // detach both threads rather than joining -- if one is still
-        // mid-open() past our timeout, we don't want to block here
-        // waiting for it; it'll finish and clean up its own local
-        // cv::VideoCapture on its own thread whenever the OS returns
-        // control to it.
-        std::cout << "[VideoLink]   openBestBackend: no backend opened within "
-            << timeoutMs << "ms (MSMF done=" << msmfResult->done.load()
-            << " DSHOW done=" << dshowResult->done.load() << ")" << std::endl;
-        msmfThread.detach();
-        dshowThread.detach();
-        return false;
-    }
-
-    std::cout << "[VideoLink]   openBestBackend: " << winnerLabel << " won in "
-        << winner->ms << "ms" << std::endl;
-
-    // The winner's thread is already done (that's how it won), so join()
-    // here is just cheap bookkeeping, not a wait. The loser is detached --
-    // it never touches `cap`, so we don't need to wait for it.
-    if (winner == msmfResult) {
-        dshowThread.detach();
-        msmfThread.join();
-    }
-    else {
-        msmfThread.detach();
-        dshowThread.join();
-    }
-
-    cap = std::move(*winner->capture);
-    return true;
 }
 
 bool VideoLink::connect(int deviceIndex) {
+    std::cout << "[" << nowStr() << "] [VideoLink] connect(" << deviceIndex
+        << ") called, current state=" << linkStateName(linkState_.load()) << std::endl;
     disconnect();
 
-    linkState_.store(LinkState::Searching);
+    setLinkState(linkState_, LinkState::Searching, "connect() start");
     lastDeviceIndex_ = deviceIndex;
 
     auto tConnectStart = std::chrono::steady_clock::now();
 
-    auto tOpen = std::chrono::steady_clock::now();
-    bool opened = openBestBackend(deviceIndex, kBackendOpenTimeoutMs);
-    std::cout << "[VideoLink]   connect: openBestBackend() took "
-        << elapsedMs(tOpen) << "ms, result=" << opened << std::endl;
-
-    if (!opened) {
-        std::cout << "[VideoLink] connect() failed: no backend could open device "
+    openPreferDshow(cap, deviceIndex);
+    if (!cap.isOpened()) {
+        std::cout << "[" << nowStr() << "] [VideoLink] connect() failed: no backend could open device "
             << deviceIndex << " after " << elapsedMs(tConnectStart) << "ms" << std::endl;
-        linkState_.store(LinkState::Disconnected);
+        setLinkState(linkState_, LinkState::Disconnected, "connect() failed: no backend opened");
         return false;
     }
 
     auto tProps = std::chrono::steady_clock::now();
     applyCaptureProperties(cap, prefW, prefH, prefFps);
-    std::cout << "[VideoLink]   connect: property cap.set() calls took "
+    std::cout << "[" << nowStr() << "] [VideoLink]   connect: property cap.set() calls took "
         << elapsedMs(tProps) << "ms total" << std::endl;
+    logActualNegotiatedFormat(cap, "connect");
 
     // A single successful read() here isn't sufficient proof the stream
     // is actually stable -- see kStableFramesRequired above. Require a
@@ -630,14 +681,14 @@ bool VideoLink::connect(int deviceIndex) {
     for (int i = 0; i < kStableFramesRequired; ++i) {
         auto tRead = std::chrono::steady_clock::now();
         bool ok = cap.read(testFrame) && !testFrame.empty();
-        std::cout << "[VideoLink]   connect: stability read " << (i + 1) << "/"
+        std::cout << "[" << nowStr() << "] [VideoLink]   connect: stability read " << (i + 1) << "/"
             << kStableFramesRequired << " took " << elapsedMs(tRead)
             << "ms, result=" << ok << std::endl;
         if (!ok) {
             cap.release();
-            std::cout << "[VideoLink] connect() failed: stability check failed after "
+            std::cout << "[" << nowStr() << "] [VideoLink] connect() failed: stability check failed after "
                 << elapsedMs(tConnectStart) << "ms total" << std::endl;
-            linkState_.store(LinkState::Disconnected);
+            setLinkState(linkState_, LinkState::Disconnected, "connect() failed: stability check");
             return false;
         }
         if (i + 1 < kStableFramesRequired)
@@ -657,26 +708,45 @@ bool VideoLink::connect(int deviceIndex) {
         }
     }
 
-    std::cout << "[VideoLink] connect() succeeded in " << elapsedMs(tConnectStart)
+    std::cout << "[" << nowStr() << "] [VideoLink] connect() succeeded in " << elapsedMs(tConnectStart)
         << "ms total" << std::endl;
 
     connected.store(true);
     keepRunning.store(true);
-    linkState_.store(LinkState::Connected);
+    setLinkState(linkState_, LinkState::Connected, "connect() succeeded");
     lastFrameTimeMs_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
+    std::cout << "[" << nowStr() << "] [VideoLink] connect(): starting capture thread" << std::endl;
     captureThread = std::thread(&VideoLink::captureLoop, this);
     return true;
 }
 
 void VideoLink::disconnect() {
+    std::cout << "[" << nowStr() << "] [VideoLink] disconnect() called, current state="
+        << linkStateName(linkState_.load()) << ", captureThread joinable="
+        << captureThread.joinable() << std::endl;
+
     keepRunning.store(false);
-    if (captureThread.joinable())
+
+    if (captureThread.joinable()) {
+        auto tJoin = std::chrono::steady_clock::now();
         captureThread.join();
-    if (cap.isOpened())
+        std::cout << "[" << nowStr() << "] [VideoLink] disconnect(): capture thread joined after "
+            << elapsedMs(tJoin) << "ms" << std::endl;
+    }
+    else {
+        std::cout << "[" << nowStr() << "] [VideoLink] disconnect(): no capture thread to join" << std::endl;
+    }
+
+    if (cap.isOpened()) {
+        auto tRel = std::chrono::steady_clock::now();
         cap.release();
+        std::cout << "[" << nowStr() << "] [VideoLink] disconnect(): cap.release() took "
+            << elapsedMs(tRel) << "ms" << std::endl;
+    }
+
     connected.store(false);
-    linkState_.store(LinkState::Disconnected);
+    setLinkState(linkState_, LinkState::Disconnected, "disconnect() complete");
 }
 
 // =============================================================================
@@ -1024,8 +1094,15 @@ void VideoLink::paintNoSignalFrame() {
 }
 
 bool VideoLink::tryReconnect() {
-    if (lastDeviceIndex_ < 0)
+    std::cout << "[" << nowStr() << "] [VideoLink] tryReconnect() called: lastDeviceIndex_="
+        << lastDeviceIndex_ << " deviceName_=\"" << deviceName_
+        << "\" cap.isOpened()=" << cap.isOpened() << std::endl;
+
+    if (lastDeviceIndex_ < 0) {
+        std::cout << "[" << nowStr() << "] [VideoLink] tryReconnect() aborting: "
+            "lastDeviceIndex_ is invalid (-1), nothing to reconnect to" << std::endl;
         return false;
+    }
 
     auto attemptStart = std::chrono::steady_clock::now();
 
@@ -1049,7 +1126,7 @@ bool VideoLink::tryReconnect() {
                 break;
             }
         }
-        std::cout << "[VideoLink]   reconnect: enumerateDevices() took "
+        std::cout << "[" << nowStr() << "] [VideoLink]   reconnect: enumerateDevices() took "
             << elapsedMs(tEnum) << "ms, device " << (resolvedIndex >= 0 ? "found" : "NOT found")
             << std::endl;
         if (resolvedIndex < 0)
@@ -1059,39 +1136,41 @@ bool VideoLink::tryReconnect() {
 
     auto tRelease = std::chrono::steady_clock::now();
     cap.release();
-    std::cout << "[VideoLink]   reconnect: cap.release() took "
+    std::cout << "[" << nowStr() << "] [VideoLink]   reconnect: cap.release() took "
         << elapsedMs(tRelease) << "ms" << std::endl;
 
-    auto tOpen = std::chrono::steady_clock::now();
-    bool opened = openBestBackend(lastDeviceIndex_, kBackendOpenTimeoutMs);
-    std::cout << "[VideoLink]   reconnect: openBestBackend() took "
-        << elapsedMs(tOpen) << "ms, result=" << opened << std::endl;
-
+    // DSHOW first, MSMF fallback -- see openPreferDshow() above for why
+    // this replaced the earlier concurrent MSMF/DSHOW race (that race
+    // left a second backend holding the same device for seconds after
+    // every connect, which is what broke both FPS and post-replug
+    // reconnect).
+    bool opened = openPreferDshow(cap, lastDeviceIndex_);
     if (!opened) {
-        std::cout << "[VideoLink] reconnect attempt failed: no backend could "
+        std::cout << "[" << nowStr() << "] [VideoLink] reconnect attempt failed: no backend could "
             "open the device (" << elapsedMs(attemptStart) << "ms total)" << std::endl;
         return false;
     }
 
     auto tProps = std::chrono::steady_clock::now();
     applyCaptureProperties(cap, prefW, prefH, prefFps);
-    std::cout << "[VideoLink]   reconnect: property cap.set() calls took "
+    std::cout << "[" << nowStr() << "] [VideoLink]   reconnect: property cap.set() calls took "
         << elapsedMs(tProps) << "ms total" << std::endl;
+    logActualNegotiatedFormat(cap, "reconnect");
 
     auto tRead = std::chrono::steady_clock::now();
     cv::Mat probe;
     bool gotFrame = cap.read(probe) && !probe.empty();
-    std::cout << "[VideoLink]   reconnect: probe cap.read() took "
+    std::cout << "[" << nowStr() << "] [VideoLink]   reconnect: probe cap.read() took "
         << elapsedMs(tRead) << "ms, result=" << gotFrame << std::endl;
 
     if (!gotFrame) {
         cap.release();
-        std::cout << "[VideoLink] reconnect attempt failed: opened but first "
+        std::cout << "[" << nowStr() << "] [VideoLink] reconnect attempt failed: opened but first "
             "read() failed (" << elapsedMs(attemptStart) << "ms total)" << std::endl;
         return false;
     }
 
-    std::cout << "[VideoLink] reconnect attempt succeeded in "
+    std::cout << "[" << nowStr() << "] [VideoLink] reconnect attempt succeeded in "
         << elapsedMs(attemptStart) << "ms total" << std::endl;
     return true;
 }
@@ -1130,6 +1209,13 @@ void VideoLink::captureLoop() {
     // instead of the steady-state kReconnectIntervalMs -- see
     // kPostArrivalBurstMs above for why.
     auto burstUntil = std::chrono::steady_clock::time_point{};
+    // Diagnostics only: counts reconnect attempts within the current
+    // SignalLost episode, and throttles the "still waiting" heartbeat so
+    // the log shows the loop is alive without printing every 20ms tick.
+    int reconnectAttemptNum = 0;
+    auto lastHeartbeat = std::chrono::steady_clock::time_point{};
+
+    std::cout << "[" << nowStr() << "] [VideoLink] captureLoop() thread started" << std::endl;
 
     while (keepRunning.load()) {
         // ── Recovery mode: a prior connection dropped, cap is dead ────
@@ -1146,8 +1232,12 @@ void VideoLink::captureLoop() {
         // /usb-class=" line logged at startup to check that on your
         // hardware.
         if (linkState_.load() == LinkState::SignalLost) {
-            if (signalLostSince == std::chrono::steady_clock::time_point{})
+            if (signalLostSince == std::chrono::steady_clock::time_point{}) {
                 signalLostSince = std::chrono::steady_clock::now();
+                reconnectAttemptNum = 0;
+                std::cout << "[" << nowStr() << "] [VideoLink] entering recovery loop for device "
+                    << lastDeviceIndex_ << " (\"" << deviceName_ << "\")" << std::endl;
+            }
 
             bool arrivalSignaled = deviceArrivalSignal_.exchange(false);
             auto now = std::chrono::steady_clock::now();
@@ -1155,7 +1245,7 @@ void VideoLink::captureLoop() {
             if (arrivalSignaled) {
                 auto sinceLost = std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - signalLostSince).count();
-                std::cout << "[VideoLink] device arrival notification received "
+                std::cout << "[" << nowStr() << "] [VideoLink] device arrival notification received "
                     << sinceLost << "ms after signal was lost -- starting fast retry"
                     << std::endl;
                 burstUntil = now + std::chrono::milliseconds(kPostArrivalBurstMs);
@@ -1167,27 +1257,59 @@ void VideoLink::captureLoop() {
                 now - lastReconnectAttempt).count();
 
             if (!arrivalSignaled && sinceLastAttempt < effectiveIntervalMs) {
+                // Heartbeat every ~2s so the log shows the recovery loop
+                // is still alive and what it's waiting on, without
+                // printing on every 20ms poll tick.
+                auto sinceHeartbeat = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - lastHeartbeat).count();
+                if (sinceHeartbeat >= 2000) {
+                    auto totalDownMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - signalLostSince).count();
+                    std::cout << "[" << nowStr() << "] [VideoLink] recovery loop waiting: "
+                        << "downtime=" << totalDownMs << "ms, attempts-so-far=" << reconnectAttemptNum
+                        << ", nextAttemptIn=" << (effectiveIntervalMs - sinceLastAttempt) << "ms"
+                        << ", burstActive=" << (now < burstUntil) << std::endl;
+                    lastHeartbeat = now;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 continue;
             }
             lastReconnectAttempt = now;
+            ++reconnectAttemptNum;
 
-            if (tryReconnect()) {
+            std::cout << "[" << nowStr() << "] [VideoLink] recovery attempt #" << reconnectAttemptNum
+                << " starting (arrivalSignaled=" << arrivalSignaled
+                << ", burstActive=" << (now < burstUntil) << ")" << std::endl;
+
+            bool reconnected = tryReconnect();
+
+            std::cout << "[" << nowStr() << "] [VideoLink] recovery attempt #" << reconnectAttemptNum
+                << " result: " << (reconnected ? "SUCCESS" : "failed, will retry") << std::endl;
+
+            if (reconnected) {
                 auto downtimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - signalLostSince).count();
-                std::cout << "[VideoLink] signal recovered on device "
-                    << lastDeviceIndex_ << " -- total downtime " << downtimeMs << "ms"
-                    << std::endl;
+                std::cout << "[" << nowStr() << "] [VideoLink] signal recovered on device "
+                    << lastDeviceIndex_ << " -- total downtime " << downtimeMs << "ms across "
+                    << reconnectAttemptNum << " attempt(s)" << std::endl;
                 consecutiveFailures = 0;
                 idleStreak = 0;
                 liveStreak = 0;
                 lastNoVideoStateChange = std::chrono::steady_clock::now();
                 signalLostSince = std::chrono::steady_clock::time_point{};
                 burstUntil = std::chrono::steady_clock::time_point{};
+                reconnectAttemptNum = 0;
                 connected.store(true);
-                linkState_.store(LinkState::Connected);
+                setLinkState(linkState_, LinkState::Connected, "recovery attempt succeeded");
                 fpsWindowStart = std::chrono::steady_clock::now();
                 framesInWindow = 0;
+                // A stale/possibly-garbage frame timestamp from before
+                // the drop must not be allowed to make the very next
+                // read-failure look like it's already been going on for
+                // a long time -- reset the "last good frame" clock the
+                // instant we're back, not just the failure counters.
+                lastFrameTimeMs_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
             }
             else {
                 // Still gone -- repaint the indicator in case the window
@@ -1201,27 +1323,91 @@ void VideoLink::captureLoop() {
 
         // ── Normal streaming ──────────────────────────────────────────
         cv::Mat frame;
-        if (!cap.read(frame) || frame.empty()) {
+        auto tReadStart = std::chrono::steady_clock::now();
+        bool readOk = cap.read(frame) && !frame.empty();
+        auto readDurationMs = elapsedMs(tReadStart);
+        // A single cap.read() call taking anywhere near 1000ms is exactly
+        // what a 30fps -> 1fps collapse looks like at the source -- this
+        // makes that visible directly rather than inferring it from the
+        // once-a-second measuredFps number. Threshold is well above a
+        // normal frame interval (33ms at 30fps, 16ms at 60fps) so this
+        // only fires on genuinely abnormal stalls, not routine jitter.
+        if (readDurationMs >= 100) {
+            std::cout << "[" << nowStr() << "] [VideoLink] SLOW cap.read() took "
+                << readDurationMs << "ms (state=" << linkStateName(linkState_.load())
+                << ", ok=" << readOk << ")" << std::endl;
+        }
+
+        // A read that took kStalledReadMs+ is treated as dead regardless
+        // of its boolean result -- see kStalledReadMs above. Confirmed on
+        // this hardware: after unplug, cap.read() kept returning true
+        // with a stale cached frame, gated behind a ~1000ms internal
+        // stall each call, and NEVER actually failed -- so relying on
+        // `!readOk` alone left the link silently frozen forever with no
+        // path to SignalLost.
+        bool stalled = readOk && readDurationMs >= kStalledReadMs;
+        if (stalled) {
+            std::cout << "[" << nowStr() << "] [VideoLink] cap.read() returned \"success\" but took "
+                << readDurationMs << "ms -- treating as a dead link, NOT a live frame"
+                << std::endl;
+        }
+
+        if (!readOk || stalled) {
+            // ── Signal-loss trigger: streak count AND elapsed time ─────
+            //
+            // On unplug, DSHOW's filter graph teardown can intermittently
+            // hand back one stale/cached "successful" read in between a
+            // run of real failures, before the pipeline is actually gone
+            // for good. A pure consecutive-failure counter gets wiped
+            // back to 0 by that single straggler and never reaches
+            // kFailuresBeforeSignalLost -- which is exactly what produced
+            // the repeating "grab failures starting... monitoring" loop
+            // that never actually declared SignalLost.
+            //
+            // lastFrameTimeMs_ only advances on a read that genuinely
+            // succeeded AND was fast enough to be live (see `stalled`
+            // above), so "time since last good frame" keeps climbing
+            // straight through both a flaky boolean-failure straggler
+            // AND a stalled-but-"successful" read, instead of getting
+            // reset by either. Trip on EITHER a clean, uninterrupted
+            // failure streak (fast path, ~75-100ms) OR this elapsed-time
+            // check (robust path, catches both flaky-success and
+            // stalled-success cases) -- whichever fires first.
             if (consecutiveFailures == 0) {
-                // Log the transition once, not on every failed grab --
-                // this is the fix for the endless
-                // "can't grab frame" console spam.
-                std::cout << "[VideoLink] grab failures starting on device "
+                // Log the transition once per genuine streak start, not
+                // on every failed grab and not every time a stray
+                // success resets the streak counter -- this is the fix
+                // for both the endless "can't grab frame" OpenCV spam
+                // (already silenced above) and our own repeating
+                // "monitoring..." log.
+                std::cout << "[" << nowStr() << "] [VideoLink] grab failures/stalls starting on device "
                     << lastDeviceIndex_ << ", monitoring..." << std::endl;
             }
             ++consecutiveFailures;
 
-            if (consecutiveFailures >= kFailuresBeforeSignalLost) {
-                std::cout << "[VideoLink] signal lost on device "
+            int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            int64_t lastGoodMs = lastFrameTimeMs_.load();
+            int64_t sinceLastGoodFrame = (lastGoodMs == 0) ? 0 : (nowMs - lastGoodMs);
+            bool timeBasedLoss = sinceLastGoodFrame >= kSignalLostTimeoutMs;
+
+            if (consecutiveFailures >= kFailuresBeforeSignalLost || timeBasedLoss) {
+                std::cout << "[" << nowStr() << "] [VideoLink] signal lost on device "
                     << lastDeviceIndex_ << " after " << consecutiveFailures
-                    << " consecutive failed grabs -- entering recovery mode"
+                    << " consecutive failed/stalled grabs (" << sinceLastGoodFrame
+                    << "ms since last good frame) -- entering recovery mode"
                     << std::endl;
                 connected.store(false);
-                linkState_.store(LinkState::SignalLost);
+                setLinkState(linkState_, LinkState::SignalLost, "read-failure threshold tripped");
                 deviceArrivalSignal_.store(false);   // discard any stale signal
                 signalLostSince = std::chrono::steady_clock::now();
                 burstUntil = std::chrono::steady_clock::time_point{};
-                cap.release();
+                {
+                    auto tRel = std::chrono::steady_clock::now();
+                    cap.release();
+                    std::cout << "[" << nowStr() << "] [VideoLink]   signal-lost: cap.release() took "
+                        << elapsedMs(tRel) << "ms" << std::endl;
+                }
                 paintNoSignalFrame();
                 lastReconnectAttempt = std::chrono::steady_clock::now();
             }
@@ -1268,10 +1454,8 @@ void VideoLink::captureLoop() {
                 }
                 if (idleStreak >= kIdleFramesToConfirm &&
                     sinceStateChange >= kStateChangeCooldownMs) {
-                    std::cout << "[VideoLink] capture card connected but no "
-                        "drone video detected (idle/blank frame) on device "
-                        << lastDeviceIndex_ << std::endl;
-                    linkState_.store(LinkState::NoVideoInput);
+                    setLinkState(linkState_, LinkState::NoVideoInput,
+                        "idle/blank frame detected");
                     lastNoVideoStateChange = nowTs;
                     idleStreak = 0;
                 }
@@ -1286,9 +1470,7 @@ void VideoLink::captureLoop() {
                 }
                 if (liveStreak >= kLiveFramesToConfirm &&
                     sinceStateChange >= kStateChangeCooldownMs) {
-                    std::cout << "[VideoLink] drone video acquired on device "
-                        << lastDeviceIndex_ << std::endl;
-                    linkState_.store(LinkState::Connected);
+                    setLinkState(linkState_, LinkState::Connected, "real video reacquired");
                     lastNoVideoStateChange = nowTs;
                     liveStreak = 0;
                 }
@@ -1312,16 +1494,31 @@ void VideoLink::captureLoop() {
         ++framesInWindow;
 
         auto now = std::chrono::steady_clock::now();
-        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        auto windowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - fpsWindowStart).count();
-        if (elapsedMs >= 1000) {
-            measuredFps.store(framesInWindow * 1000.0 / elapsedMs);
+        if (windowMs >= 1000) {
+            double fps = framesInWindow * 1000.0 / windowMs;
+            measuredFps.store(fps);
+            // Mean B/G/R of this frame -- concrete numbers to compare
+            // against a color-picker reading of the same moment in OBS
+            // (or against the frame's own dominant color from
+            // idleColorFraction) instead of eyeballing screenshots.
+            // cv::mean() is cheap and this only runs once/second.
+            cv::Scalar meanColor = cv::mean(frame);
+            std::cout << "[" << nowStr() << "] [VideoLink] fps heartbeat: " << fps
+                << " fps (" << framesInWindow << " frames / " << windowMs
+                << "ms), state=" << linkStateName(linkState_.load())
+                << ", totalFrames=" << frameCount.load()
+                << ", meanBGR=(" << static_cast<int>(meanColor[0]) << ","
+                << static_cast<int>(meanColor[1]) << "," << static_cast<int>(meanColor[2]) << ")"
+                << std::endl;
             framesInWindow = 0;
             fpsWindowStart = now;
         }
     }
     connected.store(false);
-    linkState_.store(LinkState::Disconnected);
+    setLinkState(linkState_, LinkState::Disconnected, "captureLoop() exiting (keepRunning=false)");
+    std::cout << "[" << nowStr() << "] [VideoLink] captureLoop() thread exiting" << std::endl;
 }
 
 cv::Mat VideoLink::getLatestFrame() {
@@ -1336,4 +1533,4 @@ uint64_t VideoLink::getMsSinceLastFrame() const {
     int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     return static_cast<uint64_t>(now - last);
-} // to DO remains 
+}
