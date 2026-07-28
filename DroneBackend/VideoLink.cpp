@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <cctype>
 #include <mutex>
-#include <memory>
 
 // Silences OpenCV's own internal MSMF/DSHOW logger (the
 // "OnReadSample() is called with error status", "can't grab frame",
@@ -152,23 +151,8 @@ namespace {
     // openable, so a short fast-retry burst right after the signal
     // catches that moment much sooner than waiting out the steady-state
     // poll interval.
-    constexpr int kBurstReconnectIntervalMs = 50;
+    constexpr int kBurstReconnectIntervalMs = 100;
     constexpr int kPostArrivalBurstMs = 4000;
-
-    // Ceiling for openBestBackend()'s MSMF-vs-DSHOW race (see below). Set
-    // comfortably above the worst single-backend cap.open() time observed
-    // during investigation (~5.2s for MSMF on reconnect) so a genuinely
-    // slow-but-eventually-successful backend still has room to win if the
-    // other one fails outright, while a truly hung backend can't stall
-    // recovery forever. Tighten this once you've logged a few real races
-    // on your hardware and know the actual worst-case winner time.
-    constexpr int kBackendOpenTimeoutMs = 8000;
-
-    // How often openBestBackend() polls the two racing threads for a
-    // result. Small relative to the backend open times themselves (tens
-    // to thousands of ms), so this adds negligible latency to whichever
-    // backend wins.
-    constexpr int kBackendRacePollIntervalMs = 5;
 
     // Small helper used by connect()/tryReconnect()'s step-by-step
     // timing logs -- returns milliseconds since `from`.
@@ -470,40 +454,6 @@ bool VideoLink::connectAuto() {
     return false;
 }
 
-// ── Backend race (openBestBackend) ───────────────────────────────────
-//
-// Result slot for one backend's attempt to open a device, shared between
-// the racing thread that runs it and openBestBackend() which polls it.
-// The local cv::VideoCapture lives entirely inside the thread that opens
-// it until/unless that thread turns out to be the winner -- the loser's
-// capture object is simply destroyed when its thread function returns
-// (whether that's before or after openBestBackend() has already moved
-// on), so there's no cleanup openBestBackend() needs to do on a losing
-// attempt beyond detaching the thread.
-namespace {
-    struct BackendOpenAttempt {
-        std::atomic<bool> done{ false };
-        std::atomic<bool> success{ false };
-        std::unique_ptr<cv::VideoCapture> capture;
-        long long ms = 0;
-    };
-
-    void raceOpenBackend(std::shared_ptr<BackendOpenAttempt> result, int deviceIndex, int backend) {
-        auto t0 = std::chrono::steady_clock::now();
-        auto localCap = std::make_unique<cv::VideoCapture>();
-        bool opened = localCap->open(deviceIndex, backend);
-        result->ms = elapsedMs(t0);
-        if (opened) {
-            result->capture = std::move(localCap);
-            result->success.store(true);
-        }
-        // success/capture are both written before done -- openBestBackend()
-        // only ever reads capture after observing done && success on the
-        // same result object, so it always sees a fully-populated capture.
-        result->done.store(true);
-    }
-}
-
 // Applies the standard set of capture properties (resolution, buffer
 // size, FOURCC, FPS) to whichever cv::VideoCapture is passed in, timing
 // each property individually rather than as one lumped block. This is
@@ -536,67 +486,6 @@ namespace {
     }
 }
 
-bool VideoLink::openBestBackend(int deviceIndex, int timeoutMs) {
-    auto msmfResult = std::make_shared<BackendOpenAttempt>();
-    auto dshowResult = std::make_shared<BackendOpenAttempt>();
-
-    std::thread msmfThread(raceOpenBackend, msmfResult, deviceIndex, static_cast<int>(cv::CAP_MSMF));
-    std::thread dshowThread(raceOpenBackend, dshowResult, deviceIndex, static_cast<int>(cv::CAP_DSHOW));
-
-    auto raceStart = std::chrono::steady_clock::now();
-    std::shared_ptr<BackendOpenAttempt> winner;
-    const char* winnerLabel = nullptr;
-
-    while (elapsedMs(raceStart) < timeoutMs) {
-        if (msmfResult->done.load() && msmfResult->success.load()) {
-            winner = msmfResult;
-            winnerLabel = "MSMF";
-            break;
-        }
-        if (dshowResult->done.load() && dshowResult->success.load()) {
-            winner = dshowResult;
-            winnerLabel = "DSHOW";
-            break;
-        }
-        if (msmfResult->done.load() && dshowResult->done.load())
-            break;   // both finished, neither opened successfully
-        std::this_thread::sleep_for(std::chrono::milliseconds(kBackendRacePollIntervalMs));
-    }
-
-    if (!winner) {
-        // Timed out, or both backends finished and failed. Either way,
-        // detach both threads rather than joining -- if one is still
-        // mid-open() past our timeout, we don't want to block here
-        // waiting for it; it'll finish and clean up its own local
-        // cv::VideoCapture on its own thread whenever the OS returns
-        // control to it.
-        std::cout << "[VideoLink]   openBestBackend: no backend opened within "
-            << timeoutMs << "ms (MSMF done=" << msmfResult->done.load()
-            << " DSHOW done=" << dshowResult->done.load() << ")" << std::endl;
-        msmfThread.detach();
-        dshowThread.detach();
-        return false;
-    }
-
-    std::cout << "[VideoLink]   openBestBackend: " << winnerLabel << " won in "
-        << winner->ms << "ms" << std::endl;
-
-    // The winner's thread is already done (that's how it won), so join()
-    // here is just cheap bookkeeping, not a wait. The loser is detached --
-    // it never touches `cap`, so we don't need to wait for it.
-    if (winner == msmfResult) {
-        dshowThread.detach();
-        msmfThread.join();
-    }
-    else {
-        msmfThread.detach();
-        dshowThread.join();
-    }
-
-    cap = std::move(*winner->capture);
-    return true;
-}
-
 bool VideoLink::connect(int deviceIndex) {
     disconnect();
 
@@ -606,11 +495,17 @@ bool VideoLink::connect(int deviceIndex) {
     auto tConnectStart = std::chrono::steady_clock::now();
 
     auto tOpen = std::chrono::steady_clock::now();
-    bool opened = openBestBackend(deviceIndex, kBackendOpenTimeoutMs);
-    std::cout << "[VideoLink]   connect: openBestBackend() took "
-        << elapsedMs(tOpen) << "ms, result=" << opened << std::endl;
+    bool openedMsmf = cap.open(deviceIndex, cv::CAP_MSMF);
+    std::cout << "[VideoLink]   connect: cap.open(CAP_MSMF) took "
+        << elapsedMs(tOpen) << "ms, result=" << openedMsmf << std::endl;
 
-    if (!opened) {
+    if (!cap.isOpened()) {
+        auto tOpenDshow = std::chrono::steady_clock::now();
+        bool openedDshow = cap.open(deviceIndex, cv::CAP_DSHOW);   // fallback backend
+        std::cout << "[VideoLink]   connect: cap.open(CAP_DSHOW) took "
+            << elapsedMs(tOpenDshow) << "ms, result=" << openedDshow << std::endl;
+    }
+    if (!cap.isOpened()) {
         std::cout << "[VideoLink] connect() failed: no backend could open device "
             << deviceIndex << " after " << elapsedMs(tConnectStart) << "ms" << std::endl;
         linkState_.store(LinkState::Disconnected);
@@ -1062,10 +957,17 @@ bool VideoLink::tryReconnect() {
     std::cout << "[VideoLink]   reconnect: cap.release() took "
         << elapsedMs(tRelease) << "ms" << std::endl;
 
-    auto tOpen = std::chrono::steady_clock::now();
-    bool opened = openBestBackend(lastDeviceIndex_, kBackendOpenTimeoutMs);
-    std::cout << "[VideoLink]   reconnect: openBestBackend() took "
-        << elapsedMs(tOpen) << "ms, result=" << opened << std::endl;
+    auto tOpenMsmf = std::chrono::steady_clock::now();
+    bool opened = cap.open(lastDeviceIndex_, cv::CAP_MSMF);
+    std::cout << "[VideoLink]   reconnect: cap.open(CAP_MSMF) took "
+        << elapsedMs(tOpenMsmf) << "ms, result=" << opened << std::endl;
+
+    if (!opened) {
+        auto tOpenDshow = std::chrono::steady_clock::now();
+        opened = cap.open(lastDeviceIndex_, cv::CAP_DSHOW);
+        std::cout << "[VideoLink]   reconnect: cap.open(CAP_DSHOW) took "
+            << elapsedMs(tOpenDshow) << "ms, result=" << opened << std::endl;
+    }
 
     if (!opened) {
         std::cout << "[VideoLink] reconnect attempt failed: no backend could "
@@ -1336,4 +1238,4 @@ uint64_t VideoLink::getMsSinceLastFrame() const {
     int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     return static_cast<uint64_t>(now - last);
-} // to DO remains 
+}
