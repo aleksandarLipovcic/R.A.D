@@ -30,6 +30,51 @@
 #pragma comment(lib, "user32.lib")
 
 namespace {
+    // ── SPEED TUNING TOGGLES ─────────────────────────────────────────
+    //
+    // Flip these and rebuild to A/B test against the timing log. Every
+    // connect()/reconnect() already logs per-property timings and the
+    // actual negotiated format, so the effect of each toggle is directly
+    // visible in the console (compare "property cap.set() calls took
+    // Nms total" and the following "actual negotiated format" line
+    // across runs).
+
+    // The SLONWAKE dongle was observed (see log) to always negotiate
+    // YUY2 regardless of this request -- it doesn't support onboard
+    // MJPG encoding, which is normal for cheap analog-capture bridge
+    // chips. Requesting it anyway was costing ~700ms per connect AND
+    // per reconnect for a format we never got and never used (we're
+    // already correctly consuming YUY2 as BGR8 after OpenCV's internal
+    // conversion). Left as a toggle rather than a hard delete so it's
+    // trivial to prove to yourself the format really is always YUY2 on
+    // your unit before removing it for good -- flip to true, rebuild,
+    // confirm "actual negotiated format" still reads YUY2 every time.
+    constexpr bool kSkipFourccSet = true;
+
+    // Unlike FOURCC, the FPS request MIGHT be load-bearing: it's
+    // possible this dongle defaults to a lower fps (commonly 30) and
+    // only reaches 60fps because we ask for it. The log we have so far
+    // only shows the *after* state, not what happens if we never ask.
+    // Default is false (i.e. keep setting FPS, unchanged behavior).
+    // Flip to true, rebuild, and check the "actual negotiated format"
+    // line still reports "@ 60.0002fps" -- if it does, this ~700ms is
+    // free to cut too; if it drops to 30fps, leave this false.
+    constexpr bool kSkipFpsSet = false;
+
+    // Alternate connect path: pass width/height/buffersize as params
+    // directly into cap.open(index, backend, params) instead of as
+    // separate sequential cap.set() calls. DSHOW appears to batch
+    // pending format changes and only commit/rebuild the graph once it
+    // has enough info to do so (that's the likely reason WIDTH took 0ms
+    // but HEIGHT took ~700ms in the log -- HEIGHT was the call that
+    // actually triggered the graph rebuild). Passing everything at
+    // open() may collapse that into a single graph build instead of
+    // multiple. Default false = keep the existing sequential cap.set()
+    // behavior, which is well-understood and already logged in detail.
+    // Flip to true to try the collapsed path; compare total connect()/
+    // reconnect() time either way.
+    constexpr bool kUseParamsAtOpen = false;
+
     // Wall-clock "HH:MM:SS.mmm" timestamp prefix for every log line, so
     // connect/disconnect/reconnect events across the whole lifecycle can
     // be correlated against real time (and against when you physically
@@ -545,14 +590,16 @@ bool VideoLink::connectAuto() {
 }
 
 // Applies the standard set of capture properties (resolution, buffer
-// size, FOURCC, FPS) to whichever cv::VideoCapture is passed in, timing
-// each property individually rather than as one lumped block. This is
+// size, FPS) to whichever cv::VideoCapture is passed in, timing each
+// property individually rather than as one lumped block. This is
 // shared by connect() and tryReconnect() so both paths report
-// identical, directly-comparable per-property timings -- see the
-// class-level comment in VideoLink.h / the investigation notes for why
-// the previous single "property cap.set() calls took Nms" number
-// wasn't enough to tell whether FOURCC, resolution, or something else
-// was the actual cost driver.
+// identical, directly-comparable per-property timings.
+//
+// FOURCC(MJPG) has been removed entirely (see kSkipFourccSet above) --
+// this hardware always negotiates YUY2 regardless of what's requested
+// (confirmed via the "actual negotiated format" log line on every
+// connect/reconnect), so the request was pure overhead: ~700ms spent
+// asking for a format we never received and never used.
 namespace {
     void applyCaptureProperties(cv::VideoCapture& cap, int prefW, int prefH, double prefFps) {
         auto timeIt = [](const char* label, auto&& fn) {
@@ -565,14 +612,21 @@ namespace {
         timeIt("FRAME_WIDTH", [&] { cap.set(cv::CAP_PROP_FRAME_WIDTH, prefW); });
         timeIt("FRAME_HEIGHT", [&] { cap.set(cv::CAP_PROP_FRAME_HEIGHT, prefH); });
         timeIt("BUFFERSIZE", [&] { cap.set(cv::CAP_PROP_BUFFERSIZE, 1); });   // no internal queue -- always freshest frame
-        // Ask for the highest frame rate we care about. Most backends/
-        // devices will silently clamp this to whatever mode they
-        // actually support at the requested resolution, so it's safe to
-        // just ask high -- but without asking at all, several UVC
-        // dongles default to 30 fps even when a 60 fps mode exists at
-        // the same resolution.
-        timeIt("FOURCC(MJPG)", [&] { cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G')); });
-        timeIt("FPS", [&] { cap.set(cv::CAP_PROP_FPS, prefFps); });
+
+        if (!kSkipFourccSet) {
+            // Left here (dead by default) only so it's trivial to flip
+            // back on if a future dongle/driver combo actually needs it.
+            timeIt("FOURCC(MJPG)", [&] { cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G')); });
+        }
+
+        if (!kSkipFpsSet) {
+            // Ask for the highest frame rate we care about. Most
+            // backends/devices will silently clamp this to whatever
+            // mode they actually support at the requested resolution.
+            // See kSkipFpsSet above -- flip that to true to test
+            // whether this device defaults to 60fps on its own.
+            timeIt("FPS", [&] { cap.set(cv::CAP_PROP_FPS, prefFps); });
+        }
     }
 
     // Every cap.set() call above is only a *request* -- the backend/
@@ -633,19 +687,48 @@ namespace {
     // fallback), just with the order swapped to match which backend is
     // actually fast and reliable here, and it guarantees strictly
     // sequential, single-owner device access at all times.
-    bool openPreferDshow(cv::VideoCapture& cap, int deviceIndex) {
+    //
+    // `params`, when non-null and kUseParamsAtOpen is true, is passed
+    // straight into cap.open() so DSHOW can negotiate width/height/
+    // buffersize as part of a single graph build instead of via
+    // sequential cap.set() calls afterward (see kUseParamsAtOpen
+    // above). When empty/unused, behavior is identical to before.
+    bool openPreferDshow(cv::VideoCapture& cap, int deviceIndex, const std::vector<int>* params = nullptr) {
         auto tDshow = std::chrono::steady_clock::now();
-        bool opened = cap.open(deviceIndex, cv::CAP_DSHOW);
+        bool opened = (params && !params->empty())
+            ? cap.open(deviceIndex, cv::CAP_DSHOW, *params)
+            : cap.open(deviceIndex, cv::CAP_DSHOW);
         std::cout << "[" << nowStr() << "] [VideoLink]     cap.open(CAP_DSHOW) took "
             << elapsedMs(tDshow) << "ms, result=" << opened << std::endl;
 
         if (!opened) {
             auto tMsmf = std::chrono::steady_clock::now();
-            opened = cap.open(deviceIndex, cv::CAP_MSMF);
+            opened = (params && !params->empty())
+                ? cap.open(deviceIndex, cv::CAP_MSMF, *params)
+                : cap.open(deviceIndex, cv::CAP_MSMF);
             std::cout << "[" << nowStr() << "] [VideoLink]     cap.open(CAP_MSMF) took "
                 << elapsedMs(tMsmf) << "ms, result=" << opened << std::endl;
         }
         return opened;
+    }
+
+    // Builds the params-at-open vector for the kUseParamsAtOpen A/B
+    // path. Deliberately mirrors applyCaptureProperties() (minus FOURCC,
+    // for the same reason it's skipped there) so the two paths are a
+    // fair comparison of "sequential set() calls" vs "one open() call
+    // with params" rather than also differing in which properties get
+    // requested.
+    std::vector<int> buildOpenParams(int prefW, int prefH, double prefFps) {
+        std::vector<int> params = {
+            cv::CAP_PROP_FRAME_WIDTH, prefW,
+            cv::CAP_PROP_FRAME_HEIGHT, prefH,
+            cv::CAP_PROP_BUFFERSIZE, 1,
+        };
+        if (!kSkipFpsSet) {
+            params.push_back(cv::CAP_PROP_FPS);
+            params.push_back(static_cast<int>(prefFps));
+        }
+        return params;
     }
 }
 
@@ -659,7 +742,18 @@ bool VideoLink::connect(int deviceIndex) {
 
     auto tConnectStart = std::chrono::steady_clock::now();
 
-    openPreferDshow(cap, deviceIndex);
+    if (kUseParamsAtOpen) {
+        // A/B path: negotiate width/height/buffersize/fps as part of
+        // the open() call itself instead of via sequential cap.set()
+        // calls afterward. See kUseParamsAtOpen and buildOpenParams()
+        // above.
+        std::vector<int> params = buildOpenParams(prefW, prefH, prefFps);
+        openPreferDshow(cap, deviceIndex, &params);
+    }
+    else {
+        openPreferDshow(cap, deviceIndex);
+    }
+
     if (!cap.isOpened()) {
         std::cout << "[" << nowStr() << "] [VideoLink] connect() failed: no backend could open device "
             << deviceIndex << " after " << elapsedMs(tConnectStart) << "ms" << std::endl;
@@ -667,10 +761,12 @@ bool VideoLink::connect(int deviceIndex) {
         return false;
     }
 
-    auto tProps = std::chrono::steady_clock::now();
-    applyCaptureProperties(cap, prefW, prefH, prefFps);
-    std::cout << "[" << nowStr() << "] [VideoLink]   connect: property cap.set() calls took "
-        << elapsedMs(tProps) << "ms total" << std::endl;
+    if (!kUseParamsAtOpen) {
+        auto tProps = std::chrono::steady_clock::now();
+        applyCaptureProperties(cap, prefW, prefH, prefFps);
+        std::cout << "[" << nowStr() << "] [VideoLink]   connect: property cap.set() calls took "
+            << elapsedMs(tProps) << "ms total" << std::endl;
+    }
     logActualNegotiatedFormat(cap, "connect");
 
     // A single successful read() here isn't sufficient proof the stream
@@ -1144,17 +1240,26 @@ bool VideoLink::tryReconnect() {
     // left a second backend holding the same device for seconds after
     // every connect, which is what broke both FPS and post-replug
     // reconnect).
-    bool opened = openPreferDshow(cap, lastDeviceIndex_);
+    bool opened;
+    if (kUseParamsAtOpen) {
+        std::vector<int> params = buildOpenParams(prefW, prefH, prefFps);
+        opened = openPreferDshow(cap, lastDeviceIndex_, &params);
+    }
+    else {
+        opened = openPreferDshow(cap, lastDeviceIndex_);
+    }
     if (!opened) {
         std::cout << "[" << nowStr() << "] [VideoLink] reconnect attempt failed: no backend could "
             "open the device (" << elapsedMs(attemptStart) << "ms total)" << std::endl;
         return false;
     }
 
-    auto tProps = std::chrono::steady_clock::now();
-    applyCaptureProperties(cap, prefW, prefH, prefFps);
-    std::cout << "[" << nowStr() << "] [VideoLink]   reconnect: property cap.set() calls took "
-        << elapsedMs(tProps) << "ms total" << std::endl;
+    if (!kUseParamsAtOpen) {
+        auto tProps = std::chrono::steady_clock::now();
+        applyCaptureProperties(cap, prefW, prefH, prefFps);
+        std::cout << "[" << nowStr() << "] [VideoLink]   reconnect: property cap.set() calls took "
+            << elapsedMs(tProps) << "ms total" << std::endl;
+    }
     logActualNegotiatedFormat(cap, "reconnect");
 
     auto tRead = std::chrono::steady_clock::now();
