@@ -1,3 +1,22 @@
+// Must come before ANY #include -- both of these only take effect if
+// defined before the header that would otherwise omit/macro-clobber the
+// symbols below is first pulled in (directly or transitively, e.g. via
+// VideoLink.h -> ... -> <windows.h>):
+//   _USE_MATH_DEFINES -- MSVC's <cmath>/<math.h> only define M_PI (and
+//                         the other math constants) when this is set;
+//                         without it, M_PI below is simply undeclared
+//                         (MSVC error C2065).
+//   NOMINMAX          -- <windows.h> defines `min`/`max` as raw
+//                         preprocessor macros unless this is set, which
+//                         silently swallows the `min`/`max` tokens out of
+//                         every std::min(...)/std::max(...) call in this
+//                         translation unit -- e.g. std::max(0.0f, x1)
+//                         becomes std::(0.0f, x1), hence MSVC error
+//                         C2589 ("illegal token on right side of '::'")
+//                         at the std::min/std::max call sites below.
+#define _USE_MATH_DEFINES
+#define NOMINMAX
+
 #include "DetectionLink.h"
 #include "VideoLink.h"
 #include <chrono>
