@@ -29,55 +29,69 @@
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "user32.lib")
 
+// ── Debug console logging ────────────────────────────────────────────
+//
+// Every line below used to print unconditionally -- useful in isolation
+// while diagnosing the connect/reconnect timing issues this file went
+// through, but once other subsystems are running alongside this one it
+// drowns out everything else in the console. Nothing has been deleted:
+// every std::cout call is still here verbatim, just routed through this
+// macro so it can be silenced or restored with one line instead of
+// hand-editing dozens of call sites.
+//
+// Set VIDEOLINK_VERBOSE_LOGGING to 1 (or define it via a build-system
+// flag, e.g. a debug-config preprocessor define) to bring every one of
+// these lines back exactly as they were.
+#ifndef VIDEOLINK_VERBOSE_LOGGING
+#define VIDEOLINK_VERBOSE_LOGGING 0
+#endif
+
+#if VIDEOLINK_VERBOSE_LOGGING
+#define VL_LOG(...) do { std::cout __VA_ARGS__ << std::endl; } while (0)
+#else
+#define VL_LOG(...) do { } while (0)
+#endif
+
 namespace {
-    // ── SPEED TUNING TOGGLES ─────────────────────────────────────────
+    // ── Capture-open configuration (SLONWAKE 5.8G FPV OTG Receiver) ───
     //
-    // Flip these and rebuild to A/B test against the timing log. Every
-    // connect()/reconnect() already logs per-property timings and the
-    // actual negotiated format, so the effect of each toggle is directly
-    // visible in the console (compare "property cap.set() calls took
-    // Nms total" and the following "actual negotiated format" line
-    // across runs).
-
-    // The SLONWAKE dongle was observed (see log) to always negotiate
-    // YUY2 regardless of this request -- it doesn't support onboard
-    // MJPG encoding, which is normal for cheap analog-capture bridge
-    // chips. Requesting it anyway was costing ~700ms per connect AND
-    // per reconnect for a format we never got and never used (we're
-    // already correctly consuming YUY2 as BGR8 after OpenCV's internal
-    // conversion). Left as a toggle rather than a hard delete so it's
-    // trivial to prove to yourself the format really is always YUY2 on
-    // your unit before removing it for good -- flip to true, rebuild,
-    // confirm "actual negotiated format" still reads YUY2 every time.
-    constexpr bool kSkipFourccSet = true;
-
-    // Unlike FOURCC, the FPS request MIGHT be load-bearing: it's
-    // possible this dongle defaults to a lower fps (commonly 30) and
-    // only reaches 60fps because we ask for it. Two runs so far (with
-    // FPS still being requested) show the negotiated fps landing on
-    // 60.0002 every time -- consistent with 60fps being this dongle's
-    // native/default mode rather than something our request is
-    // actually causing. Set to true here to test that directly: after
-    // rebuilding, confirm the "actual negotiated format" log line still
-    // reports "@ 60.0002fps". If it does, this ~700ms is free to cut
-    // for good. If it drops to 30fps instead, flip this back to false.
-    constexpr bool kSkipFpsSet = true;
-
-    // Alternate connect path: pass width/height/buffersize(/fps) as
-    // params directly into cap.open(index, backend, params) instead of
-    // as separate sequential cap.set() calls. DSHOW appears to batch
-    // pending format changes and only commit/rebuild the graph once it
-    // has enough info to do so (that's the likely reason WIDTH took 0ms
-    // but HEIGHT took ~700ms in the log -- HEIGHT was the call that
-    // actually triggered the graph rebuild). Passing everything at
-    // open() may collapse that into a single graph build instead of
-    // two. Set to true here for this round of testing -- compare the
-    // new "cap.open(CAP_DSHOW) took Nms" line against the OLD combined
-    // "cap.open() + property cap.set() calls" total from prior runs to
-    // see whether it actually collapsed into one rebuild or just moved
-    // the cost around. Flip back to false to return to the known-good
-    // sequential-set behavior if this doesn't help on this hardware.
-    constexpr bool kUseParamsAtOpen = true;
+    // The three points below were each individually validated against
+    // real hardware (multiple connect/disconnect/reconnect cycles, full
+    // console timing logs) before being made permanent here:
+    //
+    //  - No FOURCC request. This dongle has no onboard MJPG encoder (a
+    //    cheap analog-capture bridge chip) and always negotiates YUY2
+    //    regardless of what's requested -- confirmed by
+    //    logActualNegotiatedFormat() reporting FOURCC="YUY2" identically
+    //    whether MJPG was requested or not. Requesting it cost ~700ms
+    //    per connect/reconnect for a format never actually granted.
+    //
+    //  - No FPS request. The receiver's own spec is a 720x480 @ 30fps
+    //    analog source; the measured fps heartbeat in every capture run
+    //    (with or without an explicit FPS request) landed at ~30fps.
+    //    Requesting CAP_PROP_FPS was not changing real throughput, only
+    //    making cap.get(CAP_PROP_FPS) parrot back whatever was last
+    //    set -- and cost another ~700ms per connect/reconnect to ask
+    //    for.
+    //
+    //  - Width/height/buffersize passed directly into cap.open(index,
+    //    backend, params) instead of as separate sequential cap.set()
+    //    calls afterward. DSHOW batches pending format changes and only
+    //    commits/rebuilds the filter graph once it has enough info to
+    //    do so; passing everything at open() collapsed what used to be
+    //    two graph rebuilds (one implicit in open(), one triggered by
+    //    the first cap.set() call) into one.
+    //
+    // Combined effect measured on this hardware: connect() dropped from
+    // ~3000ms to ~800ms, and the reconnect-after-replug segment (device
+    // found by the OS -> Connected) dropped from ~2800ms to ~650ms.
+    //
+    // If a future capture device needs FOURCC/FPS negotiation after
+    // all, reintroduce those two cap.set() calls in applyOpenParams()
+    // below and confirm via logActualNegotiatedFormat() that the
+    // request is actually being honored before assuming it's doing
+    // anything -- don't trust cap.get() alone, it can echo back a
+    // requested value the hardware silently ignored.
 
     // Wall-clock "HH:MM:SS.mmm" timestamp prefix for every log line, so
     // connect/disconnect/reconnect events across the whole lifecycle can
@@ -119,13 +133,13 @@ namespace {
     // performs the store -- use this instead of calling
     // linkState_.store() directly so every transition is guaranteed to
     // be visible in the log, not just the ones someone remembered to
-    // hand-annotate with a std::cout line.
+    // hand-annotate with a VL_LOG(...) call.
     void setLinkState(std::atomic<LinkState>& stateVar, LinkState newState, const char* why) {
         LinkState old = stateVar.load();
         if (old == newState)
             return;
-        std::cout << "[" << nowStr() << "] [VideoLink] STATE " << linkStateName(old)
-            << " -> " << linkStateName(newState) << "  (" << why << ")" << std::endl;
+        VL_LOG(<< "[" << nowStr() << "] [VideoLink] STATE " << linkStateName(old)
+            << " -> " << linkStateName(newState) << "  (" << why << ")");
         stateVar.store(newState);
     }
 
@@ -419,9 +433,9 @@ void VideoLink::notifyThreadMain() {
     // fast reconnect has a working OS signal to rely on at all, or is
     // silently falling all the way back to plain polling for this
     // particular system/hardware.
-    std::cout << "[" << nowStr() << "] [VideoLink] device arrival notifications: video-class="
+    VL_LOG(<< "[" << nowStr() << "] [VideoLink] device arrival notifications: video-class="
         << (hVideoNotify ? "ok" : "FAILED") << ", usb-class="
-        << (hUsbNotify ? "ok" : "FAILED") << std::endl;
+        << (hUsbNotify ? "ok" : "FAILED"));
 
     notifyThreadId_.store(GetCurrentThreadId());
     notifyThreadReady_.store(true);
@@ -564,7 +578,7 @@ double VideoLink::idleColorFraction(const cv::Mat& frame) {
 // =============================================================================
 
 bool VideoLink::connectAuto() {
-    std::cout << "[" << nowStr() << "] [VideoLink] connectAuto() called" << std::endl;
+    VL_LOG(<< "[" << nowStr() << "] [VideoLink] connectAuto() called");
     setLinkState(linkState_, LinkState::Searching, "connectAuto start");
 
     auto devices = enumerateDevices();
@@ -578,62 +592,23 @@ bool VideoLink::connectAuto() {
         candidates = devices;
 
     for (auto& d : candidates) {
-        std::cout << "[" << nowStr() << "] [VideoLink] trying capture device [" << d.index << "] "
-            << d.name << std::endl;
+        VL_LOG(<< "[" << nowStr() << "] [VideoLink] trying capture device [" << d.index << "] "
+            << d.name);
         if (connect(d.index)) {
             deviceName_ = d.name;
-            std::cout << "[" << nowStr() << "] [VideoLink] connected: " << d.name << std::endl;
+            VL_LOG(<< "[" << nowStr() << "] [VideoLink] connected: " << d.name);
             return true;
         }
     }
 
-    std::cout << "[" << nowStr() << "] [VideoLink] connectAuto() exhausted all "
-        << candidates.size() << " candidate device(s), none connected" << std::endl;
+    VL_LOG(<< "[" << nowStr() << "] [VideoLink] connectAuto() exhausted all "
+        << candidates.size() << " candidate device(s), none connected");
     setLinkState(linkState_, LinkState::Disconnected, "connectAuto: no candidate connected");
     return false;
 }
 
-// Applies the standard set of capture properties (resolution, buffer
-// size, FPS) to whichever cv::VideoCapture is passed in, timing each
-// property individually rather than as one lumped block. This is
-// shared by connect() and tryReconnect() so both paths report
-// identical, directly-comparable per-property timings.
-//
-// FOURCC(MJPG) has been removed entirely (see kSkipFourccSet above) --
-// this hardware always negotiates YUY2 regardless of what's requested
-// (confirmed via the "actual negotiated format" log line on every
-// connect/reconnect), so the request was pure overhead: ~700ms spent
-// asking for a format we never received and never used.
 namespace {
-    void applyCaptureProperties(cv::VideoCapture& cap, int prefW, int prefH, double prefFps) {
-        auto timeIt = [](const char* label, auto&& fn) {
-            auto t0 = std::chrono::steady_clock::now();
-            fn();
-            std::cout << "[" << nowStr() << "] [VideoLink]     set " << label << " took "
-                << elapsedMs(t0) << "ms" << std::endl;
-            };
-
-        timeIt("FRAME_WIDTH", [&] { cap.set(cv::CAP_PROP_FRAME_WIDTH, prefW); });
-        timeIt("FRAME_HEIGHT", [&] { cap.set(cv::CAP_PROP_FRAME_HEIGHT, prefH); });
-        timeIt("BUFFERSIZE", [&] { cap.set(cv::CAP_PROP_BUFFERSIZE, 1); });   // no internal queue -- always freshest frame
-
-        if (!kSkipFourccSet) {
-            // Left here (dead by default) only so it's trivial to flip
-            // back on if a future dongle/driver combo actually needs it.
-            timeIt("FOURCC(MJPG)", [&] { cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G')); });
-        }
-
-        if (!kSkipFpsSet) {
-            // Ask for the highest frame rate we care about. Most
-            // backends/devices will silently clamp this to whatever
-            // mode they actually support at the requested resolution.
-            // See kSkipFpsSet above -- flip that to true to test
-            // whether this device defaults to 60fps on its own.
-            timeIt("FPS", [&] { cap.set(cv::CAP_PROP_FPS, prefFps); });
-        }
-    }
-
-    // Every cap.set() call above is only a *request* -- the backend/
+    // Every requested capture property is only a *request* -- the
     // driver is free to silently ignore it and negotiate something else
     // entirely (different FOURCC, different resolution, different
     // color format) if the device doesn't actually support what we
@@ -656,11 +631,11 @@ namespace {
         double h = cap.get(cv::CAP_PROP_FRAME_HEIGHT);
         double fps = cap.get(cv::CAP_PROP_FPS);
         double convertRgb = cap.get(cv::CAP_PROP_CONVERT_RGB);
-        std::cout << "[" << nowStr() << "] [VideoLink]   " << context
+        VL_LOG(<< "[" << nowStr() << "] [VideoLink]   " << context
             << ": actual negotiated format -- FOURCC=\"" << fourccStr
             << "\" (0x" << std::hex << fourccInt << std::dec << ")"
             << " " << w << "x" << h << " @ " << fps << "fps"
-            << ", CONVERT_RGB=" << convertRgb << std::endl;
+            << ", CONVERT_RGB=" << convertRgb);
     }
 
     // ── Backend order: DSHOW first, MSMF fallback ───────────────────
@@ -692,53 +667,45 @@ namespace {
     // actually fast and reliable here, and it guarantees strictly
     // sequential, single-owner device access at all times.
     //
-    // `params`, when non-null and kUseParamsAtOpen is true, is passed
-    // straight into cap.open() so DSHOW can negotiate width/height/
-    // buffersize as part of a single graph build instead of via
-    // sequential cap.set() calls afterward (see kUseParamsAtOpen
-    // above). When empty/unused, behavior is identical to before.
-    bool openPreferDshow(cv::VideoCapture& cap, int deviceIndex, const std::vector<int>* params = nullptr) {
+    // `params` is passed straight into cap.open() (rather than applied
+    // afterward via sequential cap.set() calls) so DSHOW can negotiate
+    // width/height/buffersize as part of a single filter-graph build --
+    // see buildOpenParams() below and the capture-open configuration
+    // notes near the top of this file for why this replaced the older
+    // sequential cap.set() approach.
+    bool openPreferDshow(cv::VideoCapture& cap, int deviceIndex, const std::vector<int>& params) {
         auto tDshow = std::chrono::steady_clock::now();
-        bool opened = (params && !params->empty())
-            ? cap.open(deviceIndex, cv::CAP_DSHOW, *params)
-            : cap.open(deviceIndex, cv::CAP_DSHOW);
-        std::cout << "[" << nowStr() << "] [VideoLink]     cap.open(CAP_DSHOW) took "
-            << elapsedMs(tDshow) << "ms, result=" << opened << std::endl;
+        bool opened = cap.open(deviceIndex, cv::CAP_DSHOW, params);
+        VL_LOG(<< "[" << nowStr() << "] [VideoLink]     cap.open(CAP_DSHOW) took "
+            << elapsedMs(tDshow) << "ms, result=" << opened);
 
         if (!opened) {
             auto tMsmf = std::chrono::steady_clock::now();
-            opened = (params && !params->empty())
-                ? cap.open(deviceIndex, cv::CAP_MSMF, *params)
-                : cap.open(deviceIndex, cv::CAP_MSMF);
-            std::cout << "[" << nowStr() << "] [VideoLink]     cap.open(CAP_MSMF) took "
-                << elapsedMs(tMsmf) << "ms, result=" << opened << std::endl;
+            opened = cap.open(deviceIndex, cv::CAP_MSMF, params);
+            VL_LOG(<< "[" << nowStr() << "] [VideoLink]     cap.open(CAP_MSMF) took "
+                << elapsedMs(tMsmf) << "ms, result=" << opened);
         }
         return opened;
     }
 
-    // Builds the params-at-open vector for the kUseParamsAtOpen A/B
-    // path. Deliberately mirrors applyCaptureProperties() (minus FOURCC,
-    // for the same reason it's skipped there) so the two paths are a
-    // fair comparison of "sequential set() calls" vs "one open() call
-    // with params" rather than also differing in which properties get
-    // requested.
-    std::vector<int> buildOpenParams(int prefW, int prefH, double prefFps) {
-        std::vector<int> params = {
+    // Capture properties requested at open() time. Deliberately omits
+    // FOURCC and FPS -- see the capture-open configuration notes near
+    // the top of this file for why both were dropped after hardware
+    // testing. prefFps is intentionally unused here; setPreferredFps()
+    // remains a valid no-op-today call in case a future capture device
+    // needs it reinstated.
+    std::vector<int> buildOpenParams(int prefW, int prefH) {
+        return {
             cv::CAP_PROP_FRAME_WIDTH, prefW,
             cv::CAP_PROP_FRAME_HEIGHT, prefH,
             cv::CAP_PROP_BUFFERSIZE, 1,
         };
-        if (!kSkipFpsSet) {
-            params.push_back(cv::CAP_PROP_FPS);
-            params.push_back(static_cast<int>(prefFps));
-        }
-        return params;
     }
 }
 
 bool VideoLink::connect(int deviceIndex) {
-    std::cout << "[" << nowStr() << "] [VideoLink] connect(" << deviceIndex
-        << ") called, current state=" << linkStateName(linkState_.load()) << std::endl;
+    VL_LOG(<< "[" << nowStr() << "] [VideoLink] connect(" << deviceIndex
+        << ") called, current state=" << linkStateName(linkState_.load()));
     disconnect();
 
     setLinkState(linkState_, LinkState::Searching, "connect() start");
@@ -746,31 +713,15 @@ bool VideoLink::connect(int deviceIndex) {
 
     auto tConnectStart = std::chrono::steady_clock::now();
 
-    if (kUseParamsAtOpen) {
-        // A/B path: negotiate width/height/buffersize/fps as part of
-        // the open() call itself instead of via sequential cap.set()
-        // calls afterward. See kUseParamsAtOpen and buildOpenParams()
-        // above.
-        std::vector<int> params = buildOpenParams(prefW, prefH, prefFps);
-        openPreferDshow(cap, deviceIndex, &params);
-    }
-    else {
-        openPreferDshow(cap, deviceIndex);
-    }
+    openPreferDshow(cap, deviceIndex, buildOpenParams(prefW, prefH));
 
     if (!cap.isOpened()) {
-        std::cout << "[" << nowStr() << "] [VideoLink] connect() failed: no backend could open device "
-            << deviceIndex << " after " << elapsedMs(tConnectStart) << "ms" << std::endl;
+        VL_LOG(<< "[" << nowStr() << "] [VideoLink] connect() failed: no backend could open device "
+            << deviceIndex << " after " << elapsedMs(tConnectStart) << "ms");
         setLinkState(linkState_, LinkState::Disconnected, "connect() failed: no backend opened");
         return false;
     }
 
-    if (!kUseParamsAtOpen) {
-        auto tProps = std::chrono::steady_clock::now();
-        applyCaptureProperties(cap, prefW, prefH, prefFps);
-        std::cout << "[" << nowStr() << "] [VideoLink]   connect: property cap.set() calls took "
-            << elapsedMs(tProps) << "ms total" << std::endl;
-    }
     logActualNegotiatedFormat(cap, "connect");
 
     // A single successful read() here isn't sufficient proof the stream
@@ -781,13 +732,13 @@ bool VideoLink::connect(int deviceIndex) {
     for (int i = 0; i < kStableFramesRequired; ++i) {
         auto tRead = std::chrono::steady_clock::now();
         bool ok = cap.read(testFrame) && !testFrame.empty();
-        std::cout << "[" << nowStr() << "] [VideoLink]   connect: stability read " << (i + 1) << "/"
+        VL_LOG(<< "[" << nowStr() << "] [VideoLink]   connect: stability read " << (i + 1) << "/"
             << kStableFramesRequired << " took " << elapsedMs(tRead)
-            << "ms, result=" << ok << std::endl;
+            << "ms, result=" << ok);
         if (!ok) {
             cap.release();
-            std::cout << "[" << nowStr() << "] [VideoLink] connect() failed: stability check failed after "
-                << elapsedMs(tConnectStart) << "ms total" << std::endl;
+            VL_LOG(<< "[" << nowStr() << "] [VideoLink] connect() failed: stability check failed after "
+                << elapsedMs(tConnectStart) << "ms total");
             setLinkState(linkState_, LinkState::Disconnected, "connect() failed: stability check");
             return false;
         }
@@ -808,41 +759,41 @@ bool VideoLink::connect(int deviceIndex) {
         }
     }
 
-    std::cout << "[" << nowStr() << "] [VideoLink] connect() succeeded in " << elapsedMs(tConnectStart)
-        << "ms total" << std::endl;
+    VL_LOG(<< "[" << nowStr() << "] [VideoLink] connect() succeeded in " << elapsedMs(tConnectStart)
+        << "ms total");
 
     connected.store(true);
     keepRunning.store(true);
     setLinkState(linkState_, LinkState::Connected, "connect() succeeded");
     lastFrameTimeMs_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
-    std::cout << "[" << nowStr() << "] [VideoLink] connect(): starting capture thread" << std::endl;
+    VL_LOG(<< "[" << nowStr() << "] [VideoLink] connect(): starting capture thread");
     captureThread = std::thread(&VideoLink::captureLoop, this);
     return true;
 }
 
 void VideoLink::disconnect() {
-    std::cout << "[" << nowStr() << "] [VideoLink] disconnect() called, current state="
+    VL_LOG(<< "[" << nowStr() << "] [VideoLink] disconnect() called, current state="
         << linkStateName(linkState_.load()) << ", captureThread joinable="
-        << captureThread.joinable() << std::endl;
+        << captureThread.joinable());
 
     keepRunning.store(false);
 
     if (captureThread.joinable()) {
         auto tJoin = std::chrono::steady_clock::now();
         captureThread.join();
-        std::cout << "[" << nowStr() << "] [VideoLink] disconnect(): capture thread joined after "
-            << elapsedMs(tJoin) << "ms" << std::endl;
+        VL_LOG(<< "[" << nowStr() << "] [VideoLink] disconnect(): capture thread joined after "
+            << elapsedMs(tJoin) << "ms");
     }
     else {
-        std::cout << "[" << nowStr() << "] [VideoLink] disconnect(): no capture thread to join" << std::endl;
+        VL_LOG(<< "[" << nowStr() << "] [VideoLink] disconnect(): no capture thread to join");
     }
 
     if (cap.isOpened()) {
         auto tRel = std::chrono::steady_clock::now();
         cap.release();
-        std::cout << "[" << nowStr() << "] [VideoLink] disconnect(): cap.release() took "
-            << elapsedMs(tRel) << "ms" << std::endl;
+        VL_LOG(<< "[" << nowStr() << "] [VideoLink] disconnect(): cap.release() took "
+            << elapsedMs(tRel) << "ms");
     }
 
     connected.store(false);
@@ -1194,13 +1145,13 @@ void VideoLink::paintNoSignalFrame() {
 }
 
 bool VideoLink::tryReconnect() {
-    std::cout << "[" << nowStr() << "] [VideoLink] tryReconnect() called: lastDeviceIndex_="
+    VL_LOG(<< "[" << nowStr() << "] [VideoLink] tryReconnect() called: lastDeviceIndex_="
         << lastDeviceIndex_ << " deviceName_=\"" << deviceName_
-        << "\" cap.isOpened()=" << cap.isOpened() << std::endl;
+        << "\" cap.isOpened()=" << cap.isOpened());
 
     if (lastDeviceIndex_ < 0) {
-        std::cout << "[" << nowStr() << "] [VideoLink] tryReconnect() aborting: "
-            "lastDeviceIndex_ is invalid (-1), nothing to reconnect to" << std::endl;
+        VL_LOG(<< "[" << nowStr() << "] [VideoLink] tryReconnect() aborting: "
+            "lastDeviceIndex_ is invalid (-1), nothing to reconnect to");
         return false;
     }
 
@@ -1226,9 +1177,8 @@ bool VideoLink::tryReconnect() {
                 break;
             }
         }
-        std::cout << "[" << nowStr() << "] [VideoLink]   reconnect: enumerateDevices() took "
-            << elapsedMs(tEnum) << "ms, device " << (resolvedIndex >= 0 ? "found" : "NOT found")
-            << std::endl;
+        VL_LOG(<< "[" << nowStr() << "] [VideoLink]   reconnect: enumerateDevices() took "
+            << elapsedMs(tEnum) << "ms, device " << (resolvedIndex >= 0 ? "found" : "NOT found"));
         if (resolvedIndex < 0)
             return false;   // not currently present -- don't attempt open()
         lastDeviceIndex_ = resolvedIndex;
@@ -1236,51 +1186,38 @@ bool VideoLink::tryReconnect() {
 
     auto tRelease = std::chrono::steady_clock::now();
     cap.release();
-    std::cout << "[" << nowStr() << "] [VideoLink]   reconnect: cap.release() took "
-        << elapsedMs(tRelease) << "ms" << std::endl;
+    VL_LOG(<< "[" << nowStr() << "] [VideoLink]   reconnect: cap.release() took "
+        << elapsedMs(tRelease) << "ms");
 
     // DSHOW first, MSMF fallback -- see openPreferDshow() above for why
     // this replaced the earlier concurrent MSMF/DSHOW race (that race
     // left a second backend holding the same device for seconds after
     // every connect, which is what broke both FPS and post-replug
     // reconnect).
-    bool opened;
-    if (kUseParamsAtOpen) {
-        std::vector<int> params = buildOpenParams(prefW, prefH, prefFps);
-        opened = openPreferDshow(cap, lastDeviceIndex_, &params);
-    }
-    else {
-        opened = openPreferDshow(cap, lastDeviceIndex_);
-    }
+    bool opened = openPreferDshow(cap, lastDeviceIndex_, buildOpenParams(prefW, prefH));
     if (!opened) {
-        std::cout << "[" << nowStr() << "] [VideoLink] reconnect attempt failed: no backend could "
-            "open the device (" << elapsedMs(attemptStart) << "ms total)" << std::endl;
+        VL_LOG(<< "[" << nowStr() << "] [VideoLink] reconnect attempt failed: no backend could "
+            "open the device (" << elapsedMs(attemptStart) << "ms total)");
         return false;
     }
 
-    if (!kUseParamsAtOpen) {
-        auto tProps = std::chrono::steady_clock::now();
-        applyCaptureProperties(cap, prefW, prefH, prefFps);
-        std::cout << "[" << nowStr() << "] [VideoLink]   reconnect: property cap.set() calls took "
-            << elapsedMs(tProps) << "ms total" << std::endl;
-    }
     logActualNegotiatedFormat(cap, "reconnect");
 
     auto tRead = std::chrono::steady_clock::now();
     cv::Mat probe;
     bool gotFrame = cap.read(probe) && !probe.empty();
-    std::cout << "[" << nowStr() << "] [VideoLink]   reconnect: probe cap.read() took "
-        << elapsedMs(tRead) << "ms, result=" << gotFrame << std::endl;
+    VL_LOG(<< "[" << nowStr() << "] [VideoLink]   reconnect: probe cap.read() took "
+        << elapsedMs(tRead) << "ms, result=" << gotFrame);
 
     if (!gotFrame) {
         cap.release();
-        std::cout << "[" << nowStr() << "] [VideoLink] reconnect attempt failed: opened but first "
-            "read() failed (" << elapsedMs(attemptStart) << "ms total)" << std::endl;
+        VL_LOG(<< "[" << nowStr() << "] [VideoLink] reconnect attempt failed: opened but first "
+            "read() failed (" << elapsedMs(attemptStart) << "ms total)");
         return false;
     }
 
-    std::cout << "[" << nowStr() << "] [VideoLink] reconnect attempt succeeded in "
-        << elapsedMs(attemptStart) << "ms total" << std::endl;
+    VL_LOG(<< "[" << nowStr() << "] [VideoLink] reconnect attempt succeeded in "
+        << elapsedMs(attemptStart) << "ms total");
     return true;
 }
 
@@ -1324,7 +1261,7 @@ void VideoLink::captureLoop() {
     int reconnectAttemptNum = 0;
     auto lastHeartbeat = std::chrono::steady_clock::time_point{};
 
-    std::cout << "[" << nowStr() << "] [VideoLink] captureLoop() thread started" << std::endl;
+    VL_LOG(<< "[" << nowStr() << "] [VideoLink] captureLoop() thread started");
 
     while (keepRunning.load()) {
         // ── Recovery mode: a prior connection dropped, cap is dead ────
@@ -1344,8 +1281,8 @@ void VideoLink::captureLoop() {
             if (signalLostSince == std::chrono::steady_clock::time_point{}) {
                 signalLostSince = std::chrono::steady_clock::now();
                 reconnectAttemptNum = 0;
-                std::cout << "[" << nowStr() << "] [VideoLink] entering recovery loop for device "
-                    << lastDeviceIndex_ << " (\"" << deviceName_ << "\")" << std::endl;
+                VL_LOG(<< "[" << nowStr() << "] [VideoLink] entering recovery loop for device "
+                    << lastDeviceIndex_ << " (\"" << deviceName_ << "\")");
             }
 
             bool arrivalSignaled = deviceArrivalSignal_.exchange(false);
@@ -1354,9 +1291,8 @@ void VideoLink::captureLoop() {
             if (arrivalSignaled) {
                 auto sinceLost = std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - signalLostSince).count();
-                std::cout << "[" << nowStr() << "] [VideoLink] device arrival notification received "
-                    << sinceLost << "ms after signal was lost -- starting fast retry"
-                    << std::endl;
+                VL_LOG(<< "[" << nowStr() << "] [VideoLink] device arrival notification received "
+                    << sinceLost << "ms after signal was lost -- starting fast retry");
                 burstUntil = now + std::chrono::milliseconds(kPostArrivalBurstMs);
             }
 
@@ -1374,10 +1310,10 @@ void VideoLink::captureLoop() {
                 if (sinceHeartbeat >= 2000) {
                     auto totalDownMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                         now - signalLostSince).count();
-                    std::cout << "[" << nowStr() << "] [VideoLink] recovery loop waiting: "
+                    VL_LOG(<< "[" << nowStr() << "] [VideoLink] recovery loop waiting: "
                         << "downtime=" << totalDownMs << "ms, attempts-so-far=" << reconnectAttemptNum
                         << ", nextAttemptIn=" << (effectiveIntervalMs - sinceLastAttempt) << "ms"
-                        << ", burstActive=" << (now < burstUntil) << std::endl;
+                        << ", burstActive=" << (now < burstUntil));
                     lastHeartbeat = now;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -1386,21 +1322,21 @@ void VideoLink::captureLoop() {
             lastReconnectAttempt = now;
             ++reconnectAttemptNum;
 
-            std::cout << "[" << nowStr() << "] [VideoLink] recovery attempt #" << reconnectAttemptNum
+            VL_LOG(<< "[" << nowStr() << "] [VideoLink] recovery attempt #" << reconnectAttemptNum
                 << " starting (arrivalSignaled=" << arrivalSignaled
-                << ", burstActive=" << (now < burstUntil) << ")" << std::endl;
+                << ", burstActive=" << (now < burstUntil) << ")");
 
             bool reconnected = tryReconnect();
 
-            std::cout << "[" << nowStr() << "] [VideoLink] recovery attempt #" << reconnectAttemptNum
-                << " result: " << (reconnected ? "SUCCESS" : "failed, will retry") << std::endl;
+            VL_LOG(<< "[" << nowStr() << "] [VideoLink] recovery attempt #" << reconnectAttemptNum
+                << " result: " << (reconnected ? "SUCCESS" : "failed, will retry"));
 
             if (reconnected) {
                 auto downtimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - signalLostSince).count();
-                std::cout << "[" << nowStr() << "] [VideoLink] signal recovered on device "
+                VL_LOG(<< "[" << nowStr() << "] [VideoLink] signal recovered on device "
                     << lastDeviceIndex_ << " -- total downtime " << downtimeMs << "ms across "
-                    << reconnectAttemptNum << " attempt(s)" << std::endl;
+                    << reconnectAttemptNum << " attempt(s)");
                 consecutiveFailures = 0;
                 idleStreak = 0;
                 liveStreak = 0;
@@ -1442,9 +1378,9 @@ void VideoLink::captureLoop() {
         // normal frame interval (33ms at 30fps, 16ms at 60fps) so this
         // only fires on genuinely abnormal stalls, not routine jitter.
         if (readDurationMs >= 100) {
-            std::cout << "[" << nowStr() << "] [VideoLink] SLOW cap.read() took "
+            VL_LOG(<< "[" << nowStr() << "] [VideoLink] SLOW cap.read() took "
                 << readDurationMs << "ms (state=" << linkStateName(linkState_.load())
-                << ", ok=" << readOk << ")" << std::endl;
+                << ", ok=" << readOk << ")");
         }
 
         // A read that took kStalledReadMs+ is treated as dead regardless
@@ -1456,9 +1392,8 @@ void VideoLink::captureLoop() {
         // path to SignalLost.
         bool stalled = readOk && readDurationMs >= kStalledReadMs;
         if (stalled) {
-            std::cout << "[" << nowStr() << "] [VideoLink] cap.read() returned \"success\" but took "
-                << readDurationMs << "ms -- treating as a dead link, NOT a live frame"
-                << std::endl;
+            VL_LOG(<< "[" << nowStr() << "] [VideoLink] cap.read() returned \"success\" but took "
+                << readDurationMs << "ms -- treating as a dead link, NOT a live frame");
         }
 
         if (!readOk || stalled) {
@@ -1489,8 +1424,8 @@ void VideoLink::captureLoop() {
                 // for both the endless "can't grab frame" OpenCV spam
                 // (already silenced above) and our own repeating
                 // "monitoring..." log.
-                std::cout << "[" << nowStr() << "] [VideoLink] grab failures/stalls starting on device "
-                    << lastDeviceIndex_ << ", monitoring..." << std::endl;
+                VL_LOG(<< "[" << nowStr() << "] [VideoLink] grab failures/stalls starting on device "
+                    << lastDeviceIndex_ << ", monitoring...");
             }
             ++consecutiveFailures;
 
@@ -1501,11 +1436,10 @@ void VideoLink::captureLoop() {
             bool timeBasedLoss = sinceLastGoodFrame >= kSignalLostTimeoutMs;
 
             if (consecutiveFailures >= kFailuresBeforeSignalLost || timeBasedLoss) {
-                std::cout << "[" << nowStr() << "] [VideoLink] signal lost on device "
+                VL_LOG(<< "[" << nowStr() << "] [VideoLink] signal lost on device "
                     << lastDeviceIndex_ << " after " << consecutiveFailures
                     << " consecutive failed/stalled grabs (" << sinceLastGoodFrame
-                    << "ms since last good frame) -- entering recovery mode"
-                    << std::endl;
+                    << "ms since last good frame) -- entering recovery mode");
                 connected.store(false);
                 setLinkState(linkState_, LinkState::SignalLost, "read-failure threshold tripped");
                 deviceArrivalSignal_.store(false);   // discard any stale signal
@@ -1514,8 +1448,8 @@ void VideoLink::captureLoop() {
                 {
                     auto tRel = std::chrono::steady_clock::now();
                     cap.release();
-                    std::cout << "[" << nowStr() << "] [VideoLink]   signal-lost: cap.release() took "
-                        << elapsedMs(tRel) << "ms" << std::endl;
+                    VL_LOG(<< "[" << nowStr() << "] [VideoLink]   signal-lost: cap.release() took "
+                        << elapsedMs(tRel) << "ms");
                 }
                 paintNoSignalFrame();
                 lastReconnectAttempt = std::chrono::steady_clock::now();
@@ -1614,20 +1548,19 @@ void VideoLink::captureLoop() {
             // idleColorFraction) instead of eyeballing screenshots.
             // cv::mean() is cheap and this only runs once/second.
             cv::Scalar meanColor = cv::mean(frame);
-            std::cout << "[" << nowStr() << "] [VideoLink] fps heartbeat: " << fps
+            VL_LOG(<< "[" << nowStr() << "] [VideoLink] fps heartbeat: " << fps
                 << " fps (" << framesInWindow << " frames / " << windowMs
                 << "ms), state=" << linkStateName(linkState_.load())
                 << ", totalFrames=" << frameCount.load()
                 << ", meanBGR=(" << static_cast<int>(meanColor[0]) << ","
-                << static_cast<int>(meanColor[1]) << "," << static_cast<int>(meanColor[2]) << ")"
-                << std::endl;
+                << static_cast<int>(meanColor[1]) << "," << static_cast<int>(meanColor[2]) << ")");
             framesInWindow = 0;
             fpsWindowStart = now;
         }
     }
     connected.store(false);
     setLinkState(linkState_, LinkState::Disconnected, "captureLoop() exiting (keepRunning=false)");
-    std::cout << "[" << nowStr() << "] [VideoLink] captureLoop() thread exiting" << std::endl;
+    VL_LOG(<< "[" << nowStr() << "] [VideoLink] captureLoop() thread exiting");
 }
 
 cv::Mat VideoLink::getLatestFrame() {
