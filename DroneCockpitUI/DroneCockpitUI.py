@@ -82,6 +82,15 @@ FIXES vs previous version
      nothing to do with the panels actually shown in that profile, and
      which also skewed the preview's scale factor. See
      _LayoutPreviewCanvas.render() below.
+  10. Object-detection & map window wired in. DetectionLink (C++, own
+      thread) pulls frames from VideoLink and telemetry from DroneLink,
+      runs YOLO inference, georeferences hits, and hands off
+      DetectionRecords. DetectionWorker polls that off the Tk thread at a
+      low, steady rate; DetectionMapWidget displays it in its own
+      Toplevel window (deliberately separate from the FPV panel -- see
+      that module's docstring) opened via the new "🎯 Detections" toolbar
+      button. See DroneCockpitApp._get_detection_telemetry /
+      _open_detection_window / _pump_detection_records below.
 """
 
 import sys
@@ -96,15 +105,17 @@ from tkinter import simpledialog, messagebox
 
 from telemetry_worker import TelemetryWorker
 from video_worker      import VideoWorker
+from detection_worker  import DetectionWorker
 
-from IMUWidget      import IMUWidget
-from Drone3DView    import Drone3DView
-from BaroWidget     import BaroWidget
-from MagWidget      import MagWidget
-from GPSWidget      import GPSWidget
-from FCStatusWidget import FCStatusWidget
-from ArmingWidget   import ArmingWidget
-from FPVWidget      import FPVWidget
+from IMUWidget           import IMUWidget
+from Drone3DView         import Drone3DView
+from BaroWidget          import BaroWidget
+from MagWidget           import MagWidget
+from GPSWidget           import GPSWidget
+from FCStatusWidget      import FCStatusWidget
+from ArmingWidget        import ArmingWidget
+from FPVWidget           import FPVWidget
+from DetectionMapWidget  import DetectionMapWidget
 
 # ── Path configuration ────────────────────────────────────────────────────────
 script_dir   = os.path.dirname(os.path.abspath(__file__))
@@ -164,6 +175,32 @@ RECONNECT_MS   = 2000
 # readable FPS counter, not fast enough for smooth video.
 VIDEO_POLL_HZ  = 15
 VIDEO_PROBE_RETRY_MS = 3000   # how often to retry connect_auto() if no device found yet
+
+# ── Object detection (DetectionLink / DetectionWorker / DetectionMapWidget) ──
+#
+# Path to the ONNX detection model DetectionLink loads at start() (see
+# DetectionLink::setModelPath()). A sibling "<same-stem>.names" file next
+# to it -- one class name per line -- is picked up automatically if
+# present; otherwise classes show up as "class_N" in the detection list.
+#
+# EDIT THIS to match your local model location.
+DETECTION_MODEL_PATH = os.path.join(script_dir, "models", "yolov8n.onnx")
+
+# Directory annotated detection screenshots are written to (created on
+# first use). Leave as "" to disable screenshot saving -- detections are
+# still recorded and georeferenced, just without an image to inspect.
+DETECTION_SCREENSHOT_DIR = os.path.join(script_dir, "detections")
+
+# How often DetectionLink runs a detection pass, independent of both the
+# 100 Hz telemetry loop and the 30fps FPV capture loop -- see
+# kDefaultDetectionIntervalMs in DetectionLink.cpp. Safe to change at
+# runtime via DetectionLink.set_detection_interval_ms().
+DETECTION_INTERVAL_MS = 250
+
+# How often DetectionWorker polls DetectionLink's cheap status/records
+# getters off the Tk thread, and how often the detection map window is
+# pumped with any newly-arrived records.
+DETECTION_POLL_HZ = 4
 
 BG_WORKSPACE   = "#1a1a2e"
 PANEL_BG       = "#0f0f1a"
@@ -1230,6 +1267,45 @@ class DroneCockpitApp:
         except Exception:
             pass
 
+        # ── Background object-detection worker ───────────────────────────────
+        # DetectionLink runs entirely on its own C++ thread -- independent of
+        # both the 100 Hz MSP telemetry loop and the FPV capture/paint
+        # thread, same "own thread, own lifecycle" pattern as VideoLink. It
+        # pulls frames straight from VideoLink in C++ (pixel data never
+        # crosses into Python here, same rule the FPV path follows) and gets
+        # telemetry via the small pybind11 trampoline below
+        # (_get_detection_telemetry), which is safe to call from a
+        # non-Python-owned thread because DroneLink.get_latest_state() is
+        # already a thread-safe, mutex-protected snapshot.
+        self.detection_link = DroneBackend.DetectionLink()
+        self.detection_link.set_video_link_source(self.video_link)
+        self.detection_link.set_telemetry_provider(self._get_detection_telemetry)
+        self.detection_link.set_model_path(DETECTION_MODEL_PATH)
+        self.detection_link.set_screenshot_dir(DETECTION_SCREENSHOT_DIR)
+        self.detection_link.set_detection_interval_ms(DETECTION_INTERVAL_MS)
+
+        # DetectionWorker only ever does cheap, mutex-protected reads off
+        # DetectionLink (status counters + incremental record pulls) --
+        # never frames, never inference, never disk I/O -- so it's safe to
+        # start polling immediately regardless of whether the model
+        # actually loaded below.
+        self._detection_worker = DetectionWorker(self.detection_link, poll_hz=DETECTION_POLL_HZ)
+        self._detection_worker.start()
+
+        # DetectionMapWidget is intentionally NOT created here -- like the
+        # rest of this app's optional panels it's opened on demand (see
+        # _open_detection_window), so a pilot who never looks at it never
+        # pays for a Toplevel + Treeview that's sitting there unused.
+        self._detection_map_window: Optional[DetectionMapWidget] = None
+        self._detection_pump_job = None
+
+        if not self.detection_link.start():
+            print("[DetectionLink] start() failed -- check that "
+                  f"DETECTION_MODEL_PATH ('{DETECTION_MODEL_PATH}') points "
+                  "at a real ONNX model and that a frame source is wired "
+                  "up. Detection stays disabled; the rest of the cockpit "
+                  "runs normally.")
+
         self._auto_connect()   # connects hub, then starts worker + pump
 
     # =========================================================================
@@ -1304,6 +1380,107 @@ class DroneCockpitApp:
                 self.root.after(VIDEO_PROBE_RETRY_MS, self._start_video_autoconnect)
 
         threading.Thread(target=_probe, daemon=True).start()
+
+    # =========================================================================
+    # Object detection (DetectionLink / DetectionWorker / DetectionMapWidget)
+    # =========================================================================
+
+    def _get_detection_telemetry(self) -> "DroneBackend.TelemetrySnapshot":
+        """
+        Trampoline passed to DetectionLink.set_telemetry_provider(). Called
+        directly from DetectionLink's own C++ worker thread once per
+        detection pass -- NOT the Tk thread, and NOT via TelemetryWorker's
+        queue (that queue is drained on the Tk thread only, at UI_REFRESH_MS,
+        which would make every detection pass wait on Tk's pump for no
+        reason). DroneLink.get_latest_state() is already a thread-safe,
+        mutex-protected snapshot (see Bindings.cpp), so it's safe to call
+        straight from here.
+
+        NOTE: gimbal_pan_deg / gimbal_tilt_deg are left at 0 (forward/level)
+        below -- the SimpleBGC gimbal has no telemetry readback wired into
+        DroneLink yet, so georeference() currently assumes a level,
+        forward-facing camera. Wire the real pan/tilt angles in here once
+        that readback exists; until then, georeferenced pins will drift off
+        whenever the gimbal is actually panned or tilted away from that
+        assumption.
+        """
+        snapshot = DroneBackend.TelemetrySnapshot()
+
+        hub = getattr(self, "hub", None)
+        if hub is None or not hub.is_connected():
+            return snapshot   # valid=False by default -- DetectionLink skips georeferencing
+
+        try:
+            state = hub.get_latest_state()
+        except Exception:
+            return snapshot
+
+        gps = state.gps
+        snapshot.valid = bool(gps.position_usable)
+        snapshot.latitude = gps.latitude
+        snapshot.longitude = gps.longitude
+        snapshot.altitude_m = float(gps.altitude_m)
+        snapshot.heading_deg = float(state.yaw)
+        snapshot.roll_deg = state.roll / 10.0
+        snapshot.pitch_deg = state.pitch / 10.0
+        snapshot.gimbal_pan_deg = 0.0
+        snapshot.gimbal_tilt_deg = 0.0
+        return snapshot
+
+    def _open_detection_window(self) -> None:
+        """
+        Open (or bring to front) the detection/map window. Deliberately
+        NOT a DraggablePanel: DetectionMapWidget is its own Toplevel by
+        design (see that module's docstring) precisely so nothing it does
+        can ever obstruct or contend with the live FPV feed. Wired to the
+        "🎯 Detections" toolbar button.
+        """
+        win = self._detection_map_window
+        if win is not None and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            return
+
+        self._detection_map_window = DetectionMapWidget(self.root)
+        self._detection_map_window.protocol(
+            "WM_DELETE_WINDOW", self._close_detection_window)
+        self._pump_detection_records()
+
+    def _close_detection_window(self) -> None:
+        """Stop pumping records into the window and let it close normally.
+        DetectionWorker/DetectionLink keep running and keep accumulating
+        records regardless -- reopening the window just resumes draining
+        them, nothing already collected is lost."""
+        if self._detection_pump_job is not None:
+            self.root.after_cancel(self._detection_pump_job)
+            self._detection_pump_job = None
+        win = self._detection_map_window
+        self._detection_map_window = None
+        if win is not None and win.winfo_exists():
+            win.destroy()
+
+    def _pump_detection_records(self) -> None:
+        """
+        Drains DetectionWorker's incremental new-records buffer into the
+        open map window -- same "poll cheap results on the Tk thread"
+        pattern the FPV status bar uses for VideoWorker. Only scheduled
+        while the window is actually open, so a pilot who never opens it
+        never pays for the Treeview churn (DetectionWorker itself keeps
+        polling and buffering in the background regardless -- see its own
+        poll loop -- so nothing is missed by the window being closed).
+        """
+        win = self._detection_map_window
+        if win is None or not win.winfo_exists():
+            self._detection_map_window = None
+            self._detection_pump_job = None
+            return
+
+        records = self._detection_worker.get_new_records()
+        if records:
+            win.add_records(records)
+
+        self._detection_pump_job = self.root.after(
+            int(1000 / DETECTION_POLL_HZ), self._pump_detection_records)
 
     # =========================================================================
     # Layout persistence
@@ -1666,6 +1843,15 @@ class DroneCockpitApp:
         )
         self._panels_btn.pack(side="left", padx=(0, 6))
 
+        self._detections_btn = self._mk_icon_btn(
+            toolbar, "🎯", self._open_detection_window,
+            "Detections — open the object-detection & map window. Runs in "
+            "its own top-level window (see DetectionMapWidget) so it never "
+            "competes with or overlaps the live FPV feed.",
+            label="Detections",
+        )
+        self._detections_btn.pack(side="left", padx=(0, 6))
+
         info_btn = self._mk_icon_btn(
             toolbar, "ℹ", None,
             "Drag a panel's title bar to move it.\n"
@@ -1926,11 +2112,15 @@ class DroneCockpitApp:
         self._persist_active()
         if self._update_job is not None:
             self.root.after_cancel(self._update_job)
+        if self._detection_pump_job is not None:
+            self.root.after_cancel(self._detection_pump_job)
         self._worker.stop()
         self.hub.disconnect()
         self._video_worker.stop()
         self.fpv_view.detach()
         self.video_link.disconnect()
+        self._detection_worker.stop()
+        self.detection_link.stop()
         self.root.destroy()
 
 

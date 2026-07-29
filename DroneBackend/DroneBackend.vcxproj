@@ -135,6 +135,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="BaroBMP280.h" />
+    <ClInclude Include="DetectionLink.h" />
     <ClInclude Include="DroneLink.h" />
     <ClInclude Include="GPSneoM10.h" />
     <ClInclude Include="IMUSensor.h" />
@@ -142,6 +143,7 @@
     <ClInclude Include="VideoLink.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="DetectionLink.cpp" />
     <ClCompile Include="DroneLink.cpp" />
     <ClCompile Include="GPSneoM10.cpp" />
     <ClCompile Include="IMUSensor.cpp" />
