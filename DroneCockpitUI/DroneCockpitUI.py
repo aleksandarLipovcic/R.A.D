@@ -1215,6 +1215,13 @@ class DroneCockpitApp:
         self._vis_vars: dict[str, tk.BooleanVar] = {}
         self._panels:   dict[str, DraggablePanel] = {}
 
+        # Tracks whether the detection/map Toplevel is currently open --
+        # separate from _vis_vars because DetectionMapWidget is
+        # deliberately not a DraggablePanel (see its module docstring),
+        # but it still needs a checkbutton-style entry in the Panels ▾
+        # menu so it's discoverable the same way the docked panels are.
+        self._detection_vis_var = tk.BooleanVar(value=False)
+
         # Per-widget frame counters for throttling
         self._frame_counters: dict[str, int] = {k: 0 for k in _THROTTLE}
 
@@ -1299,12 +1306,15 @@ class DroneCockpitApp:
         self._detection_map_window: Optional[DetectionMapWidget] = None
         self._detection_pump_job = None
 
-        if not self.detection_link.start():
-            print("[DetectionLink] start() failed -- check that "
-                  f"DETECTION_MODEL_PATH ('{DETECTION_MODEL_PATH}') points "
-                  "at a real ONNX model and that a frame source is wired "
-                  "up. Detection stays disabled; the rest of the cockpit "
-                  "runs normally.")
+        # Tracked (not just printed) so the detection window itself can
+        # show *why* the pin list is empty -- an engine that never started
+        # and an engine that's running but hasn't seen anything yet look
+        # identical from an empty Treeview alone. See
+        # DetectionMapWidget.set_engine_status() and
+        # _retry_detection_engine() below.
+        self._detection_engine_running = False
+        self._detection_engine_detail = ""
+        self._retry_detection_engine(log_on_failure=True)
 
         self._auto_connect()   # connects hub, then starts worker + pump
 
@@ -1427,23 +1437,74 @@ class DroneCockpitApp:
         snapshot.gimbal_tilt_deg = 0.0
         return snapshot
 
+    def _retry_detection_engine(self, log_on_failure: bool = False) -> None:
+        """
+        Attempts DetectionLink.start(). Safe to call more than once:
+        DetectionLink.start() itself is a no-op that returns True
+        immediately if it's already running, so this doubles as both the
+        initial startup attempt (from __init__) and a manual retry (from
+        _open_detection_window) for the common case where the model file
+        didn't exist yet at app launch and was dropped into place after,
+        without needing to restart the whole cockpit.
+        """
+        if self.detection_link.start():
+            self._detection_engine_running = True
+            self._detection_engine_detail = ""
+            return
+
+        self._detection_engine_running = False
+        self._detection_engine_detail = (
+            f"model not found at '{DETECTION_MODEL_PATH}'"
+        )
+        if log_on_failure:
+            print("[DetectionLink] start() failed -- check that "
+                  f"DETECTION_MODEL_PATH ('{DETECTION_MODEL_PATH}') points "
+                  "at a real ONNX model and that a frame source is wired "
+                  "up. Detection stays disabled; the rest of the cockpit "
+                  "runs normally.")
+
     def _open_detection_window(self) -> None:
         """
         Open (or bring to front) the detection/map window. Deliberately
         NOT a DraggablePanel: DetectionMapWidget is its own Toplevel by
         design (see that module's docstring) precisely so nothing it does
-        can ever obstruct or contend with the live FPV feed. Wired to the
-        "🎯 Detections" toolbar button.
+        can ever obstruct or contend with the live FPV feed. Reachable
+        from both the "🎯 Detections" toolbar button and the "Detections &
+        Map" entry in the Panels ▾ menu (see _toggle_detection_window).
         """
         win = self._detection_map_window
         if win is not None and win.winfo_exists():
             win.deiconify()
             win.lift()
+            win.focus_force()
+            self._detection_vis_var.set(True)
             return
+
+        # Give the engine one more chance here -- covers a pilot dropping
+        # the model file into place after launch and then opening this
+        # window, without having to restart the whole cockpit.
+        if not self._detection_engine_running:
+            self._retry_detection_engine()
 
         self._detection_map_window = DetectionMapWidget(self.root)
         self._detection_map_window.protocol(
             "WM_DELETE_WINDOW", self._close_detection_window)
+        self._detection_map_window.set_engine_status(
+            self._detection_engine_running, self._detection_engine_detail)
+
+        # Center over the main window and force it to the front. A bare
+        # Toplevel with no explicit position can land off in a corner or
+        # behind the main window depending on the window manager, which
+        # is easy to mistake for "the window never opened."
+        self.root.update_idletasks()
+        win_w, win_h = 900, 560
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win_w) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win_h) // 2
+        self._detection_map_window.geometry(f"+{max(0, x)}+{max(0, y)}")
+        self._detection_map_window.lift()
+        self._detection_map_window.focus_force()
+
+        self._detection_vis_var.set(True)
         self._pump_detection_records()
 
     def _close_detection_window(self) -> None:
@@ -1456,8 +1517,19 @@ class DroneCockpitApp:
             self._detection_pump_job = None
         win = self._detection_map_window
         self._detection_map_window = None
+        self._detection_vis_var.set(False)
         if win is not None and win.winfo_exists():
             win.destroy()
+
+    def _toggle_detection_window(self) -> None:
+        """Bound to the 'Detections & Map' checkbutton in the Panels ▾
+        menu -- mirrors _toggle_panel()'s open/close semantics for the
+        regular docked panels, even though this one lives in its own
+        Toplevel rather than the workspace canvas."""
+        if self._detection_vis_var.get():
+            self._open_detection_window()
+        else:
+            self._close_detection_window()
 
     def _pump_detection_records(self) -> None:
         """
@@ -1473,6 +1545,7 @@ class DroneCockpitApp:
         if win is None or not win.winfo_exists():
             self._detection_map_window = None
             self._detection_pump_job = None
+            self._detection_vis_var.set(False)
             return
 
         records = self._detection_worker.get_new_records()
@@ -1726,6 +1799,17 @@ class DroneCockpitApp:
                 variable=self._vis_vars[name],
                 command=lambda n=name: self._toggle_panel(n),
             )
+        menu.add_separator()
+        # Detections & Map isn't a docked DraggablePanel (see
+        # DetectionMapWidget's module docstring for why it's kept as its
+        # own Toplevel), but it still gets an entry here so it's
+        # discoverable the same way the docked panels are, instead of
+        # only being reachable via the toolbar icon.
+        menu.add_checkbutton(
+            label="  🎯 Detections & Map",
+            variable=self._detection_vis_var,
+            command=self._toggle_detection_window,
+        )
         menu.add_separator()
         menu.add_command(label="  Show All", command=self._show_all)
         menu.add_command(label="  Hide All", command=self._hide_all)

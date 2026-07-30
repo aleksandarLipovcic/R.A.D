@@ -55,8 +55,23 @@ class DetectionMapWidget(tk.Toplevel):
     # =====================================================================
 
     def _build_layout(self):
+        # ── Engine status banner ─────────────────────────────────────────
+        # An empty pin list looks identical whether nothing has been
+        # detected yet or the detection engine never started at all (e.g.
+        # the ONNX model path was wrong) -- that ambiguity used to only
+        # get resolved by reading the console. set_engine_status() (called
+        # by the owning app right after this window is created, and again
+        # on any later retry) makes that state visible right here instead.
+        self._status_var = tk.StringVar(value="●  Detection engine: unknown")
+        self._status_lbl = tk.Label(
+            self, textvariable=self._status_var,
+            fg="#888888", bg="#1a1a1a",
+            font=("Segoe UI", 9, "bold"), anchor="w",
+        )
+        self._status_lbl.pack(fill="x", padx=8, pady=(8, 0))
+
         paned = ttk.PanedWindow(self, orient="horizontal")
-        paned.pack(fill="both", expand=True)
+        paned.pack(fill="both", expand=True, pady=(6, 0))
 
         # ── Left: detection list ────────────────────────────────────
         left = tk.Frame(paned, bg="#1a1a1a")
@@ -97,6 +112,25 @@ class DetectionMapWidget(tk.Toplevel):
     # =====================================================================
     # Public API — called from the main app's poll loop
     # =====================================================================
+
+    def set_engine_status(self, running: bool, detail: str = "") -> None:
+        """
+        Called by the owning app (see DroneCockpitApp._open_detection_window
+        / ._retry_detection_engine in main.py) whenever DetectionLink's
+        running state is known or changes. Purely informational -- doesn't
+        affect whether records are accepted -- but makes "the engine never
+        started" visually distinct from "nothing detected yet", which
+        otherwise look identical from inside this window.
+        """
+        if running:
+            self._status_var.set("●  Detection engine running")
+            self._status_lbl.config(fg="#00ff88")
+        else:
+            msg = "●  Detection engine stopped"
+            if detail:
+                msg += f"  —  {detail}"
+            self._status_var.set(msg)
+            self._status_lbl.config(fg="#ff5566")
 
     def add_records(self, records) -> None:
         """
