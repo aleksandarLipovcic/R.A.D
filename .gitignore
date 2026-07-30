@@ -23,3 +23,7 @@ env/
 TestResults/
 IMUTests/
 **/junitresults_*.xml
+
+# VisDrone datasets (raw data, too large for GitHub)
+DroneCockpitUI/datasets/VisDrone/
+*.zip
