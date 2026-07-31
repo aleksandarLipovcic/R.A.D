@@ -18,6 +18,16 @@ Usage:
 
 Re-running is safe -- each step checks whether it's already done before
 doing it again.
+
+Note on Python 3.14: CUDA-enabled PyTorch wheels for the cp314 tag have
+been inconsistent across CUDA versions (some indexes publish them, some
+don't yet). If this script exhausts every CUDA bucket below and is still
+CPU-only, the fallback isn't to keep guessing -- create a separate venv
+on Python 3.12 for this training subproject specifically, where CUDA
+wheel coverage is mature and this stops being a moving target:
+    py -3.12 -m venv .venv312
+    .venv312\\Scripts\\activate
+    python setup.py
 """
 
 import subprocess
@@ -36,7 +46,7 @@ def run(cmd: list[str], description: str) -> bool:
 
 def check_gpu_driver() -> str | None:
     """
-    Returns the driver's max-supported CUDA version string (e.g. '12.4')
+    Returns the driver's max-supported CUDA version string (e.g. '13.3')
     by parsing `nvidia-smi`, or None if nvidia-smi isn't found/parseable.
     This is the DRIVER's ceiling, not necessarily what gets installed --
     it just tells us it's safe to install a CUDA build up to this version.
@@ -57,9 +67,18 @@ def check_gpu_driver() -> str | None:
 
     for line in out.splitlines():
         if "CUDA Version" in line:
-            # Example line: "| NVIDIA-SMI 551.23   Driver Version: 551.23   CUDA Version: 12.4 |"
+            # Example line: "| NVIDIA-SMI 610.74  ... CUDA Version: 13.3 |"
+            # Also handles the newer nvidia-smi layout that prints
+            # "CUDA UMD Version: 13.3" on its own header line.
             try:
-                cuda_ver = line.split("CUDA Version:")[1].strip().split()[0]
+                cuda_ver = line.split("CUDA Version:")[1].strip().split()[0].rstrip("|").strip()
+                print(f"[OK] GPU detected. Driver supports up to CUDA {cuda_ver}.")
+                return cuda_ver
+            except (IndexError, ValueError):
+                pass
+        if "CUDA UMD Version" in line:
+            try:
+                cuda_ver = line.split("CUDA UMD Version:")[1].strip().split()[0].rstrip("|").strip()
                 print(f"[OK] GPU detected. Driver supports up to CUDA {cuda_ver}.")
                 return cuda_ver
             except (IndexError, ValueError):
@@ -69,13 +88,49 @@ def check_gpu_driver() -> str | None:
     return None
 
 
+# PyTorch wheel index tags, newest first. Kept as an ordered list (not just
+# a dict) so the "pick highest eligible" fallback logic below is a single
+# linear scan instead of float-parsing version strings, which breaks on
+# CUDA's inconsistent point-release numbering (12.6 vs 13.0 vs 13.3, etc).
+CUDA_WHEEL_BUCKETS = [
+    ("13.0", "cu130"),
+    ("12.8", "cu128"),
+    ("12.6", "cu126"),
+    ("12.4", "cu124"),
+    ("12.1", "cu121"),
+    ("11.8", "cu118"),
+]
+
+
+def pick_wheel_tag(cuda_ver: str) -> str:
+    """
+    Maps a driver's reported CUDA ceiling to the closest PyTorch wheel
+    index tag at or below it. E.g. a 13.3 driver -> cu130 (PyTorch doesn't
+    publish a cu133 wheel, but cu130 wheels run fine on newer drivers --
+    CUDA is backward compatible that direction).
+    """
+    try:
+        driver_version = float(".".join(cuda_ver.split(".")[:2]))
+    except ValueError:
+        print(f"[WARN] Couldn't parse '{cuda_ver}' as a version number, "
+              f"defaulting to cu126 (safe, widely-supported baseline).")
+        return "cu126"
+
+    for bucket_ver, tag in CUDA_WHEEL_BUCKETS:
+        if driver_version >= float(bucket_ver):
+            return tag
+
+    # Driver is older than every known bucket ceiling -- go with the oldest.
+    return CUDA_WHEEL_BUCKETS[-1][1]
+
+
 def install_pytorch(cuda_ver: str | None):
     """
     Installs torch/torchvision. Recent PyPI PyTorch builds are CUDA-enabled
-    by default on Windows/Linux, so a plain install is tried first -- but
-    we VERIFY cuda works afterward rather than trusting that. If it
-    doesn't, fall back to an explicit CUDA-tagged index matching the
-    driver's supported version.
+    by default on Linux, but Windows plain installs commonly land on a
+    CPU-only build -- so a plain install is tried first, but we VERIFY cuda
+    works afterward rather than trusting that. If it doesn't, fall back to
+    an explicit CUDA-tagged index matching the driver's supported version.
     """
     print(f"\n{'=' * 70}\nInstalling PyTorch\n{'=' * 70}")
     run([sys.executable, "-m", "pip", "install", "--upgrade",
@@ -90,20 +145,7 @@ def install_pytorch(cuda_ver: str | None):
               "NVIDIA drivers first, then re-run this script.")
         return
 
-    # Map driver CUDA version to a PyTorch wheel index. PyTorch doesn't
-    # publish a wheel for every CUDA point release -- pick the closest
-    # supported bucket at or below the driver's ceiling.
-    major_minor = ".".join(cuda_ver.split(".")[:2])
-    buckets = {
-        "12.6": "cu126", "12.4": "cu124", "12.1": "cu121", "11.8": "cu118",
-    }
-    tag = buckets.get(major_minor)
-    if tag is None:
-        # Pick the highest bucket that doesn't exceed the driver's version
-        numeric = [(float(k), v) for k, v in buckets.items()]
-        eligible = [v for k, v in numeric if k <= float(major_minor)]
-        tag = eligible[-1] if eligible else "cu118"
-
+    tag = pick_wheel_tag(cuda_ver)
     print(f"\n[RETRY] Default install wasn't CUDA-enabled. Reinstalling "
           f"with explicit index for {tag}...")
     run([sys.executable, "-m", "pip", "install", "--upgrade",
@@ -111,9 +153,31 @@ def install_pytorch(cuda_ver: str | None):
          "--index-url", f"https://download.pytorch.org/whl/{tag}"],
         f"pip install torch torchvision ({tag})")
 
-    if not verify_cuda():
-        print("\n[ERROR] Still CPU-only after explicit CUDA install. "
-              "Check https://pytorch.org/get-started/locally/ and install "
+    if verify_cuda():
+        return
+
+    # Still CPU-only after an explicit CUDA index install. On Python 3.9-3.13
+    # this would almost always be a wheel/driver mismatch worth troubleshooting
+    # further. On Python 3.14 it's very likely that cp314 CUDA wheels simply
+    # aren't published yet for this CUDA bucket -- so say that plainly instead
+    # of sending the person in circles re-trying pip installs.
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+    print(f"\n[ERROR] Still CPU-only after explicit CUDA install ({tag}, "
+          f"Python {py_ver}).")
+    if sys.version_info[:2] >= (3, 14):
+        print(
+            "You're on Python 3.14 -- CUDA wheel coverage for this Python "
+            "version has been inconsistent across CUDA releases. Rather "
+            "than keep guessing wheel tags, create a separate venv on "
+            "Python 3.12 just for this training subproject:\n"
+            "    py -3.12 -m venv .venv312\n"
+            "    .venv312\\Scripts\\activate\n"
+            "    python setup.py\n"
+            "Python 3.12 has mature, stable CUDA wheel coverage and removes "
+            "this as a variable."
+        )
+    else:
+        print("Check https://pytorch.org/get-started/locally/ and install "
               "manually with the exact command it gives you for your "
               "driver version.")
 
