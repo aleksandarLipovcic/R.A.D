@@ -1,11 +1,13 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
+#include <pybind11/functional.h>
 #include <cstring>
 #include "DroneLink.h"
 #include "IMUSensor.h"
 #include "GPSNeoM10.h"
 #include "VideoLink.h"
+#include "DetectionLink.h"
 
 namespace py = pybind11;
 using namespace pybind11::literals;
@@ -595,6 +597,140 @@ PYBIND11_MODULE(DroneBackend, m) {
             "this, the native window kept rendering even while its Tk "
             "panel was hidden, since hiding a Tk canvas item has no "
             "effect on a foreign HWND.");
+
+    // =========================================================================
+    // TelemetrySnapshot
+    //
+    // Constructible from Python (py::init<>() + all fields readwrite) so a
+    // pure-Python trampoline can build one and hand it back through
+    // DetectionLink.set_telemetry_provider() -- see that binding below and
+    // DroneCockpitApp._get_detection_telemetry() in main.py. Field names
+    // are the snake_case equivalent of the camelCase C++ members in
+    // DetectionLink.h; see that header's angle-convention comment before
+    // wiring headingDeg/rollDeg/pitchDeg/gimbalPanDeg/gimbalTiltDeg from a
+    // new telemetry source.
+    // =========================================================================
+    py::class_<TelemetrySnapshot>(m, "TelemetrySnapshot")
+        .def(py::init<>())
+        .def_readwrite("valid", &TelemetrySnapshot::valid,
+            "Must be set True for DetectionLink::georeference() to run at "
+            "all -- leave False (the default) whenever GPS/attitude aren't "
+            "trustworthy yet.")
+        .def_readwrite("latitude", &TelemetrySnapshot::latitude)
+        .def_readwrite("longitude", &TelemetrySnapshot::longitude)
+        .def_readwrite("altitude_m", &TelemetrySnapshot::altitudeM,
+            "Height above the ground directly below (AGL), metres.")
+        .def_readwrite("heading_deg", &TelemetrySnapshot::headingDeg,
+            "Compass heading, 0 = north, increasing clockwise.")
+        .def_readwrite("roll_deg", &TelemetrySnapshot::rollDeg,
+            "Positive = right wing down.")
+        .def_readwrite("pitch_deg", &TelemetrySnapshot::pitchDeg,
+            "Positive = nose up.")
+        .def_readwrite("gimbal_pan_deg", &TelemetrySnapshot::gimbalPanDeg,
+            "Relative to body forward, positive = pan right.")
+        .def_readwrite("gimbal_tilt_deg", &TelemetrySnapshot::gimbalTiltDeg,
+            "0 = forward/level, +90 = straight down.");
+
+    // =========================================================================
+    // DetectionRecord
+    //
+    // Read-only on the Python side -- these are produced by DetectionLink's
+    // own worker thread, never constructed in Python. Consumed directly by
+    // DetectionMapWidget (see rec.class_name, rec.latitude/longitude,
+    // rec.telemetry.heading_deg, etc. in that module).
+    // =========================================================================
+    py::class_<DetectionRecord>(m, "DetectionRecord")
+        .def_readonly("id", &DetectionRecord::id)
+        .def_readonly("timestamp_ms", &DetectionRecord::timestampMs,
+            "Wall-clock ms (epoch) when the source frame was grabbed.")
+        .def_readonly("class_name", &DetectionRecord::className)
+        .def_readonly("confidence", &DetectionRecord::confidence)
+        .def_readonly("bbox_x", &DetectionRecord::bboxX)
+        .def_readonly("bbox_y", &DetectionRecord::bboxY)
+        .def_readonly("bbox_w", &DetectionRecord::bboxW)
+        .def_readonly("bbox_h", &DetectionRecord::bboxH)
+        .def_readonly("latitude", &DetectionRecord::latitude)
+        .def_readonly("longitude", &DetectionRecord::longitude)
+        .def_readonly("georeferenced", &DetectionRecord::georeferenced,
+            "False if telemetry wasn't valid for this pass -- lat/lon are "
+            "meaningless when this is False.")
+        .def_readonly("screenshot_path", &DetectionRecord::screenshotPath,
+            "Empty string if screenshot saving is disabled or failed.")
+        .def_readonly("telemetry", &DetectionRecord::telemetry,
+            "TelemetrySnapshot stored verbatim at detection time, for "
+            "later re-derivation/debugging.");
+
+    // =========================================================================
+    // DetectionLink
+    //
+    // Runs YOLO inference on its own C++ thread, fully independent of both
+    // the 100 Hz MSP telemetry loop and the FPV capture/paint thread -- same
+    // "own thread, own lifecycle" pattern as VideoLink. Frame source and
+    // telemetry source are both wired in from Python, decoupling
+    // DetectionLink.h/.cpp from ever needing to know about VideoLink or
+    // DroneLink directly (see DetectionLink.h's module comment).
+    //
+    // set_telemetry_provider() takes a plain Python callable returning a
+    // TelemetrySnapshot -- pybind11's std::function support (functional.h,
+    // included above) wraps it and acquires the GIL automatically each time
+    // DetectionLink's worker thread invokes it, so the bound Python
+    // function is safe to call from that non-Python-owned thread without
+    // any extra locking on the Python side. See
+    // DroneCockpitApp._get_detection_telemetry() in main.py for the
+    // trampoline that's actually passed in.
+    // =========================================================================
+    py::class_<DetectionLink>(m, "DetectionLink")
+        .def(py::init<>())
+        .def("set_video_link_source", &DetectionLink::setVideoLinkSource,
+            py::arg("video_link"),
+            "Preferred frame source: every detection pass pulls a frame "
+            "via VideoLink::getLatestFrame() directly in C++. DetectionLink "
+            "does not take ownership and does not outlive the caller's "
+            "responsibility to call stop() before the VideoLink instance "
+            "is destroyed.")
+        .def("set_telemetry_provider", &DetectionLink::setTelemetryProvider,
+            py::arg("provider"),
+            "Python callable, no args, returning a TelemetrySnapshot. "
+            "Called once per detection pass, immediately before inference.")
+        .def("set_model_path", &DetectionLink::setModelPath,
+            py::arg("path"),
+            "Path to an ONNX object-detection model (Ultralytics "
+            "YOLOv8/v11 export layout). A sibling '<stem>.names' file is "
+            "loaded automatically if present.")
+        .def("set_screenshot_dir", &DetectionLink::setScreenshotDir,
+            py::arg("dir"),
+            "Directory detection screenshots are written to (created if "
+            "missing). Leave empty to disable screenshot saving.")
+        .def("set_horizontal_fov_deg", &DetectionLink::setHorizontalFovDeg,
+            py::arg("fov_deg"),
+            "Horizontal FOV of the camera feeding this link, in degrees -- "
+            "needed to turn a pixel offset into a georeferencing ray angle.")
+        .def("set_detection_interval_ms", &DetectionLink::setDetectionIntervalMs,
+            py::arg("ms"),
+            "How often a detection pass runs, independent of the 30fps "
+            "capture loop. Safe to change at runtime.")
+        .def("set_confidence_threshold", &DetectionLink::setConfidenceThreshold,
+            py::arg("threshold"),
+            "Raw model confidence below which a detection is discarded.")
+        .def("start", &DetectionLink::start,
+            "Loads the model and starts the worker thread. Returns False "
+            "(and does not start the thread) if the model failed to load "
+            "or no frame source has been set.")
+        .def("stop", &DetectionLink::stop)
+        .def("is_running", &DetectionLink::isRunning)
+        .def("get_detection_count", &DetectionLink::getDetectionCount)
+        .def("get_last_pass_duration_ms", &DetectionLink::getLastPassDurationMs)
+        .def("get_last_pass_timestamp_ms", &DetectionLink::getLastPassTimestampMs)
+        .def("get_all_records", &DetectionLink::getAllRecords,
+            "Full copy of every record collected since start() (or since "
+            "clear_records()). Safe to call at UI refresh rate, not meant "
+            "to be called every frame.")
+        .def("get_records_since", &DetectionLink::getRecordsSince,
+            py::arg("since_id"),
+            "Only records with id > since_id, so a poller can pull "
+            "incrementally instead of re-fetching the whole list every "
+            "tick. Pass 0 to get everything.")
+        .def("clear_records", &DetectionLink::clearRecords);
 
     // =========================================================================
     // Free functions

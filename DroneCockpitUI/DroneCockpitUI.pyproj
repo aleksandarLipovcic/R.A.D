@@ -29,6 +29,8 @@
     <Compile Include="BaroWidget.py">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="DetectionMapWidget.py" />
+    <Compile Include="detection_worker.py" />
     <Compile Include="DroneCockpitUI.py" />
     <Compile Include="DroneTest.py">
       <SubType>Code</SubType>
@@ -52,6 +54,8 @@
       <SubType>Code</SubType>
     </Compile>
     <Compile Include="FPVWidget.py" />
+    <Compile Include="NNTraining\setup.py" />
+    <Compile Include="NNTraining\train.py" />
     <Compile Include="video_worker.py" />
     <Compile Include="sat_imu\conftest.py">
       <SubType>Code</SubType>
@@ -120,6 +124,7 @@
   </ItemGroup>
   <ItemGroup>
     <Folder Include="it_tests\" />
+    <Folder Include="NNTraining\" />
     <Folder Include="sat_imu\" />
     <Folder Include="TestScripts\" />
   </ItemGroup>
