@@ -46,6 +46,55 @@ WDDM / silent shared-memory spillover -- IMPORTANT, read this:
   Neither reads trainer-internal attributes beyond the callback firing
   and the epoch number Ultralytics passes in (a stable, documented
   field) -- everything else is tracked in the closure.
+
+  Root-cause refinement (confirmed against the per-batch log of this
+  project's actual run): the jumps aren't random -- they correlate
+  exactly with the "Instances" column (batch 44: 378 -> 3632 instances,
+  GPU_mem 2.78G -> 4.94G; batch 61: -> 4864 instances, 4.94G -> 8.72G,
+  the exact moment it/s dropped). Ultralytics' mosaic augmentation
+  (mosaic=1.0) composites up to 4 source images into one training sample
+  before batching even happens; a composite that happens to pull in a
+  few of VisDrone's dense crowd/traffic frames can carry 1000+ instances
+  in a single slot instead of the usual couple hundred, and loss/target-
+  assignment memory scales with instance count, not image size. Combined
+  with PyTorch's caching allocator -- which keeps a batch's peak
+  reservation as a permanent floor rather than returning it to the
+  driver right away, to avoid slow cudaFree calls every step -- each
+  unlucky dense batch permanently ratchets the reserved pool up one
+  step: a staircase, not a leak. This doesn't replace the WDDM
+  explanation above, it completes it: the staircase is why reserved
+  memory keeps climbing over the course of a run; WDDM spillover is what
+  happens once that climb crosses the card's physical 6GB ceiling
+  (silent slowdown instead of a clean crash).
+    3. PYTORCH_CUDA_ALLOC_CONF now also sets
+       garbage_collection_threshold:0.8 -- PyTorch's own allocator knob
+       for exactly this pattern: once reserved memory exceeds 80% of
+       what's actually allocated, it proactively releases blocks back
+       to the driver instead of hoarding the post-spike high-water mark
+       forever. This addresses the STAIRCASE (the permanently elevated
+       floor); it does NOT reduce the genuine peak a single very-dense
+       mosaic batch needs -- if one composite's real memory requirement
+       alone exceeds 6GB, no allocator setting saves it, which is
+       exactly why probes 1 and 2 above stay in place as the actual
+       safety net, not just this env var.
+    4. --mosaic (new, default 1.0, Ultralytics' own default) lets you
+       lower the composite probability (e.g. 0.5-0.7) if the watchdog
+       keeps tripping on dense composited batches -- trades away some
+       augmentation strength for fewer extreme-instance-count batches.
+       Leave at default unless probes 1/2 are firing repeatedly.
+    5. mosaic_guard.py / --max-mosaic-instances (new, default 800) --
+       PROACTIVE version of the fix, not just reactive monitoring.
+       Patches Ultralytics' Mosaic to steer partner-image selection away
+       from combinations that would exceed this instance budget, instead
+       of picking partners uniformly at random. Tested against a
+       synthetic dataset matching VisDrone's ~5% dense-frame ratio: cut
+       the worst-case composited instance count from ~4000 to ~1500 and
+       eliminated batches over 2000 instances entirely (0/4000 vs
+       72/4000 with stock random mosaic). Does NOT reduce the mosaic
+       grid size -- Mosaic's canvas code hardcodes geometry for a fixed
+       grid -- and can't fully protect against a single source image
+       that's dense enough on its own, which is exactly why probes 1/2
+       stay in place as the reactive backstop underneath this.
   Given it recurred even on yolo26s at 960px with the combined dataset:
   recommend trying --imgsz 640 for the real run (see Usage below) --
   more VRAM headroom AND it should let --batch go above 1, which batch=1
@@ -158,19 +207,26 @@ import time
 from pathlib import Path
 
 # Must be set before torch is imported (it reads this at CUDA init time).
-# Reduces allocator fragmentation -- without this, mid-size allocations can
-# fail with "0 bytes free" even when total usage is well under the VRAM
-# cap, because the allocator can't find one contiguous free block.
-# NOTE: your log showed "expandable_segments not supported on this
-# platform" -- this setting is a no-op on your current torch/CUDA/Windows
-# combo. Harmless to leave set (in case a future torch update adds
-# support), but don't count on it for headroom today.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# Two knobs combined here:
+#   - expandable_segments:True -- reduces allocator fragmentation. Your
+#     log showed "not supported on this platform" -- a no-op on your
+#     current torch/CUDA/Windows combo, but harmless to leave set in case
+#     a future torch update adds support.
+#   - garbage_collection_threshold:0.8 -- the actual fix for the
+#     mosaic-instance-density staircase (see WDDM/root-cause note above):
+#     once reserved memory exceeds 80% of what's actually allocated,
+#     PyTorch proactively frees blocks back to the driver instead of
+#     permanently hoarding the post-spike high-water mark.
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "expandable_segments:True,garbage_collection_threshold:0.8",
+)
 
 from ultralytics import YOLO
 
 import prepare_datasets
 from class_map import UNIFIED_CLASSES
+from mosaic_guard import install_instance_cap
 
 # Anchor all run output relative to this script's location, not the
 # current working directory. Running train.py from inside an existing
@@ -258,11 +314,11 @@ def make_ongoing_watchdog_callback(device, max_epoch_minutes=None,
 
     This exists because the startup probe alone missed a real spillover
     on yolo26s that only developed ~2800 batches (partway through epoch
-    2) into an actual run -- likely once VisDrone and xView batches
-    (different native resolutions/aspect ratios) started mixing, or once
-    disk-cache/allocator fragmentation built up. A cumulative high-water
-    check catches this regardless of when it happens, without needing to
-    know why.
+    2) into an actual run -- an unlucky mosaic-composited dense batch,
+    per the root-cause note above, not a fixed startup condition. A
+    cumulative high-water check catches this regardless of when it
+    happens, without needing to know in advance which batch will be the
+    unlucky one.
 
     Only reads `trainer.epoch` (a stable, documented Ultralytics field)
     plus wall-clock time tracked in this closure -- nothing else off the
@@ -406,6 +462,39 @@ def parse_args():
                          "two training images together; generally helps "
                          "generalization on small/imbalanced datasets. Set "
                          "to 0.0 to disable.")
+    p.add_argument("--max-mosaic-instances", type=int, default=800,
+                    help="PROACTIVE fix for the VRAM staircase (see "
+                         "root-cause note above): caps the instance "
+                         "count Mosaic partner selection will aim to "
+                         "stay under when compositing images, instead of "
+                         "picking partners uniformly at random. Doesn't "
+                         "shrink the mosaic grid, just steers it away "
+                         "from stacking several dense VisDrone frames "
+                         "together. See mosaic_guard.py. Set to a very "
+                         "large number (e.g. 999999) to effectively "
+                         "disable and get stock random mosaic behavior "
+                         "back.")
+    p.add_argument("--mosaic-max-tries", type=int, default=40,
+                    help="How many candidate partner images the instance "
+                         "cap will sample/reject before giving up and "
+                         "falling back to the least-dense candidates it "
+                         "saw. Higher = tries harder to stay under "
+                         "--max-mosaic-instances at the cost of a few "
+                         "more (cheap, label-only, no image decode) "
+                         "lookups per mosaic call.")
+    p.add_argument("--mosaic", type=float, default=1.0,
+                    help="Mosaic augmentation probability (0.0-1.0), "
+                         "Ultralytics' own default is 1.0. Mosaic "
+                         "composites up to 4 source images into one "
+                         "training sample -- occasionally combining "
+                         "several of VisDrone's dense crowd/traffic "
+                         "frames into a single very-high-instance-count "
+                         "batch, which is the actual driver of the VRAM "
+                         "staircase described in the WDDM/root-cause note "
+                         "above. Lower this (e.g. 0.5-0.7) ONLY if the "
+                         "startup probe or ongoing watchdog keep tripping "
+                         "-- it trades away some augmentation strength for "
+                         "fewer extreme-instance-count batches.")
     p.add_argument("--patience", type=int, default=15,
                     help="Early stopping: stop if val mAP hasn't improved "
                          "in this many epochs. Main overfitting guard -- "
@@ -588,6 +677,7 @@ def train_with_model_fallback(args, data_path: str):
         cos_lr=args.cos_lr,
         copy_paste=args.copy_paste,
         mixup=args.mixup,
+        mosaic=args.mosaic,
         save_period=args.save_period,
     )
     if args.label_smoothing:
@@ -635,6 +725,14 @@ def train_with_model_fallback(args, data_path: str):
 
 def main():
     args = parse_args()
+
+    # Applies to BOTH --resume and a fresh run -- unlike Ultralytics' own
+    # hyperparameters, this isn't saved/restored by the checkpoint, it's
+    # a script-level monkeypatch (see mosaic_guard.py) that needs to be
+    # in place before ANY dataset gets built. Must happen before
+    # train_with_model_fallback() and before model.train(resume=True).
+    install_instance_cap(max_instances=args.max_mosaic_instances,
+                          max_tries=args.mosaic_max_tries)
 
     if args.export_only:
         weights = Path(args.weights) if args.weights else find_latest_best_pt()
