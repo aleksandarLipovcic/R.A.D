@@ -1,17 +1,17 @@
 task: detect
 mode: train
 model: yolo26s.pt
-data: VisDrone.yaml
+data: C:\Users\TheSilent\Desktop\Project R.A.D\DroneCockpitUI\datasets\unified.yaml
 epochs: 100
 time: null
-patience: 20
-batch: -1
+patience: 15
+batch: 1
 imgsz: 960
 save: true
-save_period: -1
+save_period: 5
 cache: disk
 device: '0'
-workers: 4
+workers: 0
 project: C:\Users\TheSilent\Desktop\Project R.A.D\DroneCockpitUI\NNTraining\runs\detect
 name: yolo26s_960
 exist_ok: false
@@ -23,7 +23,7 @@ seed: 0
 deterministic: true
 single_cls: false
 rect: false
-cos_lr: false
+cos_lr: true
 close_mosaic: 10
 resume: false
 amp: true
@@ -105,9 +105,9 @@ flipud: 0.0
 fliplr: 0.5
 bgr: 0.0
 mosaic: 1.0
-mixup: 0.0
+mixup: 0.1
 cutmix: 0.0
-copy_paste: 0.0
+copy_paste: 0.3
 copy_paste_mode: flip
 auto_augment: randaugment
 erasing: 0.4

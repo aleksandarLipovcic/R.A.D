@@ -54,6 +54,10 @@
       <SubType>Code</SubType>
     </Compile>
     <Compile Include="FPVWidget.py" />
+    <Compile Include="NNTraining\class_map.py" />
+    <Compile Include="NNTraining\mosaic_guard.py" />
+    <Compile Include="NNTraining\vram_diagnostic.py" />
+    <Compile Include="NNTraining\prepare_datasets.py" />
     <Compile Include="NNTraining\setup.py" />
     <Compile Include="NNTraining\train.py" />
     <Compile Include="video_worker.py" />

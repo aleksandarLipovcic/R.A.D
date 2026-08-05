@@ -15,7 +15,7 @@ __pycache__/
 .venv/
 env/
 
-# YOLO/Machine Learning weights (they are too big for GitHub)
+# YOLO/Machine Learning weights (too big for GitHub)
 *.pt
 *.onnx
 
@@ -24,6 +24,18 @@ TestResults/
 IMUTests/
 **/junitresults_*.xml
 
-# VisDrone datasets (raw data, too large for GitHub)
-DroneCockpitUI/datasets/VisDrone/
+# Datasets (raw data, too large for GitHub)
+DroneCockpitUI/datasets/
+DroneCockpitUI/NNTraining/datasets/
 *.zip
+*.npy
+*.tif
+*.tiff
+
+# Training run outputs
+DroneCockpitUI/NNTraining/runs/
+runs/
+
+# VRAM diagnostics / profiling artifacts
+*vram_snapshot.pickle
+*vram_trace.csv
