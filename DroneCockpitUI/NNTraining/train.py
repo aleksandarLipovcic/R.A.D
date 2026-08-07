@@ -4,17 +4,17 @@ train.py — Fine-tune YOLO26 for Project R.A.D's aerial detection model
 Defaults are tuned for a 6GB laptop RTX 3060. If `nvidia-smi` shows more
 VRAM available, see the comments below for what to bump.
 
-Pipeline update: this now trains against a UNIFIED class taxonomy (see
-class_map.py) instead of VisDrone's raw 10 classes -- collapsed down to
-person/car/large_vehicle/motorcycle/other_vehicle(+building reserved),
-matching the project's actual priorities (people & vehicles first,
-fine-grained bicycle/tricycle distinctions explicitly not a priority).
-prepare_datasets.py runs automatically before training to: download/remap
-VisDrone into this taxonomy, pick up any manually-added datasets under
-datasets/external/ (see that script's docstring -- this is how you add
-more vehicle/person data, or a terrain-feature dataset like xView, for
-robustness), and write the merged datasets/unified.yaml this script trains
-against by default.
+Pipeline: trains against a UNIFIED class taxonomy (see class_map.py) --
+person/car/large_vehicle/motorcycle/other_vehicle -- spanning VisDrone,
+UAVDT, and SARD (see prepare_datasets.py). All three are genuinely
+drone-native, low-altitude footage, so letting Ultralytics' Mosaic
+augmentation freely composite across them is intentional -- unlike the
+now-inactive xView (satellite) addition, which mixed a fundamentally
+different visual domain into the same batches and measurably hurt
+vehicle/person accuracy (see class_map.py's module docstring). UAVDT
+adds vehicle diversity (no person labels); SARD adds SAR-relevant person
+poses (standing/sitting/lying/exhausted/injured) that VisDrone's general
+pedestrian labels don't cover.
 
 Model size: --model defaults to "yolo26s.pt". Pass --model auto to
 re-enable the yolo26m -> yolo26s -> yolo26n fallback search.
@@ -30,9 +30,8 @@ WDDM / silent shared-memory spillover -- IMPORTANT, read this:
     - yolo26s (the "known good" size) STILL hit it, but only ~2800
       batches into training (GPU_mem reported 7.71G against a 6144MiB
       card) -- i.e. it can develop well after training looks healthy,
-      once VisDrone and xView batches (different native resolutions)
-      start mixing in, or once disk cache / allocator fragmentation
-      builds up. A single check at startup is NOT enough.
+      once denser batches / disk cache / allocator fragmentation build
+      up. A single check at startup is NOT enough.
   Fix: two layers of monitoring, both raising VRAMBudgetExceeded (caught
   the same way a real OOM is, triggering fallback to a smaller model):
     1. make_startup_probe_callback() -- on_train_batch_end, checks the
@@ -41,8 +40,7 @@ WDDM / silent shared-memory spillover -- IMPORTANT, read this:
     2. make_ongoing_watchdog_callback() -- on_train_epoch_end, re-checks
        peak allocated memory (cumulative high-water mark) and that
        epoch's wall-clock time against --max-epoch-minutes (if set)
-       EVERY epoch for the whole run, since spillover can develop later
-       as this run just demonstrated.
+       EVERY epoch for the whole run, since spillover can develop later.
   Neither reads trainer-internal attributes beyond the callback firing
   and the epoch number Ultralytics passes in (a stable, documented
   field) -- everything else is tracked in the closure.
@@ -54,18 +52,17 @@ WDDM / silent shared-memory spillover -- IMPORTANT, read this:
   the exact moment it/s dropped). Ultralytics' mosaic augmentation
   (mosaic=1.0) composites up to 4 source images into one training sample
   before batching even happens; a composite that happens to pull in a
-  few of VisDrone's dense crowd/traffic frames can carry 1000+ instances
-  in a single slot instead of the usual couple hundred, and loss/target-
-  assignment memory scales with instance count, not image size. Combined
-  with PyTorch's caching allocator -- which keeps a batch's peak
-  reservation as a permanent floor rather than returning it to the
-  driver right away, to avoid slow cudaFree calls every step -- each
-  unlucky dense batch permanently ratchets the reserved pool up one
-  step: a staircase, not a leak. This doesn't replace the WDDM
-  explanation above, it completes it: the staircase is why reserved
-  memory keeps climbing over the course of a run; WDDM spillover is what
-  happens once that climb crosses the card's physical 6GB ceiling
-  (silent slowdown instead of a clean crash).
+  few dense frames can carry 1000+ instances in a single slot instead of
+  the usual couple hundred, and loss/target-assignment memory scales
+  with instance count, not image size. Combined with PyTorch's caching
+  allocator -- which keeps a batch's peak reservation as a permanent
+  floor rather than returning it to the driver right away, to avoid slow
+  cudaFree calls every step -- each unlucky dense batch permanently
+  ratchets the reserved pool up one step: a staircase, not a leak. This
+  doesn't replace the WDDM explanation above, it completes it: the
+  staircase is why reserved memory keeps climbing over the course of a
+  run; WDDM spillover is what happens once that climb crosses the card's
+  physical 6GB ceiling (silent slowdown instead of a clean crash).
     3. PYTORCH_CUDA_ALLOC_CONF now also sets
        garbage_collection_threshold:0.8 -- PyTorch's own allocator knob
        for exactly this pattern: once reserved memory exceeds 80% of
@@ -86,15 +83,10 @@ WDDM / silent shared-memory spillover -- IMPORTANT, read this:
        PROACTIVE version of the fix, not just reactive monitoring.
        Patches Ultralytics' Mosaic to steer partner-image selection away
        from combinations that would exceed this instance budget, instead
-       of picking partners uniformly at random. Tested against a
-       synthetic dataset matching VisDrone's ~5% dense-frame ratio: cut
-       the worst-case composited instance count from ~4000 to ~1500 and
-       eliminated batches over 2000 instances entirely (0/4000 vs
-       72/4000 with stock random mosaic). Does NOT reduce the mosaic
-       grid size -- Mosaic's canvas code hardcodes geometry for a fixed
-       grid -- and can't fully protect against a single source image
-       that's dense enough on its own, which is exactly why probes 1/2
-       stay in place as the reactive backstop underneath this.
+       of picking partners uniformly at random. Does NOT reduce the
+       mosaic grid size, and can't fully protect against a single source
+       image that's dense enough on its own -- probes 1/2 stay in place
+       as the reactive backstop underneath this.
   Given it recurred even on yolo26s at 960px with the combined dataset:
   recommend trying --imgsz 640 for the real run (see Usage below) --
   more VRAM headroom AND it should let --batch go above 1, which batch=1
@@ -123,51 +115,28 @@ needed -- Ultralytics already does this, it just wasn't surfaced before):
 
 Overfitting / "fast but low error" controls, given the dataset is still
 fairly small/imbalanced and time is limited:
-  - --patience (default 20): early stopping on val mAP. This is the main
+  - --patience (default 15): early stopping on val mAP. This is the main
     overfitting guard already -- best.pt is always the best-val epoch,
-    not whatever epoch training happens to stop on. Given the time
-    pressure, --epochs 100 --patience 15 is a reasonable "run until it
-    actually plateaus, not longer" combo -- it won't burn your whole
-    time budget on epochs past the point of improvement, and it won't
-    stop prematurely either.
+    not whatever epoch training happens to stop on.
   - --cos-lr (default on): cosine LR decay, tends to generalize slightly
     better late in training than linear.
-  - --label-smoothing: REMOVED as a passed-through train() kwarg. Your
-    log showed Ultralytics 8.4.112 reporting it deprecated/no-op -- so it
-    was silently doing nothing. Flag is still accepted here for
-    forward-compatibility but only forwarded (with a one-time printed
-    reminder that it may be a no-op on your version) if you explicitly
-    set it non-zero.
+  - --label-smoothing: kept for forward-compat only (reported deprecated/
+    no-op on the installed Ultralytics version) -- only forwarded if you
+    explicitly set it non-zero, with a one-time printed reminder.
   - copy_paste/mixup (already present): keep these on -- they matter more
-    than usual here since the sparser classes (motorcycle/other_vehicle/
-    building) have the least real data to learn from.
+    than usual here since the sparser classes (motorcycle/other_vehicle)
+    and SARD's SAR-specific poses have the least real data to learn from.
   - check_overfitting() after every run reads results.csv and flags it if
     val loss is rising while train loss keeps falling over the last N
-    epochs -- a heuristic, not a verdict; also look at the per-class AP
-    and PR-curve plots Ultralytics saves in the run folder, since a small
-    dataset can overfit individual sparse classes well before the
-    aggregate loss shows anything.
+    epochs -- a heuristic, not a verdict.
+  - evaluate_per_source() (new) additionally reports mAP separately for
+    VisDrone/UAVDT/SARD's own val sets after training, not just the
+    blended unified.yaml number -- see its docstring for why this
+    matters: a blended average can hide one source regressing while
+    another improves.
   - The most reliable fix for overfitting on a dataset this size is still
-    more/varied data, not more knobs -- prepare_datasets.py's docstring
-    covers adding more external datasets.
-
-Concrete recommendation for THIS run, given real-world confirmed timings:
-  batch=1 at 960px is slow by construction (zero batching efficiency),
-  and the combined VisDrone+xView set has already shown it can trip WDDM
-  well into a run. Given you're time-constrained:
-    1. Stop the current smoke test (Ctrl+C) -- it already told you what
-       it needed to (WDDM trips even on yolo26s at 960px eventually).
-    2. Try: python train.py --model yolo26s.pt --imgsz 640 --batch 4
-       --epochs 5   (a real smoke test at settings likelier to leave
-       headroom -- watch whether GPU_mem stays comfortably under 6GB and
-       it/s stays reasonable; raise --batch further only if that holds)
-    3. Once a short run looks healthy, commit to the real run:
-       python train.py --model yolo26s.pt --imgsz 640 --epochs 100
-       --patience 15 --save-period 5
-       (drop to --imgsz 960 later ONLY as an optional fine-tune pass from
-       the 640px best.pt via --resume-equivalent fresh run pointing
-       --weights at it, once you have time to spare -- not for the
-       time-constrained first pass)
+    more/varied data, not more knobs -- prepare_datasets.py covers
+    adding more datasets.
 
 Baseline history, for reference:
   yolo26n, 640px, VisDrone's original 10 classes -> mAP50 ~0.31 (plateaued,
@@ -176,9 +145,12 @@ Baseline history, for reference:
     the ceiling diagnosis; every class improved)
   yolo26m, 960px, unified taxonomy -> never actually trained at a usable
     speed: silently spilled into shared system RAM immediately.
-  yolo26s, 960px, unified taxonomy, VisDrone+xView -> spilled ~2800
-    batches into epoch 2 (this run) -- prompted the 640px recommendation
-    above and the ongoing (not just startup) watchdog.
+  yolo26s, 960px, unified taxonomy, VisDrone+xView -> spilled into WDDM
+    partway through epoch 2 -- prompted the 640px recommendation below,
+    the ongoing (not just startup) watchdog, and (separately) the later
+    decision to drop xView entirely for accuracy reasons, not just VRAM.
+  yolo26s, unified taxonomy (5 classes), VisDrone+UAVDT+SARD -> current
+    run, not yet complete.
 
 Usage:
     python train.py                    # yolo26s, unified taxonomy (default)
@@ -187,8 +159,8 @@ Usage:
                                         # the startup probe and the
                                         # ongoing per-epoch watchdog
     python train.py --imgsz 640 --batch 4   # recommended starting point
-                                        # for the combined VisDrone+xView
-                                        # run -- see note above
+                                        # given past WDDM spillover -- see
+                                        # note above
     python train.py --data VisDrone.yaml --model yolo26n.pt --imgsz 640
                                         # reproduce the ORIGINAL 10-class
                                         # baseline exactly, bypassing the
@@ -202,39 +174,27 @@ Usage:
 
 import argparse
 import csv
+import json
 import os
 import time
 from pathlib import Path
 
 # Must be set before torch is imported (it reads this at CUDA init time).
-# Two knobs combined here:
-#   - expandable_segments:True -- reduces allocator fragmentation. Your
-#     log showed "not supported on this platform" -- a no-op on your
-#     current torch/CUDA/Windows combo, but harmless to leave set in case
-#     a future torch update adds support.
-#   - garbage_collection_threshold:0.8 -- the actual fix for the
-#     mosaic-instance-density staircase (see WDDM/root-cause note above):
-#     once reserved memory exceeds 80% of what's actually allocated,
-#     PyTorch proactively frees blocks back to the driver instead of
-#     permanently hoarding the post-spike high-water mark.
 os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF",
     "expandable_segments:True,garbage_collection_threshold:0.8",
 )
 
+import yaml
 from ultralytics import YOLO
 
 import prepare_datasets
 from class_map import UNIFIED_CLASSES
 from mosaic_guard import install_instance_cap
 
-# Anchor all run output relative to this script's location, not the
-# current working directory. Running train.py from inside an existing
-# runs/detect/ folder previously produced a nested
-# runs/detect/runs/detect/train path -- this fixes that regardless of
-# where the script is invoked from.
 SCRIPT_DIR = Path(__file__).resolve().parent
 RUNS_PROJECT = SCRIPT_DIR / "runs" / "detect"
+PER_SOURCE_MANIFEST_PATH = SCRIPT_DIR / "datasets" / "per_source_val.json"
 
 # Tried in this order when --model auto is used. Biggest first -- more
 # capacity generally means better accuracy, so we only give it up if it
@@ -311,18 +271,6 @@ def make_ongoing_watchdog_callback(device, max_epoch_minutes=None,
     card's physical total after every epoch, for the whole run -- not
     just at startup. Also flags any single epoch that takes longer than
     --max-epoch-minutes, if set.
-
-    This exists because the startup probe alone missed a real spillover
-    on yolo26s that only developed ~2800 batches (partway through epoch
-    2) into an actual run -- an unlucky mosaic-composited dense batch,
-    per the root-cause note above, not a fixed startup condition. A
-    cumulative high-water check catches this regardless of when it
-    happens, without needing to know in advance which batch will be the
-    unlucky one.
-
-    Only reads `trainer.epoch` (a stable, documented Ultralytics field)
-    plus wall-clock time tracked in this closure -- nothing else off the
-    trainer object.
     """
     state = {"last_epoch_start": None}
 
@@ -366,27 +314,21 @@ def parse_args():
     p.add_argument("--model", default="yolo26s.pt",
                     help="Base pretrained weights, or 'auto' to try "
                          "yolo26m first and fall back to yolo26s then "
-                         "yolo26n if a size doesn't fit (each candidate "
-                         "checked by both the startup probe and the "
-                         "ongoing watchdog -- see WDDM note in this "
-                         "script's docstring).")
+                         "yolo26n if a size doesn't fit.")
     p.add_argument("--data", default=None,
                     help="Dataset yaml. Defaults to the auto-generated "
                          "datasets/unified.yaml (see prepare_datasets.py) "
-                         "-- collapsed person/vehicle/building taxonomy "
-                         "spanning VisDrone plus anything added under "
-                         "datasets/external/. Pass 'VisDrone.yaml' "
-                         "explicitly to reproduce the original 10-class "
-                         "baseline instead.")
+                         "-- unified taxonomy spanning VisDrone+UAVDT+SARD "
+                         "plus anything under datasets/external/. Pass "
+                         "'VisDrone.yaml' explicitly to reproduce the "
+                         "original 10-class baseline instead.")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--imgsz", type=int, default=960,
-                    help="960 is the historical default -- VisDrone "
-                         "objects are small even at native resolution. "
-                         "BUT: the combined VisDrone+xView run has shown "
-                         "WDDM spillover even on yolo26s at 960px/batch=1 "
-                         "(see WDDM note). Try 640 first for the combined "
-                         "dataset -- more headroom, and lets --batch go "
-                         "above 1.")
+                    help="960 is the historical default -- objects are "
+                         "small even at native resolution. BUT: this "
+                         "combo has shown WDDM spillover even on yolo26s "
+                         "at 960px/batch=1 (see WDDM note). Try 640 first "
+                         "-- more headroom, and lets --batch go above 1.")
     p.add_argument("--batch", type=int, default=1,
                     help="Explicit batch size. batch=1 has zero batching "
                          "efficiency and is a major speed tax by itself, "
@@ -406,133 +348,85 @@ def parse_args():
                          "reloads the full CUDA DLL stack per process, "
                          "which has caused paging-file exhaustion crashes "
                          "on this setup. Raise to 2-4 only after fixing "
-                         "Windows' paging file size (see "
-                         "SETUP_AND_TRAINING.md) if dataloading becomes "
-                         "the bottleneck.")
+                         "Windows' paging file size if dataloading "
+                         "becomes the bottleneck.")
     p.add_argument("--cache", default="disk",
                     help="'disk' caches decoded images to local disk "
-                         "between epochs (fast re-reads, avoids re-decoding "
-                         "JPEGs every epoch, and avoids blowing out RAM the "
-                         "way cache='ram' would on a laptop). Set to False "
-                         "if disk space is tight.")
+                         "between epochs. Set to False if disk space is "
+                         "tight.")
     p.add_argument("--resume", action="store_true",
                     help="Continue training from the most recently modified "
                          "runs/detect/*/weights/last.pt -- full optimizer "
-                         "state (epoch count, LR schedule position, etc.) "
-                         "preserved, NOT a from-scratch restart. Since "
-                         "last.pt is overwritten after every completed "
-                         "epoch (not just periodically), this is also your "
-                         "crash-recovery path: if the run gets interrupted, "
-                         "just re-run with --resume. --model/--data/--name/"
-                         "--epochs are ignored when this is set; settings "
-                         "come from the checkpoint's saved args. NOTE: if "
-                         "class_map.py's taxonomy changed since that "
-                         "checkpoint was trained (different nc), resuming "
-                         "will fail loudly -- that's correct behavior, not "
-                         "a bug; start a fresh run instead.")
+                         "state preserved, NOT a from-scratch restart. "
+                         "--model/--data/--name/--epochs are ignored when "
+                         "this is set. NOTE: if class_map.py's taxonomy "
+                         "changed since that checkpoint was trained "
+                         "(different nc), resuming will fail loudly -- "
+                         "that's correct behavior; start a fresh run "
+                         "instead.")
     p.add_argument("--save-period", type=int, default=5,
                     help="Also write numbered checkpoint snapshots "
-                         "(epoch5.pt, epoch10.pt, ...) every N epochs, on "
-                         "top of last.pt/best.pt which already update "
-                         "every single epoch regardless of this setting. "
-                         "Extra insurance if you ever want to roll back "
-                         "further than one epoch, or in case last.pt "
-                         "itself gets corrupted by an interruption mid-"
-                         "write. Set to -1 to disable and save disk space.")
+                         "(epoch5.pt, epoch10.pt, ...) every N epochs. "
+                         "Set to -1 to disable and save disk space.")
     p.add_argument("--max-epoch-minutes", type=float, default=None,
                     help="Optional failsafe: if any single epoch takes "
                          "longer than this many minutes, the ongoing "
                          "watchdog aborts this model size in favor of a "
-                         "smaller one rather than silently eating your "
-                         "whole time budget on a run that's thrashing "
-                         "(e.g. WDDM spillover developing mid-run). "
-                         "Unset by default since a reasonable ceiling "
-                         "depends on your dataset size/settings -- pick "
-                         "something a bit above what a healthy epoch takes "
-                         "at your settings once you've seen one complete.")
+                         "smaller one.")
     p.add_argument("--copy-paste", type=float, default=0.3,
                     help="Copy-paste augmentation probability (0.0-1.0). "
-                         "Pastes object instances from other images into "
-                         "training images -- helps the lower-priority "
-                         "'other_vehicle' bucket and any other sparse "
-                         "class stay reasonably detectable without needing "
-                         "new source data. Set to 0.0 to disable.")
+                         "Helps the sparser classes stay detectable "
+                         "without needing new source data. Set to 0.0 to "
+                         "disable.")
     p.add_argument("--mixup", type=float, default=0.1,
-                    help="Mixup augmentation probability (0.0-1.0). Blends "
-                         "two training images together; generally helps "
-                         "generalization on small/imbalanced datasets. Set "
-                         "to 0.0 to disable.")
+                    help="Mixup augmentation probability (0.0-1.0). "
+                         "Generally helps generalization on small/"
+                         "imbalanced datasets. Set to 0.0 to disable.")
     p.add_argument("--max-mosaic-instances", type=int, default=800,
                     help="PROACTIVE fix for the VRAM staircase (see "
                          "root-cause note above): caps the instance "
                          "count Mosaic partner selection will aim to "
-                         "stay under when compositing images, instead of "
-                         "picking partners uniformly at random. Doesn't "
-                         "shrink the mosaic grid, just steers it away "
-                         "from stacking several dense VisDrone frames "
-                         "together. See mosaic_guard.py. Set to a very "
-                         "large number (e.g. 999999) to effectively "
-                         "disable and get stock random mosaic behavior "
-                         "back.")
+                         "stay under when compositing images. See "
+                         "mosaic_guard.py. Set to a very large number "
+                         "(e.g. 999999) to effectively disable.")
     p.add_argument("--mosaic-max-tries", type=int, default=40,
                     help="How many candidate partner images the instance "
                          "cap will sample/reject before giving up and "
-                         "falling back to the least-dense candidates it "
-                         "saw. Higher = tries harder to stay under "
-                         "--max-mosaic-instances at the cost of a few "
-                         "more (cheap, label-only, no image decode) "
-                         "lookups per mosaic call.")
+                         "falling back to the least-dense candidates.")
     p.add_argument("--mosaic", type=float, default=1.0,
-                    help="Mosaic augmentation probability (0.0-1.0), "
-                         "Ultralytics' own default is 1.0. Mosaic "
-                         "composites up to 4 source images into one "
-                         "training sample -- occasionally combining "
-                         "several of VisDrone's dense crowd/traffic "
-                         "frames into a single very-high-instance-count "
-                         "batch, which is the actual driver of the VRAM "
-                         "staircase described in the WDDM/root-cause note "
-                         "above. Lower this (e.g. 0.5-0.7) ONLY if the "
-                         "startup probe or ongoing watchdog keep tripping "
-                         "-- it trades away some augmentation strength for "
-                         "fewer extreme-instance-count batches.")
+                    help="Mosaic augmentation probability (0.0-1.0). "
+                         "Lower this (e.g. 0.5-0.7) ONLY if the startup "
+                         "probe or ongoing watchdog keep tripping.")
     p.add_argument("--patience", type=int, default=15,
                     help="Early stopping: stop if val mAP hasn't improved "
-                         "in this many epochs. Main overfitting guard -- "
-                         "best.pt is always kept from the best-val epoch "
-                         "regardless of how much longer training continues "
-                         "past it. Lowered from 20 to 15 by default given "
-                         "the time constraint -- raise it back if you see "
-                         "training stop while val mAP still looks like "
-                         "it's trending up.")
+                         "in this many epochs. best.pt is always kept "
+                         "from the best-val epoch regardless.")
     p.add_argument("--cos-lr", dest="cos_lr", action="store_true",
                     default=True,
-                    help="Cosine LR decay instead of linear (default on). "
-                         "Tends to generalize slightly better than a hard "
-                         "linear decay late in training.")
+                    help="Cosine LR decay instead of linear (default on).")
     p.add_argument("--no-cos-lr", dest="cos_lr", action="store_false",
                     help="Disable cosine LR decay, use Ultralytics' "
                          "linear default instead.")
     p.add_argument("--label-smoothing", type=float, default=0.0,
-                    help="Label smoothing. NOTE: your installed Ultralytics "
-                         "(8.4.112) reports this as deprecated/no-op -- "
-                         "kept here for forward-compat only, and only "
-                         "forwarded to train() if you set it non-zero "
-                         "(with a printed reminder it may do nothing on "
-                         "your version).")
+                    help="Label smoothing. Reported deprecated/no-op on "
+                         "the installed Ultralytics version -- kept for "
+                         "forward-compat only.")
     p.add_argument("--name", default=None,
                     help="Run subfolder name under runs/detect/. Defaults "
-                         "to '<model>_<imgsz>' so different experiments "
-                         "land in separate folders instead of overwriting "
-                         "each other -- pass this explicitly for a custom "
-                         "label.")
+                         "to '<model>_<imgsz>'.")
     p.add_argument("--export-only", action="store_true",
                     help="Skip training, just export an existing "
-                         "runs/detect/<name>/weights/best.pt (use "
-                         "--weights to point at a specific checkpoint).")
+                         "runs/detect/<name>/weights/best.pt.")
     p.add_argument("--weights", default=None,
                     help="Checkpoint to export when --export-only is set. "
                          "Defaults to the most recently modified "
                          "runs/detect/*/weights/best.pt found.")
+    p.add_argument("--skip-per-source-eval", action="store_true",
+                    help="Skip the post-training per-source validation "
+                         "pass (VisDrone/UAVDT/SARD evaluated separately). "
+                         "On by default since it's a handful of extra "
+                         "quick val() passes -- disable only if you're "
+                         "iterating fast and don't need it every run.")
     return p.parse_args()
 
 
@@ -565,9 +459,7 @@ def export_for_cpp(weights_path: Path):
     """
     Exports with end2end=False (the one-to-many head) so the ONNX output
     shape stays (1, nc+4, N) -- what DetectionLink::runInference() already
-    parses via manual class-argmax + cv::dnn::NMSBoxes. This deliberately
-    avoids the newer NMS-free one-to-one export path for now; see
-    SETUP_AND_TRAINING.md for why.
+    parses via manual class-argmax + cv::dnn::NMSBoxes.
     """
     print(f"\nExporting {weights_path} to ONNX (one-to-many head, "
           f"NMS still required on the C++ side -- matches current "
@@ -577,7 +469,6 @@ def export_for_cpp(weights_path: Path):
                               end2end=False, nms=False)
     onnx_path = Path(onnx_path)
 
-    # Write the sibling .names file DetectionLink::setModelPath() auto-loads.
     names_path = onnx_path.with_suffix(".names")
     class_names = model.names  # dict[int, str], index order matters
     with open(names_path, "w") as f:
@@ -597,11 +488,7 @@ def check_overfitting(run_dir: Path, lookback: int = 10) -> None:
     """
     Reads results.csv from a completed run and flags the textbook
     overfitting signature: val loss rising over the last `lookback`
-    epochs while train loss keeps falling. Heuristic, not a verdict --
-    also check the per-class AP and PR-curve plots Ultralytics saves in
-    the same run folder, especially for the sparser classes (motorcycle/
-    other_vehicle/building), since a small dataset can overfit on
-    individual classes well before the aggregate loss shows it.
+    epochs while train loss keeps falling. Heuristic, not a verdict.
     """
     csv_path = run_dir / "results.csv"
     if not csv_path.exists():
@@ -627,9 +514,7 @@ def check_overfitting(run_dir: Path, lookback: int = 10) -> None:
     val_box = col("val/box_loss")
     if train_box is None or val_box is None:
         print(f"\n[overfitting check] Couldn't find train/box_loss and "
-              f"val/box_loss columns in results.csv (Ultralytics may have "
-              f"changed its column names) -- skipping automated check, "
-              f"take a look at the CSV/plots directly instead.")
+              f"val/box_loss columns in results.csv -- skipping.")
         return
 
     recent_train = train_box[-lookback:]
@@ -645,21 +530,73 @@ def check_overfitting(run_dir: Path, lookback: int = 10) -> None:
     if train_trend < 0 and val_trend > 0:
         print("  WARNING: train loss still falling while val loss is "
               "rising over this window -- classic overfitting signature. "
-              "best.pt was still saved from the best-val epoch (--patience "
-              "guards against this), but consider: more/varied training "
-              "data (see prepare_datasets.py), a lower --epochs ceiling, "
-              "or stronger augmentation.")
+              "best.pt was still saved from the best-val epoch, but "
+              "consider more/varied training data, a lower --epochs "
+              "ceiling, or stronger augmentation.")
     else:
         print("  No clear divergence in this window.")
+
+
+def evaluate_per_source(model: YOLO, run_dir: Path) -> None:
+    """
+    Runs a SEPARATE model.val() pass against each source dataset's own
+    val set (VisDrone/UAVDT/SARD individually), reading
+    datasets/per_source_val.json (written by prepare_datasets.py). This
+    is the only way to tell whether combining these three datasets
+    actually helped -- the single blended unified.yaml val number can
+    hide one source regressing while another improves. Silently skipped
+    if the manifest doesn't exist (e.g. --data was set manually to
+    bypass prepare_datasets.py).
+    """
+    if not PER_SOURCE_MANIFEST_PATH.exists():
+        print(f"\n[per-source eval] No {PER_SOURCE_MANIFEST_PATH} found "
+              f"(prepare_datasets.py wasn't run this session?) -- skipping.")
+        return
+
+    with open(PER_SOURCE_MANIFEST_PATH) as f:
+        per_source = json.load(f)
+    if not per_source:
+        print("\n[per-source eval] Manifest is empty -- skipping.")
+        return
+
+    print(f"\n{'=' * 70}")
+    print("Per-source validation (isolating each dataset's contribution)")
+    print(f"{'=' * 70}")
+
+    tmp_dir = run_dir / "per_source_eval"
+    tmp_dir.mkdir(exist_ok=True)
+
+    for name, val_dirs in per_source.items():
+        tmp_yaml = tmp_dir / f"{name.lower()}.yaml"
+        with open(tmp_yaml, "w") as f:
+            yaml.safe_dump({
+                "path": None,
+                "train": val_dirs,  # unused by val(), Ultralytics requires the key
+                "val": val_dirs,
+                "nc": len(UNIFIED_CLASSES),
+                "names": UNIFIED_CLASSES,
+            }, f, sort_keys=False)
+        try:
+            metrics = model.val(data=str(tmp_yaml), split="val", verbose=False)
+            print(f"  {name:10s}  mAP50={metrics.box.map50:.3f}  "
+                  f"mAP50-95={metrics.box.map:.3f}  "
+                  f"precision={metrics.box.mp:.3f}  recall={metrics.box.mr:.3f}")
+        except Exception as e:
+            print(f"  {name:10s}  [skipped: {e}]")
+
+    print(f"{'=' * 70}")
+    print("Note: each source's classes are limited to what that dataset "
+          "actually labels (e.g. UAVDT has no person labels, SARD has no "
+          "vehicle labels) -- per-class numbers for classes a source "
+          "never annotated aren't meaningful for that source's row.")
 
 
 def train_with_model_fallback(args, data_path: str):
     """
     Tries each candidate in MODEL_SIZE_CANDIDATES (or just args.model if
     it's an explicit choice, not 'auto') until one survives both the
-    startup probe (first few batches) AND the ongoing watchdog (every
-    epoch, for the whole run) without tripping VRAMBudgetExceeded, and
-    without a real CUDA OOM either.
+    startup probe AND the ongoing watchdog without tripping
+    VRAMBudgetExceeded, and without a real CUDA OOM either.
     """
     import torch
 
@@ -726,11 +663,6 @@ def train_with_model_fallback(args, data_path: str):
 def main():
     args = parse_args()
 
-    # Applies to BOTH --resume and a fresh run -- unlike Ultralytics' own
-    # hyperparameters, this isn't saved/restored by the checkpoint, it's
-    # a script-level monkeypatch (see mosaic_guard.py) that needs to be
-    # in place before ANY dataset gets built. Must happen before
-    # train_with_model_fallback() and before model.train(resume=True).
     install_instance_cap(max_instances=args.max_mosaic_instances,
                           max_tries=args.mosaic_max_tries)
 
@@ -740,9 +672,6 @@ def main():
         return
 
     if args.resume:
-        # Resuming loads epochs/imgsz/batch/data/augmentation/project/name
-        # from the checkpoint's own saved training args -- so those flags
-        # are ignored here on purpose, not forgotten.
         last_pt = find_latest_last_pt()
         print(f"\nResuming training from {last_pt}...")
         model = YOLO(str(last_pt))
@@ -758,6 +687,9 @@ def main():
     print(f"Best checkpoint: {best_pt}")
 
     check_overfitting(run_dir)
+
+    if not args.skip_per_source_eval:
+        evaluate_per_source(model, run_dir)
 
     export_for_cpp(best_pt)
 

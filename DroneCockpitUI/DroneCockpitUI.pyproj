@@ -55,6 +55,7 @@
     </Compile>
     <Compile Include="FPVWidget.py" />
     <Compile Include="NNTraining\class_map.py" />
+    <Compile Include="NNTraining\predict_test.py" />
     <Compile Include="NNTraining\mosaic_guard.py" />
     <Compile Include="NNTraining\vram_diagnostic.py" />
     <Compile Include="NNTraining\prepare_datasets.py" />
