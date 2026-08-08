@@ -4,12 +4,14 @@ train.py / prepare_datasets.py's docstrings against your ACTUAL prepared
 data and ACTUAL installed library versions, instead of trusting comments.
 
 Run this from the same directory as train.py / prepare_datasets.py /
-class_map.py (it imports them directly, same as train.py does).
+class_map.py / mosaic_guard.py (it imports them directly, same as
+train.py does).
 
     python verify_pipeline_assumptions.py
     python verify_pipeline_assumptions.py --checkpoint runs/detect/yolo26s_960/weights/best.pt
+    python verify_pipeline_assumptions.py --max-mosaic-instances 800
 
-Five checks, each prints CONFIRMED / CONTRADICTED / INCONCLUSIVE:
+Six checks, each prints CONFIRMED / CONTRADICTED / INCONCLUSIVE:
 
   A. Per-class instance counts on your actual merged train set, and
      whether the true sparsest class is covered by --oversample-classes.
@@ -22,12 +24,20 @@ Five checks, each prints CONFIRMED / CONTRADICTED / INCONCLUSIVE:
   D. Whether CoarseDropout's hole_height_range/hole_width_range really
      are literal pixels (not a fraction of image size) on your installed
      version -- verified on a synthetic image, not assumed from memory.
-  E. (optional, --checkpoint) Real per-class mAP on a trained checkpoint,
+  E. Mosaic partner-selection bias: does InstanceCappedMosaic actually
+     over-select sparse-instance sources (e.g. SARD) as "filler" when
+     paired with a dense anchor, on YOUR real prepared data -- the
+     mechanism a code review flagged as a possible cause of degraded
+     small-object/person detection. Drives the real get_indexes() code
+     path directly, not a reimplementation of its logic.
+  F. (optional, --checkpoint) Real per-class mAP on a trained checkpoint,
      if you have one -- the actual number the whole exercise is for.
 """
 
 import argparse
+import random
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -296,11 +306,210 @@ def check_coarse_dropout_is_literal_pixels():
 
 
 # ---------------------------------------------------------------------
-# E. (optional) Real per-class mAP on an actual checkpoint
+# E. Mosaic partner-selection bias -- does InstanceCappedMosaic actually
+#    over-select SARD (or any sparse source) as filler when paired with
+#    a dense anchor, on YOUR real prepared data? This drives the real
+#    Mosaic class through get_indexes() directly -- it's the same code
+#    path train.py wires into model.train(), not a re-implementation of
+#    its logic that could drift from the real thing.
+# ---------------------------------------------------------------------
+
+def check_mosaic_filler_bias(max_instances: int, max_tries: int,
+                               n_trials: int = 4000, dense_anchor_pct: float = 90):
+    section("E. Mosaic partner-selection bias by source (empirical, on "
+            "your real prepared data)")
+    try:
+        import prepare_datasets as pd
+        from class_map import taxonomy_signature
+        from mosaic_guard import InstanceCappedMosaic
+    except Exception as e:
+        verdict("Could not import prepare_datasets/mosaic_guard", None, str(e))
+        return
+
+    signature = taxonomy_signature()
+    try:
+        visdrone_dirs = pd.prepare_visdrone(signature)
+        xview_dirs = pd.prepare_xview(signature)
+        uavdt_dirs = pd.prepare_uavdt(signature)
+        sard_dirs = pd.prepare_sard(signature)
+        external_dirs = pd.prepare_external(signature)
+    except Exception as e:
+        verdict("Dataset assembly failed", None,
+                 f"{e} -- run prepare_datasets.py once manually first.")
+        return
+
+    named_train_dirs = {
+        "VisDrone": visdrone_dirs["train"],
+        "xView": xview_dirs["train"],
+        "UAVDT": uavdt_dirs["train"],
+        "SARD": sard_dirs["train"],
+        "external": external_dirs["train"],
+    }
+
+    labels: list[dict] = []
+    sources: list[str] = []
+
+    for source_name, dirs in named_train_dirs.items():
+        for entry in dirs:
+            for img_path in pd._iter_images_in_entry(entry):
+                label_path = pd._label_path_for_image(img_path)
+                if label_path is None:
+                    continue
+                cls_ids = []
+                for line in label_path.read_text().splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        cls_ids.append(int(line.split()[0]))
+                    except ValueError:
+                        continue
+                labels.append({"cls": np.array(cls_ids).reshape(-1, 1)})
+                sources.append(source_name)
+
+    n_images = len(labels)
+    if n_images < 50:
+        verdict("Enough images to run a meaningful selection-bias trial", False,
+                 f"Only found {n_images} labeled images across prepared "
+                 f"train sources -- run prepare_datasets.py fully first.")
+        return
+
+    class _LabelOnlyDataset:
+        """Minimal stand-in exposing only what Mosaic/InstanceCappedMosaic
+        actually touch (.cache, .labels, .buffer, __len__) -- avoids
+        building a real YOLODataset (image decode/cache) just to test
+        index-selection behavior. Matches mosaic_guard.py's own stated
+        design of only ever reading dataset.labels[i]['cls'] here.
+
+        NOTE: dataset.cache=None makes buffer_enabled True (same as your
+        real --cache disk runs, since Mosaic's buffer_enabled check is
+        `dataset.cache != "ram"`), but .buffer stays empty here, so
+        _sample_candidate_index() falls through to uniform-over-whole-
+        dataset -- a reasonable approximation of early-training behavior
+        before Ultralytics' image buffer fills up, not a perfect replica
+        of steady-state buffer-biased sampling.
+        """
+        def __init__(self, labels):
+            self.labels = labels
+            self.cache = None
+            self.buffer = []
+
+        def __len__(self):
+            return len(self.labels)
+
+    dataset = _LabelOnlyDataset(labels)
+    mosaic = InstanceCappedMosaic(dataset, imgsz=640, p=1.0, n=4,
+                                    max_instances=max_instances,
+                                    max_tries=max_tries)
+
+    baseline_share = Counter(sources)
+    for k in list(baseline_share):
+        baseline_share[k] /= n_images
+
+    instance_counts = [len(l["cls"]) for l in labels]
+    dense_threshold = np.percentile(instance_counts, dense_anchor_pct)
+    print(f"Dataset: {n_images} images. Source shares: "
+          f"{ {k: round(v, 3) for k, v in baseline_share.items()} }")
+    print(f"Dense-anchor threshold (p{dense_anchor_pct}): "
+          f"{dense_threshold:.0f} instances/image")
+
+    dense_partner_sources: Counter = Counter()
+    sparse_partner_sources: Counter = Counter()
+    dense_trials = sparse_trials = 0
+
+    order = list(range(n_images))
+    random.shuffle(order)
+
+    for i in range(n_trials):
+        anchor_idx = order[i % n_images]
+        anchor_count = instance_counts[anchor_idx]
+        mosaic._own_count = anchor_count  # what get_params() would stash
+        partner_idxs = mosaic.get_indexes()
+
+        is_dense = anchor_count >= dense_threshold
+        for p_idx in partner_idxs:
+            (dense_partner_sources if is_dense else sparse_partner_sources)[sources[p_idx]] += 1
+        if is_dense:
+            dense_trials += 1
+        else:
+            sparse_trials += 1
+
+    def _print_bucket(name, counter, trials):
+        total = sum(counter.values())
+        if total == 0:
+            print(f"  {name}: no trials landed in this bucket.")
+            return {}
+        print(f"  {name} ({trials} anchors, {total} partner slots):")
+        rates = {}
+        for src, n in sorted(counter.items(), key=lambda kv: -kv[1]):
+            rate = n / total
+            rates[src] = rate
+            base = baseline_share.get(src, 0)
+            mult = (rate / base) if base > 0 else float("inf")
+            print(f"    {src:10s} {rate:6.1%} of partner slots vs "
+                  f"{base:6.1%} baseline share  ({mult:.2f}x)")
+        return rates
+
+    print(f"\nPartner-source selection rate when the ANCHOR is dense "
+          f"(top {100 - dense_anchor_pct:.0f}% by instance count):")
+    dense_rates = _print_bucket("dense-anchor mosaics", dense_partner_sources, dense_trials)
+
+    print(f"\nPartner-source selection rate when the ANCHOR is NOT dense:")
+    sparse_rates = _print_bucket("normal-anchor mosaics", sparse_partner_sources, sparse_trials)
+
+    sard_base = baseline_share.get("SARD", 0)
+    if sard_base == 0:
+        verdict("SARD filler-bias check", None,
+                 "No SARD images found in prepared train dirs -- run "
+                 "prepare_datasets.py with SARD downloaded first.")
+        return
+
+    dense_mult = dense_rates.get("SARD", 0) / sard_base
+    sparse_mult = sparse_rates.get("SARD", 0) / sard_base
+
+    print(f"\nSARD selected as partner {dense_mult:.2f}x its baseline "
+          f"share in dense-anchor mosaics, vs {sparse_mult:.2f}x in "
+          f"normal-anchor mosaics.")
+
+    if dense_mult > 1.5 and dense_mult > sparse_mult * 1.3:
+        verdict("Dense mosaics disproportionately pull in SARD as filler "
+                 "(the mechanism the code review flagged)", True,
+                 f"SARD is over-selected {dense_mult:.2f}x its dataset "
+                 f"share specifically when the anchor is dense, and this "
+                 f"effect is much weaker ({sparse_mult:.2f}x) for normal "
+                 f"anchors -- this IS the filler-bias mechanism, "
+                 f"empirically confirmed on your actual prepared data "
+                 f"with your actual --max-mosaic-instances={max_instances}. "
+                 f"Worth applying a frequency-based get_indexes() fix, or "
+                 f"lowering --max-mosaic-instances if VRAM allows.")
+    elif dense_mult > 1.5:
+        verdict("Dense mosaics disproportionately pull in SARD as filler",
+                 None,
+                 f"SARD is over-selected {dense_mult:.2f}x in dense "
+                 f"mosaics, but nearly as much ({sparse_mult:.2f}x) in "
+                 f"normal ones -- looks more like SARD images are simply "
+                 f"favored by the general sparsity-driven selection than "
+                 f"a dense-anchor-specific effect. Still worth watching.")
+    else:
+        verdict("Dense mosaics disproportionately pull in SARD as filler "
+                 "(the mechanism the code review flagged)", False,
+                 f"SARD's selection rate in dense-anchor mosaics "
+                 f"({dense_rates.get('SARD', 0):.1%}) is close to its "
+                 f"baseline dataset share ({sard_base:.1%}, "
+                 f"{dense_mult:.2f}x) at "
+                 f"--max-mosaic-instances={max_instances} on your actual "
+                 f"data -- the effect the review predicted doesn't show "
+                 f"up at a meaningful magnitude here. Don't spend time on "
+                 f"the get_indexes() patch unless this changes at a "
+                 f"different --max-mosaic-instances value.")
+
+
+# ---------------------------------------------------------------------
+# F. (optional) Real per-class mAP on an actual checkpoint
 # ---------------------------------------------------------------------
 
 def check_real_per_class_map(checkpoint: str):
-    section("E. Real per-class mAP on your checkpoint (the number that "
+    section("F. Real per-class mAP on your checkpoint (the number that "
             "actually matters)")
     ckpt_path = Path(checkpoint)
     if not ckpt_path.exists():
@@ -335,8 +544,18 @@ def main():
                           help="Comma-separated list matching whatever you're "
                                "currently passing to train.py, so check A can "
                                "tell you if it's missing the true sparsest class.")
+    parser.add_argument("--max-mosaic-instances", type=int, default=800,
+                          help="Match whatever you actually pass to train.py's "
+                               "--max-mosaic-instances so check E tests your "
+                               "real VRAM budget, not an assumed default.")
+    parser.add_argument("--mosaic-max-tries", type=int, default=40,
+                          help="Match train.py's --mosaic-max-tries.")
+    parser.add_argument("--mosaic-trials", type=int, default=4000,
+                          help="How many simulated mosaic anchor draws to "
+                               "run for check E. Higher = less noisy "
+                               "percentages, slower.")
     parser.add_argument("--checkpoint", default=None,
-                          help="Path to a best.pt to run check E against. "
+                          help="Path to a best.pt to run check F against. "
                                "Skipped if not provided (requires inference "
                                "time / GPU).")
     args = parser.parse_args()
@@ -347,17 +566,20 @@ def main():
     check_copy_paste_is_really_inert()
     check_degradation_transform_builds()
     check_coarse_dropout_is_literal_pixels()
+    check_mosaic_filler_bias(args.max_mosaic_instances, args.mosaic_max_tries,
+                               n_trials=args.mosaic_trials)
     if args.checkpoint:
         check_real_per_class_map(args.checkpoint)
     else:
-        section("E. Real per-class mAP")
+        section("F. Real per-class mAP")
         print("Skipped -- pass --checkpoint runs/detect/<run>/weights/best.pt "
               "to run this against an actual trained model.")
 
     section("Done")
     print("Every result above came from running against your actual data / "
-          "actual installed libraries -- nothing here was assumed from a "
-          "docstring or a prior review's claims.")
+          "actual installed libraries / the actual mosaic_guard.py code -- "
+          "nothing here was assumed from a docstring or a prior review's "
+          "claims.")
 
 
 if __name__ == "__main__":

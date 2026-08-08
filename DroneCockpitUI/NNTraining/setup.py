@@ -4,7 +4,11 @@ setup.py — Environment + dataset prep for Project R.A.D detection training
 Run this once before train.py. It:
   1. Installs PyTorch + torchvision (checking CUDA actually works, not just
      that the install succeeded -- a CPU-only torch install with no error
-     message is the most common way this silently goes wrong).
+     message is the most common way this silently goes wrong). Also prints
+     physical VRAM once CUDA is confirmed -- train.py's defaults (imgsz 640,
+     batch 4, max-mosaic-instances 800) are all calibrated to a 6GB card, so
+     this surfaces that assumption up front instead of only finding out via
+     a WDDM spillover hours into a real run.
   2. Installs ultralytics (pulls in YOLO26 + the VisDrone downloader).
   3. Installs albumentations (new) -- powers train.py's degradation
      augmentation pipeline (motion/gaussian blur, compression artifacts,
@@ -22,6 +26,19 @@ Run this once before train.py. It:
      step only ever reports what it finds and prints the manual steps
      if either is missing. See prepare_datasets.py's module docstring
      for the exact download links and extraction convention.
+  6. Prints the exact installed versions of torch/ultralytics/
+     albumentations at the end (new). train.py's degradation-augment and
+     mosaic-guard monkeypatches both target non-public Ultralytics
+     internals (see train.py's docstring) -- they can silently stop
+     applying if a future `pip install --upgrade` (from re-running this
+     script, or anyone else on this project running it fresh) lands on a
+     version where those internals changed shape. Nothing else in this
+     pipeline records what was actually verified working, so this is
+     the one place that does -- if training results drift unexpectedly
+     after a future setup.py re-run, compare against what got printed
+     here, and re-run verify_pipeline_assumptions.py's checks B/C
+     (copy-paste inertness, degradation transform build count) to
+     confirm the patches still apply cleanly.
 
 Usage:
     python -m venv .venv
@@ -151,6 +168,7 @@ def install_pytorch(cuda_ver: str | None):
          "torch", "torchvision"], "pip install torch torchvision")
 
     if verify_cuda():
+        print_vram_summary()
         return
 
     if cuda_ver is None:
@@ -168,6 +186,7 @@ def install_pytorch(cuda_ver: str | None):
         f"pip install torch torchvision ({tag})")
 
     if verify_cuda():
+        print_vram_summary()
         return
 
     # Still CPU-only after an explicit CUDA index install. On Python 3.9-3.13
@@ -211,6 +230,40 @@ def verify_cuda() -> bool:
     else:
         print("[WARN] torch.cuda.is_available() returned False.")
     return available
+
+
+def print_vram_summary() -> None:
+    """
+    Prints physical VRAM once CUDA is confirmed working (new). Every
+    tuned default in train.py -- --imgsz 640, --batch 4,
+    --max-mosaic-instances 800, the whole WDDM startup-probe/watchdog
+    setup -- is calibrated specifically against a 6GB card. This doesn't
+    change any of those defaults, it just surfaces the assumption at
+    setup time instead of letting it stay implicit until a WDDM spillover
+    shows up hours into a real run on a different card.
+    """
+    check = subprocess.run(
+        [sys.executable, "-c",
+         "import torch; print(torch.cuda.get_device_properties(0).total_memory)"],
+        capture_output=True, text=True)
+    raw = check.stdout.strip()
+    if not raw.isdigit():
+        print("[WARN] Could not read VRAM size from torch -- skipping "
+              "VRAM sanity check.")
+        return
+    gb = int(raw) / 1e9
+    print(f"[OK] Physical VRAM: {gb:.1f}GB")
+    if gb < 5.5:
+        print("[WARN] Under 5.5GB -- train.py's defaults assume a 6GB "
+              "card (imgsz=640, batch=4, max-mosaic-instances=800). "
+              "Consider lowering --max-mosaic-instances and/or --batch "
+              "for your first smoke test.")
+    elif gb > 8.5:
+        print("[note] Comfortably above the 6GB card train.py's defaults "
+              "target -- you likely have headroom to raise --batch, "
+              "--imgsz, or try --model yolo26m.pt / --model auto, once a "
+              "640px yolo26s baseline is confirmed working. See train.py's "
+              "module docstring for the recommended order to try these in.")
 
 
 def install_ultralytics() -> bool:
@@ -277,6 +330,23 @@ def download_visdrone():
               "it fails there too.")
 
 
+def _resolve_datasets_dir() -> Path:
+    """
+    Mirrors prepare_datasets.py's own datasets_dir resolution exactly --
+    Ultralytics' SETTINGS first, falling back to a script-relative
+    datasets/ folder (NOT the current working directory) if SETTINGS
+    isn't importable. Previously this fell back to Path.cwd() / "datasets"
+    instead, which only agrees with prepare_datasets.py's fallback when
+    setup.py happens to be invoked from the project root -- anchoring to
+    __file__ instead removes that dependency on invocation location.
+    """
+    try:
+        from ultralytics.utils import SETTINGS
+        return Path(SETTINGS.get("datasets_dir", Path(__file__).resolve().parent / "datasets"))
+    except Exception:
+        return Path(__file__).resolve().parent / "datasets"
+
+
 def check_manual_datasets():
     """
     UAVDT and SARD (new check) can't be pre-downloaded here the way
@@ -287,16 +357,13 @@ def check_manual_datasets():
     manual steps rather than leaving you to dig through
     prepare_datasets.py's docstring to find them again.
 
-    Uses the same datasets_dir resolution prepare_datasets.py uses (falls
-    back to a local datasets/ folder if ultralytics' SETTINGS isn't
-    importable yet, e.g. if ultralytics install failed earlier in this
-    script).
+    Uses _resolve_datasets_dir(), the same datasets_dir resolution
+    prepare_datasets.py uses (falls back to a local datasets/ folder
+    anchored to this script's own location, not the current working
+    directory, if ultralytics' SETTINGS isn't importable yet -- e.g. if
+    ultralytics install failed earlier in this script).
     """
-    try:
-        from ultralytics.utils import SETTINGS
-        datasets_dir = Path(SETTINGS.get("datasets_dir", Path.cwd() / "datasets"))
-    except Exception:
-        datasets_dir = Path.cwd() / "datasets"
+    datasets_dir = _resolve_datasets_dir()
 
     print(f"\n{'=' * 70}\nChecking UAVDT / SARD (manual download required)\n{'=' * 70}")
 
@@ -338,6 +405,37 @@ def check_manual_datasets():
               "will pick them up automatically on the next train.py run.")
 
 
+def print_installed_versions():
+    """
+    Records what actually got installed (new). train.py's degradation-
+    augment and mosaic-guard patches both target non-public Ultralytics
+    internals -- if a future `pip install --upgrade` (from re-running
+    this script) lands on a version where those internals changed shape,
+    the patch can silently stop applying with no error, and nothing else
+    in this pipeline records what was verified working at the time a
+    training run's results were produced. This is the one place that
+    does. If results drift unexpectedly after a future setup.py re-run,
+    compare against what's printed here, and re-run
+    verify_pipeline_assumptions.py's checks B/C to confirm the patches
+    still apply cleanly on whatever versions are now installed.
+    """
+    print(f"\n{'=' * 70}\nInstalled versions (record these -- compare against\n"
+          f"this if training results drift after a future setup.py re-run)\n"
+          f"{'=' * 70}")
+    for pkg in ("torch", "ultralytics", "albumentations"):
+        check = subprocess.run(
+            [sys.executable, "-c", f"import {pkg}; print({pkg}.__version__)"],
+            capture_output=True, text=True)
+        ver = check.stdout.strip() or "not installed"
+        print(f"  {pkg:15s} {ver}")
+    print(f"\nAfter any future re-run of this script, it's worth re-running:\n"
+          f"    python verify_pipeline_assumptions.py\n"
+          f"specifically checks B (copy-paste inertness) and C (degradation "
+          f"transform build count) -- both depend on non-public Ultralytics/"
+          f"albumentations internals that a version bump could silently "
+          f"change.")
+
+
 def main():
     print("Project R.A.D — training environment setup\n")
 
@@ -354,6 +452,7 @@ def main():
 
     download_visdrone()
     check_manual_datasets()
+    print_installed_versions()
 
     print(f"\n{'=' * 70}\nSetup complete\n{'=' * 70}")
     print("Next step: python train.py --epochs 5   (smoke test first)")

@@ -119,6 +119,21 @@ DEGRADATION AUGMENTATION -- why this exists, and calibrated against what:
   applied once in the main process before training starts, no
   per-worker re-import race to worry about.
 
+  PATCH SIGNATURE ROBUSTNESS (fixed): patched_init() below now accepts
+  *args/**kwargs and forwards them all to orig_init(), rather than
+  declaring only `p=1.0`. This was previously a hardcoded signature
+  match against the Ultralytics version this was written against;
+  a newer Ultralytics release (confirmed against 8.4.116) added a
+  `transforms=` kwarg to Albumentations.__init__ (used internally to
+  pass hyp-driven augmentations in), which the old hardcoded signature
+  couldn't accept, causing a hard TypeError at dataloader build time
+  ("got an unexpected keyword argument 'transforms'") before training
+  ever started. Forwarding *args/**kwargs makes this patch resilient to
+  that kind of additive signature change going forward -- orig_init
+  still runs with whatever Ultralytics passes, and this project's own
+  transform/contains_spatial overrides are still applied afterward,
+  same intent as before.
+
 REAL-TIME DEPRIORITIZED (project decision): inference-side latency is
   not a hard constraint for this deployment -- precision/robustness on
   a noisy analog feed matters more than 30fps. This module's VRAM/time
@@ -708,6 +723,13 @@ def install_degradation_augment():
     images) after any Ultralytics version bump. Safe with --workers 0
     (this project's default) since it's applied once in the main process
     before model.train() spins up any dataloader workers.
+
+    patched_init() forwards *args/**kwargs to orig_init() rather than
+    hardcoding a fixed parameter list -- see "PATCH SIGNATURE
+    ROBUSTNESS" in the module docstring for why (Ultralytics 8.4.116
+    added a `transforms=` kwarg to the real __init__ that an
+    earlier, hardcoded `def patched_init(self, p=1.0)` couldn't accept,
+    causing a hard TypeError before training could start).
     """
     transform = build_degradation_transform()
     if transform is None:
@@ -717,8 +739,8 @@ def install_degradation_augment():
 
     orig_init = aug_mod.Albumentations.__init__
 
-    def patched_init(self, p=1.0):
-        orig_init(self, p=p)
+    def patched_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
         self.transform = transform
         self.contains_spatial = False
 
