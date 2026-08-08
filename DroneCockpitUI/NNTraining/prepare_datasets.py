@@ -47,6 +47,40 @@ What it does:
      -- a manifest of each source's own val dir, used by train.py's
      evaluate_per_source() to report per-dataset accuracy after training
      (not just the blended number).
+  6. SPARSE-CLASS OVERSAMPLING -- see _oversample_sparse_classes() below.
+     Scans the assembled train image dirs for images containing any of a
+     configurable set of under-represented classes (default: motorcycle,
+     other_vehicle) and duplicates those image paths into a synthetic
+     datasets/oversample_train.txt list, appended to unified.yaml's
+     train: entries. This does NOT touch val -- only train dirs are ever
+     passed in, so val stays a clean, untouched measurement of
+     real-world distribution. Also does not modify any label files; it
+     only affects how often existing (image, label) pairs are sampled
+     per epoch. copy_paste/mixup augmentation still apply on top of
+     oversampled images same as any other -- oversampling fixes "seen
+     too rarely," copy_paste/mixup fix "not enough variety once seen."
+       NOTE (verified against Ultralytics' actual CopyPaste
+       implementation): CopyPaste only pastes objects using segmentation
+       polygons (labels["instances"].segments). VisDrone/UAVDT/SARD are
+       all bounding-box-only YOLO labels -- no polygons -- so
+       --copy-paste is currently a no-op on this pipeline regardless of
+       its value. Oversampling and mixup are the augmentation actually
+       doing sparse-class protection right now; --copy-paste is left on
+       in train.py only because it's harmless (costs nothing when
+       inert), not because it's contributing anything.
+  7. PER-CLASS INSTANCE COUNTING (new) -- see _count_instances_per_class()
+     below. Unlike the per-SOURCE counts already printed at the end of
+     main() (which tell you how many images each dataset contributed),
+     this counts total labeled INSTANCES per class across the assembled
+     train set, before oversampling. This is the number that actually
+     tells you whether a class is sparse -- a class can appear in plenty
+     of images but still trail badly in total boxes if instance density
+     per image differs (SARD frames typically have a handful of people;
+     VisDrone traffic scenes can have dozens of vehicles each). Use it to
+     sanity-check --oversample-classes rather than assuming the default
+     list (motorcycle, other_vehicle) is still the right one once
+     UAVDT/SARD are folded in -- "person" is this project's stated
+     priority class but isn't in that default list.
 
 Remapping is idempotent and reversible: each dataset's ORIGINAL labels are
 backed up once (labels_backup_original_<split>/), and re-applied fresh from
@@ -88,11 +122,21 @@ UAVDT_ROOT = DATASETS_DIR / "UAVDT"
 SARD_ROOT = DATASETS_DIR / "SARD"
 UNIFIED_YAML_PATH = DATASETS_DIR / "unified.yaml"
 PER_SOURCE_MANIFEST_PATH = DATASETS_DIR / "per_source_val.json"
+OVERSAMPLE_LIST_PATH = DATASETS_DIR / "oversample_train.txt"
 
 SIGNATURE_FILENAME = ".taxonomy_signature"
 BACKUP_DIRNAME = "labels_backup_original"
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
+
+# Default classes to oversample if train.py doesn't pass an explicit list
+# (e.g. when this module is run standalone). Matches train.py's
+# --oversample-classes default -- keep these in sync if you change one.
+# See _count_instances_per_class() -- check real per-class counts before
+# assuming this list still covers the actual sparse classes once
+# UAVDT/SARD are folded in.
+DEFAULT_OVERSAMPLE_CLASSES = ["motorcycle", "other_vehicle"]
+DEFAULT_OVERSAMPLE_MULTIPLIER = 3
 
 
 def _remap_label_file(path: Path, index_remap: list) -> None:
@@ -147,7 +191,7 @@ def _write_signature(root: Path, signature: str) -> None:
 
 def _count_images_in(path_str: str) -> int:
     """Counts images referenced by a train/val entry, whether it's a
-    directory or a txt list file (auto-split output)."""
+    directory or a txt list file (auto-split / oversample output)."""
     p = Path(path_str)
     if p.is_dir():
         return sum(1 for f in p.iterdir() if f.suffix.lower() in IMAGE_EXTS)
@@ -158,6 +202,164 @@ def _count_images_in(path_str: str) -> int:
 
 def _count_all(paths: list[str]) -> int:
     return sum(_count_images_in(p) for p in paths)
+
+
+def _iter_images_in_entry(entry: str):
+    """Yields image Paths referenced by one train/val yaml entry, whether
+    it's a directory of images or a txt list file (one path per line)."""
+    p = Path(entry)
+    if p.is_dir():
+        for f in p.iterdir():
+            if f.suffix.lower() in IMAGE_EXTS:
+                yield f
+    elif p.is_file():
+        for line in p.read_text().splitlines():
+            line = line.strip()
+            if line:
+                yield Path(line)
+
+
+def _label_path_for_image(img_path: Path) -> Path | None:
+    """
+    Best-effort mapping from an image path to its YOLO label .txt,
+    covering both dataset conventions used in this project:
+      - VisDrone-style:   .../images/<split>/x.jpg -> .../labels/<split>/x.txt
+      - Roboflow-style:   .../<split>/images/x.jpg  -> .../<split>/labels/x.txt
+    Returns None if neither pattern matches, rather than guessing wrong.
+    """
+    parts = list(img_path.parts)
+    if "images" not in parts:
+        return None
+    idx = len(parts) - 1 - parts[::-1].index("images")  # last "images" segment
+    label_parts = parts[:idx] + ["labels"] + parts[idx + 1:]
+    label_path = Path(*label_parts).with_suffix(".txt")
+    return label_path if label_path.exists() else None
+
+
+# ---------------------------------------------------------------------
+# Per-class instance counting (new) -- see module docstring point 7.
+# ---------------------------------------------------------------------
+
+def _count_instances_per_class(dirs: list[str]) -> dict[str, int]:
+    """
+    Scans every label file referenced by `dirs` (dataset dirs or txt list
+    files -- covers both VisDrone/Roboflow-style dirs and UAVDT's
+    auto-split txt lists) and counts total labeled INSTANCES per class
+    name -- not images.
+
+    This is deliberately separate from the per-SOURCE image counts
+    already printed at the end of main(): a source's image count doesn't
+    tell you which CLASS is actually sparse once everything is merged.
+    A class can appear in plenty of images but still trail badly in
+    total boxes if instance density per image differs -- e.g. SARD
+    frames typically contain a handful of people each, while VisDrone
+    traffic scenes can have dozens of vehicles in one frame. Only a
+    direct instance count across the merged set answers "is person
+    actually underrepresented relative to the vehicle classes."
+
+    Read-only -- does not touch any label file, purely a reporting pass.
+    """
+    counts = {name: 0 for name in UNIFIED_CLASSES}
+    for entry in dirs:
+        for img_path in _iter_images_in_entry(entry):
+            label_path = _label_path_for_image(img_path)
+            if label_path is None:
+                continue
+            for line in label_path.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    idx = int(line.split()[0])
+                except ValueError:
+                    continue
+                if 0 <= idx < len(UNIFIED_CLASSES):
+                    counts[UNIFIED_CLASSES[idx]] += 1
+    return counts
+
+
+# ---------------------------------------------------------------------
+# Sparse-class oversampling
+# ---------------------------------------------------------------------
+
+def _oversample_sparse_classes(train_dirs: list[str], target_classes: list[str],
+                                 multiplier: int = DEFAULT_OVERSAMPLE_MULTIPLIER
+                                 ) -> list[str]:
+    """
+    Scans every image referenced by train_dirs (directories OR txt list
+    files -- covers both VisDrone/Roboflow-style dirs and UAVDT's
+    auto-split txt lists) for labels containing any class in
+    target_classes, and writes datasets/oversample_train.txt containing
+    (multiplier - 1) EXTRA copies of each matching image's absolute path.
+    That txt is added as an additional train: entry -- Ultralytics
+    accepts repeated image paths across multiple train: list entries,
+    each occurrence sampled independently per epoch, which is what
+    actually increases how often the model sees these classes.
+
+    Does NOT touch val_dirs (never passed in here) and does NOT modify
+    any label file -- purely a sampling-frequency change over existing
+    (image, label) pairs. Idempotent: reruns overwrite
+    oversample_train.txt fresh rather than compounding.
+
+    target_classes=[] or multiplier<=1 is a no-op (returns [] without
+    writing anything), so this is safe to call unconditionally from
+    main().
+    """
+    if not target_classes or multiplier <= 1:
+        return []
+
+    unknown = [c for c in target_classes if c not in UNIFIED_CLASSES]
+    if unknown:
+        print(f"\n[oversample] WARNING: {unknown} not in current "
+              f"UNIFIED_CLASSES {UNIFIED_CLASSES} -- ignoring those.")
+    target_names = [c for c in target_classes if c in UNIFIED_CLASSES]
+    if not target_names:
+        return []
+
+    target_idxs = {UNIFIED_CLASSES.index(c) for c in target_names}
+
+    print(f"\n[oversample] Scanning train images for classes {target_names} "
+          f"(multiplier={multiplier}x)...")
+
+    extra_paths: list[str] = []
+    scanned = 0
+    matched = 0
+    for entry in train_dirs:
+        for img_path in _iter_images_in_entry(entry):
+            scanned += 1
+            label_path = _label_path_for_image(img_path)
+            if label_path is None:
+                continue
+            classes_present = set()
+            for line in label_path.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    classes_present.add(int(line.split()[0]))
+                except ValueError:
+                    continue
+            if classes_present & target_idxs:
+                matched += 1
+                extra_paths.extend(
+                    [str(img_path.resolve())] * (multiplier - 1))
+
+    if not extra_paths:
+        print(f"  [oversample] Scanned {scanned} images, found none "
+              f"matching {target_names} -- nothing to oversample "
+              f"(datasets not prepared yet, or these classes are truly "
+              f"absent from the current train set).")
+        if OVERSAMPLE_LIST_PATH.exists():
+            OVERSAMPLE_LIST_PATH.unlink()
+        return []
+
+    DATASETS_DIR.mkdir(parents=True, exist_ok=True)
+    OVERSAMPLE_LIST_PATH.write_text("\n".join(extra_paths) + "\n")
+    print(f"  [oversample] {matched}/{scanned} train images contained a "
+          f"target class -- wrote {len(extra_paths)} duplicate entries to "
+          f"{OVERSAMPLE_LIST_PATH.name} ({multiplier}x total exposure for "
+          f"those images).")
+    return [str(OVERSAMPLE_LIST_PATH)]
 
 
 # ---------------------------------------------------------------------
@@ -497,7 +699,25 @@ def write_per_source_manifest(sources: dict[str, dict]) -> None:
         json.dump(manifest, f, indent=2)
 
 
-def main() -> Path:
+def main(oversample_classes: list[str] | None = None,
+         oversample_multiplier: int = DEFAULT_OVERSAMPLE_MULTIPLIER) -> Path:
+    """
+    oversample_classes: UNIFIED_CLASSES names to duplicate train image
+    paths for (see _oversample_sparse_classes()). Defaults to
+    DEFAULT_OVERSAMPLE_CLASSES (motorcycle/other_vehicle) when this
+    module is run standalone (`python prepare_datasets.py`); train.py
+    passes its own --oversample-classes value explicitly. Pass [] to
+    disable oversampling entirely.
+
+    Check the "Per-class instance counts" block this prints (new) before
+    trusting that default -- it's based on VisDrone alone and may not
+    reflect the actual sparsest class once UAVDT/SARD are folded in.
+    "person" is this project's stated priority class and is NOT in the
+    default oversample list.
+    """
+    if oversample_classes is None:
+        oversample_classes = DEFAULT_OVERSAMPLE_CLASSES
+
     signature = taxonomy_signature()
     print(f"Taxonomy signature: {signature}")
     print(f"Unified classes ({len(UNIFIED_CLASSES)}): {UNIFIED_CLASSES}")
@@ -514,6 +734,31 @@ def main() -> Path:
     val_dirs = (visdrone_dirs["val"] + xview_dirs["val"]
                 + uavdt_dirs["val"] + sard_dirs["val"]
                 + external_dirs["val"])
+
+    # Per-class instance counts (new) -- computed on train_dirs BEFORE
+    # oversampling duplicates anything, so this reflects the real,
+    # naturally-occurring class balance across the merged dataset. This
+    # is what should actually drive --oversample-classes, not an assumed
+    # default -- see this function's docstring.
+    print(f"\n{'=' * 70}")
+    print("Per-class instance counts (train, before oversampling)")
+    print(f"{'=' * 70}")
+    class_counts = _count_instances_per_class(train_dirs)
+    for name, n in class_counts.items():
+        flag = "  <- in --oversample-classes" if name in oversample_classes else ""
+        print(f"  {name:15s}  {n:>7}{flag}")
+    print("Use this to sanity-check --oversample-classes -- a class can "
+          "be the stated priority (e.g. 'person') and still end up the "
+          "most underrepresented one if it isn't in that list.")
+    print(f"{'=' * 70}")
+
+    # Oversampling only ever ADDS extra train: entries (duplicate image
+    # paths) -- val_dirs is never touched, so val stays a clean,
+    # untouched measurement of real-world class distribution.
+    oversample_dirs = _oversample_sparse_classes(
+        train_dirs, target_classes=oversample_classes,
+        multiplier=oversample_multiplier)
+    train_dirs = train_dirs + oversample_dirs
 
     yaml_path = write_unified_yaml(train_dirs, val_dirs)
 
@@ -544,6 +789,10 @@ def main() -> Path:
         status = "" if (n_train or n_val) else "  (not found / not prepared)"
         print(f"  {name:10s}  train={n_train:>6}  val={n_val:>6}  "
               f"test={n_test:>6}{status}")
+    if oversample_dirs:
+        n_over = _count_all(oversample_dirs)
+        print(f"  {'oversample':10s}  train=+{n_over:<5}  (extra duplicate "
+              f"entries for {oversample_classes}, {oversample_multiplier}x)")
     print(f"{'=' * 70}")
 
     return yaml_path

@@ -6,9 +6,22 @@ Run this once before train.py. It:
      that the install succeeded -- a CPU-only torch install with no error
      message is the most common way this silently goes wrong).
   2. Installs ultralytics (pulls in YOLO26 + the VisDrone downloader).
-  3. Pre-downloads and validates the VisDrone dataset, so train.py starts
+  3. Installs albumentations (new) -- powers train.py's degradation
+     augmentation pipeline (motion/gaussian blur, compression artifacts,
+     ISO noise, gamma shift) that closes some of the gap between the
+     clean training datasets and the real analog FPV feed. train.py
+     still runs fine without it (auto-skips with a warning), but this
+     step means you don't find that out mid-run -- it's verified here,
+     up front, same as CUDA is.
+  4. Pre-downloads and validates the VisDrone dataset, so train.py starts
      training immediately instead of spending its first several minutes
      downloading a 2GB archive.
+  5. Checks whether UAVDT/SARD are present under datasets/ (new). These
+     two CANNOT be automated the way VisDrone is -- Roboflow gates both
+     behind a free account with no public direct-download API, so this
+     step only ever reports what it finds and prints the manual steps
+     if either is missing. See prepare_datasets.py's module docstring
+     for the exact download links and extraction convention.
 
 Usage:
     python -m venv .venv
@@ -33,6 +46,7 @@ wheel coverage is mature and this stops being a moving target:
 import subprocess
 import sys
 import shutil
+from pathlib import Path
 
 
 def run(cmd: list[str], description: str) -> bool:
@@ -204,6 +218,41 @@ def install_ultralytics() -> bool:
                 "ultralytics"], "Installing ultralytics (YOLO26 + dataset tooling)")
 
 
+def install_albumentations() -> bool:
+    """
+    Powers train.py's install_degradation_augment() -- the analog-FPV-feed
+    degradation pipeline (motion/gaussian blur, compression artifacts,
+    ISO noise, gamma shift). NON-FATAL if this fails: train.py checks for
+    albumentations itself and skips the degradation augmentation with a
+    printed warning rather than crashing, so a failure here doesn't block
+    setup.py from finishing -- but verifying it now means you find out
+    here, not three hours into a training run's log output.
+    """
+    ok = run([sys.executable, "-m", "pip", "install", "--upgrade",
+              "albumentations"], "Installing albumentations (degradation "
+             "augmentation for analog-feed robustness)")
+    if not ok:
+        print("[WARN] albumentations install failed -- train.py's "
+              "degradation augmentation will auto-skip (non-fatal, "
+              "training still runs). Try `pip install albumentations` "
+              "manually, or pass --no-degradation-aug to train.py to "
+              "silence the warning if you're skipping it intentionally.")
+        return False
+
+    check = subprocess.run(
+        [sys.executable, "-c", "import albumentations; print('OK')"],
+        capture_output=True, text=True)
+    if check.stdout.strip() == "OK":
+        print("[OK] albumentations importable -- degradation augmentation "
+              "will be active by default in train.py.")
+        return True
+    print(f"[WARN] albumentations installed but failed to import: "
+          f"{check.stderr.strip()}. train.py will auto-skip degradation "
+          f"augmentation with a warning -- not fatal, but worth "
+          f"investigating before a long run if you want that feature.")
+    return False
+
+
 def download_visdrone():
     print(f"\n{'=' * 70}\nDownloading and validating VisDrone dataset\n{'=' * 70}")
     script = (
@@ -228,6 +277,67 @@ def download_visdrone():
               "it fails there too.")
 
 
+def check_manual_datasets():
+    """
+    UAVDT and SARD (new check) can't be pre-downloaded here the way
+    VisDrone is -- both are gated behind a free Roboflow account with no
+    public direct-download API, so there's no URL this script can safely
+    curl. What this CAN do is report whether they're already present in
+    the expected location and, for anything missing, print the exact
+    manual steps rather than leaving you to dig through
+    prepare_datasets.py's docstring to find them again.
+
+    Uses the same datasets_dir resolution prepare_datasets.py uses (falls
+    back to a local datasets/ folder if ultralytics' SETTINGS isn't
+    importable yet, e.g. if ultralytics install failed earlier in this
+    script).
+    """
+    try:
+        from ultralytics.utils import SETTINGS
+        datasets_dir = Path(SETTINGS.get("datasets_dir", Path.cwd() / "datasets"))
+    except Exception:
+        datasets_dir = Path.cwd() / "datasets"
+
+    print(f"\n{'=' * 70}\nChecking UAVDT / SARD (manual download required)\n{'=' * 70}")
+
+    targets = {
+        "UAVDT": (datasets_dir / "UAVDT",
+                  "https://universe.roboflow.com/kfupm-v0syf/uavdt-4g4uv"),
+        "SARD": (datasets_dir / "SARD",
+                 "https://universe.roboflow.com/animesh-shastry/sard_yolo"
+                 "  (pick version \"v1 Original\" specifically -- other "
+                 "versions on that project are grayscale/resized/"
+                 "augmented)"),
+    }
+
+    missing = []
+    for name, (root, url) in targets.items():
+        if (root / "data.yaml").exists():
+            print(f"  [OK] {name} found at {root}")
+        else:
+            print(f"  [MISSING] {name} not found at {root}")
+            missing.append((name, root, url))
+
+    if missing:
+        print(f"\nManual step required for: "
+              f"{', '.join(n for n, _, _ in missing)}")
+        for name, root, url in missing:
+            print(f"\n  {name}:")
+            print(f"    1. Sign in and download from: {url}")
+            print(f"    2. Export format: YOLOv8, raw/1x (skip Roboflow's "
+                  f"own augmentation multiplier)")
+            print(f"    3. Extract so data.yaml sits directly at {root}\\ "
+                  f"(not nested in an extra wrapper folder)")
+        print(f"\ntrain.py will still run without these -- VisDrone alone "
+              f"is enough to train -- but the unified taxonomy is built "
+              f"for VisDrone+UAVDT+SARD together, so accuracy on vehicle "
+              f"diversity (UAVDT) and SAR-specific person poses (SARD) "
+              f"will be limited until both are in place.")
+    else:
+        print("\n[OK] Both UAVDT and SARD are present -- prepare_datasets.py "
+              "will pick them up automatically on the next train.py run.")
+
+
 def main():
     print("Project R.A.D — training environment setup\n")
 
@@ -240,7 +350,10 @@ def main():
               "version below 3.9 (check with `python --version`).")
         sys.exit(1)
 
+    install_albumentations()
+
     download_visdrone()
+    check_manual_datasets()
 
     print(f"\n{'=' * 70}\nSetup complete\n{'=' * 70}")
     print("Next step: python train.py --epochs 5   (smoke test first)")
