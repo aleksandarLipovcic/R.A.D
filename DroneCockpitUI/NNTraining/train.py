@@ -381,7 +381,25 @@ from mosaic_guard import install_instance_cap
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RUNS_PROJECT = SCRIPT_DIR / "runs" / "detect"
-PER_SOURCE_MANIFEST_PATH = SCRIPT_DIR / "datasets" / "per_source_val.json"
+
+# per_source_val.json is written by prepare_datasets.py into ITS
+# DATASETS_DIR, which follows Ultralytics' own global 'datasets_dir'
+# setting -- NOT necessarily a "datasets" folder next to this script.
+# Confirmed on this project: that setting resolves one level above
+# NNTraining/ (i.e. .../DroneCockpitUI/datasets/), so a hardcoded
+# SCRIPT_DIR / "datasets" here silently looked in the wrong folder and
+# evaluate_per_source() was skipped on every run ("no per_source_val.json
+# found ... wasn't run this session?") even though prepare_datasets.py
+# had, in fact, just run and written it -- just somewhere else. Resolving
+# via the same Ultralytics SETTINGS lookup prepare_datasets.py itself
+# uses keeps both scripts pointed at the same actual location.
+try:
+    from ultralytics.utils import SETTINGS
+    DATASETS_DIR = Path(SETTINGS.get("datasets_dir", SCRIPT_DIR / "datasets"))
+except Exception:
+    DATASETS_DIR = SCRIPT_DIR / "datasets"
+
+PER_SOURCE_MANIFEST_PATH = DATASETS_DIR / "per_source_val.json"
 
 # Tried in this order when --model auto is used. Biggest first -- more
 # capacity generally means better accuracy, so we only give it up if it
@@ -1007,7 +1025,13 @@ def parse_args():
                          "forward-compat only.")
     p.add_argument("--name", default=None,
                     help="Run subfolder name under runs/detect/. Defaults "
-                         "to '<model>_<imgsz>'.")
+                         "to '<model>_<imgsz>' for a fresh run. When "
+                         "combined with --resume, targets that specific "
+                         "run's last.pt instead of guessing by most-"
+                         "recently-modified file across all runs -- "
+                         "e.g. --resume --name yolo26s_960-4. Strongly "
+                         "recommended over bare --resume if more than "
+                         "one run folder exists under runs/detect/.")
     p.add_argument("--export-only", action="store_true",
                     help="Skip training, just export an existing "
                          "runs/detect/<name>/weights/best.pt.")
@@ -1030,13 +1054,51 @@ def default_run_name(model: str, imgsz: int) -> str:
     return f"{stem}_{imgsz}"
 
 
-def find_latest_last_pt() -> Path:
+def find_latest_last_pt(name: str | None = None) -> Path:
+    """
+    Locates the last.pt to resume from.
+
+    If `name` is given (pass --name when resuming, matching the run
+    folder under runs/detect/), resumes THAT specific run only --
+    error loudly if it doesn't have a last.pt, rather than silently
+    falling back to something else.
+
+    If `name` is not given, falls back to the previous behavior: picks
+    the most-recently-modified last.pt across ALL runs/detect/*/ --
+    but now prints every candidate it found (path + mtime) before
+    choosing, so a stray/unrelated run folder (e.g. "runs/detect/train/"
+    left over from an ad-hoc `yolo train` invocation outside this
+    project's own scripts, which defaults to that generic name) can't
+    silently win just because its last.pt happens to be newer. Confirmed
+    this can happen: an unrelated coco8.yaml/80-class run in a folder
+    literally named "train" was picked over a real yolo26s_960-4 run
+    here, because nothing surfaced the ambiguity before committing to
+    an answer. Pass --name explicitly to avoid relying on mtime at all.
+    """
+    if name:
+        target = RUNS_PROJECT / name / "weights" / "last.pt"
+        if not target.exists():
+            raise FileNotFoundError(
+                f"No last.pt found at {target} -- check --name matches "
+                f"an existing run folder under {RUNS_PROJECT}.")
+        return target
+
     candidates = sorted(RUNS_PROJECT.glob("*/weights/last.pt"),
                          key=lambda p: p.stat().st_mtime)
     if not candidates:
         raise FileNotFoundError(
             f"No {RUNS_PROJECT}/*/weights/last.pt found to resume from. "
             f"Run training without --resume first.")
+
+    if len(candidates) > 1:
+        print(f"\n[resume] Multiple runs found under {RUNS_PROJECT} -- "
+              f"no --name given, so picking by most recent file "
+              f"modification time. If this isn't the run you meant, "
+              f"rerun with --resume --name <run_folder_name> instead:")
+        for c in candidates:
+            marker = " <- selected" if c == candidates[-1] else ""
+            print(f"    {c}  (modified {c.stat().st_mtime}){marker}")
+
     return candidates[-1]
 
 
@@ -1325,7 +1387,7 @@ def main():
     data_path = None  # only set on a fresh (non-resume) run -- see guard below
 
     if args.resume:
-        last_pt = find_latest_last_pt()
+        last_pt = find_latest_last_pt(args.name)
         print(f"\nResuming training from {last_pt}...")
         model = YOLO(str(last_pt))
         model.train(resume=True)
