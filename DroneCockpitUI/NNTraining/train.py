@@ -1054,6 +1054,44 @@ def default_run_name(model: str, imgsz: int) -> str:
     return f"{stem}_{imgsz}"
 
 
+def _is_resumable_checkpoint(path: Path) -> bool:
+    """
+    Checks whether a .pt checkpoint actually has resumable training
+    state (epoch counter + optimizer state), BEFORE handing it to
+    Ultralytics' model.train(resume=True).
+
+    Why this exists: a checkpoint from a run that completed normally
+    (reached its target epoch count, wasn't interrupted) has its
+    optimizer stripped automatically -- see the "Optimizer stripped
+    from ...last.pt" line Ultralytics prints at the end of every
+    successful run. That checkpoint is no longer resumable, no matter
+    what --epochs is set to in that run's saved args.yaml. Ultralytics
+    itself detects this and prints a warning ("not a resumable training
+    checkpoint ... Starting new training instead") -- but the "new
+    training" it starts uses ITS OWN internal defaults (coco8.yaml,
+    80 classes, batch=16, workers=8, etc.), NOT this project's real
+    data/imgsz/batch/degradation-aug setup, because train.py's resume
+    branch calls model.train(resume=True) with no other kwargs to fall
+    back on. Confirmed on this project: that silent fallback trained
+    several real epochs against the wrong 4-image toy dataset before
+    anyone noticed. Checking resumability ourselves first, and refusing
+    loudly with the correct next step, is much safer than letting that
+    silent fallback happen again.
+    """
+    import torch
+
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as e:
+        print(f"[resume check] Could not load {path} to inspect it "
+              f"({e}) -- treating as non-resumable to be safe.")
+        return False
+
+    has_epoch = ckpt.get("epoch") is not None
+    has_optimizer = ckpt.get("optimizer") is not None
+    return has_epoch and has_optimizer
+
+
 def find_latest_last_pt(name: str | None = None) -> Path:
     """
     Locates the last.pt to resume from.
@@ -1388,6 +1426,27 @@ def main():
 
     if args.resume:
         last_pt = find_latest_last_pt(args.name)
+
+        if not _is_resumable_checkpoint(last_pt):
+            raise SystemExit(
+                f"\n[resume] {last_pt} has no epoch/optimizer state left "
+                f"to resume -- this means that run already completed "
+                f"normally (Ultralytics strips optimizer state from "
+                f"last.pt/best.pt once a run finishes, regardless of what "
+                f"--epochs is set to in its args.yaml). True resume is "
+                f"only possible for a run that was INTERRUPTED before "
+                f"reaching its target epoch count.\n\n"
+                f"To train more epochs starting from these weights "
+                f"instead, run a fresh (non-resume) training pass using "
+                f"this checkpoint as the starting model -- e.g.:\n\n"
+                f"    python train.py --model \"{last_pt}\" --epochs 5\n\n"
+                f"This is a warm start, not a true continuation: the LR "
+                f"schedule and optimizer momentum restart from scratch "
+                f"rather than picking up exactly where training left "
+                f"off, but the learned weights carry over. Adjust "
+                f"--epochs/--imgsz/--batch/etc. as you would for any "
+                f"normal run.")
+
         print(f"\nResuming training from {last_pt}...")
         model = YOLO(str(last_pt))
         model.train(resume=True)
