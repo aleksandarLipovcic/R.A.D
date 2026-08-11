@@ -55,6 +55,8 @@
     </Compile>
     <Compile Include="FPVWidget.py" />
     <Compile Include="NNTraining\class_map.py" />
+    <Compile Include="NNTraining\cross_reference_gaps.py" />
+    <Compile Include="NNTraining\check_label_gaps.py" />
     <Compile Include="NNTraining\verify_pipeline_assumptions.py" />
     <Compile Include="NNTraining\predict_test.py" />
     <Compile Include="NNTraining\mosaic_guard.py" />
