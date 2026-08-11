@@ -11,12 +11,12 @@ classification loss treats every unlabeled region as confirmed background, a
 real (but unlabeled) instance of a "missing" class in these sources actively
 punishes the model for correctly detecting something it learned from VisDrone.
 
-This script does NOT fix anything or touch any label file. It runs a general
-COCO-pretrained YOLO26 checkpoint over each source's images, looking ONLY for
-the classes that source structurally never labels, and reports how often it
-finds them -- so the next step (pseudo-label the gaps, mask the loss, or do
-nothing because the risk is negligible) is a decision backed by actual counts
-and actual images, not a guess.
+This script does NOT fix anything or touch any label file. It runs a YOLO26
+checkpoint over each source's images, looking ONLY for the classes that
+source structurally never labels, and reports how often it finds them -- so
+the next step (pseudo-label the gaps, mask the loss, or do nothing because
+the risk is negligible) is a decision backed by actual counts and actual
+images, not a guess.
 
 Which classes are "missing" per source is derived directly from
 VISDRONE_REMAP / EXTERNAL_REMAPS in class_map.py -- not hardcoded here -- so
@@ -30,21 +30,64 @@ Output:
     highest-confidence + random hits) for manual eyeballing before trusting
     any of this.
 
-CAVEAT (read before trusting a "clean" result): the scanning model is
-COCO-pretrained on mostly ground-level photos. Its recall on small, aerial,
-top-down objects is worse than a model trained on this project's own drone
-footage. Every count here is a LOWER BOUND on the real gap, not a ceiling.
-Zero hits means "this pass didn't catch anything," not "there is no gap."
+=======================================================================
+FIX (2026-08-11): default scanning model swapped from a generic COCO-
+pretrained checkpoint to dronefreak/visdrone-yolov26l, a VisDrone-domain-
+finetuned checkpoint from the HF Hub -- same model cross_reference_
+gaps.py's YOLO side now uses. See that script's module docstring for the
+full reasoning (the short version: a full run with the old COCO-
+pretrained + open-vocab-DINO pairing showed the open-vocab side's
+mismatch counts sitting right on the confidence floor -- classic domain-
+mismatch noise, not signal. The COCO-pretrained YOLO side of THIS script
+was never cross-checked against a second model the way the open-vocab
+side was, so it was never proven innocent of the same failure mode --
+"COCO-pretrained on mostly ground-level photos" scanning a UAV dataset
+of small, top-down, aerial objects is exactly the same domain gap.
+Swapping to the VisDrone-finetuned checkpoint here removes that risk and
+means this script's counts and cross_reference_gaps.py's yolo_only/agree
+counts are now produced by the literal same model on the literal same
+images -- so if the two reports disagree, that's informative rather
+than a self-inflicted false signal.
 
-FIX (2026-08-11): model.predict() was previously called with source=<python
-list of path strings> in both scan_source() and save_review_images(). A raw
-python list source is NOT streamed the way a directory or a .txt list file
-is -- Ultralytics' check_source() routes list/tuple sources through
-autocast_list(), which eagerly Image.open()s every element up front and
-returns in-memory PIL images with no real path preserved. Once that happens,
-Results.path for each result falls back to Ultralytics' synthetic
-placeholder names ("image0.jpg", "image1.jpg", "image2.jpg", ... cycling per
-batch) instead of the actual file path.
+Class taxonomy note: this checkpoint's classes are VisDrone-native
+(pedestrian/people/bicycle/car/van/truck/tricycle/awning-tricycle/bus/
+motor), not COCO's 80 classes. COCO_NAMES_FOR_UNIFIED (which mapped
+unified classes to their nearest COCO analogs, e.g. other_vehicle ->
+["bicycle"] only, since COCO has no tricycle/awning-tricycle) is
+replaced by VISDRONE_NAMES_FOR_UNIFIED, derived by inverting class_map.
+py's own VISDRONE_REMAP -- so it's guaranteed correct against the actual
+taxonomy this project trains on, not a hand-maintained COCO analog
+table. COCO_NAMES_FOR_UNIFIED and resolve_coco_indices() are kept below
+as aliases pointing at the new implementation, in case anything else in
+this project imports them by name -- remove the aliases once you've
+confirmed nothing does.
+
+Old --model behavior (a plain Ultralytics checkpoint name like
+"yolo26l.pt", auto-downloaded from Ultralytics' own hub) is still
+supported: load_scanning_model() only treats --model as a Hugging Face
+repo id (routed through hf_hub_download) when it contains a "/", same
+convention the huggingface_hub / transformers ecosystem itself uses to
+distinguish "org/repo" from a bare local/hub filename.
+=======================================================================
+
+CAVEAT (read before trusting a "clean" result): even a domain-matched
+scanning model's recall on small, aerial, top-down, heavily-occluded
+objects is imperfect -- dronefreak/visdrone-yolov26l reports 40.42%
+recall on VisDrone's own test set (see its HF model card), meaning it's
+expected to still MISS a substantial fraction of real instances. Every
+count here remains a LOWER BOUND on the real gap, not a ceiling. Zero
+hits means "this pass didn't catch anything," not "there is no gap."
+
+FIX (2026-08-11, pre-dating the model swap above): model.predict() was
+previously called with source=<python list of path strings> in both
+scan_source() and save_review_images(). A raw python list source is NOT
+streamed the way a directory or a .txt list file is -- Ultralytics'
+check_source() routes list/tuple sources through autocast_list(), which
+eagerly Image.open()s every element up front and returns in-memory PIL
+images with no real path preserved. Once that happens, Results.path for
+each result falls back to Ultralytics' synthetic placeholder names
+("image0.jpg", "image1.jpg", "image2.jpg", ... cycling per batch)
+instead of the actual file path.
 
 That silently corrupted scan_source()'s own hit records (hits[cls].append((
 conf, area_frac, r.path)) stored a fake cycling name, not the real image),
@@ -62,10 +105,15 @@ loader path, which does preserve real file paths in Results.path. Any
 label_gap_report.json written before this fix should be treated as
 unreliable and regenerated.
 
+REQUIREMENTS:
+    pip install ultralytics huggingface_hub --break-system-packages
+(opencv is already required by prepare_datasets.py / train.py.) First run
+downloads the VisDrone-finetuned checkpoint from the HF Hub (~50-90MB).
+
 Usage:
-    python check_label_gaps.py                     # full scan, default thresholds
+    python check_label_gaps.py                     # full scan, default model+thresholds
     python check_label_gaps.py --limit 300          # quick pass, 300 imgs/source
-    python check_label_gaps.py --model yolo26l.pt   # stronger scanning model
+    python check_label_gaps.py --model yolo26l.pt   # fall back to a plain COCO checkpoint
     python check_label_gaps.py --conf-thresholds 0.25 0.4 0.6 0.8
 """
 
@@ -78,23 +126,36 @@ from collections import defaultdict
 from pathlib import Path
 
 import cv2
+from huggingface_hub import hf_hub_download
 from ultralytics import YOLO
 
 import prepare_datasets
 from class_map import UNIFIED_CLASSES, VISDRONE_REMAP, EXTERNAL_REMAPS, taxonomy_signature
 
-# Which COCO class NAMES correspond to each unified class, for scanning with a
-# COCO-pretrained model. Resolved to indices at runtime against the loaded
-# model's own model.names rather than hardcoded indices -- COCO ordering is
-# consistent across Ultralytics checkpoints, but resolving by name is safer
-# than assuming that holds forever.
-COCO_NAMES_FOR_UNIFIED = {
-    "person": ["person"],
-    "car": ["car"],
-    "large_vehicle": ["bus", "truck"],
-    "motorcycle": ["motorcycle"],
-    "other_vehicle": ["bicycle"],  # closest COCO analog to tricycle/etc.
-}
+# Must match cross_reference_gaps.py's YOLO_REPO / YOLO_WEIGHTS_FILENAME --
+# both scripts are meant to scan with the literal same checkpoint. If you
+# change one, change the other.
+DEFAULT_YOLO_REPO = "dronefreak/visdrone-yolov26l"
+YOLO_WEIGHTS_FILENAME = "best.pt"
+
+
+def _build_visdrone_names_for_unified() -> dict[str, list[str]]:
+    """VisDrone's native class names -> this project's unified taxonomy,
+    derived by inverting class_map.py's own VISDRONE_REMAP (imported
+    above) rather than hand-duplicated -- can't drift out of sync with
+    the taxonomy the rest of the project actually trains on."""
+    out: dict[str, list[str]] = {}
+    for visdrone_name, uni_name in VISDRONE_REMAP.items():
+        if uni_name is None:
+            continue
+        out.setdefault(uni_name, []).append(visdrone_name)
+    return out
+
+
+VISDRONE_NAMES_FOR_UNIFIED = _build_visdrone_names_for_unified()
+# Backward-compat alias -- see the FIX note above. Remove once you've
+# confirmed nothing else in the project imports the old COCO-shaped name.
+COCO_NAMES_FOR_UNIFIED = VISDRONE_NAMES_FOR_UNIFIED
 
 # source_name -> (prepare_fn, remap_table). prepare_fn(signature) returns
 # {"train": [...], "val": [...], "test": [...]} the exact same way
@@ -125,16 +186,56 @@ def gather_images(dirs_dict: dict, splits=("train", "val")) -> list[Path]:
     return paths
 
 
-def resolve_coco_indices(model_names: dict, class_names: list[str]) -> list[int]:
-    name_to_idx = {v: k for k, v in model_names.items()}
+def resolve_class_indices(model_names: dict, class_names: list[str]) -> list[int]:
+    """model_names: {idx: name} as returned by the loaded model.
+    class_names: lowercase VisDrone class names to look up (case-
+    insensitive match against model_names' values, since we don't
+    control the exact casing a given HF checkpoint's names dict uses)."""
+    name_to_idx = {v.lower(): k for k, v in model_names.items()}
     idxs = []
     for name in class_names:
-        if name in name_to_idx:
-            idxs.append(name_to_idx[name])
+        key = name.lower()
+        if key in name_to_idx:
+            idxs.append(name_to_idx[key])
         else:
-            print(f"  [warn] COCO class '{name}' not found on this checkpoint "
-                  f"-- skipping.")
+            print(f"  [warn] class '{name}' not found on this checkpoint "
+                  f"-- skipping. (Checkpoint reports: "
+                  f"{sorted(model_names.values())})")
     return idxs
+
+
+# Backward-compat alias -- see the FIX note above.
+resolve_coco_indices = resolve_class_indices
+
+
+def load_scanning_model(model_arg: str) -> YOLO:
+    """
+    model_arg containing "/" is treated as a Hugging Face repo id and
+    routed through hf_hub_download (e.g. the default,
+    "dronefreak/visdrone-yolov26l") -- same convention the huggingface_hub
+    ecosystem uses to tell "org/repo" apart from a bare checkpoint name.
+    Anything else (e.g. "yolo26l.pt") is passed straight to YOLO(), which
+    resolves it against Ultralytics' own hub/local cache as before -- so
+    the old COCO-checkpoint behavior still works if you explicitly ask
+    for it via --model.
+    """
+    if "/" in model_arg:
+        print(f"Downloading/loading {model_arg} from the HF Hub "
+              f"(VisDrone-domain-finetuned checkpoint)...")
+        weights = hf_hub_download(repo_id=model_arg, filename=YOLO_WEIGHTS_FILENAME)
+        model = YOLO(weights)
+    else:
+        print(f"Loading {model_arg} (Ultralytics checkpoint name/path)...")
+        model = YOLO(model_arg)
+    print(f"  Scanning model classes: {sorted(model.names.values())}")
+    return model
+
+
+def _print_taxonomy_mapping():
+    print("\nVisDrone -> unified class mapping in use (derived from "
+          "class_map.py's VISDRONE_REMAP):")
+    for uni_name, visdrone_names in VISDRONE_NAMES_FOR_UNIFIED.items():
+        print(f"  {uni_name:15s} <- {', '.join(visdrone_names)}")
 
 
 def _write_source_list(paths, out_path: Path) -> Path:
@@ -162,17 +263,18 @@ def _write_source_list(paths, out_path: Path) -> Path:
 def scan_source(model: YOLO, source_name: str, image_paths: list[Path],
                  missing_classes: list[str], conf_floor: float, device,
                  batch: int) -> dict[str, list[tuple]]:
-    """One inference pass over image_paths, looking only for the COCO classes
-    that correspond to this source's missing UNIFIED_CLASSES, at conf_floor
-    (the lowest threshold we care about -- higher thresholds are computed
-    afterward from these same detections, no need to rerun inference)."""
+    """One inference pass over image_paths, looking only for the VisDrone
+    classes that correspond to this source's missing UNIFIED_CLASSES, at
+    conf_floor (the lowest threshold we care about -- higher thresholds
+    are computed afterward from these same detections, no need to rerun
+    inference)."""
     print(f"\n{'=' * 70}\n{source_name}: scanning {len(image_paths)} images "
           f"for {missing_classes}\n{'=' * 70}")
 
-    coco_names = []
+    visdrone_names = []
     for c in missing_classes:
-        coco_names.extend(COCO_NAMES_FOR_UNIFIED.get(c, []))
-    class_idxs = resolve_coco_indices(model.names, coco_names)
+        visdrone_names.extend(VISDRONE_NAMES_FOR_UNIFIED.get(c, []))
+    class_idxs = resolve_class_indices(model.names, visdrone_names)
     if not class_idxs:
         print(f"  Nothing to scan for -- skipping {source_name}.")
         return {}
@@ -199,9 +301,9 @@ def scan_source(model: YOLO, source_name: str, image_paths: list[Path],
 
         for cls_id, conf, xywhn in zip(r.boxes.cls.tolist(), r.boxes.conf.tolist(),
                                          r.boxes.xywhn.tolist()):
-            coco_name = model.names[int(cls_id)]
-            for uni_name, coco_list in COCO_NAMES_FOR_UNIFIED.items():
-                if uni_name in missing_classes and coco_name in coco_list:
+            visdrone_name = model.names[int(cls_id)].lower()
+            for uni_name, visdrone_list in VISDRONE_NAMES_FOR_UNIFIED.items():
+                if uni_name in missing_classes and visdrone_name in visdrone_list:
                     area_frac = xywhn[2] * xywhn[3]
                     hits[uni_name].append((conf, area_frac, r.path))
 
@@ -282,8 +384,8 @@ def save_review_images(model: YOLO, hits: dict, missing_classes: list[str],
     out_dir = review_dir / source_name.lower()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    coco_names = [n for c in missing_classes for n in COCO_NAMES_FOR_UNIFIED.get(c, [])]
-    class_idxs = resolve_coco_indices(model.names, coco_names)
+    visdrone_names = [n for c in missing_classes for n in VISDRONE_NAMES_FOR_UNIFIED.get(c, [])]
+    class_idxs = resolve_class_indices(model.names, visdrone_names)
 
     # Same fix as scan_source(): write `chosen` (real paths recovered from
     # the FIRST pass's hit records) out to a .txt list file instead of
@@ -308,12 +410,15 @@ def save_review_images(model: YOLO, hits: dict, missing_classes: list[str],
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model", default="yolo26m.pt",
-                    help="COCO-pretrained checkpoint to scan with. Bigger = "
-                         "better recall/precision for this one-off diagnostic "
-                         "pass (inference-only, none of train.py's VRAM "
-                         "constraints apply) -- try yolo26l.pt/yolo26x.pt for "
-                         "a stronger pass if you don't mind the auto-download.")
+    p.add_argument("--model", default=DEFAULT_YOLO_REPO,
+                    help="Scanning checkpoint. A string containing '/' is "
+                         "treated as a Hugging Face repo id (e.g. the "
+                         "default, dronefreak/visdrone-yolov26l -- VisDrone-"
+                         "domain-finetuned, matches cross_reference_gaps."
+                         "py's YOLO side). Anything else is passed straight "
+                         "to Ultralytics' YOLO() as before (e.g. "
+                         "yolo26l.pt/yolo26x.pt for a plain COCO-pretrained "
+                         "checkpoint).")
     p.add_argument("--limit", type=int, default=None,
                     help="Randomly sample at most this many images per source "
                          "instead of scanning everything. Good for a fast "
@@ -344,10 +449,8 @@ def main():
     random.seed(args.seed)
     conf_floor = min(args.conf_thresholds)
 
-    print(f"Loading {args.model} (COCO-pretrained -- used only to scan for "
-          f"classes each source doesn't label; this is NOT the unified-"
-          f"taxonomy model)...")
-    model = YOLO(args.model)
+    _print_taxonomy_mapping()
+    model = load_scanning_model(args.model)
 
     signature = taxonomy_signature()
     datasets_dir = prepare_datasets.DATASETS_DIR
@@ -359,15 +462,16 @@ def main():
         "model": args.model,
         "conf_thresholds": args.conf_thresholds,
         "splits_scanned": args.splits,
+        "visdrone_to_unified_mapping": VISDRONE_NAMES_FOR_UNIFIED,
         "sources": {},
         "notes": (
-            "Counts are a LOWER BOUND on real missing instances -- the "
-            "scanning model is COCO-pretrained on mostly ground-level "
-            "photos, so recall on small/aerial objects is worse than a "
-            "model trained on this project's own drone footage. Zero hits "
-            "is not proof a gap is safe, just that this pass didn't catch "
-            "anything -- check label_gap_review/ before trusting a clean "
-            "result at face value."
+            "Counts are a LOWER BOUND on real missing instances -- even a "
+            "VisDrone-domain-finetuned scanning model has imperfect recall "
+            "on small/aerial/occluded objects (see this script's module "
+            "docstring for the specific figure). Zero hits is not proof a "
+            "gap is safe, just that this pass didn't catch anything -- "
+            "check label_gap_review/ before trusting a clean result at "
+            "face value."
         ),
     }
 
