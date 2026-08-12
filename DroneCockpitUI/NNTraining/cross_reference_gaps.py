@@ -80,6 +80,34 @@ WHAT THIS SCRIPT STILL DOES (unchanged from V2):
   This script still only measures and reviews -- no label file is ever
   touched here.
 
+FIX (2026-08-12): compare_and_review() called out_dir.mkdir(parents=True,
+exist_ok=True) for label_gap_review/<source>_cross/ but never cleared it
+first -- the same staleness bug as check_label_gaps.py's
+save_review_images() (see that module's matching 2026-08-12 FIX note).
+Review images from a previous run (a different --iou-threshold /
+--skip-coco / --skip-dino / --limit, or just a run that produced more
+low-vote clusters and filled more numbered slots) could survive on disk
+mixed in with a newer run's images, with no way to tell which is
+current just by looking at the folder.
+
+This affects ONLY the rendered .jpg review images under
+label_gap_review/<source>_cross/ -- it does NOT affect
+cross_reference_report.json / cross_reference_candidates.json /
+cross_reference_full.json. Each of those is a single json.dump() call
+under mode "w", executed once at the very end of main() after all four
+phases have finished, and built entirely from this run's in-memory
+`dets` dict -- nothing in that path ever reads a previous run's output
+back off disk. In particular, the expensive part of a run (the four
+phase-loaded model scans themselves, ~3hr with DINO included) is
+unaffected by this bug and does NOT need to be repeated to get correct
+JSON output; only the review-image folder needs a fresh look, and
+regenerating it does not require rerunning the scans -- it's produced
+from the same in-memory clusters right after they're computed.
+
+Fixed via clean_review_subdir(), imported from check_label_gaps.py
+(defined there, reused here, rather than duplicated) -- see that
+function's docstring for exactly what it does and its safety guard.
+
 REQUIREMENTS:
     pip install rfdetr huggingface_hub pillow transformers torch \
         --break-system-packages
@@ -142,6 +170,7 @@ from check_label_gaps import (
     missing_classes_for,
     gather_images,
     _write_source_list,
+    clean_review_subdir,
 )
 
 try:
@@ -677,7 +706,7 @@ def compare_and_review(source_name: str, image_paths: list[Path],
     chosen = [Path(k) for k, _ in ranked[:max_review]]
 
     out_dir = review_dir / f"{source_name.lower()}_cross"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    clean_review_subdir(out_dir)
     print(f"\n  Saving {len(chosen)} cross-reference review images to "
           f"{out_dir}/ ...")
 

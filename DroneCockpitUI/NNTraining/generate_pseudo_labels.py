@@ -58,6 +58,77 @@ default. No review images are generated for discards (would defeat the
 point of cutting the manual-review volume).
 
 =======================================================================
+V5 (2026-08-12): guaranteed clean-slate outputs on EVERY run.
+=======================================================================
+Before V5, datasets/pseudo_labels/ (the auto-accept tree) and
+datasets/pseudo_labels_review/ (the rendered review images) were only
+ever ADDED to on each run -- write_auto_accept_labels() wrote a label
+file for every image accepted THIS run, but never removed a label file
+left over from a PREVIOUS run for an image that isn't accepted this
+time (e.g. because you retuned --min-conf/--min-iou/--min-single-vote-
+conf/--min-always-review-conf between runs, or reran after cross_
+reference_gaps.py produced a different candidate set). Concretely: run
+A auto-accepts image X at loose thresholds -> pseudo_labels/.../X.txt
+exists. You tighten thresholds and rerun; X no longer qualifies. The
+new run never touches X.txt because it has nothing to write for X --
+so the stale, no-longer-justified label file from run A silently
+survives into whatever --apply merges into the real dataset. Same
+problem for pseudo_labels_review/: if run A rendered review images 000
+through 250 and run B's (smaller) queue only fills 000-180, images
+181-250 from run A are untouched leftovers that don't correspond to
+anything in the CURRENT pseudo_labels_review_queue.json, and someone
+skimming the review folder has no way to tell they're stale.
+
+Both trees are fully reproducible from cross_reference_candidates.json
++ cross_reference_full.json plus the current CLI flags -- nothing
+irreplaceable lives in either of them. So as of V5, EVERY run (dry run
+or --apply) now wipes both trees completely via clean_output_dir()
+before writing anything, unconditionally -- no flag needed to opt in,
+because there's never a good reason to keep a previous run's partial
+output lying around next to this run's. Pass --keep-existing-outputs
+only if you explicitly want the old (pre-V5, additive) behavior for
+some kind of manual A/B comparison between two runs' output folders;
+this is NOT the normal/recommended way to use this script.
+
+datasets/pseudo_labels_review_queue.json, pseudo_labels_discarded.json,
+and pseudo_labels_summary.json were ALREADY safe before V5 -- each is a
+single JSON file opened with mode "w" and written in one shot, which
+inherently replaces its entire previous contents rather than appending
+to them. No change needed there; noting it here so it's obvious this
+wasn't also a silent-staleness risk.
+
+WHAT V5 NEVER TOUCHES (hard safety boundary, not just convention):
+clean_output_dir() is called ONLY on pseudo_root (datasets/
+pseudo_labels/) and review_dir (datasets/pseudo_labels_review/) --
+this script's OWN output trees. It is never called anywhere near
+datasets/pseudo_labels_reviewed/ (review_labels.py's manual-review
+output tree), datasets/review_progress.json, or datasets/
+review_completed.json -- those hold actual human review work and
+belong exclusively to review_labels.py; this script only ever READS
+near them, at --apply time, via merge_pseudo_trees_into_dataset(),
+which opens reviewed_root read-only (rglob + read_text, no write/
+delete calls against that tree at all). clean_output_dir() also
+refuses at runtime (raises, does not silently no-op) if ever called
+with a path whose name is "pseudo_labels_reviewed" or that resolves
+under a directory containing "review_progress.json"/"review_completed.
+json" as siblings -- a belt-and-suspenders check purely to make an
+accidental future call site (e.g. a copy-paste mistake) fail loudly
+instead of deleting someone's manual review work.
+
+PRE-CLEAN STALENESS WARNING: if datasets/review_progress.json already
+has entries (i.e. manual review has started) when this script runs
+again, regenerating the queue can change which items are queued vs.
+auto-accepted vs. discarded this time -- an item a reviewer already
+made a decision on may vanish from the new queue (harmless but stale
+progress.json entry) or, less commonly, an item never seen before may
+newly appear. This script now prints an explicit warning and a count
+of existing progress entries in that situation, before doing anything
+else, so this is a decision you make with the numbers in front of you
+rather than something that silently happens. It does not block the
+run -- review_labels.py's own progress/completed files are untouched
+either way (see boundary note above) -- it's purely informational.
+
+=======================================================================
 THREE-TIER SPLIT (auto-accept side, unchanged from V3):
   - AUTO-ACCEPT (vote_count >= 3): written straight to a YOLO-format
     label file, UNCONDITIONALLY -- no confidence floor. Three or four
@@ -95,29 +166,33 @@ Default:
 
 Override via --always-review SOURCE:class (repeatable).
 
-OUTPUT: same shape as V3, plus one new file --
+OUTPUT (all fully rewritten from scratch every run -- see V5 note):
   datasets/pseudo_labels/<SOURCE>/<mirrors the real label path>.txt
       YOLO-format lines for AUTO-ACCEPT boxes only (both the
       unconditional 3/4-vote tier and the conditional 2-vote tier that
       passed its gate). Written to a SEPARATE tree -- see --apply.
+      Directory is wiped clean at the start of every run before any
+      file is written (V5).
   datasets/pseudo_labels_review_queue.json
       Every NEEDS REVIEW item (post-discard-gate), carrying a full
       "votes" dict (all four models' confidence-or-null) and
-      "vote_count".
+      "vote_count". Whole-file overwrite every run (always was).
   datasets/pseudo_labels_discarded.json  [NEW in V4]
       Every DISCARDED item, same shape as the review queue plus a
       "reason" of "below_single_vote_floor" or
       "below_always_review_floor" -- an audit trail for what got cut
       and why, in case --min-single-vote-conf / --min-always-review-conf
-      need retuning.
+      need retuning. Whole-file overwrite every run (always was).
   datasets/pseudo_labels_review/<source>/
-      Annotated review images for the (now smaller) queue.
+      Annotated review images for the (now smaller) queue. Directory
+      is wiped clean at the start of every run before any file is
+      written (V5).
   datasets/pseudo_labels_summary.json
       Per-source/per-class auto-accepted vs queued vs discarded counts
       BY TIER (3-4-vote unconditional, 2-vote conditional, plus a
       threshold-sensitivity table for the 2-vote tier only -- the 3/4-
       vote tier has no threshold to sweep, it's unconditional by
-      design).
+      design). Whole-file overwrite every run (always was).
 
 LABEL-PATH ASSUMPTION (verify before trusting --apply): unchanged --
 derives each image's label file by replacing the "images" path
@@ -126,14 +201,17 @@ prints the first derived (image -> label) pair per source at startup --
 confirm that path is a real, existing file before trusting --apply.
 
 --apply: unchanged -- merges datasets/pseudo_labels/ (this script's
-auto-accept tier) and datasets/pseudo_labels_reviewed/
-(review_labels.py's output, if present) into the real dataset,
-appending and skipping byte-identical duplicate lines.
+auto-accept tier, freshly regenerated this run) and datasets/
+pseudo_labels_reviewed/ (review_labels.py's output, if present, NEVER
+modified by this script -- read-only at merge time) into the real
+dataset, appending and skipping byte-identical duplicate lines.
 
 USAGE:
     # 1. Dry run with the new discard gate at its defaults (0.40 single-
     #    vote / 0.30 always-review). Cheap -- reads cross_reference_
     #    candidates.json / cross_reference_full.json, no GPU involved.
+    #    Every run starts from a clean pseudo_labels/ + pseudo_labels_
+    #    review/ -- see V5 note above.
     python generate_pseudo_labels.py
 
     # 2. Check datasets/pseudo_labels_summary.json's per-class
@@ -141,17 +219,30 @@ USAGE:
     #    tier only), and a handful of datasets/pseudo_labels_discarded
     #    .json entries to sanity-check nothing real is being thrown
     #    away. Adjust --min-conf / --min-iou / --min-single-vote-conf /
-    #    --min-always-review-conf and rerun if the split looks wrong.
+    #    --min-always-review-conf and rerun if the split looks wrong --
+    #    every rerun is a full clean regeneration, so there's never a
+    #    mix of two different threshold settings' output sitting in the
+    #    same folder.
     #    Passing --min-single-vote-conf 0 --min-always-review-conf 0
     #    fully restores V3 behavior (nothing discarded) if you'd rather
     #    start from the unfiltered queue.
+    #
+    #    IMPORTANT: do this threshold-tuning BEFORE starting manual
+    #    review in review_labels.py. Once review_progress.json has real
+    #    decisions in it, rerunning this script (even just to tweak a
+    #    threshold) regenerates the queue and can orphan some of that
+    #    progress -- the script will warn you with a count if it
+    #    detects this, but the clean way to work is: tune thresholds
+    #    here first, confirm the summary/discarded files look right,
+    #    THEN start review_labels.py.
 
-    # 3. Once satisfied:
+    # 3. Once satisfied and manual review (if any) is complete:
     python generate_pseudo_labels.py --apply
 """
 
 import argparse
 import json
+import shutil
 import statistics
 from pathlib import Path
 
@@ -168,6 +259,93 @@ MODEL_ABBREV = {"yolo_visdrone": "yv", "rfdetr_visdrone": "rf",
                  "yolo_coco": "yc", "dino": "dn"}
 
 COLOR_QUEUE = (0, 165, 255)   # orange
+
+# Filenames that mark a directory as belonging to review_labels.py's
+# manual-review workflow. clean_output_dir() refuses to touch any
+# directory that is named this, or that directly contains either of
+# these files as a sibling -- see the V5 docstring note's safety
+# boundary section. This is deliberately redundant with "we simply
+# never call clean_output_dir() on those paths" below -- the point is
+# that a future copy-paste mistake at a NEW call site fails loudly
+# instead of silently deleting manual review work.
+PROTECTED_DIR_NAME = "pseudo_labels_reviewed"
+PROTECTED_SIBLING_FILES = ("review_progress.json", "review_completed.json")
+
+
+# ---------------------------------------------------------------------
+# Clean-slate output helper -- V5
+# ---------------------------------------------------------------------
+
+def clean_output_dir(path: Path, label: str) -> None:
+    """
+    Wipes `path` completely (if it exists) and recreates it empty, so
+    every run of this script starts its OWN output trees
+    (pseudo_labels/, pseudo_labels_review/) from zero -- see this
+    module's V5 docstring note for why that's necessary (previously,
+    files from a prior run with different thresholds/candidates could
+    silently survive alongside this run's files).
+
+    SAFETY: refuses (raises RuntimeError, does not silently skip) if
+    `path`'s name matches PROTECTED_DIR_NAME, or if `path` contains
+    either of PROTECTED_SIBLING_FILES directly inside it. Those mark a
+    directory as review_labels.py's manual-review output, which this
+    script must NEVER delete. This function is only ever called (see
+    main()) on pseudo_root and review_dir -- this check exists purely
+    as a second, independent guard in case a future edit adds another
+    call site by mistake.
+    """
+    if path.name == PROTECTED_DIR_NAME:
+        raise RuntimeError(
+            f"Refusing to clean {path} -- its name matches the protected "
+            f"manual-review directory ({PROTECTED_DIR_NAME}). This "
+            f"function must only ever be called on this script's OWN "
+            f"output trees (pseudo_labels/, pseudo_labels_review/).")
+    if path.exists():
+        for sibling in PROTECTED_SIBLING_FILES:
+            if (path / sibling).exists():
+                raise RuntimeError(
+                    f"Refusing to clean {path} -- it directly contains "
+                    f"{sibling}, which marks this as a manual-review "
+                    f"directory belonging to review_labels.py.")
+
+    if path.exists():
+        n_existing = sum(1 for _ in path.rglob("*") if _.is_file())
+        shutil.rmtree(path)
+        print(f"  [clean] removed {n_existing} existing file(s) from "
+              f"{label} ({path})")
+    else:
+        print(f"  [clean] {label} ({path}) did not exist yet -- nothing to remove")
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def warn_if_review_in_progress(datasets_dir: Path) -> None:
+    """Purely informational (does not block, does not touch any file) --
+    see V5 docstring note. Lets you rerun with your eyes open instead of
+    being surprised later that some review_progress.json entries no
+    longer correspond to anything in the freshly regenerated queue."""
+    progress_path = datasets_dir / "review_progress.json"
+    if not progress_path.exists():
+        return
+    try:
+        with open(progress_path) as f:
+            progress = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return
+    # Only count real per-item decision entries, not the
+    # "__manual__<image>" / "__override__<image>" bookkeeping keys
+    # review_labels.py also stores in this same file.
+    n_decisions = sum(1 for k in progress if not k.startswith("__"))
+    if n_decisions == 0:
+        return
+    print(f"\n  {'!' * 66}")
+    print(f"  WARNING: {progress_path} already has {n_decisions} manual "
+          f"review decision(s) recorded.")
+    print(f"  Regenerating the queue now may change which items are "
+          f"queued/auto-accepted/discarded, which can leave some of "
+          f"those decisions referring to items no longer in the new "
+          f"queue (harmless, but stale). If you're just tuning "
+          f"thresholds, prefer doing that BEFORE manual review starts.")
+    print(f"  {'!' * 66}\n")
 
 
 # ---------------------------------------------------------------------
@@ -380,7 +558,7 @@ def tier_source(source_name: str, candidates: list[dict], full_detections: dict,
 
 
 # ---------------------------------------------------------------------
-# Label file writing -- unchanged
+# Label file writing
 # ---------------------------------------------------------------------
 
 _dim_cache: dict[str, tuple[int, int]] = {}
@@ -405,6 +583,11 @@ def box_to_yolo_line(cls_name: str, box: list[float], img_w: int, img_h: int) ->
 
 def write_auto_accept_labels(auto_accepted: list[dict], source_name: str,
                               pseudo_root: Path) -> dict[Path, list[str]]:
+    """Writes this run's auto-accepted boxes into pseudo_root. As of V5,
+    pseudo_root has already been fully wiped by clean_output_dir() in
+    main() before this is ever called for the first source -- so every
+    file this function creates is guaranteed to reflect ONLY this run's
+    decisions, never a mix with a previous run's leftovers."""
     by_label_path: dict[Path, list[str]] = {}
     for item in auto_accepted:
         img_path = Path(item["image"])
@@ -425,7 +608,11 @@ def merge_pseudo_trees_into_dataset(roots: list[Path], datasets_dir: Path):
     """Unchanged -- see V2/V3 docstring for the two-tree merge reasoning
     (auto-accept tree gets wholesale-rewritten every run, reviewed tree
     doesn't, so they're merged at apply time instead of being the same
-    tree)."""
+    tree). Read-only against every root passed in -- only rglob() and
+    read_text() are called on them, nothing is ever deleted or modified
+    here. The only writes in this function target the REAL dataset
+    label files under datasets_dir, never the pseudo_labels* trees
+    themselves."""
     written, skipped_dupe = 0, 0
     per_root_counts = {}
 
@@ -474,6 +661,15 @@ def votes_str(item: dict) -> str:
 
 def save_review_images(queued: list[dict], source_name: str, review_dir: Path,
                         max_images: int):
+    """Renders this run's queued items into review_dir. As of V5,
+    review_dir has already been fully wiped by clean_output_dir() in
+    main() before this is ever called for the first source -- so the
+    only images present after this function runs are the ones that
+    correspond to entries actually in THIS run's
+    pseudo_labels_review_queue.json. out_dir itself is freshly created
+    per source (it didn't exist a moment ago, since review_dir was just
+    wiped), so no mkdir(exist_ok=True) risk of silently reusing a stale
+    directory either."""
     by_image: dict[str, list[dict]] = {}
     for item in queued:
         by_image.setdefault(item["image"], []).append(item)
@@ -557,6 +753,15 @@ def parse_args():
                          "real dataset label files. Without this flag, "
                          "output only goes to datasets/pseudo_labels/ "
                          "(a dry run).")
+    p.add_argument("--keep-existing-outputs", action="store_true",
+                    help="[V5] Skip wiping datasets/pseudo_labels/ and "
+                         "datasets/pseudo_labels_review/ before this "
+                         "run -- restores the pre-V5 additive behavior. "
+                         "NOT recommended for normal use (see V5 "
+                         "docstring note for why the additive behavior "
+                         "was a correctness risk); only pass this if "
+                         "you deliberately want two runs' output sitting "
+                         "side by side for a manual A/B comparison.")
     return p.parse_args()
 
 
@@ -573,6 +778,21 @@ def main():
     queue_path = datasets_dir / "pseudo_labels_review_queue.json"
     discarded_path = datasets_dir / "pseudo_labels_discarded.json"
     summary_path = datasets_dir / "pseudo_labels_summary.json"
+
+    warn_if_review_in_progress(datasets_dir)
+
+    # V5: guaranteed clean slate for THIS script's own output trees,
+    # every run, before a single file is written. Never touches
+    # pseudo_labels_reviewed/ or review_progress.json/review_completed.
+    # json -- those belong to review_labels.py. See clean_output_dir()'s
+    # docstring for the safety guard backing that up.
+    print("Cleaning previous run's output (see V5 docstring note)...")
+    if args.keep_existing_outputs:
+        print("  --keep-existing-outputs passed -- skipping clean, using "
+              "additive (pre-V5) behavior. Not recommended for normal use.")
+    else:
+        clean_output_dir(pseudo_root, "auto-accept label tree")
+        clean_output_dir(review_dir, "review images tree")
 
     all_queued = []
     all_discarded = []
@@ -649,6 +869,8 @@ def main():
         reviewed_root = datasets_dir / "pseudo_labels_reviewed"
         merge_pseudo_trees_into_dataset([pseudo_root, reviewed_root], datasets_dir)
 
+    # Whole-file overwrites -- were already safe pre-V5 (mode "w" fully
+    # replaces prior contents), noted here for completeness.
     with open(queue_path, "w") as f:
         json.dump(all_queued, f, indent=2, default=str)
     with open(discarded_path, "w") as f:
@@ -657,10 +879,10 @@ def main():
         json.dump(summary, f, indent=2, default=str)
 
     print(f"\n{'=' * 70}")
-    print(f"Pseudo-labels (dry run tree): {pseudo_root}/")
+    print(f"Pseudo-labels (dry run tree, freshly regenerated this run): {pseudo_root}/")
     print(f"Review queue ({len(all_queued)} items): {queue_path}")
     print(f"Discarded, below confidence floor ({len(all_discarded)} items): {discarded_path}")
-    print(f"Review images: {review_dir}/<source>/")
+    print(f"Review images (freshly regenerated this run): {review_dir}/<source>/")
     print(f"Summary + sensitivity table: {summary_path}")
     if not args.apply:
         print(f"\nDRY RUN -- real dataset label files were NOT modified. "

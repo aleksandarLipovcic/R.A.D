@@ -105,6 +105,23 @@ loader path, which does preserve real file paths in Results.path. Any
 label_gap_report.json written before this fix should be treated as
 unreliable and regenerated.
 
+FIX (2026-08-12): save_review_images() called out_dir.mkdir(parents=True,
+exist_ok=True) but never cleared out_dir first, so annotated review
+images from a PREVIOUS run (a different --model / --conf-thresholds /
+--limit, or simply a run that had more hits and therefore filled more
+numbered slots) could survive on disk alongside this run's images with
+no way to tell which is current. This is purely a diagnostic-image-
+folder staleness bug -- it does NOT affect label_gap_report.json, which
+is a single json.dump() under mode "w" and is fully rebuilt from this
+run's in-memory `hits` dict every time (hits is computed fresh by
+scan_source() each run and never reads anything back off disk from a
+prior run). Fixed via clean_review_subdir(), which wipes out_dir before
+this run writes into it -- see that function's docstring. If you've hit
+this, label_gap_report.json from that run is still trustworthy; only
+label_gap_review/<source>/ needs a fresh look (rerunning is cheap --
+save_review_images() only re-renders `--max-review-images` images, it
+does not repeat the full scan).
+
 REQUIREMENTS:
     pip install ultralytics huggingface_hub --break-system-packages
 (opencv is already required by prepare_datasets.py / train.py.) First run
@@ -120,6 +137,7 @@ Usage:
 import argparse
 import json
 import random
+import shutil
 import statistics
 import time
 from collections import defaultdict
@@ -260,6 +278,47 @@ def _write_source_list(paths, out_path: Path) -> Path:
     return out_path
 
 
+def clean_review_subdir(out_dir: Path) -> None:
+    """
+    Wipes out_dir -- a single source's review-image LEAF directory under
+    label_gap_review/ (e.g. label_gap_review/uavdt/) -- completely, then
+    recreates it empty, so every run of save_review_images() starts that
+    source's folder from zero. See this module's 2026-08-12 FIX note for
+    why: previously out_dir.mkdir(parents=True, exist_ok=True) only
+    ensured the directory existed, so images left over from a run with a
+    different --model / --conf-thresholds / --limit (or just a run that
+    had more hits and filled more numbered slots) could survive
+    indefinitely alongside a newer run's images, with no way to tell
+    which is current just by looking at the folder.
+
+    Only ever touches out_dir itself -- never label_gap_review/ as a
+    whole -- so it can't disturb cross_reference_gaps.py's sibling
+    <source>_cross/ output directories living under the same parent.
+
+    SAFETY: refuses (raises RuntimeError, does not silently no-op) if
+    out_dir's name looks like the shared parent directory itself rather
+    than a specific source's leaf directory -- this function must only
+    ever be called on a fully-qualified per-source subdirectory.
+    """
+    if out_dir.name in ("", ".", "label_gap_review"):
+        raise RuntimeError(
+            f"Refusing to clean {out_dir} -- its name suggests this is "
+            f"the shared label_gap_review/ parent directory, not a "
+            f"specific source's leaf directory. clean_review_subdir() "
+            f"must only ever be called on a per-source subdirectory "
+            f"(e.g. label_gap_review/uavdt/ or label_gap_review/"
+            f"uavdt_cross/).")
+
+    if out_dir.exists():
+        n_existing = sum(1 for _ in out_dir.rglob("*") if _.is_file())
+        shutil.rmtree(out_dir)
+        print(f"  [clean] removed {n_existing} stale file(s) left over "
+              f"from a previous run: {out_dir}")
+    else:
+        print(f"  [clean] {out_dir} did not exist yet -- nothing to remove")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+
 def scan_source(model: YOLO, source_name: str, image_paths: list[Path],
                  missing_classes: list[str], conf_floor: float, device,
                  batch: int) -> dict[str, list[tuple]]:
@@ -382,7 +441,7 @@ def save_review_images(model: YOLO, hits: dict, missing_classes: list[str],
     chosen += remainder[:max_review - len(chosen)]
 
     out_dir = review_dir / source_name.lower()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    clean_review_subdir(out_dir)
 
     visdrone_names = [n for c in missing_classes for n in VISDRONE_NAMES_FOR_UNIFIED.get(c, [])]
     class_idxs = resolve_class_indices(model.names, visdrone_names)
