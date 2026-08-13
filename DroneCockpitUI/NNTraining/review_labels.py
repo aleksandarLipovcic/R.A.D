@@ -115,17 +115,257 @@ V8 NOTE -- deletion, undo/redo, and speed release.
      resets on undo, mostly so long sessions have some small feedback
      loop.
 
+V9 NOTE -- resize + crash-safety release.
+  1. ADDED: manual (cyan) boxes can now be RESIZED, not just moved.
+     Selecting one shows 8 small square handles (4 corners + 4 edge
+     midpoints); drag any handle to stretch that edge/corner. Opposite
+     edges never cross -- a box can't be dragged past zero/negative
+     width or height, it just clamps to a minimum size (MIN_BOX_PX)
+     instead. Corner handles resize both axes at once, edge handles
+     resize one axis. This is the fix for "hard to get the right size
+     when drawing" -- draw it roughly, then nudge the edges to fit
+     instead of deleting and redrawing.
+  2. ADDED: an armed queue box ("Enable Reposition") can now ALSO be
+     resized via the same handles, not just moved -- still a single
+     one-shot arm that disarms itself the instant you release the
+     mouse, same guarantee as before (accidental clicks can't touch a
+     queue box's geometry, only a deliberate arm-then-drag can, and it
+     locks again immediately after).
+  3. ADDED: cursor changes to the matching resize arrow (or move
+     cursor, or crosshair) when hovering a handle / draggable box /
+     empty canvas, so the resize handles are discoverable without
+     opening the Help dialog.
+  4. CHANGED: Escape now also cancels an in-progress move OR resize
+     (restores the box to where it was before the drag started), not
+     just an in-progress draw as before.
+  5. CHANGED: autosave debounce shortened 1000ms -> 400ms, and the
+     current image is now ALSO force-flushed to disk immediately on
+     window focus-loss (Alt-Tab, OS sleep, another window stealing
+     focus) in addition to the existing navigate/close flush points.
+     This closes almost all of the old "last click before a crash
+     inside the debounce window could be lost" gap -- the only
+     remaining exposure is a crash inside the same fraction of a
+     second as a click AND before you ever change focus, which is a
+     much smaller window than before.
+
+V10 NOTE -- cross-frame sync release.
+  1. ADDED: cross-frame decision sync. Drone sequences are heavily
+     overlapping frame-to-frame, and all 4 models already ran on every
+     frame independently -- so most of the time, deciding a box on one
+     frame means a near-identical candidate box is already sitting
+     pending a few frames away. When you Accept / Reject / Delete a
+     queue box (menu, Fast Mode click, or a bulk action), the tool now
+     looks at nearby frames in the same sequence (parsed from the
+     filename, e.g. "..._M1201_img000322_..." -> sequence "M1201",
+     frame 322) and, for each neighbor within the configured frame
+     window, looks for an already-queued box of the SAME CLASS whose
+     position is close to the same spot. If it finds one AND that
+     neighbor box is still pending (never a box you, or a previous
+     sync, already decided), it applies the same decision there too --
+     writing straight into review_progress.json and that neighbor's
+     pseudo_labels_reviewed/ output, exactly as if you'd clicked it
+     yourself.
+  2. Deliberately conservative: same class only, position within a
+     tolerance scaled to image size, one nearest match per neighbor
+     frame, and it will NEVER overwrite an existing decision (yours or
+     a prior sync's) or reopen an image already in the completed list.
+     Geometry (box position) is never synced, only the decision --
+     resizing/repositioning a box never touches its neighbors.
+  3. (V10 behavior; CHANGED in V11 -- see below.) Manual boxes used to
+     be excluded from sync entirely.
+  4. Synced boxes are tagged "[synced]" in their on-canvas label so
+     you can spot-check them, and "Undo Last Sync" (toolbar / Edit
+     menu) reverts exactly the last batch of auto-applied decisions
+     back to pending, across every frame it touched.
+  5. ADDED: a toolbar row -- "Sync nearby frames" checkbox (on by
+     default) and a "+/- N frames" window spinner -- plus matching
+     --sync-window / --no-sync startup flags. Turn it off entirely, or
+     widen/narrow the window, per session.
+
+V11 NOTE -- manual-box safety, self-healing progress, sync-everything
+release. This addresses a real incident: a full review session's worth
+of accepted/deleted boxes and hand-drawn manual boxes looked "gone" on
+reopening the tool. Root cause: item_key() is derived from each queue
+item's box coordinates, and generate_pseudo_labels.py getting rerun
+between sessions shifted those coordinates by a fraction of a pixel --
+enough to change the rounded key, so saved decisions stopped matching
+on load (they were never deleted, just orphaned under a key that no
+longer existed in the freshly-loaded queue). Four changes:
+
+  1. ADDED: manual (hand-drawn) boxes now go through the same
+     pending -> accept/reject workflow as queue boxes, instead of being
+     silently included in output the instant you draw them. A freshly
+     drawn box is "pending" (orange) until you explicitly Accept it
+     (cyan) or Reject it (red, hidden unless "Show Deleted" is on) from
+     its right-click menu -- same Accept / Reject / Reset to Pending
+     options queue boxes already had. accepted_items() (and therefore
+     the pseudo_labels_reviewed/ output) only includes manual boxes
+     with decision == "accepted". An image can no longer move into
+     review_completed.json while ANY manual box on it is still
+     "pending" -- _update_completed_list() now checks manual box
+     decisions in addition to queue item decisions. Manual boxes saved
+     by a version before this one have no "decision" field; those are
+     treated as "accepted" on load (they were already being written to
+     output unconditionally at the time, so this preserves what you'd
+     already finished instead of retroactively un-completing it).
+  2. ADDED (the actual long-term fix, not a one-off script): every
+     launch now runs reconcile_progress() against the CURRENTLY loaded
+     queue before the window even opens. For every saved box-decision
+     entry, it tries an exact item_key() match first; on a miss (the
+     bug above), it falls back to same-image/same-class nearest-box-
+     center matching within a small tolerance -- the same idea the
+     cross-frame sync matcher already used, just applied to the load
+     step instead of only to syncing across frames. Matches get
+     re-keyed to whatever the current queue computes, so decisions
+     stop silently going stale every time the queue is regenerated.
+     Anything that still can't be matched (image genuinely gone from
+     the queue, or truly no candidate within tolerance) is kept under
+     its OLD key rather than dropped -- nothing this step touches is
+     ever deleted, only re-labeled or left alone -- and is printed to
+     the console so you can look at it by hand. review_completed.json
+     is then recomputed from the reconciled progress + the full
+     (unfiltered) queue rather than trusted as-is, so the "done" list
+     self-heals too. Disable with --no-key-reconcile if you ever need
+     to debug this step itself.
+  3. ADDED: an automatic timestamped backup of review_progress.json and
+     review_completed.json into datasets/review_backups/<timestamp>/
+     on every single launch, before reconciliation or anything else
+     touches them. This is the actual safety net -- even if
+     reconciliation above ever mismatches something, the exact
+     on-disk state from the start of the session is sitting right
+     there to restore from. Disable with --no-backup (not recommended).
+  4. ADDED: cross-frame sync now also covers manual boxes, not just
+     queue-item decisions. When you Accept a manual box, the tool
+     copies it (same class, same pixel position) into every in-window
+     neighbor frame that (a) isn't already completed and (b) doesn't
+     already have a queue or manual box of that class sitting near
+     that position -- tagged "[synced]" like everything else sync
+     creates. If you later Reject/Reset/Delete that source box, every
+     copy it created is removed the same way (tracked per-box, so this
+     only ever touches copies that trace back to that specific box --
+     never a box someone drew independently in another frame). "Undo
+     Last Sync" reverts the most recent batch either way, whether it
+     was queue-decision syncs, manual-box syncs, or a mix.
+
+V12 NOTE -- workflow/layout release, based on real usage feedback.
+  1. ADDED: in-app access to the completed queue. Previously the only
+     way to open a QA pass over already-decided images was to quit and
+     relaunch with --qa. There's now a "Switch to QA / Completed"
+     button (toolbar + View menu) that swaps the current session's
+     image list, live, between "still pending" and "already completed"
+     for the current --source/--cls filters, without restarting the
+     app or losing any autosaved work. This is also how you get back
+     to a box you decided by mistake: switch to QA, find the image
+     (still fully editable -- Accept/Reject/Reset/Delete/Change Class
+     all work exactly as in normal review), fix it, switch back. An
+     image automatically drops out of the completed list the instant
+     any box on it is reset to pending, exactly as before.
+  2. FIXED: the bottom toolbar (Previous / Next / Save Now / progress
+     counter) and the status bar could get pushed off the bottom of
+     the window and stay invisible even after resizing, because they
+     were packed AFTER the (expand=True) image canvas -- so the canvas
+     claimed all remaining space before the nav bar ever got a slice
+     of it. Nav + status are now packed FIRST (before the canvas), so
+     they always reserve their space and are always visible; the
+     canvas (which already has zoom + scrollbars for exactly this
+     situation) simply gets whatever room is left. The initial image
+     display size is now also computed from the actual screen size
+     (leaving room for every toolbar row + nav + status), instead of a
+     fixed 1280x860 that could already be taller than a laptop screen
+     before the nav bar was even accounted for.
+  3. CHANGED: the four models are now labelled with their full names
+     (e.g. "DINO", "RF-DETR", "YOLO-VisDrone", "YOLO-COCO") everywhere
+     in the UI -- toolbar checkboxes, the per-image detection-count
+     panel, and the sync console log -- instead of two-letter codes.
+  4. CHANGED: a hand-drawn (manual) box is now auto-accepted the
+     instant you draw it and pick its class -- no separate "open its
+     menu and click Accept" step. It's included in output and can
+     trigger cross-frame sync immediately, the same as it worked
+     before V11. If you draw one by mistake, its menu still has
+     Reject / Reset to Pending / Delete, so correcting a bad manual box
+     is still one click away -- this only removes the *extra* click
+     that used to be required for the common case of a box you meant
+     to add.
+
+V13 NOTE -- correctness release (review + bugfix pass). Five issues
+found on review, in order of importance:
+  1. FIXED (completion status used a filtered view): when running with
+     --source/--cls, ReviewApp only ever saw the FILTERED by_image
+     dict. _update_completed_list() / _recompute_completed_for_image()
+     checked completeness against that filtered set, so an image with
+     e.g. all "person" boxes decided but pending "car" boxes outside
+     the filter could get written into review_completed.json mid-
+     session -- prematurely marking it done, and (worse) causing cross-
+     frame sync to skip it as a neighbor from then on, since synced
+     neighbors are never applied to an already-"completed" image. Fix:
+     the FULL, unfiltered by_image_full dict is now threaded into
+     ReviewApp and used for every completeness check, so "done" always
+     means every box on the image (matching this filter or not) has a
+     real decision, exactly as the on-disk reconciliation at startup
+     already did.
+  2. FIXED (reversing a queue-box decision didn't retract what it had
+     already synced): syncing forward (Accept -> propagate Accept to
+     neighbors) worked, but if you later changed your mind on the
+     SOURCE box (Accept -> Reject, or -> Delete, or -> Reset to
+     Pending), the neighbor copies that earlier sync created were left
+     exactly as they were -- _apply_sync_batch only ever skipped
+     already-decided neighbors, it never revisited them. Manual boxes
+     already tracked which synced copies belonged to which box
+     (_sync_children) and cleanly retracted them on Reject/Reset/
+     Delete; queue items had no equivalent. Every queue decision now
+     tracks its own "synced_children" (which neighbor box, in which
+     frame, it most recently synced) on its progress.json entry.
+     Changing that decision first retracts any synced child still
+     sitting in the state it was synced to (never touches a neighbor
+     that's since been manually re-decided by hand), then re-applies
+     the new decision forward as before. "Undo Last Sync" also cleans
+     up the source's synced_children bookkeeping so it can't point at
+     a match_key that no longer exists.
+  3. FIXED (Enable-Reposition/Resize could disarm on a plain click):
+     the one-shot "arm exactly one drag" guarantee on a queue box was
+     being cleared on ANY mouse-up on that box, including a click that
+     never actually dragged (which just reopens the box's menu). A
+     queue box armed for reposition would silently disarm itself the
+     moment you clicked it again to check its menu, before you ever
+     got to drag it. Now it only disarms once an actual move/resize
+     drag happened.
+  4. FIXED (cross-frame class matching ignored the neighbor's class
+     override): when looking for a same-class match in a neighbor
+     frame, the matcher compared against the neighbor box's raw queue
+     class, not any class override saved for it -- so a neighbor box
+     you'd already relabelled (Change Class) could be missed as a sync
+     target, or wrongly matched under its original class. Both the
+     decision-sync matcher and the manual-box "is this position
+     already covered" check now resolve each candidate's class through
+     that neighbor image's own saved __override__ dict first.
+  5. MITIGATED (small save-ordering race): a sync could write a
+     neighbor frame's decision to disk immediately while the SOURCE
+     box's own new decision was still sitting in the ~400ms autosave
+     debounce -- a crash in that window could persist the synced
+     effect without the cause. Whenever a decision change actually
+     triggers (or retracts) a sync, the source image is now force-
+     flushed immediately afterward instead of waiting out the
+     debounce, the same way navigation/close/focus-loss already did.
+
 WHAT CHANGED, keyboard command -> new equivalent:
   click box, cycle       -> click box: pops up a menu with Accept /
   pending/accept/reject     Reject / Reset to Pending / Change Class /
                              (queue boxes only) Delete
   drag-draw + digit key   -> drag-draw on empty canvas -> release opens
                               a class-picker menu at the cursor (works
-                              for any number of boxes, one at a time)
+                              for any number of boxes, one at a time).
+                              The new box is auto-accepted (V12) as
+                              soon as you pick its class -- open its
+                              menu afterward if you need to Reject /
+                              Reset to Pending / Delete it.
   (nothing before)        -> click-and-drag ON a manual (cyan) box
                               moves it. Queue boxes are click-only
                               unless explicitly armed for one reposition
                               via their menu (see V7 note above).
+  (nothing before)        -> drag one of the 8 square handles on a
+                              SELECTED manual box (or an armed queue
+                              box) to resize it instead of moving it
+                              (see V9 note #1-2).
   (nothing before)        -> per-box menu also offers "Change Class"
                               and, for manual boxes, "Delete"; queue
                               boxes now also get "Delete (hide from
@@ -158,6 +398,22 @@ WHAT CHANGED, keyboard command -> new equivalent:
   (nothing before)         -> 1-9 = apply Nth class to selected box
   (nothing before)         -> Fast Mode: left-click queue box = accept,
                               right-click = reject (no menu)
+  (nothing before)         -> Esc while dragging a move/resize cancels
+                              it and snaps the box back (V9 note #4)
+  (nothing before)         -> Accept/Reject/Delete on a queue box, OR
+                              Accept/Reject/Reset/Delete on a manual
+                              box, syncs the same action to matching
+                              (or newly-created) boxes in nearby frames
+                              of the same sequence (V10 + V11 note
+                              above); "Undo Last Sync" reverts just
+                              that batch. Changing your mind on a
+                              source box (V13) retracts what it
+                              previously synced, not just the most
+                              recent batch.
+  (nothing before)         -> "Switch to QA / Completed" button (V12):
+                              swap between reviewing pending images and
+                              browsing/correcting already-completed
+                              ones, without restarting the app.
 
 WHY A SEPARATE OUTPUT TREE (see generate_pseudo_labels.py's module
 docstring for the full reasoning): this writes to datasets/
@@ -181,15 +437,30 @@ USAGE:
                                              # hidden once complete)
     python review_labels.py --qa            # QA pass: only images a
                                              # first reviewer already
-                                             # fully decided
+                                             # fully decided (can also
+                                             # be reached live from the
+                                             # toolbar -- see V12 note)
     python review_labels.py --hide-original # don't overlay existing
                                              # real-dataset labels
+    python review_labels.py --no-sync       # start with cross-frame
+                                             # sync OFF
+    python review_labels.py --sync-window 5 # sync up to 5 frames out
+                                             # in each direction
+    python review_labels.py --no-backup         # skip the automatic
+                                                 # per-launch backup
+                                                 # (not recommended)
+    python review_labels.py --no-key-reconcile  # skip the automatic
+                                                 # startup key-repair
+                                                 # pass (debugging only)
 """
 
 import argparse
 import copy
 import json
+import re
+import shutil
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
 
@@ -203,31 +474,62 @@ import generate_pseudo_labels as gpl
 REVIEWED_DIRNAME = "pseudo_labels_reviewed"
 PROGRESS_FILENAME = "review_progress.json"
 COMPLETED_FILENAME = "review_completed.json"
+BACKUP_DIRNAME = "review_backups"
 
 # Must match the keys cross_reference_gaps.py writes into each queue
 # item's "votes" dict.
 MODEL_KEYS = ["yolo_visdrone", "rfdetr_visdrone", "yolo_coco", "dino"]
-MODEL_SHORT = {"yolo_visdrone": "yv", "rfdetr_visdrone": "rf",
-               "yolo_coco": "yc", "dino": "dn"}
+
+# (V12) Full, readable names shown everywhere in the UI (toolbar,
+# per-image detection counts, sync console log) instead of the old
+# two-letter codes (yv/rf/yc/dn). MODEL_KEYS itself is unchanged since
+# it has to keep matching the "votes" keys cross_reference_gaps.py
+# writes -- only the display strings changed.
+MODEL_SHORT = {"yolo_visdrone": "YOLO-VisDrone", "rfdetr_visdrone": "RF-DETR",
+               "yolo_coco": "YOLO-COCO", "dino": "DINO"}
 
 COLOR_PENDING = "#ffa500"    # orange
 COLOR_ACCEPT = "#00c800"     # green
 COLOR_REJECT = "#dc0000"     # red
 COLOR_DELETED = "#777777"    # grey, dashed -- hidden by default, recoverable
-COLOR_MANUAL = "#00c8ff"     # cyan-ish
+COLOR_MANUAL = "#00c8ff"     # cyan-ish -- accepted manual boxes
 COLOR_ORIGINAL = "#ff00ff"   # magenta, existing real-dataset labels (reference only)
 COLOR_ARMED = "#ffff00"      # yellow, queue box temporarily armed for one reposition
+COLOR_HANDLE = "#ffffff"     # resize-handle squares
+COLOR_HANDLE_OUTLINE = "#000000"
 
 DISPLAY_MAX_W = 1280
 DISPLAY_MAX_H = 860
+
+# (V12) Rough vertical/horizontal space reserved for everything that
+# ISN'T the image canvas -- menubar, 3 toolbar rows, the detection-
+# count row, the status bar, and the nav row -- used to size the
+# canvas so the bottom nav bar can never be pushed off-screen. This is
+# intentionally generous; _load_image() also re-measures the real
+# chrome height once the window exists and uses whichever is bigger.
+CHROME_RESERVED_H = 300
+CHROME_RESERVED_W = 60
+MIN_CANVAS_W = 480
+MIN_CANVAS_H = 320
 
 MIN_ZOOM = 1.0     # can't zoom out past "fit to window"
 MAX_ZOOM = 8.0
 ZOOM_STEP = 1.15
 
-AUTOSAVE_DEBOUNCE_MS = 1000
+AUTOSAVE_DEBOUNCE_MS = 400
 AUTO_ADVANCE_DELAY_MS = 400
 UNDO_LIMIT = 50
+
+# Resize handles: side length of each square handle in screen (canvas)
+# pixels, and how many extra pixels around a handle still count as a
+# hit (so you don't have to pixel-hunt to grab one).
+HANDLE_SIZE = 7
+HANDLE_HIT_PAD = 5
+
+# Smallest a box (manual, or a queue box mid-resize) is allowed to
+# shrink to, in ORIGINAL IMAGE pixels (not screen/zoom pixels) -- keeps
+# a resize drag from collapsing a box to zero/negative width or height.
+MIN_BOX_PX = 4.0
 
 CLASS_NAMES = list(UNIFIED_CLASSES)
 
@@ -236,13 +538,94 @@ CLASS_NAMES = list(UNIFIED_CLASSES)
 # canvas unless the "Show deleted" checkbox is on.
 DECISION_STATES = ("pending", "accept", "reject", "deleted")
 
+# Decision states a MANUAL (hand-drawn) box can be in (V11). Mirrors
+# DECISION_STATES in spirit: a manual box is accepted immediately when
+# drawn (V12), but can still be moved to "rejected" or back to
+# "pending" from its menu if you drew it by mistake.
+MANUAL_DECISION_STATES = ("pending", "accepted", "rejected")
+
+# Handle names, and which x/y edges of the box each one controls.
+# "x": -1 means it moves x1 (left edge), +1 means it moves x2 (right
+# edge), 0 means it doesn't touch x at all. Same for "y".
+HANDLES = [
+    ("nw", -1, -1), ("n", 0, -1), ("ne", 1, -1),
+    ("w", -1, 0),                 ("e", 1, 0),
+    ("sw", -1, 1),  ("s", 0, 1),  ("se", 1, 1),
+]
+# Cursor to show for each handle (standard Tk cursor names).
+HANDLE_CURSOR = {
+    "nw": "size_nw_se", "se": "size_nw_se",
+    "ne": "size_ne_sw", "sw": "size_ne_sw",
+    "n": "sb_v_double_arrow", "s": "sb_v_double_arrow",
+    "e": "sb_h_double_arrow", "w": "sb_h_double_arrow",
+}
+
+# --- Cross-frame sync (V10 / V11) --------------------------------------
+# Filenames like "011_M1201_img000322_jpg_rf_<hash>.jpg" encode a
+# sequence id ("M1201") and a frame number ("000322"). This is a
+# heuristic over the filename ONLY -- images that don't match this
+# pattern simply have no sync neighbors, which is a safe no-op.
+SEQ_FRAME_RE = re.compile(r"_(?P<seq>[A-Za-z0-9]+)_img(?P<frame>\d+)_")
+
+SYNC_DEFAULT_WINDOW = 3          # frames each direction, default
+SYNC_MAX_WINDOW = 10
+# How close (as a fraction of the image diagonal) a same-class box in a
+# neighbor frame has to be to count as "the same object" for syncing,
+# and (V11) for deciding a position in a neighbor is "already covered"
+# so manual-box sync doesn't stack a duplicate on top of it.
+SYNC_POS_TOLERANCE_FRAC = 0.035
+
+# (V11) Tolerance used ONLY by the startup key-reconciliation pass, as
+# a fraction of a saved box's own diagonal -- deliberately tighter than
+# the cross-frame sync tolerance above, since this is meant to catch
+# "same box, coordinates drifted by float noise", not "probably the
+# same object a few frames later".
+KEY_RECONCILE_TOL_FRAC = 0.02
+
+FRAME_DIGITS_RE = re.compile(r"\d+")
+
+
+def parse_seq_frame(image_key: str):
+    """Returns (sequence_id, frame_number) for grouping/sorting frames
+    within a sequence. Tries two layouts, in order:
+
+      1. Sequence embedded in the FILENAME with underscores, e.g. a
+         Roboflow-style export "..._M1201_img000322_...". This is what
+         V10 originally shipped with, matched against sample filenames
+         that turned out to be Roboflow's own export naming, not
+         necessarily this dataset's real on-disk layout.
+      2. Sequence as the PARENT DIRECTORY name with the frame number
+         being the last run of digits in the filename, e.g.
+         ".../M1201/img000322.jpg" -> ("M1201", 322). This is the
+         common UAVDT/VisDrone/SARD-style layout (one folder per
+         sequence) and is tried whenever (1) doesn't match.
+
+    Returns None if neither applies -- that image simply gets no sync
+    neighbors (safe no-op), rather than silently guessing wrong.
+    """
+    p = Path(image_key)
+    m = SEQ_FRAME_RE.search(p.name)
+    if m:
+        return m.group("seq"), int(m.group("frame"))
+    if p.parent.name:
+        digits = FRAME_DIGITS_RE.findall(p.stem)
+        if digits:
+            return p.parent.name, int(digits[-1])
+    return None
+
 
 def item_key(item: dict) -> str:
     """Stable id for a queue item -- (image, cls, rounded ORIGINAL box)
     is deterministic across runs since it's derived from item["_orig_box"],
     which is captured once right after the queue JSON loads and never
     touched again. Deliberately NOT derived from item["box"] (mutable --
-    see V6 note in the module docstring for why that used to crash)."""
+    see V6 note in the module docstring for why that used to crash).
+
+    NOTE (V11): this can still drift if generate_pseudo_labels.py is
+    rerun and produces slightly different float coordinates -- that's
+    exactly the bug reconcile_progress() below exists to repair on
+    every launch, so a drifted key no longer means "your decision is
+    gone", just "it gets re-matched at startup"."""
     box_str = ",".join(f"{v:.1f}" for v in item["_orig_box"])
     return f"{item['image']}|{item['cls']}|{box_str}"
 
@@ -302,6 +685,154 @@ def load_original_labels(label_path: Path, img_w: int, img_h: int) -> list[dict]
     return out
 
 
+# ------------------------------------------------------------------
+# V11: startup safety net -- automatic backups + self-healing key
+# reconciliation. These run in main(), before the Tk window opens, on
+# EVERY launch (not a one-off script) so the tool can't drift back into
+# the "looks empty on reload" bug after enough reruns of
+# generate_pseudo_labels.py.
+# ------------------------------------------------------------------
+
+def backup_progress_files(datasets_dir: Path, progress_path: Path,
+                           completed_path: Path):
+    """Copies review_progress.json and review_completed.json into
+    datasets/review_backups/<timestamp>/ before anything this run
+    touches them. This is the actual safety net: even if key
+    reconciliation below (or anything else) ever gets a match wrong,
+    the exact on-disk state from the moment this session started is
+    sitting right there to restore from. Returns the backup dir, or
+    None if there was nothing to back up yet (first-ever run)."""
+    if not progress_path.exists() and not completed_path.exists():
+        return None
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_dir = datasets_dir / BACKUP_DIRNAME / ts
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    for p in (progress_path, completed_path):
+        if p.exists():
+            shutil.copy2(p, backup_dir / p.name)
+    return backup_dir
+
+
+def reconcile_progress(by_image_full: dict, progress: dict,
+                        tol_frac: float = KEY_RECONCILE_TOL_FRAC):
+    """Runs on every startup. Some decisions in `progress` may be keyed
+    against box coordinates from a PREVIOUS run of
+    generate_pseudo_labels.py that no longer match item_key() computed
+    from the CURRENTLY loaded queue (regenerating the queue can shift
+    float box coordinates slightly, changing the rounded key -- see the
+    V11 module note for the full story). Rather than silently treating
+    those as "pending" from then on, this looks up every saved
+    box-decision entry: exact key match first, then same-image/
+    same-class nearest-box-center fallback within `tol_frac` of the
+    box's own diagonal. Returns (repaired_progress, stats, unresolved).
+
+    Manual-box and class-override entries are keyed by image path only
+    and are always immune to this drift -- copied over untouched.
+    Nothing is ever deleted here: an entry that can't be matched is
+    kept under its OLD key (so it behaves as it did before this
+    feature existed) instead of being dropped.
+
+    IMPORTANT: the fuzzy fallback matches on each entry's "orig_box"
+    (the box's stable DETECTION-time position, saved alongside -- but
+    separate from -- its current, possibly hand-edited "box"), against
+    the CURRENT queue's "_orig_box" for each candidate. Both sides of
+    that comparison are always detector output, so a rerun of
+    generate_pseudo_labels.py should only ever shift them by float
+    noise -- which is exactly what `tol_frac` is sized for. Matching on
+    the edited "box" instead (as an earlier version of this function
+    did) breaks precisely for boxes you deliberately repositioned or
+    resized to correct them: that edit can legitimately move a box far
+    from where it was originally detected, so comparing it to a fresh
+    detection's position looks like "no match" even though it's the
+    same box -- silently orphaning exactly the edits you did the most
+    work on. Entries saved before this fix has no "orig_box" field; for
+    those we fall back to "box" (the old behavior) since there's
+    nothing better to match on."""
+    box_entries = {k: v for k, v in progress.items() if not k.startswith("__")}
+    meta_entries = {k: v for k, v in progress.items() if k.startswith("__")}
+
+    repaired = dict(meta_entries)
+    exact, fuzzy = 0, 0
+    unresolved = []
+
+    for old_key, entry in box_entries.items():
+        image = entry.get("image")
+        cls = entry.get("cls")
+        # Prefer the stable detection-identity box; only legacy entries
+        # (saved before "orig_box" existed) fall back to the edited box.
+        ref_box = entry.get("orig_box") or entry.get("box")
+        items = by_image_full.get(image, [])
+
+        if not items:
+            unresolved.append((old_key, "image no longer in current queue"))
+            continue
+
+        hit = None
+        for it in items:
+            if item_key(it) == old_key:
+                hit = it
+                break
+        if hit is not None:
+            repaired[item_key(hit)] = entry
+            exact += 1
+            continue
+
+        if not ref_box or len(ref_box) < 4:
+            unresolved.append((old_key, "no box coordinates to fuzzy-match with"))
+            continue
+        candidates = [it for it in items if it["cls"] == cls]
+        if not candidates:
+            unresolved.append((old_key, f"no '{cls}' items for this image anymore"))
+            continue
+
+        cx, cy = (ref_box[0] + ref_box[2]) / 2, (ref_box[1] + ref_box[3]) / 2
+        diag = ((ref_box[2] - ref_box[0]) ** 2 + (ref_box[3] - ref_box[1]) ** 2) ** 0.5 or 1.0
+        tol = max(diag * tol_frac, 3.0)
+        best, best_d = None, None
+        for it in candidates:
+            bb = it["_orig_box"]
+            bcx, bcy = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+            d = ((bcx - cx) ** 2 + (bcy - cy) ** 2) ** 0.5
+            if d <= tol and (best_d is None or d < best_d):
+                best, best_d = it, d
+
+        if best is not None:
+            repaired[item_key(best)] = entry
+            fuzzy += 1
+        else:
+            legacy_note = "" if entry.get("orig_box") else " (legacy entry, no orig_box saved)"
+            unresolved.append((old_key, f"nearest '{cls}' box was outside tolerance{legacy_note}"))
+
+    for old_key, _ in unresolved:
+        repaired[old_key] = box_entries[old_key]
+
+    stats = {"exact": exact, "fuzzy": fuzzy, "unresolved": len(unresolved)}
+    return repaired, stats, unresolved
+
+
+def compute_completed_set(by_image_full: dict, progress: dict) -> set:
+    """Self-healing recomputation of the completed-images set, done
+    from the (already-reconciled) progress dict + the FULL (unfiltered
+    by --source/--cls) queue, instead of trusting whatever
+    review_completed.json happened to say on disk. An image counts as
+    done when every one of its queue items is non-pending AND (V11)
+    every manual box on it is non-pending. Manual boxes saved before
+    V11 have no "decision" field -- treated as "accepted" here, since
+    they were already being included in output unconditionally at the
+    time they were drawn, so this preserves previously-completed status
+    instead of retroactively un-completing old sessions."""
+    completed = set()
+    for image, items in by_image_full.items():
+        queue_done = all(
+            progress.get(item_key(it), {}).get("decision", "pending") != "pending"
+            for it in items)
+        manual = progress.get(f"__manual__{image}", [])
+        manual_done = all(mb.get("decision", "accepted") != "pending" for mb in manual)
+        if queue_done and manual_done:
+            completed.add(image)
+    return completed
+
+
 class ReviewApp:
     """Owns the Tkinter window and all mutable state for the image
     currently on screen. One instance runs the whole review session;
@@ -309,16 +840,39 @@ class ReviewApp:
 
     def __init__(self, root, image_keys, by_image, progress, reviewed_root,
                  progress_path, completed_path, completed_set,
-                 show_original_default: bool, qa_mode: bool):
+                 show_original_default: bool, qa_mode: bool,
+                 sync_enabled_default: bool = True,
+                 sync_window_default: int = SYNC_DEFAULT_WINDOW,
+                 all_image_keys_filtered=None,
+                 by_image_full=None):
         self.root = root
         self.image_keys = image_keys
         self.by_image = by_image
+        # (V13 fix A) The FULL, unfiltered-by---source/--cls image ->
+        # queue-items map. Completion checks MUST use this, not the
+        # (possibly filtered) self.by_image above -- otherwise a
+        # session run with --cls person can mark an image "complete"
+        # while it still has pending "car" boxes just because those
+        # boxes aren't part of this session's filter. Falls back to
+        # self.by_image if the caller doesn't pass one (keeps this
+        # class usable standalone/in tests without behavior change
+        # when there is no filtering to begin with).
+        self.by_image_full = by_image_full if by_image_full is not None else by_image
         self.progress = progress
         self.reviewed_root = reviewed_root
         self.progress_path = progress_path
         self.completed_path = completed_path
         self.completed_set = completed_set
         self.qa_mode = qa_mode
+
+        # (V12) The full set of images matching --source/--cls, BEFORE
+        # any completed/pending split -- kept around so "Switch to QA /
+        # Completed" can recompute pending vs. completed live from the
+        # CURRENT completed_set at any point in the session, instead of
+        # only being reachable by relaunching with --qa.
+        self.all_image_keys_filtered = (all_image_keys_filtered
+                                         if all_image_keys_filtered is not None
+                                         else list(image_keys))
 
         self.idx = 0
         self.dirty = False
@@ -331,10 +885,11 @@ class ReviewApp:
         self.pil_img_full = None
         self.tk_img = None
         self.item_map = {}        # canvas item id -> (kind, key)
+        self.handle_map = {}      # canvas item id -> (kind, key, handle_name)
         self.drag = None
         self.selected_key = None
         self._rubber_id = None
-        self.reposition_armed = None   # (kind, key) currently allowed one drag
+        self.reposition_armed = None   # (kind, key) currently allowed one drag/resize
 
         self.image_key = None
         self.source_name = None
@@ -363,6 +918,48 @@ class ReviewApp:
 
         self.model_count_labels = {}
 
+        # --- Cross-frame sync (V10 / V11) state ---
+        self.sync_enabled = tk.BooleanVar(value=sync_enabled_default)
+        self.seq_neighbors_window = tk.IntVar(value=sync_window_default)
+        self.sync_debug = tk.BooleanVar(value=False)
+        self.sync_status_var = tk.StringVar(value="")
+        self._last_sync_batch = []     # [{"kind":..., "image_key":..., ...}, ...]
+        self._img_dims_cache = {}
+        self.synced_from_map = {}      # key -> source image_key, for the CURRENT image
+
+        # Precompute (sequence_key -> sorted [(frame_num, image_key), ...])
+        # and image_key -> (sequence_key, frame_num), once, from every
+        # image in this session's filtered by_image (so sync never
+        # reaches into images outside --source/--cls scope).
+        self.image_seq_key = {}
+        self.image_frame_num = {}
+        seq_map: dict = {}
+        for k in self.by_image.keys():
+            sf = parse_seq_frame(k)
+            if sf is None:
+                continue
+            seq_id, frame_num = sf
+            seq_key = f"{Path(k).parent}::{seq_id}"
+            self.image_seq_key[k] = seq_key
+            self.image_frame_num[k] = frame_num
+            seq_map.setdefault(seq_key, []).append((frame_num, k))
+        self.sequence_frames = {sk: sorted(v) for sk, v in seq_map.items()}
+
+        n_parsed = len(self.image_seq_key)
+        n_total = len(self.by_image)
+        print(f"[sync] parsed sequence/frame for {n_parsed}/{n_total} images "
+              f"across {len(self.sequence_frames)} sequence(s).")
+        if n_parsed == 0 and n_total > 0:
+            sample = next(iter(self.by_image.keys()))
+            print(f"[sync] WARNING: could not parse a sequence/frame from ANY "
+                  f"image path -- sync will find zero neighbors for everything. "
+                  f"Example path: {sample!r}. Expected either a filename like "
+                  f"'..._<SEQ>_img<FRAME>_...' or a folder-per-sequence layout "
+                  f"like '.../<SEQ>/img<FRAME>.ext'. If your paths look "
+                  f"different, tell Claude the actual 'image' path format from "
+                  f"pseudo_labels_review_queue.json so parse_seq_frame() can be "
+                  f"adjusted.")
+
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._load_image(0)
@@ -385,6 +982,8 @@ class ReviewApp:
         edit_menu.add_separator()
         edit_menu.add_command(label="Accept All Pending", command=self.bulk_accept_pending)
         edit_menu.add_command(label="Reject All Pending", command=self.bulk_reject_pending)
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Undo Last Sync", command=self.undo_last_sync)
         menubar.add_cascade(label="Edit", menu=edit_menu)
 
         view_menu = tk.Menu(menubar, tearoff=0)
@@ -392,17 +991,25 @@ class ReviewApp:
                                    variable=self.show_original, command=self.redraw)
         view_menu.add_checkbutton(label="Show All Queue Boxes",
                                    variable=self.show_all_queue, command=self.redraw)
-        view_menu.add_checkbutton(label="Show Deleted (recoverable)",
+        view_menu.add_checkbutton(label="Show Deleted/Rejected (recoverable)",
                                    variable=self.show_deleted, command=self.redraw)
         view_menu.add_separator()
         for m in MODEL_KEYS:
-            view_menu.add_checkbutton(label=f"Show {m} detections",
+            view_menu.add_checkbutton(label=f"Show {MODEL_SHORT[m]} detections",
                                        variable=self.model_vars[m], command=self.redraw)
         view_menu.add_separator()
         view_menu.add_checkbutton(label="Fast Mode (click=accept, right-click=reject)",
                                    variable=self.fast_mode)
         view_menu.add_checkbutton(label="Auto-advance when image is fully decided",
                                    variable=self.auto_advance)
+        view_menu.add_separator()
+        view_menu.add_checkbutton(label="Sync nearby frames (cross-frame propagation)",
+                                   variable=self.sync_enabled)
+        view_menu.add_checkbutton(label="Verbose sync log (console)",
+                                   variable=self.sync_debug)
+        view_menu.add_separator()
+        view_menu.add_command(label="Switch to QA / Completed view",
+                               command=self.toggle_qa_mode)
         view_menu.add_separator()
         view_menu.add_command(label="Zoom In\t+", command=lambda: self._zoom_centered(ZOOM_STEP))
         view_menu.add_command(label="Zoom Out\t-", command=lambda: self._zoom_centered(1 / ZOOM_STEP))
@@ -415,6 +1022,33 @@ class ReviewApp:
 
         self.root.config(menu=menubar)
 
+        # (V12) Bottom-of-window chrome (status bar + Prev/Next/Save nav)
+        # is built and packed to the BOTTOM *before* the scrollable image
+        # canvas is packed. In Tk's pack geometry manager, space is
+        # claimed in the order pack() is called, not by which "side" a
+        # widget uses -- so packing the canvas (which expands to fill
+        # everything left over) before the nav bar used to let the
+        # canvas swallow the space the nav bar needed, pushing it off
+        # the bottom of the window with no way to get it back short of
+        # a bigger monitor. Reserving the nav/status space first fixes
+        # that permanently; the canvas (which already has zoom + pan +
+        # scrollbars for exactly this situation) just gets whatever
+        # room remains.
+        self.status_var = tk.StringVar()
+        ttk.Label(self.root, textvariable=self.status_var, anchor="w").pack(
+            side=tk.BOTTOM, fill=tk.X, padx=6, pady=(0, 2))
+
+        nav = ttk.Frame(self.root)
+        nav.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=4)
+        ttk.Button(nav, text="\u25c0 Previous", command=self.go_prev).pack(side=tk.LEFT)
+        ttk.Button(nav, text="Next \u25b6", command=self.go_next).pack(side=tk.LEFT, padx=4)
+        ttk.Button(nav, text="Save Now", command=self.save_current).pack(side=tk.LEFT, padx=12)
+        self.qa_toggle_btn = ttk.Button(nav, text="Switch to QA / Completed",
+                                         command=self.toggle_qa_mode)
+        self.qa_toggle_btn.pack(side=tk.LEFT, padx=12)
+        self.progress_var = tk.StringVar()
+        ttk.Label(nav, textvariable=self.progress_var).pack(side=tk.RIGHT)
+
         toolbar = ttk.Frame(self.root)
         toolbar.pack(side=tk.TOP, fill=tk.X, padx=6, pady=4)
         ttk.Label(toolbar, text="Show:").pack(side=tk.LEFT, padx=(0, 4))
@@ -422,7 +1056,7 @@ class ReviewApp:
                          variable=self.show_original, command=self.redraw).pack(side=tk.LEFT, padx=4)
         ttk.Checkbutton(toolbar, text="All queue boxes", variable=self.show_all_queue,
                          command=self.redraw).pack(side=tk.LEFT, padx=4)
-        ttk.Checkbutton(toolbar, text="Deleted", variable=self.show_deleted,
+        ttk.Checkbutton(toolbar, text="Deleted/Rejected", variable=self.show_deleted,
                          command=self.redraw).pack(side=tk.LEFT, padx=4)
         ttk.Separator(toolbar, orient="vertical").pack(side=tk.LEFT, fill="y", padx=6)
         ttk.Label(toolbar, text="Models:").pack(side=tk.LEFT, padx=(0, 4))
@@ -455,6 +1089,25 @@ class ReviewApp:
         ttk.Button(toolbar2, text="\u21b6 Undo", command=self.undo).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar2, text="\u21b7 Redo", command=self.redo).pack(side=tk.LEFT, padx=2)
 
+        # Cross-frame sync controls (V10/V11): on/off + how many frames
+        # out in each direction to look for a matching pending box (or
+        # to copy an accepted manual box into), plus a dedicated undo
+        # for just the auto-applied batch.
+        toolbar3 = ttk.Frame(self.root)
+        toolbar3.pack(side=tk.TOP, fill=tk.X, padx=6)
+        ttk.Checkbutton(toolbar3, text="Sync nearby frames",
+                         variable=self.sync_enabled).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(toolbar3, text="\u00b1").pack(side=tk.LEFT)
+        ttk.Spinbox(toolbar3, from_=0, to=SYNC_MAX_WINDOW, width=3,
+                    textvariable=self.seq_neighbors_window).pack(side=tk.LEFT, padx=(2, 2))
+        ttk.Label(toolbar3, text="frames").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(toolbar3, text="Undo Last Sync",
+                   command=self.undo_last_sync).pack(side=tk.LEFT, padx=2)
+        ttk.Checkbutton(toolbar3, text="Verbose sync log (console)",
+                         variable=self.sync_debug).pack(side=tk.LEFT, padx=(8, 2))
+        ttk.Label(toolbar3, textvariable=self.sync_status_var,
+                  foreground="#1a6f1a").pack(side=tk.LEFT, padx=10)
+
         # Per-model detection-count readout for the CURRENT image, so a
         # model contributing zero boxes here is obvious rather than just
         # silently absent. Independent of the visibility checkboxes above.
@@ -484,6 +1137,10 @@ class ReviewApp:
         self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_mouse_up)
 
+        # Hover feedback: show the right resize/move/draw cursor before
+        # you've even clicked, so the handles are discoverable.
+        self.canvas.bind("<Motion>", self.on_mouse_move_hover)
+
         # Fast mode: right-click a queue box = instant reject.
         self.canvas.bind("<ButtonPress-3>", self.on_right_click)
 
@@ -496,22 +1153,22 @@ class ReviewApp:
         self.canvas.bind("<Button-4>", self.on_mousewheel)
         self.canvas.bind("<Button-5>", self.on_mousewheel)
 
-        self.status_var = tk.StringVar()
-        ttk.Label(self.root, textvariable=self.status_var, anchor="w").pack(
-            side=tk.BOTTOM, fill=tk.X, padx=6, pady=(0, 2))
-
-        nav = ttk.Frame(self.root)
-        nav.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=4)
-        ttk.Button(nav, text="\u25c0 Previous", command=self.go_prev).pack(side=tk.LEFT)
-        ttk.Button(nav, text="Next \u25b6", command=self.go_next).pack(side=tk.LEFT, padx=4)
-        ttk.Button(nav, text="Save Now", command=self.save_current).pack(side=tk.LEFT, padx=12)
-        self.progress_var = tk.StringVar()
-        ttk.Label(nav, textvariable=self.progress_var).pack(side=tk.RIGHT)
-
         self.root.bind("<Key>", self.on_key)
         self.root.bind("<Control-z>", lambda e: self.undo())
         self.root.bind("<Control-y>", lambda e: self.redo())
         self.root.bind("<Control-Z>", lambda e: self.redo())  # Ctrl+Shift+Z on many platforms
+
+        # Crash-safety: flush the current image to disk immediately the
+        # moment this window loses OS focus (Alt-Tab, another app,
+        # screen lock, sleep) -- don't wait out the autosave debounce.
+        # Covers the vast majority of "app got killed mid-edit" cases
+        # that the old fixed 1s debounce could theoretically lose.
+        self.root.bind("<FocusOut>", lambda e: self._flush_now_if_dirty())
+
+        # (V12) Reasonable minimum window size so the nav/status bars
+        # (now packed first) and a usable slice of canvas can never
+        # both be squeezed to nothing.
+        self.root.minsize(720, 480)
 
     def _select_all_models(self):
         for v in self.model_vars.values():
@@ -524,8 +1181,66 @@ class ReviewApp:
         self.redraw()
 
     # ------------------------------------------------------------------
+    # QA / completed toggle (V12)
+    # ------------------------------------------------------------------
+
+    def toggle_qa_mode(self):
+        """Swaps the current session between reviewing PENDING images
+        and browsing/correcting already-COMPLETED ones, live, without
+        restarting the app. Recomputed fresh from self.completed_set
+        every time it's called, so it always reflects whatever's
+        actually been decided so far this session -- not just what was
+        true at launch. Flushes the current image first so nothing is
+        lost on the switch."""
+        self._flush_now_if_dirty()
+        target_qa = not self.qa_mode
+        if target_qa:
+            keys = [k for k in self.all_image_keys_filtered if k in self.completed_set]
+            empty_msg = ("No images are fully reviewed yet for these filters -- "
+                         "nothing to open in QA/Completed view.")
+        else:
+            keys = [k for k in self.all_image_keys_filtered if k not in self.completed_set]
+            empty_msg = ("Everything matching these filters is fully reviewed. "
+                         "Staying in QA/Completed view so you can still browse "
+                         "and correct it.")
+        if not keys:
+            messagebox.showinfo("Nothing to show", empty_msg)
+            return
+        self.qa_mode = target_qa
+        self.image_keys = keys
+        self.qa_toggle_btn.config(
+            text="Back to Pending Review" if self.qa_mode else "Switch to QA / Completed")
+        self._load_image(0)
+
+    # ------------------------------------------------------------------
     # Image loading / navigation
     # ------------------------------------------------------------------
+
+    def _display_size_budget(self):
+        """(V12) Computes the max width/height the image canvas can use
+        without pushing the nav/status bars (or any toolbar row) off
+        the visible screen. Uses the real screen size, minus a
+        reserved chrome allowance, and re-measures the window's actual
+        non-canvas chrome once it's been drawn at least once (more
+        accurate than the static estimate for unusual font sizes/DPI)."""
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+
+        reserved_h = CHROME_RESERVED_H
+        try:
+            self.root.update_idletasks()
+            win_h = self.root.winfo_height()
+            canvas_h = self.canvas.winfo_height() if hasattr(self, "canvas") else 0
+            if win_h > 1 and canvas_h > 1:
+                measured_chrome = win_h - canvas_h
+                if measured_chrome > 0:
+                    reserved_h = max(reserved_h, measured_chrome)
+        except tk.TclError:
+            pass
+
+        max_w = min(DISPLAY_MAX_W, max(MIN_CANVAS_W, screen_w - CHROME_RESERVED_W))
+        max_h = min(DISPLAY_MAX_H, max(MIN_CANVAS_H, screen_h - reserved_h))
+        return max_w, max_h
 
     def _load_image(self, idx):
         while 0 <= idx < len(self.image_keys):
@@ -548,10 +1263,16 @@ class ReviewApp:
 
         h, w = img.shape[:2]
         self.img_w, self.img_h = w, h
+        self._img_dims_cache[image_key] = (w, h)
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         self.pil_img_full = Image.fromarray(rgb)
 
-        self.base_scale = min(DISPLAY_MAX_W / w, DISPLAY_MAX_H / h, 1.0)
+        # (V12) Fit the image within whatever room is actually left
+        # after the always-visible nav/status/toolbar chrome, instead
+        # of a fixed 1280x860 that could already be taller than the
+        # screen on its own.
+        max_w, max_h = self._display_size_budget()
+        self.base_scale = min(max_w / w, max_h / h, 1.0)
         self.zoom = 1.0
 
         base_w = max(1, int(w * self.base_scale))
@@ -559,6 +1280,7 @@ class ReviewApp:
         self.canvas.config(width=base_w, height=base_h)
 
         self.decisions = {}
+        self.synced_from_map = {}
         self.model_counts = {m: 0 for m in MODEL_KEYS}
         for it in self.queue_items:
             it["_orig_box"] = list(it.get("_orig_box", it["box"]))
@@ -567,6 +1289,8 @@ class ReviewApp:
             self.decisions[k] = saved.get("decision", "pending")
             if "box" in saved:
                 it["box"] = list(saved["box"])
+            if saved.get("synced_from"):
+                self.synced_from_map[k] = saved["synced_from"]
             votes = it.get("votes", {})
             for m in MODEL_KEYS:
                 if votes.get(m) is not None:
@@ -577,11 +1301,16 @@ class ReviewApp:
         # Manual boxes are identified by a stable "_id", not their position
         # in the list -- deleting/editing box #2 of 5 must not silently
         # shift what boxes #3-5 refer to for the rest of the session.
-        # Backfill ids for saves written before this existed.
+        # Backfill ids (and, V11, "decision") for saves written before
+        # those existed. Pre-V11 manual boxes were included in output
+        # unconditionally, so they backfill to "accepted" -- not
+        # "pending" -- to avoid retroactively un-completing old work.
         next_id = 0
         for mb in self.manual_boxes:
             if "_id" not in mb:
                 mb["_id"] = next_id
+            if "decision" not in mb:
+                mb["decision"] = "accepted"
             next_id = max(next_id, mb["_id"] + 1)
         self._next_manual_id = next_id
 
@@ -653,9 +1382,8 @@ class ReviewApp:
             self._zoom_centered(1 / ZOOM_STEP)
         elif event.keysym == "0":
             self.reset_zoom()
-        elif event.keysym == "Escape" and self.drag and self.drag.get("mode") == "draw":
-            self.canvas.delete(self._rubber_id)
-            self.drag = None
+        elif event.keysym == "Escape" and self.drag:
+            self._cancel_drag()
         elif event.keysym in "123456789" and self.selected_key is not None:
             # Quick class-assign: Nth class in CLASS_NAMES order, applied
             # to whichever box is currently selected (last one clicked).
@@ -670,6 +1398,21 @@ class ReviewApp:
                     self._find_manual(key)["cls"] = cls
                 self._mark_dirty()
                 self.redraw()
+
+    def _cancel_drag(self):
+        """Escape while dragging: abandon the in-progress draw, move, or
+        resize. For move/resize we already _push_undo()'d once the drag
+        crossed the move threshold, so the box's pre-drag geometry is
+        sitting right there on top of the undo stack -- just pop it back
+        via undo() rather than duplicating restore logic."""
+        mode = self.drag.get("mode") if self.drag else None
+        if mode == "draw":
+            self.canvas.delete(self._rubber_id)
+        elif mode in ("move", "resize") and self.drag.get("snapshotted"):
+            self.undo()  # restores pre-drag geometry, also clears redo of it? no -- fine either way
+            self.redo_stack.clear()  # a cancelled drag isn't something you'd want to "redo" back in
+        self.drag = None
+        self._update_status()
 
     # ------------------------------------------------------------------
     # Zoom / pan
@@ -789,6 +1532,429 @@ class ReviewApp:
         self.streak = 0
 
     # ------------------------------------------------------------------
+    # Cross-frame sync (V10 queue decisions / V11 manual boxes / V13 retraction)
+    # ------------------------------------------------------------------
+
+    def _get_image_dims_cached(self, image_key):
+        dims = self._img_dims_cache.get(image_key)
+        if dims is None:
+            dims = gpl.get_image_dims(image_key)
+            self._img_dims_cache[image_key] = dims
+        return dims
+
+    def _neighbor_image_keys(self, image_key):
+        seq_key = self.image_seq_key.get(image_key)
+        if seq_key is None:
+            return []
+        frame = self.image_frame_num[image_key]
+        window = max(0, min(SYNC_MAX_WINDOW, self.seq_neighbors_window.get()))
+        order = self.sequence_frames.get(seq_key, [])
+        return [k for (fnum, k) in order if k != image_key and abs(fnum - frame) <= window]
+
+    def _queue_item_by_key(self, key):
+        for it in self.queue_items:
+            if item_key(it) == key:
+                return it
+        return None
+
+    def _resolve_neighbor_class(self, image_key, it):
+        """(V13 fix D) A neighbor candidate's EFFECTIVE class, honoring
+        any class override already saved for it on that image -- not
+        just its raw queue-detected class. Without this, a neighbor box
+        you'd already relabelled via "Change Class" could be missed as
+        a sync target (or matched under the wrong class)."""
+        overrides = self.progress.get(f"__override__{image_key}", {})
+        return overrides.get(item_key(it), it["cls"])
+
+    def _find_matching_queue_item(self, image_key, cls, box, debug_log=None):
+        """Same-class queue box in `image_key` whose center is within
+        SYNC_POS_TOLERANCE_FRAC of the image diagonal from `box`'s
+        center. Uses each candidate's CURRENT (possibly already-synced
+        or hand-repositioned) box from progress.json, not its original
+        detector box, and its CURRENT effective class (honoring any
+        class override -- V13 fix D). Returns the nearest match, or
+        None. If `debug_log` (a list) is passed, appends a one-line
+        explanation of what was found/rejected and why."""
+        items = self.by_image_full.get(image_key, [])
+        if not items:
+            if debug_log is not None:
+                debug_log.append(f"    {Path(image_key).name}: no queue items at all")
+            return None
+        try:
+            img_w, img_h = self._get_image_dims_cached(image_key)
+        except Exception as e:
+            if debug_log is not None:
+                debug_log.append(f"    {Path(image_key).name}: couldn't read image dims ({e})")
+            return None
+        diag = (img_w ** 2 + img_h ** 2) ** 0.5
+        tol = diag * SYNC_POS_TOLERANCE_FRAC
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        best, best_d = None, None
+        same_class_count = 0
+        nearest_wrong_dist = None
+        for it in items:
+            eff_cls = self._resolve_neighbor_class(image_key, it)
+            if eff_cls != cls:
+                continue
+            same_class_count += 1
+            k = item_key(it)
+            saved = self.progress.get(k, {})
+            bb = saved.get("box", it["box"])
+            bcx, bcy = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+            d = ((bcx - cx) ** 2 + (bcy - cy) ** 2) ** 0.5
+            if d <= tol and (best_d is None or d < best_d):
+                best_d, best = d, it
+            elif nearest_wrong_dist is None or d < nearest_wrong_dist:
+                nearest_wrong_dist = d
+        if debug_log is not None:
+            if best is not None:
+                debug_log.append(
+                    f"    {Path(image_key).name}: MATCH '{cls}' at dist={best_d:.1f}px (tol={tol:.1f}px)")
+            elif same_class_count == 0:
+                debug_log.append(
+                    f"    {Path(image_key).name}: no '{cls}' boxes in queue here at all")
+            else:
+                debug_log.append(
+                    f"    {Path(image_key).name}: {same_class_count} '{cls}' box(es) here, "
+                    f"nearest is {nearest_wrong_dist:.1f}px away (tol={tol:.1f}px) -- too far, no match")
+        return best
+
+    def _position_already_covered(self, image_key, cls, box) -> bool:
+        """(V11) True if a queue box OR manual box of the same
+        EFFECTIVE class (honoring class overrides -- V13 fix D) already
+        sits within the sync position tolerance of `box` in
+        `image_key`. Used to stop manual-box sync from stacking a
+        duplicate on top of something already there -- a queue box you
+        already accepted, or a manual box drawn independently in that
+        frame."""
+        try:
+            img_w, img_h = self._get_image_dims_cached(image_key)
+        except Exception:
+            return False
+        diag = (img_w ** 2 + img_h ** 2) ** 0.5
+        tol = diag * SYNC_POS_TOLERANCE_FRAC
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+
+        for it in self.by_image_full.get(image_key, []):
+            eff_cls = self._resolve_neighbor_class(image_key, it)
+            if eff_cls != cls:
+                continue
+            saved = self.progress.get(item_key(it), {})
+            bb = saved.get("box", it["box"])
+            bcx, bcy = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+            if ((bcx - cx) ** 2 + (bcy - cy) ** 2) ** 0.5 <= tol:
+                return True
+
+        for mb in self.progress.get(f"__manual__{image_key}", []):
+            if mb["cls"] != cls:
+                continue
+            bb = mb["box"]
+            bcx, bcy = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+            if ((bcx - cx) ** 2 + (bcy - cy) ** 2) ** 0.5 <= tol:
+                return True
+        return False
+
+    def _sync_after_decision_change(self, source_key, prev_state, new_state):
+        """(V13 fix B) Called after a single queue-box decision change
+        on the CURRENT image (Accept/Reject/Delete/Reset). Two halves:
+
+          1. RETRACT: if the box was previously in a state that had
+             been synced forward (accept/reject/deleted), undo exactly
+             those synced copies -- but only the ones still sitting in
+             the state they were synced to (never a copy the user has
+             since manually re-decided by hand).
+          2. FORWARD: if the box's new state is accept/reject/deleted,
+             sync it forward the same way V10 always did.
+
+        This is what makes "I changed my mind on this box" propagate
+        the same way the original decision did, instead of leaving
+        stale synced copies in neighbor frames forever."""
+        if not self.sync_enabled.get():
+            return
+        it = self._queue_item_by_key(source_key)
+        if it is None:
+            return
+
+        retracted = set()
+        if prev_state in ("accept", "reject", "deleted"):
+            retracted = self._retract_sync_children(source_key, prev_state)
+
+        forward_touched = set()
+        if new_state in ("accept", "reject", "deleted"):
+            cls = self.class_overrides.get(source_key, it["cls"])
+            box = it["box"]
+            forward_touched = self._apply_sync_batch([(source_key, cls, box, new_state)])
+
+        extra = retracted - forward_touched
+        if extra:
+            for nk in extra:
+                self._write_reviewed_labels_for_image(nk)
+                self._recompute_completed_for_image(nk)
+            save_json(self.progress_path, self.progress)
+            save_completed(self.completed_path, self.completed_set)
+            if not forward_touched:
+                self.sync_status_var.set(f"Retracted sync on {len(extra)} frame(s)")
+
+        # (V13 fix E) A decision change that had any sync side-effect
+        # touches OTHER images' files immediately; make sure the
+        # SOURCE image's own new decision is committed to disk right
+        # away too, instead of leaving it in the autosave debounce --
+        # otherwise a crash in that window could persist the synced
+        # effect without the decision that caused it.
+        if retracted or forward_touched:
+            self._flush_now_if_dirty()
+
+    def _retract_sync_children(self, source_key, prev_state):
+        """(V13 fix B) Reverts every neighbor queue box this source item
+        previously auto-synced (while it was in `prev_state`) back to
+        pending. Only retracts a neighbor if it (a) was synced FROM
+        this exact source item and (b) still holds the state it was
+        synced to -- if the user has since manually re-decided that
+        specific neighbor box, it's left alone. Returns the set of
+        touched neighbor image_keys (caller is responsible for writing
+        their reviewed-labels output and recomputing their completed
+        status -- this only mutates self.progress in memory)."""
+        entry = self.progress.get(source_key)
+        if not entry:
+            return set()
+        children = entry.get("synced_children", [])
+        if not children:
+            return set()
+        touched = set()
+        for mk in children:
+            child = self.progress.get(mk)
+            if (child and child.get("synced_from_key") == source_key
+                    and child.get("decision") == prev_state):
+                child["decision"] = "pending"
+                child.pop("synced_from", None)
+                child.pop("synced_from_key", None)
+                if child.get("image"):
+                    touched.add(child["image"])
+        # Cleared unconditionally: any child NOT retracted above has
+        # diverged (manually re-decided since it was synced), so we
+        # stop tracking it as "ours" rather than risk clobbering a
+        # manual edit on a future retraction.
+        entry["synced_children"] = []
+        return touched
+
+    def _apply_sync_batch(self, sources):
+        """sources: list of (source_key, cls, box, state) tuples
+        describing decisions just made on QUEUE boxes on the image
+        currently on screen. For each, looks at nearby frames in the
+        same sequence and, for each neighbor within the configured
+        frame window, finds a same-EFFECTIVE-class queue box close to
+        the same position that is STILL PENDING there, and applies the
+        same decision. Never touches a neighbor box that already has a
+        decision (yours or a previous sync's), and never reopens an
+        image already in the completed list. Geometry is never
+        touched, only the decision. Records which neighbor entries
+        each source created (source's "synced_children") so a later
+        change to that SAME source can cleanly retract them (V13 fix
+        B). Returns the set of touched neighbor image_keys."""
+        touched_images = set()
+        if not self.sync_enabled.get():
+            return touched_images
+        verbose = self.sync_debug.get()
+        applied = []
+        skipped_completed = 0
+        skipped_decided = 0
+
+        seq_key = self.image_seq_key.get(self.image_key)
+        if seq_key is None:
+            self.sync_status_var.set(
+                "Sync: couldn't parse a sequence/frame from this image's path -- see console")
+            if verbose:
+                print(f"[sync] '{self.image_key}': not parseable, no neighbors possible.")
+            return touched_images
+
+        neighbors = self._neighbor_image_keys(self.image_key)
+        if not neighbors:
+            self.sync_status_var.set(
+                f"Sync: 0 neighbor frame(s) found for this image (seq={seq_key!r})")
+            if verbose:
+                print(f"[sync] '{self.image_key}' seq={seq_key!r} frame="
+                      f"{self.image_frame_num.get(self.image_key)}: 0 neighbors within "
+                      f"\u00b1{self.seq_neighbors_window.get()} frames.")
+            return touched_images
+
+        if verbose:
+            print(f"[sync] '{self.image_key}' seq={seq_key!r} frame="
+                  f"{self.image_frame_num.get(self.image_key)}: "
+                  f"{len(neighbors)} neighbor(s) -> {[Path(n).name for n in neighbors]}")
+
+        for source_key, cls, box, state in sources:
+            debug_log = [] if verbose else None
+            source_entry = self.progress.setdefault(source_key, {})
+            children = list(source_entry.get("synced_children", []))
+            for nk in neighbors:
+                if nk in self.completed_set:
+                    skipped_completed += 1
+                    if debug_log is not None:
+                        debug_log.append(f"    {Path(nk).name}: skipped (already in completed list)")
+                    continue
+                match = self._find_matching_queue_item(nk, cls, box, debug_log=debug_log)
+                if match is None:
+                    continue
+                mk = item_key(match)
+                cur = self.progress.get(mk, {}).get("decision", "pending")
+                if cur != "pending":
+                    skipped_decided += 1
+                    if debug_log is not None:
+                        debug_log.append(f"    {Path(nk).name}: match found but already decided ({cur}) -- skipped")
+                    continue
+                self.progress[mk] = {
+                    "decision": state,
+                    "image": nk,
+                    "cls": match["cls"],
+                    "box": self.progress.get(mk, {}).get("box", match["box"]),
+                    "synced_from": self.image_key,
+                    "synced_from_key": source_key,
+                }
+                applied.append({"kind": "queue", "image_key": nk, "match_key": mk,
+                                 "source_key": source_key})
+                touched_images.add(nk)
+                if mk not in children:
+                    children.append(mk)
+            source_entry["synced_children"] = children
+            if debug_log:
+                print(f"[sync] decision={state!r} cls={cls!r} box={[round(v) for v in box]}:")
+                for line in debug_log:
+                    print(line)
+
+        if not applied:
+            reason = []
+            if skipped_completed:
+                reason.append(f"{skipped_completed} already-completed neighbor(s) skipped")
+            if skipped_decided:
+                reason.append(f"{skipped_decided} already-decided match(es) skipped")
+            suffix = f" ({', '.join(reason)})" if reason else " (no matching class/position found)"
+            self.sync_status_var.set(f"Sync: 0 applied{suffix} -- see console for details" if verbose
+                                      else f"Sync: 0 applied{suffix} -- enable 'Verbose sync log' for detail")
+            return touched_images
+
+        for nk in touched_images:
+            self._write_reviewed_labels_for_image(nk)
+            self._recompute_completed_for_image(nk)
+        save_json(self.progress_path, self.progress)
+        save_completed(self.completed_path, self.completed_set)
+        self._last_sync_batch = applied
+        self.sync_status_var.set(
+            f"Synced {len(applied)} box(es) across {len(touched_images)} nearby frame(s)")
+        return touched_images
+
+    def _sync_propagate_manual_add(self, mb):
+        """(V11) Mirrors the queue-decision sync, but for a manual box
+        that was just Accepted (V12: this now happens automatically the
+        moment the box is drawn). There's no detector candidate to
+        match against in a neighbor frame -- so instead of matching,
+        this DIRECTLY CREATES a copy of the box (same class, same pixel
+        position) in each in-window neighbor frame, unless that
+        position is already covered by something (see
+        _position_already_covered) or the neighbor is already
+        completed. Every copy created is tagged "synced_from" and
+        recorded onto `mb["_sync_children"]` so a later Reject/Reset/
+        Delete of THIS box can cleanly remove exactly the copies it
+        made -- never a box drawn independently elsewhere."""
+        if not self.sync_enabled.get():
+            return
+        neighbors = self._neighbor_image_keys(self.image_key)
+        if not neighbors:
+            return
+
+        applied = []
+        for nk in neighbors:
+            if nk in self.completed_set:
+                continue
+            if self._position_already_covered(nk, mb["cls"], mb["box"]):
+                continue
+            existing = list(self.progress.get(f"__manual__{nk}", []))
+            next_id = max((m.get("_id", 0) for m in existing), default=-1) + 1
+            new_mb = {"cls": mb["cls"], "box": list(mb["box"]), "_id": next_id,
+                      "decision": "accepted", "synced_from": self.image_key}
+            existing.append(new_mb)
+            self.progress[f"__manual__{nk}"] = existing
+            mb.setdefault("_sync_children", []).append((nk, next_id))
+            applied.append({"kind": "manual_add", "image_key": nk, "manual_id": next_id})
+            self._write_reviewed_labels_for_image(nk)
+            self._recompute_completed_for_image(nk)
+
+        if applied:
+            save_json(self.progress_path, self.progress)
+            save_completed(self.completed_path, self.completed_set)
+            self._last_sync_batch = applied
+            self.sync_status_var.set(f"Synced manual box to {len(applied)} nearby frame(s)")
+            self._flush_now_if_dirty()  # V13 fix E: commit the source's own state too
+
+    def _sync_propagate_manual_remove(self, mb):
+        """(V11) Reverses _sync_propagate_manual_add: removes every
+        synced copy this specific box previously created (tracked in
+        its own "_sync_children"), wherever they ended up. Only ever
+        touches boxes that trace back to THIS box."""
+        children = mb.pop("_sync_children", [])
+        if not children:
+            return
+        touched = set()
+        for nk, manual_id in children:
+            existing = self.progress.get(f"__manual__{nk}", [])
+            new_list = [m for m in existing if m.get("_id") != manual_id]
+            if len(new_list) != len(existing):
+                self.progress[f"__manual__{nk}"] = new_list
+                touched.add(nk)
+        for nk in touched:
+            self._write_reviewed_labels_for_image(nk)
+            self._recompute_completed_for_image(nk)
+        if touched:
+            save_json(self.progress_path, self.progress)
+            save_completed(self.completed_path, self.completed_set)
+            self.sync_status_var.set(f"Removed synced manual box from {len(touched)} frame(s)")
+            self._flush_now_if_dirty()  # V13 fix E
+
+    def undo_last_sync(self):
+        """Reverts exactly the last auto-applied sync batch (a queue-
+        decision sync, a manual-box sync, or a mix from one bulk
+        action) back out, across every frame it touched -- not the
+        general per-image undo stack. Also cleans up the source item's
+        "synced_children" bookkeeping (V13) so it can't keep pointing
+        at a match_key that no longer reflects a sync this source is
+        responsible for."""
+        batch = self._last_sync_batch
+        if not batch:
+            messagebox.showinfo("Undo Last Sync", "No sync batch to undo.")
+            return
+        touched_images = set()
+        for entry in batch:
+            kind = entry.get("kind", "queue")
+            if kind == "queue":
+                mk = entry["match_key"]
+                if mk in self.progress:
+                    self.progress[mk]["decision"] = "pending"
+                    self.progress[mk].pop("synced_from", None)
+                    self.progress[mk].pop("synced_from_key", None)
+                src_key = entry.get("source_key")
+                if src_key and src_key in self.progress:
+                    children = self.progress[src_key].get("synced_children", [])
+                    if mk in children:
+                        children.remove(mk)
+                touched_images.add(entry["image_key"])
+            elif kind == "manual_add":
+                nk = entry["image_key"]
+                manual_id = entry["manual_id"]
+                existing = self.progress.get(f"__manual__{nk}", [])
+                self.progress[f"__manual__{nk}"] = [m for m in existing if m.get("_id") != manual_id]
+                touched_images.add(nk)
+        for nk in touched_images:
+            self._write_reviewed_labels_for_image(nk)
+            self._recompute_completed_for_image(nk)
+        save_json(self.progress_path, self.progress)
+        save_completed(self.completed_path, self.completed_set)
+        self._last_sync_batch = []
+        self.sync_status_var.set(f"Reverted sync on {len(touched_images)} frame(s)")
+        if self.image_key in touched_images:
+            self._load_image(self.idx)
+        else:
+            self._update_status()
+
+    # ------------------------------------------------------------------
     # Saving / autosave / completed-list bookkeeping
     # ------------------------------------------------------------------
 
@@ -799,7 +1965,10 @@ class ReviewApp:
             if self.decisions[k] == "accept":
                 cls = self.class_overrides.get(k, it["cls"])
                 out.append({"cls": cls, "box": it["box"]})
-        out.extend({"cls": mb["cls"], "box": mb["box"]} for mb in self.manual_boxes)
+        # V11: a manual box only reaches output once explicitly Accepted
+        # (V12: this happens automatically the moment it's drawn).
+        out.extend({"cls": mb["cls"], "box": mb["box"]} for mb in self.manual_boxes
+                   if mb.get("decision", "pending") == "accepted")
         return out
 
     def _write_reviewed_labels(self):
@@ -819,14 +1988,68 @@ class ReviewApp:
         reviewed_label_path.parent.mkdir(parents=True, exist_ok=True)
         reviewed_label_path.write_text("\n".join(lines) + "\n")
 
+    def _accepted_items_for_image(self, image_key):
+        """Same as accepted_items(), but computed from review_progress.json
+        for an arbitrary (not-currently-loaded) image -- used by cross-
+        frame sync to update a neighbor frame's output without loading
+        it into the UI."""
+        items = self.by_image_full.get(image_key, [])
+        overrides = self.progress.get(f"__override__{image_key}", {})
+        manual = self.progress.get(f"__manual__{image_key}", [])
+        out = []
+        for it in items:
+            k = item_key(it)
+            saved = self.progress.get(k, {})
+            if saved.get("decision") == "accept":
+                cls = overrides.get(k, it["cls"])
+                box = saved.get("box", it["box"])
+                out.append({"cls": cls, "box": box})
+        # Legacy (pre-V11) manual boxes have no "decision" -- default to
+        # "accepted" so old output doesn't silently disappear.
+        out.extend({"cls": mb["cls"], "box": mb["box"]} for mb in manual
+                   if mb.get("decision", "accepted") == "accepted")
+        return out
+
+    def _write_reviewed_labels_for_image(self, image_key):
+        """_write_reviewed_labels(), generalized to any image -- used
+        when a sync auto-applies a decision to a neighbor frame that
+        isn't the one currently on screen."""
+        accepted = self._accepted_items_for_image(image_key)
+        img_path = Path(image_key)
+        real_label_path = gpl.image_path_to_label_path(img_path)
+        items = self.by_image_full.get(image_key, [])
+        source_name = items[0]["source"] if items else self.source_name
+        reviewed_label_path = gpl.mirror_under_pseudo_root(
+            real_label_path, source_name, self.reviewed_root)
+
+        if not accepted:
+            if reviewed_label_path.exists():
+                reviewed_label_path.unlink()
+            return
+
+        w, h = self._get_image_dims_cached(image_key)
+        lines = [gpl.box_to_yolo_line(a["cls"], a["box"], w, h) for a in accepted]
+        reviewed_label_path.parent.mkdir(parents=True, exist_ok=True)
+        reviewed_label_path.write_text("\n".join(lines) + "\n")
+
     def _update_completed_list(self):
-        """An image counts as 'done' once every queue item on it has a
+        """An image counts as 'done' once every queue item on it --
+        across the FULL unfiltered queue, not just whatever this
+        session's --source/--cls filter shows (V13 fix A) -- has a
         real decision (nothing pending -- "deleted" counts as decided,
-        same as "accept"/"reject"). Moves it into (or out of, if
-        something got reset to pending) review_completed.json -- a
-        separate, explicit list a second reviewer can open with --qa,
-        instead of everything living undifferentiated in progress.json."""
-        fully_decided = all(v != "pending" for v in self.decisions.values())
+        same as "accept"/"reject") AND (V11) every manual box on it is
+        non-pending too. Moves the image into (or out of, if something
+        got reset to pending) review_completed.json -- a separate,
+        explicit list a second reviewer can open with --qa, or (V12)
+        with the in-app "Switch to QA / Completed" toggle, instead of
+        everything living undifferentiated in progress.json."""
+        full_items = self.by_image_full.get(self.image_key, [])
+        queue_done = all(
+            self.progress.get(item_key(it), {}).get("decision", "pending") != "pending"
+            for it in full_items)
+        manual_done = all(mb.get("decision", "pending") != "pending"
+                           for mb in self.manual_boxes)
+        fully_decided = queue_done and manual_done
         changed = False
         if fully_decided and self.image_key not in self.completed_set:
             self.completed_set.add(self.image_key)
@@ -838,6 +2061,23 @@ class ReviewApp:
             save_completed(self.completed_path, self.completed_set)
         return fully_decided
 
+    def _recompute_completed_for_image(self, image_key):
+        """_update_completed_list(), generalized to any image -- used
+        for neighbor frames touched by a sync. Uses the FULL unfiltered
+        queue (V13 fix A), same reasoning as _update_completed_list.
+        Does NOT write the completed-list file itself (caller batches
+        that after touching possibly several images)."""
+        items = self.by_image_full.get(image_key, [])
+        manual = self.progress.get(f"__manual__{image_key}", [])
+        fully_decided = (
+            all(self.progress.get(item_key(it), {}).get("decision", "pending") != "pending"
+                for it in items)
+            and all(mb.get("decision", "accepted") != "pending" for mb in manual))
+        if fully_decided and image_key not in self.completed_set:
+            self.completed_set.add(image_key)
+        elif not fully_decided and image_key in self.completed_set:
+            self.completed_set.discard(image_key)
+
     def _flush(self):
         """Writes everything for the current image to disk: per-item
         decisions + current box position into progress.json, the
@@ -845,12 +2085,29 @@ class ReviewApp:
         updates the completed-images list."""
         for it in self.queue_items:
             k = item_key(it)
-            self.progress[k] = {
+            existing = self.progress.get(k, {})
+            entry = {
                 "decision": self.decisions[k],
                 "image": self.image_key,
                 "cls": it["cls"],
                 "box": it["box"],
+                # Stable detection-identity box, saved SEPARATELY from the
+                # (possibly hand-edited) "box" above. reconcile_progress()
+                # matches on this, not on "box" -- see the note there for
+                # why matching on the edited box silently orphaned exactly
+                # the boxes you'd manually repositioned/resized.
+                "orig_box": list(it["_orig_box"]),
             }
+            if k in self.synced_from_map:
+                entry["synced_from"] = self.synced_from_map[k]
+            # (V13 fix B) Preserve this item's sync bookkeeping across a
+            # flush -- _flush() rebuilds the entry from scratch every
+            # time, so without this a routine autosave would silently
+            # wipe out "synced_children", breaking retraction the next
+            # time this box's decision changes.
+            if "synced_children" in existing:
+                entry["synced_children"] = existing["synced_children"]
+            self.progress[k] = entry
         self.progress[f"__manual__{self.image_key}"] = self.manual_boxes
         self.progress[f"__override__{self.image_key}"] = self.class_overrides
         self._write_reviewed_labels()
@@ -861,8 +2118,11 @@ class ReviewApp:
         """Call after any edit. Schedules an autosave a short moment
         from now -- debounced so a burst of clicks (accepting several
         boxes in a row) doesn't write the file after every single one,
-        while still guaranteeing nothing survives more than ~1s
-        unsaved if the app were to crash."""
+        while still guaranteeing nothing survives more than
+        AUTOSAVE_DEBOUNCE_MS unsaved if the app were to crash. Focus-
+        loss (Alt-Tab, sleep, etc.) also force-flushes immediately --
+        see the <FocusOut> binding in _build_ui -- so in practice the
+        debounce window is the only real exposure left."""
         self.dirty = True
         if self._autosave_after_id is not None:
             self.root.after_cancel(self._autosave_after_id)
@@ -875,8 +2135,10 @@ class ReviewApp:
         self._update_status()
 
     def _flush_now_if_dirty(self):
-        """Used when navigating away or closing -- don't wait out the
-        debounce timer, write immediately."""
+        """Used when navigating away, closing, losing window focus, or
+        (V13) right after a decision change that had a cross-frame sync
+        side-effect -- don't wait out the debounce timer, write
+        immediately."""
         if self._autosave_after_id is not None:
             self.root.after_cancel(self._autosave_after_id)
             self._autosave_after_id = None
@@ -892,10 +2154,21 @@ class ReviewApp:
         """Called after any decision changes. If auto-advance is on and
         the image just became fully decided, queue a move to the next
         image after a short delay (so the last change is visibly on
-        screen for a beat before it jumps)."""
+        screen for a beat before it jumps). Uses the FULL unfiltered
+        queue (V13 fix A) so auto-advance doesn't fire early just
+        because everything IN THE CURRENT FILTER happens to be
+        decided."""
         if not self.auto_advance.get():
             return
-        fully_decided = all(v != "pending" for v in self.decisions.values())
+        full_items = self.by_image_full.get(self.image_key, [])
+        queue_done = all(
+            self.progress.get(item_key(it), {}).get("decision", self.decisions.get(item_key(it), "pending")) != "pending"
+            if item_key(it) not in self.decisions
+            else self.decisions[item_key(it)] != "pending"
+            for it in full_items)
+        manual_done = all(mb.get("decision", "pending") != "pending"
+                           for mb in self.manual_boxes)
+        fully_decided = queue_done and manual_done
         if fully_decided and self._autoadvance_after_id is None:
             self._autoadvance_after_id = self.root.after(
                 AUTO_ADVANCE_DELAY_MS, self._do_auto_advance)
@@ -918,11 +2191,19 @@ class ReviewApp:
                 f"Accept all {len(pending_keys)} pending box(es) in this image?"):
             return
         self._push_undo()
+        sources = []
         for k in pending_keys:
             self.decisions[k] = "accept"
+            it = self._queue_item_by_key(k)
+            if it is not None:
+                cls = self.class_overrides.get(k, it["cls"])
+                sources.append((k, cls, it["box"], "accept"))
         self._mark_dirty()
         self.redraw()
         self._maybe_auto_advance()
+        touched = self._apply_sync_batch(sources)
+        if touched:
+            self._flush_now_if_dirty()  # V13 fix E
 
     def bulk_reject_pending(self):
         pending_keys = [k for k, v in self.decisions.items() if v == "pending"]
@@ -933,11 +2214,19 @@ class ReviewApp:
                 f"Reject all {len(pending_keys)} pending box(es) in this image?"):
             return
         self._push_undo()
+        sources = []
         for k in pending_keys:
             self.decisions[k] = "reject"
+            it = self._queue_item_by_key(k)
+            if it is not None:
+                cls = self.class_overrides.get(k, it["cls"])
+                sources.append((k, cls, it["box"], "reject"))
         self._mark_dirty()
         self.redraw()
         self._maybe_auto_advance()
+        touched = self._apply_sync_batch(sources)
+        if touched:
+            self._flush_now_if_dirty()  # V13 fix E
 
     # ------------------------------------------------------------------
     # Drawing
@@ -951,6 +2240,39 @@ class ReviewApp:
             return True
         votes = it.get("votes", {})
         return any(self.model_vars[m].get() and votes.get(m) is not None for m in MODEL_KEYS)
+
+    def _manual_box_visible(self, mb) -> bool:
+        """(V11) Rejected manual boxes hide by default, same as
+        "deleted" queue boxes -- both reuse the "Show Deleted/Rejected"
+        toggle so a rejected box is never permanently gone from view,
+        just tucked away."""
+        if mb.get("decision", "pending") == "rejected" and not self.show_deleted.get():
+            return False
+        return True
+
+    def _box_is_resizable(self, kind, key) -> bool:
+        """Manual boxes are always resizable. A queue box is resizable
+        only while explicitly armed for this one drag (same gate as
+        moving it -- see V7 note in the module docstring)."""
+        if kind == "manual":
+            return True
+        return self.reposition_armed == (kind, key)
+
+    def _draw_handles(self, box, kind, key):
+        """Draws the 8 resize handles for a selected, resizable box and
+        registers them in self.handle_map so on_mouse_down can hit-test
+        them. Only called for the currently-selected box, and only if
+        it's actually resizable right now (see _box_is_resizable)."""
+        x1, y1, x2, y2 = [v * self.scale for v in box]
+        xs = {-1: x1, 0: (x1 + x2) / 2, 1: x2}
+        ys = {-1: y1, 0: (y1 + y2) / 2, 1: y2}
+        half = HANDLE_SIZE / 2
+        for name, hx, hy in HANDLES:
+            cx, cy = xs[hx], ys[hy]
+            hid = self.canvas.create_rectangle(
+                cx - half, cy - half, cx + half, cy + half,
+                fill=COLOR_HANDLE, outline=COLOR_HANDLE_OUTLINE, width=1)
+            self.handle_map[hid] = (kind, key, name)
 
     def _draw_box(self, box, color, label, key=None, kind=None, dash=None):
         x1, y1, x2, y2 = [v * self.scale for v in box]
@@ -966,10 +2288,13 @@ class ReviewApp:
         if kind is not None:
             self.item_map[rect_id] = (kind, key)
             self.item_map[text_id] = (kind, key)
+            if selected and self._box_is_resizable(kind, key):
+                self._draw_handles(box, kind, key)
 
     def redraw(self):
         self.canvas.delete("all")
         self.item_map = {}
+        self.handle_map = {}
         self.canvas.create_image(0, 0, anchor="nw", image=self.tk_img, tags="bg")
 
         # Original real-dataset labels: reference-only. Note these are
@@ -990,13 +2315,27 @@ class ReviewApp:
             color = {"pending": COLOR_PENDING, "accept": COLOR_ACCEPT,
                      "reject": COLOR_REJECT, "deleted": COLOR_DELETED}[state]
             cls_name = self.class_overrides.get(k, it["cls"])
-            label = f"{cls_name} {gpl.votes_str(it)} [{state}]"
+            synced_tag = "  [synced]" if k in self.synced_from_map else ""
+            label = f"{cls_name} {gpl.votes_str(it)} [{state}]{synced_tag}"
             self._draw_box(it["box"], color, label, key=k, kind="queue",
                            dash=(2, 2) if state == "deleted" else None)
 
+        # V11: manual boxes now carry their own pending/accepted/rejected
+        # state, drawn with the same color language as queue boxes
+        # (orange=pending, cyan=accepted, red/hidden=rejected) so it's
+        # immediately visible which ones still need a decision. (V12:
+        # a freshly drawn box is auto-accepted, so in practice you'll
+        # mostly see cyan here unless you've since rejected/reset one.)
         for mb in self.manual_boxes:
-            self._draw_box(mb["box"], COLOR_MANUAL, f"{mb['cls']} [manual, draggable]",
-                           key=mb["_id"], kind="manual")
+            if not self._manual_box_visible(mb):
+                continue
+            state = mb.get("decision", "pending")
+            color = {"pending": COLOR_PENDING, "accepted": COLOR_MANUAL,
+                      "rejected": COLOR_REJECT}[state]
+            synced_tag = "  [synced]" if mb.get("synced_from") else ""
+            label = f"{mb['cls']} [manual, {state}]{synced_tag}"
+            self._draw_box(mb["box"], color, label, key=mb["_id"], kind="manual",
+                           dash=None if state == "accepted" else (2, 2))
 
         self._update_status()
 
@@ -1005,13 +2344,18 @@ class ReviewApp:
         n_accept = sum(1 for v in self.decisions.values() if v == "accept")
         n_reject = sum(1 for v in self.decisions.values() if v == "reject")
         n_deleted = sum(1 for v in self.decisions.values() if v == "deleted")
+        n_manual_pending = sum(1 for mb in self.manual_boxes
+                                if mb.get("decision", "pending") == "pending")
         unsaved = "  [saving\u2026]" if self.dirty else "  [saved]"
         streak_txt = f"  |  streak={self.streak}" if self.streak > 1 else ""
+        blocked_txt = ("  |  \u26a0 manual pending, can't complete"
+                        if n_manual_pending else "")
         self.status_var.set(
             f"{Path(self.image_key).name}  |  pending={n_pending} accept={n_accept} "
-            f"reject={n_reject} deleted={n_deleted} manual={len(self.manual_boxes)} "
+            f"reject={n_reject} deleted={n_deleted} "
+            f"manual={len(self.manual_boxes)}(pending={n_manual_pending}) "
             f"orig={len(self.original_boxes)}  |  zoom={int(self.zoom * 100)}%"
-            f"{streak_txt}{unsaved}")
+            f"{streak_txt}{blocked_txt}{unsaved}")
         done = len(self.completed_set)
         total = len(self.image_keys) if self.qa_mode else (len(self.image_keys) + done)
         self.progress_var.set(
@@ -1020,7 +2364,7 @@ class ReviewApp:
             + ("" if self.qa_mode else f"/{total}"))
 
     # ------------------------------------------------------------------
-    # Box get/set (shared by drag-move and the context menus)
+    # Box get/set (shared by drag-move/resize and the context menus)
     # ------------------------------------------------------------------
 
     def _find_manual(self, manual_id):
@@ -1048,6 +2392,7 @@ class ReviewApp:
             self._find_manual(key)["box"] = new_box
 
     def _set_decision(self, key, state):
+        prev_state = self.decisions.get(key, "pending")
         self._push_undo()
         self.decisions[key] = state
         if state in ("accept", "reject"):
@@ -1057,6 +2402,11 @@ class ReviewApp:
         self._mark_dirty()
         self.redraw()
         self._maybe_auto_advance()
+        # (V13 fix B) Handles BOTH forward-syncing the new state AND
+        # retracting whatever the box's PREVIOUS state had synced --
+        # covers Accept->Reject, Accept->Delete, ->Reset to Pending,
+        # etc., not just the original "pending->decided" case.
+        self._sync_after_decision_change(key, prev_state, state)
 
     def _override_class(self, key, cls):
         self._push_undo()
@@ -1070,9 +2420,32 @@ class ReviewApp:
         self._mark_dirty()
         self.redraw()
 
+    def _set_manual_decision(self, manual_id, state):
+        """(V11) Accept / Reject / Reset to Pending for a manual box --
+        a freshly drawn box is now auto-accepted (V12), so this is
+        mainly how you correct a box you drew by mistake. An image
+        can't complete while any manual box on it is still "pending" (see
+        _update_completed_list). Accepting also syncs the box (as a
+        fresh copy) into nearby frames; un-accepting (reject or reset
+        to pending) removes exactly the copies that specific accept
+        created."""
+        self._push_undo()
+        mb = self._find_manual(manual_id)
+        prev = mb.get("decision", "pending")
+        mb["decision"] = state
+        self._mark_dirty()
+        self.redraw()
+        self._maybe_auto_advance()
+        if state == "accepted" and prev != "accepted":
+            self._sync_propagate_manual_add(mb)
+        elif state != "accepted" and prev == "accepted":
+            self._sync_propagate_manual_remove(mb)
+
     def _delete_manual(self, manual_id):
         self._push_undo()
-        self.manual_boxes = [mb for mb in self.manual_boxes if mb["_id"] != manual_id]
+        mb = self._find_manual(manual_id)
+        self._sync_propagate_manual_remove(mb)   # cascade-remove synced copies first
+        self.manual_boxes = [m for m in self.manual_boxes if m["_id"] != manual_id]
         self._mark_dirty()
         self.redraw()
 
@@ -1080,15 +2453,28 @@ class ReviewApp:
         """Appends a new manually-drawn box. No cap on how many you can
         add -- call this as many times as you like (one per drag-draw on
         empty canvas). Each gets its own stable id so adding/deleting
-        others around it never disturbs it."""
+        others around it never disturbs it.
+
+        (V12) Auto-accepted immediately: it's included in output and
+        counted toward completing the image the instant you pick its
+        class, and (if sync is on) is propagated to nearby frames right
+        away -- no separate "open its menu and click Accept" step for
+        the common case of a box you meant to add. If you drew it by
+        mistake, open its menu and use Reject / Reset to Pending /
+        Delete to correct it."""
         self._push_undo()
-        self.manual_boxes.append({"cls": cls, "box": box, "_id": self._next_manual_id})
+        mb = {"cls": cls, "box": box, "_id": self._next_manual_id, "decision": "accepted"}
+        self.manual_boxes.append(mb)
         self._next_manual_id += 1
+        self.streak += 1
         self._mark_dirty()
         self.redraw()
+        self._maybe_auto_advance()
+        self._sync_propagate_manual_add(mb)
 
     def _arm_reposition(self, kind, key):
         self.reposition_armed = (kind, key)
+        self.selected_key = (kind, key)
         self.redraw()
 
     # ------------------------------------------------------------------
@@ -1120,7 +2506,7 @@ class ReviewApp:
                 class_menu.add_command(label=c, command=lambda c=c: self._override_class(key, c))
             menu.add_cascade(label="Change Class", menu=class_menu)
             menu.add_separator()
-            menu.add_command(label="Enable Reposition (then drag once)",
+            menu.add_command(label="Enable Reposition/Resize (then drag once)",
                               command=lambda: self._arm_reposition(kind, key))
             menu.add_separator()
             if state == "deleted":
@@ -1130,10 +2516,23 @@ class ReviewApp:
                 menu.add_command(label="Delete (hide from view)",
                                   command=lambda: self._set_decision(key, "deleted"))
         else:
+            # V11: manual boxes get the same Accept/Reject/Reset trio as
+            # queue boxes -- this is the safety gate the box has to pass
+            # through before it can reach output or let the image complete.
+            # (V12: Accept already happened automatically when drawn, so
+            # this menu is mainly for correcting a mistaken box.)
+            mb_state = self._find_manual(key).get("decision", "pending")
+            menu.add_command(label="Accept", command=lambda: self._set_manual_decision(key, "accepted"))
+            menu.add_command(label="Reject (= exclude from output)",
+                              command=lambda: self._set_manual_decision(key, "rejected"))
+            menu.add_command(label="Reset to Pending",
+                              command=lambda: self._set_manual_decision(key, "pending"))
+            menu.add_separator()
             class_menu = tk.Menu(menu, tearoff=0)
             for c in CLASS_NAMES:
                 class_menu.add_command(label=c, command=lambda c=c: self._set_manual_class(key, c))
             menu.add_cascade(label="Change Class", menu=class_menu)
+            menu.add_separator()
             menu.add_command(label="Delete", command=lambda: self._delete_manual(key))
         menu.add_separator()
         menu.add_command(label="Cancel")
@@ -1146,26 +2545,49 @@ class ReviewApp:
             "for model (queue) boxes\n\n"
             "Drag ON a box:                only works for boxes YOU drew (cyan). "
             "The model's own proposed boxes can't be bumped by accident -- click "
-            "one and use \"Enable Reposition\" in its menu if it genuinely needs "
-            "moving, then drag it once (it locks again automatically). Original "
-            "dataset labels (magenta) can never be clicked, dragged, or deleted "
-            "at all.\n\n"
+            "one and use \"Enable Reposition/Resize\" in its menu if it genuinely "
+            "needs adjusting, then drag it (or one of its handles) once -- it "
+            "locks again automatically the moment you actually drag it (just "
+            "opening the menu again does NOT disarm it). Original dataset labels "
+            "(magenta) can never be clicked, dragged, resized, or deleted at "
+            "all.\n\n"
+            "Resize a box:                 click a box once to select it (its "
+            "menu opens -- just click Cancel to dismiss and keep it selected). "
+            "8 small square handles appear on its corners and edges -- drag any "
+            "handle to stretch that side. Works for manual (cyan) boxes any "
+            "time, and for a queue box only while it's armed via \"Enable "
+            "Reposition/Resize\". A box can't be shrunk past a few pixels.\n\n"
             "Drag on empty area:           draw a new box, then pick its class "
-            "from the popup. Add as many as you like.\n\n"
+            "from the popup. The new box is auto-accepted (V12) as soon as you "
+            "pick a class -- it's included in output right away. Open its menu "
+            "afterward if you need to Reject / Reset to Pending / Delete it, or "
+            "just add as many as you like, one drag at a time.\n\n"
+            "Click on empty area (no drag): deselects whatever box was "
+            "selected -- clears its resize handles and disarms an in-progress "
+            "\"Enable Reposition/Resize\" arm if one was active.\n\n"
+            "Manual box states:            accepted (cyan, in output -- the "
+            "default the instant you draw one) / pending (orange, only seen if "
+            "you Reset one) / rejected (red, hidden unless \"Show Deleted/"
+            "Rejected\" is on). An image CANNOT move to the completed list while "
+            "any manual box on it is still pending -- same rule queue boxes have "
+            "always had.\n\n"
             "Delete (queue boxes):         hides the box from the canvas and "
             "excludes it from output, but it's fully recoverable -- check "
-            "\"Show Deleted\" to see grey/dashed deleted boxes again and reset "
-            "one back to Pending if you deleted it by mistake.\n\n"
+            "\"Show Deleted/Rejected\" to see grey/dashed deleted boxes again and "
+            "reset one back to Pending if you deleted it by mistake.\n\n"
             "Fast Mode:                    left-click a queue box = Accept, "
             "right-click = Reject, no menu popup. Toggle it in the toolbar or "
             "View menu. Manual boxes and Enable-Reposition boxes are unaffected.\n\n"
             "Accept All / Reject All Pending:  bulk-decide every still-pending "
             "queue box on the current image at once (confirms first). Counts as "
-            "one undo step.\n\n"
+            "one undo step. (Manual boxes are auto-accepted on draw, so there's "
+            "normally nothing pending among them to bulk-decide.)\n\n"
             "Undo / Redo:                  Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z), "
             "also in the Edit menu and toolbar. Covers every edit on the current "
-            "image -- decisions, class changes, manual add/delete, drags. Resets "
-            "when you move to another image.\n\n"
+            "image -- decisions, class changes, manual add/delete, drags and "
+            "resizes. Resets when you move to another image.\n\n"
+            "Esc while dragging:           cancels the drag/resize in progress "
+            "and snaps the box back to where it was.\n\n"
             "1-9 keys:                     apply the Nth class (in class-list "
             "order) to whichever box you most recently clicked.\n\n"
             "Mouse wheel:                  zoom in/out, centered on the cursor\n"
@@ -1176,20 +2598,59 @@ class ReviewApp:
             "shown ON by default so you don't accidentally re-draw something "
             "that's already labeled\n"
             "Model checkboxes + \"All\"/\"None\": choose which models' proposed "
-            "boxes are visible. The counts next to each model's name (above the "
-            "image) show how many boxes THAT model actually proposed for this "
-            "image -- shown in red/bold if it's zero, so a model silently missing "
-            "an image is obvious.\n\n"
+            "boxes are visible (labelled with each model's full name -- "
+            "YOLO-VisDrone, RF-DETR, YOLO-COCO, DINO). The counts next to each "
+            "model's name (above the image) show how many boxes THAT model "
+            "actually proposed for this image -- shown in red/bold if it's zero, "
+            "so a model silently missing an image is obvious.\n\n"
+            "Sync nearby frames:           when ON (default), Accept/Reject/"
+            "Delete on a queue box, OR Accept/Reject/Reset/Delete on a manual "
+            "box, looks a few frames forward and back in the same sequence and "
+            "applies the same action there too -- for queue boxes, to an "
+            "already-queued box of the SAME EFFECTIVE CLASS (honoring any class "
+            "override) in roughly the SAME POSITION (only if it's still "
+            "pending); for manual boxes, by copying the box itself into the "
+            "neighbor frame (only if nothing of that class already sits near "
+            "that spot there). It never overrides a decision you or a previous "
+            "sync already made, and never touches an already-completed image. "
+            "Synced boxes show a \"[synced]\" tag. Changing your mind on a "
+            "source box later (Accept -> Reject, -> Delete, or -> Reset to "
+            "Pending) automatically retracts exactly the copies THAT box "
+            "created, as long as they haven't since been manually re-decided by "
+            "hand. The \u00b1N spinner controls how many frames out to look; "
+            "\"Undo Last Sync\" reverts exactly the last auto-applied batch, "
+            "everywhere it touched.\n\n"
+            "Switch to QA / Completed:     swaps the current session, live, "
+            "between images still pending review and images that are already "
+            "fully decided (same list --qa opens from the command line) -- no "
+            "need to close and relaunch. Everything is still fully editable "
+            "there: use it to spot-check finished work, or to find and fix a "
+            "box you decided by mistake. The button/menu item flips back to "
+            "\"Back to Pending Review\" while you're in that view.\n\n"
             "Auto-advance:                 optional -- once every box on the "
-            "image has a decision, automatically jump to the next image.\n\n"
-            "Everything autosaves as you go (within about a second of any "
-            "change) -- Next/Previous/closing the window never lose work, and "
-            "there's no save prompt because there's nothing left unsaved to ask "
-            "about. \"Save Now\" / 's' just forces it immediately.\n\n"
-            "Once every box on an image has a decision, that image moves into "
-            "a separate completed list (review_completed.json) and won't show "
-            "up again in a normal review session. Run with --qa to open a "
-            "session sourced only from that list, e.g. for a second reviewer.\n"
+            "image (queue AND manual, across the FULL queue, not just what a "
+            "--source/--cls filter shows) has a decision, automatically jump to "
+            "the next image.\n\n"
+            "Everything autosaves as you go (within under half a second of any "
+            "change, or instantly if the window loses focus, or instantly right "
+            "after a change that triggers/retracts a cross-frame sync) -- Next/"
+            "Previous/closing/Alt-Tabbing never lose work, and there's no save "
+            "prompt because there's nothing left unsaved to ask about. \"Save "
+            "Now\" / 's' just forces it immediately.\n\n"
+            "Once every box (queue and manual) on an image has a decision -- "
+            "again, across the FULL queue for that image, not just a --source/"
+            "--cls filtered view -- that image moves into a separate completed "
+            "list (review_completed.json) and won't show up again in a normal "
+            "review session. Reach it again any time with the \"Switch to QA / "
+            "Completed\" button, or by running with --qa.\n\n"
+            "Startup safety net (V11):     every launch backs up "
+            "review_progress.json and review_completed.json into "
+            "datasets/review_backups/<timestamp>/ before touching anything, then "
+            "re-matches any saved decision whose box coordinates drifted from a "
+            "rerun of generate_pseudo_labels.py (rather than treating it as lost/"
+            "pending), and recomputes the completed list from the result. Watch "
+            "the console at startup for a summary. Disable either step with "
+            "--no-backup / --no-key-reconcile if you ever need to.\n"
         ))
 
     # ------------------------------------------------------------------
@@ -1212,15 +2673,72 @@ class ReviewApp:
             self.selected_key = (kind, key)
             self._set_decision(key, "reject")
 
+    def _handle_hit_at(self, view_x, view_y):
+        """Hit-tests the resize handles with a small pixel pad, since
+        the handle squares themselves are tiny and precision-clicking
+        them would be its own usability problem. Returns
+        (kind, key, handle_name) or None."""
+        cx = self.canvas.canvasx(view_x)
+        cy = self.canvas.canvasy(view_y)
+        pad = HANDLE_HIT_PAD
+        best = None
+        best_dist = None
+        for hid, (kind, key, name) in self.handle_map.items():
+            coords = self.canvas.coords(hid)
+            if not coords:
+                continue
+            x1, y1, x2, y2 = coords
+            if (x1 - pad) <= cx <= (x2 + pad) and (y1 - pad) <= cy <= (y2 + pad):
+                hcx, hcy = (x1 + x2) / 2, (y1 + y2) / 2
+                dist = (hcx - cx) ** 2 + (hcy - cy) ** 2
+                if best_dist is None or dist < best_dist:
+                    best_dist = dist
+                    best = (kind, key, name)
+        return best
+
+    def on_mouse_move_hover(self, event):
+        """Pure visual feedback -- no state changes. Shows a resize
+        cursor over a handle, a move cursor over a draggable box, or
+        the default crosshair (for drawing) elsewhere."""
+        if self.drag is not None:
+            return  # mid-drag, don't fight the cursor set for that drag
+        handle_hit = self._handle_hit_at(event.x, event.y)
+        if handle_hit:
+            self.canvas.config(cursor=HANDLE_CURSOR[handle_hit[2]])
+            return
+        current = self.canvas.find_withtag("current")
+        hit = self.item_map.get(current[0]) if current else None
+        if hit:
+            kind, key = hit
+            if kind == "manual" or self.reposition_armed == (kind, key):
+                self.canvas.config(cursor="fleur")
+            else:
+                self.canvas.config(cursor="hand2")
+        else:
+            self.canvas.config(cursor="tcross")
+
     def on_mouse_down(self, event):
         cx, cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+
+        # Resize handles take priority over everything else under the
+        # cursor -- they're only drawn on the already-selected box, so
+        # there's no ambiguity about which box a handle belongs to.
+        handle_hit = self._handle_hit_at(event.x, event.y)
+        if handle_hit:
+            kind, key, name = handle_hit
+            self.drag = {"mode": "resize", "kind": kind, "key": key, "handle": name,
+                         "start": (cx, cy), "moved": False, "snapshotted": False,
+                         "orig_box": list(self._get_box(kind, key))}
+            return
+
         current = self.canvas.find_withtag("current")
         hit = self.item_map.get(current[0]) if current else None
         if hit:
             kind, key = hit
             if kind == "manual" or self.reposition_armed == (kind, key):
                 self.drag = {"mode": "move", "kind": kind, "key": key,
-                             "start": (cx, cy), "moved": False, "snapshotted": False}
+                             "start": (cx, cy), "moved": False, "snapshotted": False,
+                             "orig_box": list(self._get_box(kind, key))}
             elif kind == "queue" and self.fast_mode.get():
                 # Fast Mode: left-click a queue box accepts it immediately,
                 # no menu, no drag possible.
@@ -1264,7 +2782,49 @@ class ReviewApp:
                 self.drag["start"] = (cx, cy)
                 self._mark_dirty()
                 self.redraw()
+        elif self.drag["mode"] == "resize":
+            if abs(cx - sx) > 1 or abs(cy - sy) > 1:
+                self.drag["moved"] = True
+            if self.drag["moved"]:
+                if not self.drag["snapshotted"]:
+                    self._push_undo()
+                    self.drag["snapshotted"] = True
+                self._apply_resize(cx, cy)
+                self._mark_dirty()
+                self.redraw()
         # "queue_click" / "fast_accept" modes: intentionally ignore drag motion.
+
+    def _apply_resize(self, cx, cy):
+        """Moves whichever edge(s) the active handle controls to follow
+        the cursor, in ORIGINAL IMAGE coordinates, clamped so the box
+        can never invert or collapse below MIN_BOX_PX. Corner handles
+        (hx != 0 and hy != 0) move both edges; edge handles move one."""
+        d = self.drag
+        kind, key, handle = d["kind"], d["key"], d["handle"]
+        hx, hy = next((hx_, hy_) for name, hx_, hy_ in HANDLES if name == handle)
+        img_x = cx / self.scale
+        img_y = cy / self.scale
+
+        x1, y1, x2, y2 = self._get_box(kind, key)
+        if hx == -1:
+            x1 = min(img_x, x2 - MIN_BOX_PX)
+        elif hx == 1:
+            x2 = max(img_x, x1 + MIN_BOX_PX)
+        if hy == -1:
+            y1 = min(img_y, y2 - MIN_BOX_PX)
+        elif hy == 1:
+            y2 = max(img_y, y1 + MIN_BOX_PX)
+
+        # Clamp to image bounds too -- a handle dragged off-canvas
+        # shouldn't be able to push the box coordinates negative or
+        # past the image size (scrollregion lets you drag past the
+        # visible area while zoomed/panned).
+        x1 = max(0.0, min(x1, self.img_w))
+        y1 = max(0.0, min(y1, self.img_h))
+        x2 = max(0.0, min(x2, self.img_w))
+        y2 = max(0.0, min(y2, self.img_h))
+
+        self._set_box(kind, key, [x1, y1, x2, y2])
 
     def on_mouse_up(self, event):
         if not self.drag:
@@ -1280,11 +2840,30 @@ class ReviewApp:
                        max(sx, cx) / self.scale, max(sy, cy) / self.scale]
                 self._open_class_menu(event.x_root, event.y_root,
                                        on_pick=lambda cls: self._add_manual_box(cls, box))
-        elif mode == "move":
-            if self.reposition_armed == (self.drag["kind"], self.drag["key"]):
+            elif self.selected_key is not None or self.reposition_armed is not None:
+                # (fix) A plain click on empty canvas -- started as "draw"
+                # but never actually dragged past the threshold -- used to
+                # be a complete no-op, which meant the ONLY way to drop a
+                # selection (and its resize handles) was to click another
+                # box. That's backwards: empty space should be the "give
+                # me nothing selected" gesture. Clear the selection and
+                # disarm any one-shot reposition/resize arm that was still
+                # waiting on a drag, then redraw so the handles disappear
+                # immediately.
+                self.selected_key = None
+                self.reposition_armed = None
+                self.redraw()
+        elif mode in ("move", "resize"):
+            # (V13 fix C) Only disarm a one-shot "Enable Reposition/Resize"
+            # once an actual move/resize drag happened. Previously this
+            # disarmed on ANY mouse-up on the armed box -- including a
+            # plain click that just reopens its context menu -- so the
+            # box could silently lose its arming before you ever got to
+            # drag it.
+            if self.drag["moved"] and self.reposition_armed == (self.drag["kind"], self.drag["key"]):
                 self.reposition_armed = None   # one-shot: disarm after use
                 self.redraw()
-            if not self.drag["moved"]:
+            if not self.drag["moved"] and mode == "move":
                 self._open_box_context_menu(event.x_root, event.y_root,
                                              self.drag["kind"], self.drag["key"])
         elif mode == "queue_click":
@@ -1295,6 +2874,7 @@ class ReviewApp:
             self._set_decision(self.drag["key"], "accept")
 
         self.drag = None
+        self.on_mouse_move_hover(event)  # refresh cursor for wherever we ended up
 
 
 def parse_args():
@@ -1313,7 +2893,28 @@ def parse_args():
                     help="Quality-assurance mode: open a session sourced ONLY "
                          "from review_completed.json (images a previous pass "
                          "already fully decided), for a second reviewer to "
-                         "check over. Ignores --show-all.")
+                         "check over. Ignores --show-all. You can also reach "
+                         "this live from inside the app via the 'Switch to QA "
+                         "/ Completed' button -- no need to relaunch.")
+    p.add_argument("--no-sync", action="store_true",
+                    help="Start with cross-frame sync OFF (default: on). "
+                         "Toggleable at any time in the toolbar/View menu.")
+    p.add_argument("--sync-window", type=int, default=SYNC_DEFAULT_WINDOW,
+                    help=f"How many frames out (each direction) in the same "
+                         f"sequence to look for a matching pending box when "
+                         f"syncing decisions (default: {SYNC_DEFAULT_WINDOW}). "
+                         f"Adjustable at any time via the toolbar spinner.")
+    p.add_argument("--no-backup", action="store_true",
+                    help="(V11) Skip the automatic snapshot of "
+                         "review_progress.json/review_completed.json taken on "
+                         "every launch into datasets/review_backups/. Not "
+                         "recommended -- this is the actual safety net.")
+    p.add_argument("--no-key-reconcile", action="store_true",
+                    help="(V11) Skip the automatic startup pass that re-matches "
+                         "saved decisions whose box coordinates drifted from a "
+                         "rerun of generate_pseudo_labels.py, and the completed-"
+                         "list recomputation that follows it. Only useful for "
+                         "debugging that step itself.")
     return p.parse_args()
 
 
@@ -1329,20 +2930,73 @@ def main():
         raise SystemExit(f"{queue_path} not found -- run generate_pseudo_labels.py first.")
 
     with open(queue_path) as f:
-        all_items = json.load(f)
+        all_items_full = json.load(f)
+
+    # Capture each item's original, immutable box up front -- item_key()
+    # depends on this, not on the (editable) "box" field. Must happen
+    # before anything below calls item_key(), and before --source/--cls
+    # filtering so reconciliation always sees the FULL queue.
+    for it in all_items_full:
+        it["_orig_box"] = list(it["box"])
+
+    by_image_full: dict = {}
+    for it in all_items_full:
+        by_image_full.setdefault(it["image"], []).append(it)
+
     progress = load_json_dict(progress_path)
     completed_set = load_completed(completed_path)
 
+    # --- V11 startup safety net: backup, then self-heal ------------------
+    if not args.no_backup:
+        backup_dir = backup_progress_files(datasets_dir, progress_path, completed_path)
+        if backup_dir:
+            print(f"[backup] snapshotted progress/completed files -> {backup_dir}")
+
+    if not args.no_key_reconcile:
+        progress, stats, unresolved = reconcile_progress(by_image_full, progress)
+        print(f"[reconcile] {stats['exact']} exact-key match(es), "
+              f"{stats['fuzzy']} recovered by fuzzy box match, "
+              f"{stats['unresolved']} unresolved.")
+        if unresolved:
+            print("[reconcile] unresolved entries (kept under their old key -- "
+                  "NOT deleted, just not matched to a current queue item):")
+            for k, reason in unresolved[:20]:
+                print(f"    {reason}: {k}")
+            if len(unresolved) > 20:
+                print(f"    ... and {len(unresolved) - 20} more")
+        save_json(progress_path, progress)
+
+        recomputed_completed = compute_completed_set(by_image_full, progress)
+        if recomputed_completed != completed_set:
+            added = recomputed_completed - completed_set
+            removed = completed_set - recomputed_completed
+            if added:
+                print(f"[reconcile] {len(added)} image(s) now recognized as fully "
+                      f"reviewed that weren't marked complete before.")
+            if removed:
+                print(f"[reconcile] {len(removed)} image(s) dropped from the "
+                      f"completed list (they have pending item(s) again).")
+            completed_set = recomputed_completed
+            save_completed(completed_path, completed_set)
+
+    n_decided_images = sum(
+        1 for image, items in by_image_full.items()
+        if any(progress.get(item_key(it), {}).get("decision", "pending") != "pending"
+               for it in items))
+    n_manual_pending_total = sum(
+        1 for image in by_image_full
+        for mb in progress.get(f"__manual__{image}", [])
+        if mb.get("decision", "pending") == "pending")
+    print(f"[startup] {len(completed_set)} image(s) fully reviewed, "
+          f"{n_decided_images} image(s) with at least one saved decision, "
+          f"{n_manual_pending_total} manual box(es) still pending review.")
+    # --- end V11 startup safety net ---------------------------------------
+
+    all_items = all_items_full
     if args.source:
         all_items = [it for it in all_items if it["source"] == args.source]
     if args.cls:
         all_items = [it for it in all_items if it["cls"] == args.cls]
-
-    # Capture each item's original, immutable box up front -- item_key()
-    # depends on this, not on the (editable) "box" field. Must happen
-    # before anything below calls item_key().
-    for it in all_items:
-        it["_orig_box"] = list(it["box"])
 
     by_image: dict = {}
     for it in all_items:
@@ -1360,8 +3014,13 @@ def main():
         image_keys = [k for k in all_image_keys if k not in completed_set]
         if not args.show_all:
             def has_pending(image_key):
-                return any(progress.get(item_key(it), {}).get("decision", "pending") == "pending"
-                           for it in by_image[image_key])
+                queue_pending = any(
+                    progress.get(item_key(it), {}).get("decision", "pending") == "pending"
+                    for it in by_image[image_key])
+                manual_pending = any(
+                    mb.get("decision", "pending") == "pending"
+                    for mb in progress.get(f"__manual__{image_key}", []))
+                return queue_pending or manual_pending
             image_keys = [k for k in image_keys if has_pending(k)]
         if not image_keys:
             print("Nothing to review (try --show-all, or check --source/--cls "
@@ -1373,9 +3032,22 @@ def main():
 
     root = tk.Tk()
     root.title("Label Review")
+    # (V12) all_image_keys (matching --source/--cls, NOT pre-filtered by
+    # completed status) is passed through so the in-app "Switch to QA /
+    # Completed" toggle can recompute pending-vs-completed live from the
+    # session's current completed_set, instead of being locked to
+    # whichever mode the app happened to be launched in.
+    # (V13 fix A) by_image_full (the TRUE unfiltered queue) is also
+    # passed through so every completeness check inside ReviewApp -- not
+    # just the ones at startup -- reflects the whole image, not just
+    # whatever this session's --source/--cls filter shows.
     ReviewApp(root, image_keys, by_image, progress, reviewed_root, progress_path,
               completed_path, completed_set,
-              show_original_default=not args.hide_original, qa_mode=args.qa)
+              show_original_default=not args.hide_original, qa_mode=args.qa,
+              sync_enabled_default=not args.no_sync,
+              sync_window_default=args.sync_window,
+              all_image_keys_filtered=all_image_keys,
+              by_image_full=by_image_full)
     root.mainloop()
 
 
