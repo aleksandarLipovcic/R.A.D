@@ -483,6 +483,36 @@ V17 NOTE -- Spinbox crash fix + deferred "sync on save" release.
      guarantee is automatic now that sync runs inside the same flush
      that commits the decision.
 
+V18 NOTE -- keyframe-triage sidebar release.
+  1. ADDED: a left-hand image list/sidebar, split into two sections --
+     "Remaining" and "Reviewed" -- each grouped by source dataset
+     (SARD / UAVDT / VisDrone), with every leaf color-tagged by its
+     source (a light background stripe, see SOURCE_COLORS) so the mix
+     of sets in the current filter is visible at a glance. Clicking any
+     image jumps straight to it in the main viewer -- no more Next/
+     Next/Next to get somewhere specific. This does NOT touch the
+     existing accept/reject/decision machinery in any way -- it is
+     purely a navigation aid built on top of data ReviewApp already
+     tracks (self.all_image_keys_filtered, self.completed_set,
+     self.by_image_full). Rebuilt automatically after every save (i.e.
+     whenever the completed/remaining split could have changed) and
+     when Switch-to-QA/Completed is used, so it never goes stale for
+     long.
+  2. ADDED: "Check sequence coverage" (sidebar button + View menu) --
+     a read-only report, grouped by source and parsed sequence id (the
+     same parse_seq_frame() used by cross-frame sync), of how many
+     frames in each sequence are currently in the Reviewed/completed
+     list, flagging any sequence with fewer than
+     MIN_REVIEWED_FRAMES_PER_SEQUENCE (default 3) reviewed frames --
+     this is the "does every set/sequence have enough manually
+     reviewed keyframes to start training" check. Purely informational;
+     changes nothing on disk.
+  3. Neither addition changes review_progress.json / review_completed.
+     json / pseudo_labels_reviewed/ output in any way, and neither
+     touches decisions on boxes that are already correctly labeled in
+     the source datasets (e.g. UAVDT/VisDrone vehicle boxes) -- this is
+     scoped entirely to "which image am I looking at" bookkeeping.
+
 WHAT CHANGED, keyboard command -> new equivalent:
   click box, cycle       -> click box: pops up a menu with Accept /
   pending/accept/reject     Reject / Reset to Pending / Change Class /
@@ -562,6 +592,12 @@ WHAT CHANGED, keyboard command -> new equivalent:
                               copies it created). No-op if nothing is
                               selected. (V15: now also works while that
                               box's own context menu is still open.)
+  (nothing before)         -> V18: left sidebar lists every image in
+                              the current filter, split into Remaining/
+                              Reviewed and color-coded by source set --
+                              click one to jump straight to it. "Check
+                              sequence coverage" reports reviewed-frame
+                              counts per source/sequence.
 
 WHY A SEPARATE OUTPUT TREE (see generate_pseudo_labels.py's module
 docstring for the full reasoning): this writes to datasets/
@@ -646,6 +682,25 @@ COLOR_ARMED = "#ffff00"      # yellow, queue box temporarily armed for one repos
 COLOR_HANDLE = "#ffffff"     # resize-handle squares
 COLOR_HANDLE_OUTLINE = "#000000"
 
+# (V18) Light background stripe per source dataset, used ONLY by the
+# sidebar image list (see _build_sidebar_tree) to make the mix of sets
+# in a filtered session visually obvious at a glance. Purely cosmetic --
+# has no effect on review logic, output, or which images are shown.
+# Extend this if/when another source dataset gets folded into the
+# combined set; anything not listed here falls back to SOURCE_COLOR_OTHER.
+SOURCE_COLORS = {
+    "SARD": "#dce8ff",     # light blue
+    "UAVDT": "#dff5df",    # light green
+    "VisDrone": "#fff3d6", # light amber
+}
+SOURCE_COLOR_OTHER = "#ececec"  # light grey, any source not listed above
+
+# (V18) Threshold used only by the "Check sequence coverage" report --
+# flags a source/sequence combination as needing more manual attention
+# if fewer than this many of its frames are in the Reviewed/completed
+# list yet. Purely informational, changes nothing on disk.
+MIN_REVIEWED_FRAMES_PER_SEQUENCE = 3
+
 DISPLAY_MAX_W = 1280
 DISPLAY_MAX_H = 860
 
@@ -659,6 +714,9 @@ CHROME_RESERVED_H = 300
 CHROME_RESERVED_W = 60
 MIN_CANVAS_W = 480
 MIN_CANVAS_H = 320
+
+# (V18) Fixed width of the left-hand image-list sidebar, in pixels.
+SIDEBAR_WIDTH_PX = 270
 
 MIN_ZOOM = 1.0     # can't zoom out past "fit to window"
 MAX_ZOOM = 8.0
@@ -1047,6 +1105,21 @@ class ReviewApp:
                                          if all_image_keys_filtered is not None
                                          else list(image_keys))
 
+        # (V18) image_key -> source dataset name (e.g. "SARD", "UAVDT",
+        # "VisDrone"), derived once from the FULL unfiltered queue so the
+        # sidebar can color/group every image regardless of the current
+        # --source/--cls filter. Falls back to "unknown" for an image
+        # with no queue items at all (shouldn't normally happen, since
+        # by_image_full is built FROM the queue, but kept defensive).
+        self.image_source = {
+            image: items[0].get("source", "unknown")
+            for image, items in self.by_image_full.items()
+        }
+        # (V18) Populated by _build_sidebar_tree(); maps a Treeview leaf
+        # item id -> the image_key it represents. Group/section nodes are
+        # simply absent from this dict.
+        self._sidebar_item_to_key = {}
+
         self.idx = 0
         self.dirty = False
         self._autosave_after_id = None
@@ -1158,6 +1231,7 @@ class ReviewApp:
                   f"adjusted.")
 
         self._build_ui()
+        self._build_sidebar_tree()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._load_image(0)
 
@@ -1211,6 +1285,9 @@ class ReviewApp:
         view_menu.add_separator()
         view_menu.add_command(label="Switch to QA / Completed view",
                                command=self.toggle_qa_mode)
+        view_menu.add_separator()
+        view_menu.add_command(label="Check Sequence Coverage",
+                               command=self._show_sequence_coverage)
         view_menu.add_separator()
         view_menu.add_command(label="Zoom In\t+", command=lambda: self._zoom_centered(ZOOM_STEP))
         view_menu.add_command(label="Zoom Out\t-", command=lambda: self._zoom_centered(1 / ZOOM_STEP))
@@ -1331,8 +1408,18 @@ class ReviewApp:
             lbl.pack(side=tk.LEFT, padx=8)
             self.model_count_labels[m] = lbl
 
-        canvas_frame = ttk.Frame(self.root)
-        canvas_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=(4, 0))
+        # (V18) main_area holds the new left-hand image-list sidebar and
+        # the existing scrollable image canvas side by side. This is the
+        # ONLY structural change to the chrome layout -- nav/status are
+        # still packed to self.root directly, BEFORE main_area, so V12's
+        # "nav bar can never be pushed off-screen" guarantee is untouched.
+        main_area = ttk.Frame(self.root)
+        main_area.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=(4, 0))
+
+        self._build_sidebar(main_area)
+
+        canvas_frame = ttk.Frame(main_area)
+        canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self.canvas = tk.Canvas(canvas_frame, bg="#111111", cursor="tcross")
         hbar = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL, command=self.canvas.xview)
@@ -1412,7 +1499,51 @@ class ReviewApp:
         # (V12) Reasonable minimum window size so the nav/status bars
         # (now packed first) and a usable slice of canvas can never
         # both be squeezed to nothing.
-        self.root.minsize(720, 480)
+        self.root.minsize(900, 480)
+
+    def _build_sidebar(self, parent):
+        """(V18) Left-hand image-list sidebar. Purely a navigation aid --
+        does not read or write review_progress.json/review_completed.json
+        itself, only the in-memory self.all_image_keys_filtered /
+        self.completed_set / self.image_source ReviewApp already
+        maintains. See _build_sidebar_tree() for how it's populated and
+        _on_sidebar_select()/_jump_to_image() for what a click does."""
+        sidebar = ttk.Frame(parent, width=SIDEBAR_WIDTH_PX)
+        sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
+        sidebar.pack_propagate(False)  # keep the fixed width even as the tree grows
+
+        ttk.Label(sidebar, text="Images (Remaining / Reviewed)",
+                  font=("TkDefaultFont", 9, "bold")).pack(side=tk.TOP, anchor="w", pady=(0, 2))
+
+        tree_frame = ttk.Frame(sidebar)
+        tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.sidebar_tree = ttk.Treeview(tree_frame, show="tree", selectmode="browse")
+        sidebar_vbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.sidebar_tree.yview)
+        self.sidebar_tree.configure(yscrollcommand=sidebar_vbar.set)
+        self.sidebar_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sidebar_vbar.pack(side=tk.LEFT, fill=tk.Y)
+
+        # Color tags: one per known source (light stripe, see
+        # SOURCE_COLORS), plus a grey fallback for anything unlisted.
+        for src, color in SOURCE_COLORS.items():
+            self.sidebar_tree.tag_configure(f"src_{src}", background=color)
+        self.sidebar_tree.tag_configure("src_other", background=SOURCE_COLOR_OTHER)
+
+        self.sidebar_tree.bind("<<TreeviewSelect>>", self._on_sidebar_select)
+
+        legend = ttk.Frame(sidebar)
+        legend.pack(side=tk.TOP, fill=tk.X, pady=(4, 2))
+        ttk.Label(legend, text="Set colors:", font=("TkDefaultFont", 8)).pack(side=tk.TOP, anchor="w")
+        for src, color in list(SOURCE_COLORS.items()):
+            row = tk.Frame(legend)
+            row.pack(side=tk.TOP, anchor="w")
+            tk.Label(row, text="  ", bg=color, relief="solid", borderwidth=1).pack(side=tk.LEFT)
+            tk.Label(row, text=f" {src}", font=("TkDefaultFont", 8)).pack(side=tk.LEFT)
+
+        ttk.Button(sidebar, text="Refresh list",
+                   command=self._refresh_sidebar).pack(side=tk.TOP, fill=tk.X, pady=(4, 2))
+        ttk.Button(sidebar, text="Check sequence coverage",
+                   command=self._show_sequence_coverage).pack(side=tk.TOP, fill=tk.X)
 
     def _validate_sync_window_input(self, proposed: str) -> bool:
         """(V17) Spinbox validatecommand -- only digits or empty
@@ -1452,6 +1583,142 @@ class ReviewApp:
         for v in self.model_vars.values():
             v.set(False)
         self.redraw()
+
+    # ------------------------------------------------------------------
+    # (V18) Sidebar image list -- build, select, jump, coverage report.
+    # None of this reads/writes progress/completed files directly; it
+    # only reflects the in-memory state ReviewApp already maintains, and
+    # is rebuilt (see call sites of _refresh_sidebar) whenever that state
+    # could have changed the Remaining/Reviewed split.
+    # ------------------------------------------------------------------
+
+    def _build_sidebar_tree(self):
+        """(re)populates the sidebar Treeview from scratch: two top-level
+        sections, "Remaining" and "Reviewed", each split into per-source
+        groups (color-tagged, see SOURCE_COLORS), each containing one
+        leaf per image (tagged with its source's color) sorted by
+        filename. Cheap enough to call after every save -- typical
+        session sizes here are in the hundreds to low thousands of
+        images, not enough for a full Treeview rebuild to be noticeable
+        on a debounced ~400ms cadence."""
+        tree = self.sidebar_tree
+        selected_key = self.image_key  # preserve highlight across a rebuild
+        tree.delete(*tree.get_children())
+        self._sidebar_item_to_key = {}
+
+        remaining = [k for k in self.all_image_keys_filtered if k not in self.completed_set]
+        reviewed = [k for k in self.all_image_keys_filtered if k in self.completed_set]
+
+        for section_label, keys in (("Remaining", remaining), ("Reviewed", reviewed)):
+            section_node = tree.insert(
+                "", "end", text=f"{section_label} ({len(keys)})",
+                open=(section_label == "Remaining"))
+            by_src: dict = {}
+            for k in keys:
+                by_src.setdefault(self.image_source.get(k, "unknown"), []).append(k)
+            for src in sorted(by_src):
+                src_keys = sorted(by_src[src], key=lambda kk: Path(kk).name)
+                tag = f"src_{src}" if src in SOURCE_COLORS else "src_other"
+                src_node = tree.insert(section_node, "end",
+                                        text=f"{src} ({len(src_keys)})", open=False,
+                                        tags=(tag,))
+                for k in src_keys:
+                    leaf = tree.insert(src_node, "end", text=Path(k).name, tags=(tag,))
+                    self._sidebar_item_to_key[leaf] = k
+
+        if selected_key is not None:
+            self._highlight_sidebar_selection()
+
+    def _refresh_sidebar(self):
+        self._build_sidebar_tree()
+
+    def _highlight_sidebar_selection(self):
+        """Selects (and scrolls to) whichever sidebar leaf corresponds to
+        self.image_key, without triggering another jump -- _on_sidebar_
+        select() below no-ops when the clicked/selected leaf is already
+        the current image."""
+        for item_id, key in self._sidebar_item_to_key.items():
+            if key == self.image_key:
+                self.sidebar_tree.see(item_id)
+                self.sidebar_tree.selection_set(item_id)
+                return
+
+    def _on_sidebar_select(self, event=None):
+        sel = self.sidebar_tree.selection()
+        if not sel:
+            return
+        key = self._sidebar_item_to_key.get(sel[0])
+        if key is None:
+            return  # a "Remaining (n)" / "Reviewed (n)" / source group node, not a leaf
+        if key == self.image_key:
+            return
+        self._jump_to_image(key)
+
+    def _jump_to_image(self, image_key):
+        """Navigates straight to `image_key`, wherever it currently sits
+        (still-pending or already-completed), flushing the image
+        currently on screen first exactly like Next/Previous/Switch-to-
+        QA already do. Silently does nothing if `image_key` somehow
+        isn't part of this session's --source/--cls filter."""
+        if image_key not in self.all_image_keys_filtered:
+            return
+        self._flush_now_if_dirty()
+        target_qa = image_key in self.completed_set
+        keys = [k for k in self.all_image_keys_filtered
+                if (k in self.completed_set) == target_qa]
+        if image_key not in keys:
+            return
+        self.qa_mode = target_qa
+        self.image_keys = keys
+        self.qa_toggle_btn.config(
+            text="Back to Pending Review" if self.qa_mode else "Switch to QA / Completed")
+        self._load_image(keys.index(image_key))
+
+    def _show_sequence_coverage(self):
+        """(V18) Read-only report: for every (source, sequence) pair in
+        the CURRENT --source/--cls filter, how many of its frames are in
+        the Reviewed/completed list right now, flagging anything under
+        MIN_REVIEWED_FRAMES_PER_SEQUENCE. Uses the same parse_seq_frame()
+        cross-frame sync relies on, so "sequence" here means the same
+        thing it means everywhere else in this tool. Changes nothing on
+        disk -- purely informational, meant to answer "do we have enough
+        manually reviewed keyframes per set/sequence to start training
+        yet?"."""
+        totals: dict = {}
+        reviewed_counts: dict = {}
+        for k in self.all_image_keys_filtered:
+            src = self.image_source.get(k, "unknown")
+            sf = parse_seq_frame(k)
+            seq = sf[0] if sf else "(unparsed sequence)"
+            group = (src, seq)
+            totals[group] = totals.get(group, 0) + 1
+            if k in self.completed_set:
+                reviewed_counts[group] = reviewed_counts.get(group, 0) + 1
+
+        if not totals:
+            messagebox.showinfo("Sequence coverage", "No images in the current filter.")
+            return
+
+        low = []
+        lines = []
+        for group in sorted(totals):
+            src, seq = group
+            c = reviewed_counts.get(group, 0)
+            t = totals[group]
+            flag = "" if c >= MIN_REVIEWED_FRAMES_PER_SEQUENCE else "   <-- needs more"
+            lines.append(f"{src:>10s} | {seq:<20s} reviewed {c:>3d} / {t:<4d}{flag}")
+            if c < MIN_REVIEWED_FRAMES_PER_SEQUENCE:
+                low.append(group)
+
+        header = (f"{len(low)} of {len(totals)} sequence(s) have fewer than "
+                   f"{MIN_REVIEWED_FRAMES_PER_SEQUENCE} reviewed frame(s).\n\n")
+        body = "\n".join(lines)
+        # messagebox has no scrollbar -- keep it readable by truncating
+        # very long reports rather than showing an unusably tall dialog.
+        if len(body) > 4000:
+            body = body[:4000] + "\n... (truncated -- narrow the --source/--cls filter to see the rest)"
+        messagebox.showinfo("Sequence coverage (reviewed frames per set/sequence)",
+                             header + body)
 
     # ------------------------------------------------------------------
     # QA / completed toggle (V12)
@@ -1511,7 +1778,12 @@ class ReviewApp:
         except tk.TclError:
             pass
 
-        max_w = min(DISPLAY_MAX_W, max(MIN_CANVAS_W, screen_w - CHROME_RESERVED_W))
+        # (V18) The sidebar now also eats into available width -- widen
+        # the reserved-width allowance to account for it so the canvas
+        # doesn't try to claim space the sidebar is already using.
+        reserved_w = CHROME_RESERVED_W + SIDEBAR_WIDTH_PX
+
+        max_w = min(DISPLAY_MAX_W, max(MIN_CANVAS_W, screen_w - reserved_w))
         max_h = min(DISPLAY_MAX_H, max(MIN_CANVAS_H, screen_h - reserved_h))
         return max_w, max_h
 
@@ -1623,6 +1895,11 @@ class ReviewApp:
         self._render_canvas_image()
         self._update_model_count_labels()
         self.redraw()
+        # (V18) Keep the sidebar's highlighted row in sync with whatever
+        # image is now on screen, however we got here (Next/Previous,
+        # QA toggle, or a sidebar click itself).
+        if hasattr(self, "sidebar_tree"):
+            self._highlight_sidebar_selection()
 
     def _update_model_count_labels(self):
         for m in MODEL_KEYS:
@@ -2576,7 +2853,12 @@ class ReviewApp:
 
         (V17) Drains any deferred cross-frame sync actions first, so
         sync always runs as part of -- and immediately before -- the
-        same save that commits the decisions which triggered it."""
+        same save that commits the decisions which triggered it.
+
+        (V18) Also refreshes the sidebar tree, since this is the one
+        place that always runs right after the completed-images list
+        could have changed (this image's own status, or -- via
+        cross-frame sync -- one or more neighbor images')."""
         self._drain_pending_sync()
         for it in self.queue_items:
             k = item_key(it)
@@ -2607,7 +2889,10 @@ class ReviewApp:
         self.progress[f"__override__{self.image_key}"] = self.class_overrides
         self._write_reviewed_labels()
         save_json(self.progress_path, self.progress)
-        return self._update_completed_list()
+        fully_decided = self._update_completed_list()
+        if hasattr(self, "sidebar_tree"):
+            self._refresh_sidebar()
+        return fully_decided
 
     def _mark_dirty(self):
         """Call after any edit. Schedules an autosave a short moment
@@ -3308,6 +3593,17 @@ class ReviewApp:
             "there: use it to spot-check finished work, or to find and fix a "
             "box you decided by mistake. The button/menu item flips back to "
             "\"Back to Pending Review\" while you're in that view.\n\n"
+            "Image list sidebar (left side):  every image in the current "
+            "--source/--cls filter, split into \"Remaining\" and \"Reviewed\", "
+            "each grouped by source dataset (SARD/UAVDT/VisDrone) with a light "
+            "color stripe per source (see the legend under the list) -- click "
+            "any image to jump straight to it, in either state, without "
+            "Next/Previous-ing your way there. Rebuilds automatically after "
+            "every save. \"Check sequence coverage\" reports, per source and "
+            "sequence, how many frames are currently Reviewed -- flagging any "
+            "sequence with fewer than a few, so you can tell at a glance whether "
+            "every set/sequence has enough manually reviewed keyframes yet to "
+            "start training. Purely informational -- changes nothing on disk.\n\n"
             "Auto-advance:                 optional -- once every box on the "
             "image (queue AND manual, across the FULL queue, not just what a "
             "--source/--cls filter shows) has a decision, automatically jump to "
