@@ -347,6 +347,103 @@ found on review, in order of importance:
      flushed immediately afterward instead of waiting out the
      debounce, the same way navigation/close/focus-loss already did.
 
+V14 NOTE -- copy/paste release.
+  1. ADDED: copy/paste for boxes. Select any box (a manual box, or a
+     queue box -- selecting just means it was the last one you
+     clicked/right-clicked/fast-mode-clicked; you don't need its menu
+     open), press Ctrl+C to copy it, then Ctrl+V to paste a new manual
+     box with the same class and the same size, offset diagonally by
+     PASTE_OFFSET_PX (image pixels) from the copied position. This is
+     the "multiply an existing box instead of redrawing it every time"
+     workflow -- handy for repeated objects of the same size (e.g. a
+     row of parked cars) without drag-drawing each one from scratch.
+     A pasted box goes through the exact same path as a hand-drawn one
+     (_add_manual_box): auto-accepted, undoable (Ctrl+Z removes it like
+     any other edit), autosaved, and cross-frame synced if sync is on.
+  2. Repeated Ctrl+V without a new Ctrl+C in between keeps cascading --
+     each paste offsets another PASTE_OFFSET_PX from the last, so
+     pasting 5 times in a row visibly staircases 5 new boxes across the
+     image instead of stacking them invisibly on top of each other.
+     A fresh Ctrl+C on a (possibly different) box resets the cascade
+     back to a single PASTE_OFFSET_PX step from that new copy.
+  3. The copied box is clamped to the image bounds on paste (same
+     clamping resize already uses) so repeated pasting near an edge
+     can't push a box's coordinates negative or past the image size.
+  4. Copy is a no-op if nothing is selected (nothing to copy); paste is
+     a no-op if nothing has been copied yet this session. Both print
+     nothing and just quietly do nothing -- there's no dialog for what
+     is meant to be a fast, repeatable shortcut.
+
+V15 NOTE -- Delete-key bugfix release.
+  1. FIXED: pressing Delete/BackSpace while a box's right-click context
+     menu was open did nothing. Root cause: tk.Menu.tk_popup() takes an
+     internal keyboard grab while the menu is posted (that's what makes
+     arrow-key navigation through the menu work), so key events -- like
+     Delete -- stop reaching the <Delete>/<BackSpace> bindings on
+     self.root while any menu is open; they only worked again once the
+     menu had already been dismissed. Fixed by ALSO binding Delete /
+     BackSpace directly on the popup menu itself (in
+     _open_box_context_menu, right before tk_popup()) so they fire
+     immediately even while the menu has the grab, unposting the menu
+     first and then calling the same _delete_selected() the root-level
+     binding already used -- so deleting behaves identically either
+     way, menu open or closed.
+
+V16 NOTE -- sequence/frame parsing fix + motion-predicted sync release.
+  1. FIXED (SEQ_FRAME_RE never matched filenames without a leading
+     underscore before the sequence id): the regex required a literal
+     "_" immediately before the sequence name (e.g. "..._M1201_img
+     000322_..."), but this dataset's actual filenames start directly
+     with the sequence id ("M0101_img000005_jpg.rf.<hash>.jpg" -- no
+     leading underscore). That meant this branch NEVER matched here,
+     and parse_seq_frame() silently fell through to its folder-per-
+     sequence fallback -- which also doesn't apply to this dataset
+     (everything sits flat in one "images" folder per split), so every
+     image collapsed into ONE fake "sequence" keyed by that folder
+     name, with a bogus "frame number" pulled from a digit run inside
+     the Roboflow export hash suffix rather than the real
+     "img<FRAME>" counter. Cross-frame sync was therefore matching
+     "neighbors" essentially at random across the whole dataset, not
+     actual nearby video frames -- confirmed against real
+     review_progress.json data: ~99.8% of previously-synced manual
+     boxes pointed at an image with a DIFFERENT real sequence id or a
+     real frame number hundreds of frames away. Fixed by allowing the
+     match at the START of the filename too (see the updated regex
+     below) -- this now correctly parses "M0101_img000005_..." as
+     sequence "M0101", frame 5, matching this dataset's real layout.
+     ACTION REQUIRED: this fix only changes matching going forward.
+     Entries already written under the old, broken sequence grouping
+     are not automatically corrected -- audit review_progress.json's
+     "synced_from" entries against each box's REAL (regex-parsed)
+     sequence/frame before trusting them, and treat any mismatch as
+     unverified rather than reviewed.
+  2. ADDED: motion-predicted cross-frame matching. Previously, syncing
+     a decision to frame N+k always searched for a same-class box near
+     the SOURCE frame's box position, regardless of k -- fine for k=1,
+     increasingly wrong for a panning/moving shot as k grows, since the
+     object has actually moved. Sync now walks OUTWARD from the source
+     frame, nearest-frame-first, independently in each direction
+     (backward toward lower frame numbers, forward toward higher), and
+     maintains a running position PREDICTION: it starts at the source
+     box, and the moment it has found the object in two real frames, it
+     derives a per-frame velocity from those two observations and uses
+     it to extrapolate where the object should be in the next frame out
+     -- updating that estimate every time it gets a new real
+     observation, and coasting on the last known velocity through any
+     frame where no candidate box was found at all (e.g. a frame that
+     failed the review-queue's own confidence gate). This is a simple
+     constant-velocity ("dead reckoning") predictor, not a full tracker
+     -- it has no notion of acceleration, turns, or occlusion, and a
+     fast direction change will still throw it off within a frame or
+     two -- but it materially improves match accuracy over a static
+     "same pixel spot" assumption on the smooth, mostly-linear motion
+     typical of drone footage over a handful of frames. See
+     _predict_and_match_chain() / _ordered_neighbor_frames() below.
+     Manual-box sync (_sync_propagate_manual_add) is UNCHANGED by this
+     -- it has no detector candidate to observe a real position from in
+     each neighbor frame, so there's nothing to derive a velocity from;
+     it still stamps a same-position copy, same as before.
+
 WHAT CHANGED, keyboard command -> new equivalent:
   click box, cycle       -> click box: pops up a menu with Accept /
   pending/accept/reject     Reject / Reset to Pending / Change Class /
@@ -396,8 +493,11 @@ WHAT CHANGED, keyboard command -> new equivalent:
                               middle-click-drag or scrollbars = pan
   (nothing before)         -> Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z = undo/redo
   (nothing before)         -> 1-9 = apply Nth class to selected box
+  (nothing before)         -> Ctrl+C / Ctrl+V = copy / paste-with-offset
+                              the selected box as a new manual box
+                              (V14, see note above)
   (nothing before)         -> Fast Mode: left-click queue box = accept,
-                              right-click = reject (no menu)
+                              right-click = reject (no menu popup)
   (nothing before)         -> Esc while dragging a move/resize cancels
                               it and snaps the box back (V9 note #4)
   (nothing before)         -> Accept/Reject/Delete on a queue box, OR
@@ -405,20 +505,27 @@ WHAT CHANGED, keyboard command -> new equivalent:
                               box, syncs the same action to matching
                               (or newly-created) boxes in nearby frames
                               of the same sequence (V10 + V11 note
-                              above); "Undo Last Sync" reverts just
-                              that batch. Changing your mind on a
-                              source box (V13) retracts what it
-                              previously synced, not just the most
-                              recent batch.
+                              above, motion-predicted per V16); "Undo
+                              Last Sync" reverts just that batch.
+                              Changing your mind on a source box (V13)
+                              retracts what it previously synced, not
+                              just the most recent batch.
   (nothing before)         -> "Switch to QA / Completed" button (V12):
                               swap between reviewing pending images and
                               browsing/correcting already-completed
                               ones, without restarting the app.
+  Delete / BackSpace       -> deletes whichever box is currently
+                              selected (queue box -> "deleted" state,
+                              hidden + recoverable; manual box ->
+                              removed outright, including any synced
+                              copies it created). No-op if nothing is
+                              selected. (V15: now also works while that
+                              box's own context menu is still open.)
 
 WHY A SEPARATE OUTPUT TREE (see generate_pseudo_labels.py's module
 docstring for the full reasoning): this writes to datasets/
 pseudo_labels_reviewed/<SOURCE>/..., NOT datasets/pseudo_labels/ (the
-auto-accept tree). generate_pseudo_labels.py overwrites pseudo_labels/
+auto-accept tier). generate_pseudo_labels.py overwrites pseudo_labels/
 wholesale on every rerun -- if this tool wrote there too, a later rerun
 would silently erase your manual review work. --apply merges BOTH
 trees into the real dataset, so this separation costs nothing at apply
@@ -526,6 +633,25 @@ UNDO_LIMIT = 50
 HANDLE_SIZE = 7
 HANDLE_HIT_PAD = 5
 
+# How far (in screen/canvas pixels) a box's popup menu is offset from
+# the box's own edge, so the menu opens BESIDE the box instead of
+# directly on top of it. Previously the menu popped up exactly at the
+# click point, which for a small box could cover the box (and its
+# resize handles) entirely -- making it impossible to then grab a
+# handle to resize/move it without first closing the menu and hunting
+# for the box underneath. See _menu_pos_clear_of_box().
+MENU_OFFSET_PX = 18
+MENU_EST_WIDTH_PX = 190  # rough width to check we're not offsetting off-screen
+
+# How far (in ORIGINAL IMAGE pixels) each successive Ctrl+V paste is
+# offset, diagonally, from the copied box's original position. Without
+# this every paste would land in the exact same spot and stack
+# invisibly on top of the previous one/the original -- offsetting means
+# repeated Ctrl+V visibly cascades new copies across the image so you
+# can see each one to drag into place. Resets to 0 on every fresh
+# Ctrl+C (see _copy_selected).
+PASTE_OFFSET_PX = 15
+
 # Smallest a box (manual, or a queue box mid-resize) is allowed to
 # shrink to, in ORIGINAL IMAGE pixels (not screen/zoom pixels) -- keeps
 # a resize drag from collapsing a box to zero/negative width or height.
@@ -560,12 +686,20 @@ HANDLE_CURSOR = {
     "e": "sb_h_double_arrow", "w": "sb_h_double_arrow",
 }
 
-# --- Cross-frame sync (V10 / V11) --------------------------------------
-# Filenames like "011_M1201_img000322_jpg_rf_<hash>.jpg" encode a
+# --- Cross-frame sync (V10 / V11 / V16) --------------------------------
+# Filenames like "011_M1201_img000322_jpg_rf_<hash>.jpg" (Roboflow-style)
+# OR, as of V16, "M1201_img000322_jpg.rf.<hash>.jpg" (this dataset's real
+# layout -- no leading underscore before the sequence id) encode a
 # sequence id ("M1201") and a frame number ("000322"). This is a
 # heuristic over the filename ONLY -- images that don't match this
 # pattern simply have no sync neighbors, which is a safe no-op.
-SEQ_FRAME_RE = re.compile(r"_(?P<seq>[A-Za-z0-9]+)_img(?P<frame>\d+)_")
+#
+# V16 FIX: the sequence id is now matched at either the START of the
+# filename OR after an underscore -- (?:^|_) -- instead of requiring a
+# literal leading underscore unconditionally. See the V16 module note
+# above for why the old, underscore-only version silently never matched
+# this dataset's actual filenames and what that broke.
+SEQ_FRAME_RE = re.compile(r"(?:^|_)(?P<seq>[A-Za-z0-9]+)_img(?P<frame>\d+)_")
 
 SYNC_DEFAULT_WINDOW = 3          # frames each direction, default
 SYNC_MAX_WINDOW = 10
@@ -589,11 +723,9 @@ def parse_seq_frame(image_key: str):
     """Returns (sequence_id, frame_number) for grouping/sorting frames
     within a sequence. Tries two layouts, in order:
 
-      1. Sequence embedded in the FILENAME with underscores, e.g. a
-         Roboflow-style export "..._M1201_img000322_...". This is what
-         V10 originally shipped with, matched against sample filenames
-         that turned out to be Roboflow's own export naming, not
-         necessarily this dataset's real on-disk layout.
+      1. Sequence embedded in the FILENAME, e.g. "M1201_img000322_..."
+         (this dataset's real layout, V16) or a Roboflow-style export
+         "..._M1201_img000322_..." (leading underscore also matches).
       2. Sequence as the PARENT DIRECTORY name with the frame number
          being the last run of digits in the filename, e.g.
          ".../M1201/img000322.jpg" -> ("M1201", 322). This is the
@@ -891,6 +1023,16 @@ class ReviewApp:
         self._rubber_id = None
         self.reposition_armed = None   # (kind, key) currently allowed one drag/resize
 
+        # (V14) Clipboard for copy/paste: {"cls": str, "box": [x1,y1,x2,y2]}
+        # (box in ORIGINAL IMAGE pixel coordinates, same space every other
+        # box is stored in) or None if nothing has been copied yet this
+        # session. _paste_count tracks how many times Ctrl+V has been
+        # pressed since the last Ctrl+C, so successive pastes cascade by
+        # PASTE_OFFSET_PX instead of stacking on top of each other -- see
+        # _copy_selected() / _paste_clipboard().
+        self.clipboard = None
+        self._paste_count = 0
+
         self.image_key = None
         self.source_name = None
         self.queue_items = []
@@ -979,6 +1121,10 @@ class ReviewApp:
         edit_menu = tk.Menu(menubar, tearoff=0)
         edit_menu.add_command(label="Undo", command=self.undo, accelerator="Ctrl+Z")
         edit_menu.add_command(label="Redo", command=self.redo, accelerator="Ctrl+Y")
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Copy Selected Box", command=self._copy_selected, accelerator="Ctrl+C")
+        edit_menu.add_command(label="Paste Box", command=self._paste_clipboard, accelerator="Ctrl+V")
+        edit_menu.add_command(label="Delete Selected Box", command=self._delete_selected, accelerator="Del")
         edit_menu.add_separator()
         edit_menu.add_command(label="Accept All Pending", command=self.bulk_accept_pending)
         edit_menu.add_command(label="Reject All Pending", command=self.bulk_reject_pending)
@@ -1088,6 +1234,10 @@ class ReviewApp:
         ttk.Separator(toolbar2, orient="vertical").pack(side=tk.LEFT, fill="y", padx=6)
         ttk.Button(toolbar2, text="\u21b6 Undo", command=self.undo).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar2, text="\u21b7 Redo", command=self.redo).pack(side=tk.LEFT, padx=2)
+        ttk.Separator(toolbar2, orient="vertical").pack(side=tk.LEFT, fill="y", padx=6)
+        ttk.Button(toolbar2, text="Copy", command=self._copy_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar2, text="Paste", command=self._paste_clipboard).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar2, text="Delete", command=self._delete_selected).pack(side=tk.LEFT, padx=2)
 
         # Cross-frame sync controls (V10/V11): on/off + how many frames
         # out in each direction to look for a matching pending box (or
@@ -1157,6 +1307,38 @@ class ReviewApp:
         self.root.bind("<Control-z>", lambda e: self.undo())
         self.root.bind("<Control-y>", lambda e: self.redo())
         self.root.bind("<Control-Z>", lambda e: self.redo())  # Ctrl+Shift+Z on many platforms
+
+        # (V14) Copy/paste: Ctrl+C copies whichever box is currently
+        # selected (see self.selected_key), Ctrl+V pastes a new manual
+        # box from the clipboard, cascading by PASTE_OFFSET_PX on each
+        # repeated paste. Bound on both lowercase (the common case) and
+        # uppercase keysyms so it still fires if Caps Lock happens to be
+        # on -- Tk reports a different keysym in that case, same reason
+        # <Control-Z> is bound above alongside <Control-y>.
+        self.root.bind("<Control-c>", lambda e: self._copy_selected())
+        self.root.bind("<Control-C>", lambda e: self._copy_selected())
+        self.root.bind("<Control-v>", lambda e: self._paste_clipboard())
+        self.root.bind("<Control-V>", lambda e: self._paste_clipboard())
+
+        # Delete/Backspace: delete whichever box is currently selected
+        # (set by clicking a box -- see _open_box_context_menu /
+        # fast-mode / drag-select). No-op if nothing is selected. Bound
+        # directly rather than routed through on_key() since Delete/
+        # BackSpace keysyms aren't in the small set on_key() already
+        # switches on.
+        #
+        # (V15) NOTE: this root-level binding only fires while NO menu
+        # currently holds Tk's keyboard grab. tk.Menu.tk_popup() (used
+        # by _open_box_context_menu) takes that grab for the duration
+        # the menu is posted, which is what makes arrow-key navigation
+        # through the menu work -- but it also means Delete/BackSpace
+        # pressed while a box's context menu is open never reaches this
+        # binding at all. _open_box_context_menu() ALSO binds Delete/
+        # BackSpace directly on the popup menu widget itself (right
+        # before tk_popup()) so the shortcut works identically whether
+        # the menu is open or closed -- see the comment there.
+        self.root.bind("<Delete>", lambda e: self._delete_selected())
+        self.root.bind("<BackSpace>", lambda e: self._delete_selected())
 
         # Crash-safety: flush the current image to disk immediately the
         # moment this window loses OS focus (Alt-Tab, another app,
@@ -1321,6 +1503,13 @@ class ReviewApp:
         self.selected_key = None
         self.drag = None
         self.reposition_armed = None
+
+        # (V14) Copy/paste clipboard is deliberately NOT cleared here --
+        # unlike undo/redo (which is scoped per-image on purpose), a
+        # copied box is exactly the kind of thing you'd want to carry
+        # across a Next/Previous navigation (copy a box on frame N,
+        # paste equivalents into frame N+1, N+2, ...), so it persists
+        # for the whole session until a fresh Ctrl+C replaces it.
 
         # Undo/redo is scoped per-image -- a fresh image starts with a
         # clean slate rather than carrying over unrelated history.
@@ -1532,7 +1721,75 @@ class ReviewApp:
         self.streak = 0
 
     # ------------------------------------------------------------------
-    # Cross-frame sync (V10 queue decisions / V11 manual boxes / V13 retraction)
+    # Copy / paste (V14)
+    # ------------------------------------------------------------------
+
+    def _copy_selected(self):
+        """Copies whichever box is currently selected (self.selected_key
+        -- set by clicking/right-clicking/fast-mode-clicking a box, or by
+        drawing/pasting a new one) onto the in-memory clipboard: its
+        class and its box, in ORIGINAL IMAGE pixel coordinates. No-op if
+        nothing is selected. A fresh copy always resets the paste
+        cascade back to a single PASTE_OFFSET_PX step -- see
+        _paste_clipboard()."""
+        if self.selected_key is None:
+            return
+        kind, key = self.selected_key
+        try:
+            box = self._get_box(kind, key)
+        except KeyError:
+            return
+        if kind == "queue":
+            it = self._queue_item_by_key(key)
+            if it is None:
+                return
+            cls = self.class_overrides.get(key, it["cls"])
+        else:
+            try:
+                cls = self._find_manual(key)["cls"]
+            except KeyError:
+                return
+        self.clipboard = {"cls": cls, "box": list(box)}
+        self._paste_count = 0
+        self._update_status()
+
+    def _paste_clipboard(self):
+        """Pastes the copied box as a brand-new MANUAL box (same class,
+        same size), offset diagonally by PASTE_OFFSET_PX * (how many
+        times Ctrl+V has been pressed since the last Ctrl+C) so repeated
+        pastes cascade visibly across the image instead of stacking
+        invisibly on the same spot. Goes through the exact same path a
+        hand-drawn box does (_add_manual_box): auto-accepted, undoable,
+        autosaved, and cross-frame synced if sync is on. No-op if
+        nothing has been copied yet."""
+        if self.clipboard is None:
+            return
+        self._paste_count += 1
+        offset = PASTE_OFFSET_PX * self._paste_count
+        x1, y1, x2, y2 = self.clipboard["box"]
+        w = x2 - x1
+        h = y2 - y1
+        new_x1 = x1 + offset
+        new_y1 = y1 + offset
+        # Clamp so a cascade of pastes near an edge can't push the box
+        # off the image entirely -- same clamping logic resize already
+        # uses, just applied to a translated copy instead of a dragged
+        # edge.
+        new_x1 = max(0.0, min(new_x1, self.img_w - w))
+        new_y1 = max(0.0, min(new_y1, self.img_h - h))
+        new_box = [new_x1, new_y1, new_x1 + w, new_y1 + h]
+        self._add_manual_box(self.clipboard["cls"], new_box)
+        # The newly pasted box becomes the new selection so an immediate
+        # Ctrl+C would copy IT, not the original -- consistent with
+        # "selection follows what you just did" everywhere else (drawing,
+        # fast-mode accept, etc.).
+        if self.manual_boxes:
+            self.selected_key = ("manual", self.manual_boxes[-1]["_id"])
+            self.redraw()
+
+    # ------------------------------------------------------------------
+    # Cross-frame sync (V10 queue decisions / V11 manual boxes / V13
+    # retraction / V16 motion-predicted chained matching)
     # ------------------------------------------------------------------
 
     def _get_image_dims_cached(self, image_key):
@@ -1543,6 +1800,14 @@ class ReviewApp:
         return dims
 
     def _neighbor_image_keys(self, image_key):
+        """Flat (unordered-by-distance) list of every neighbor frame
+        within the sync window, in ascending-frame order. Still used by
+        manual-box sync (_sync_propagate_manual_add) and
+        _position_already_covered, which have no detector-observed
+        position to derive a velocity from and so have no use for the
+        directional/distance-ordered split below -- see V16 module
+        note. Queue-decision sync (_apply_sync_batch) uses
+        _ordered_neighbor_frames() instead."""
         seq_key = self.image_seq_key.get(image_key)
         if seq_key is None:
             return []
@@ -1550,6 +1815,31 @@ class ReviewApp:
         window = max(0, min(SYNC_MAX_WINDOW, self.seq_neighbors_window.get()))
         order = self.sequence_frames.get(seq_key, [])
         return [k for (fnum, k) in order if k != image_key and abs(fnum - frame) <= window]
+
+    def _ordered_neighbor_frames(self, image_key):
+        """(V16) Returns (backward, forward): two lists of
+        (frame_num, image_key) tuples within the sync window, each
+        ordered NEAREST-FIRST moving away from image_key's own frame --
+        backward = descending frame number (toward earlier frames),
+        forward = ascending frame number (toward later frames). Used by
+        _predict_and_match_chain() to walk outward frame-by-frame in
+        each direction independently, so a running position prediction
+        can be built up and refined with each real observation instead
+        of always testing every neighbor against the SOURCE frame's
+        static box position."""
+        seq_key = self.image_seq_key.get(image_key)
+        if seq_key is None:
+            return [], []
+        frame = self.image_frame_num[image_key]
+        window = max(0, min(SYNC_MAX_WINDOW, self.seq_neighbors_window.get()))
+        order = self.sequence_frames.get(seq_key, [])
+        backward = [(fnum, k) for (fnum, k) in order
+                    if k != image_key and 0 < frame - fnum <= window]
+        forward = [(fnum, k) for (fnum, k) in order
+                   if k != image_key and 0 < fnum - frame <= window]
+        backward.sort(key=lambda t: t[0], reverse=True)   # nearest first
+        forward.sort(key=lambda t: t[0])                  # nearest first
+        return backward, forward
 
     def _queue_item_by_key(self, key):
         for it in self.queue_items:
@@ -1562,15 +1852,20 @@ class ReviewApp:
         any class override already saved for it on that image -- not
         just its raw queue-detected class. Without this, a neighbor box
         you'd already relabelled via "Change Class" could be missed as
-        a sync target (or matched under the wrong class)."""
+        a sync target, or wrongly matched under the wrong class."""
         overrides = self.progress.get(f"__override__{image_key}", {})
         return overrides.get(item_key(it), it["cls"])
 
     def _find_matching_queue_item(self, image_key, cls, box, debug_log=None):
         """Same-class queue box in `image_key` whose center is within
         SYNC_POS_TOLERANCE_FRAC of the image diagonal from `box`'s
-        center. Uses each candidate's CURRENT (possibly already-synced
-        or hand-repositioned) box from progress.json, not its original
+        center. `box` is normally the source item's own position for a
+        1-frame-out neighbor, but as of V16 the caller
+        (_predict_and_match_chain) may instead pass a MOTION-PREDICTED
+        position for frames further out -- this function itself doesn't
+        care which, it just searches near whatever box it's given. Uses
+        each candidate's CURRENT (possibly already-synced or
+        hand-repositioned) box from progress.json, not its original
         detector box, and its CURRENT effective class (honoring any
         class override -- V13 fix D). Returns the nearest match, or
         None. If `debug_log` (a list) is passed, appends a one-line
@@ -1618,6 +1913,80 @@ class ReviewApp:
                     f"    {Path(image_key).name}: {same_class_count} '{cls}' box(es) here, "
                     f"nearest is {nearest_wrong_dist:.1f}px away (tol={tol:.1f}px) -- too far, no match")
         return best
+
+    def _predict_and_match_chain(self, source_frame_num, source_box, cls,
+                                  frame_list, debug_log=None):
+        """(V16) Walks `frame_list` -- a nearest-first ordered
+        [(frame_num, image_key), ...] in ONE direction from the source
+        frame (see _ordered_neighbor_frames) -- and, at each step,
+        searches for a same-class pending queue box near a PREDICTED
+        position rather than always the source box's raw position.
+
+        The prediction starts as the source box itself. The first real
+        observation (a matched box, whether or not its decision is
+        still pending -- see below) just confirms/refines the current
+        position. Once there have been TWO real observations, a
+        per-frame velocity is derived from them (position delta /
+        frame-number delta) and used to extrapolate the predicted
+        position for the next frame out; that velocity is refreshed on
+        every subsequent real observation. If a frame in between has no
+        matching candidate at all (e.g. it failed the review queue's
+        own confidence gate), the predictor simply coasts on the last
+        known velocity rather than resetting -- so a short gap doesn't
+        throw off the whole chain.
+
+        An observation used to update the trajectory does NOT have to
+        be "pending" -- an already-decided neighbor is still real
+        evidence of where the object actually is, so it's used to keep
+        the prediction accurate for frames further out even though its
+        own decision is left untouched (never overwritten). Only
+        PENDING matches are returned for the caller to actually decide.
+
+        Returns a list of (image_key, matched_item) for every frame
+        where a still-pending match was found within tolerance -- the
+        caller applies the actual decision."""
+        results = []
+        last_frame_num, last_box = source_frame_num, source_box
+        velocity = None  # [dx1, dy1, dx2, dy2] per frame-number step
+
+        for fnum, nk in frame_list:
+            gap = fnum - last_frame_num
+            if velocity is not None and gap != 0:
+                predicted = [last_box[i] + velocity[i] * gap for i in range(4)]
+            else:
+                predicted = last_box
+
+            if nk in self.completed_set:
+                if debug_log is not None:
+                    debug_log.append(f"    {Path(nk).name}: skipped (already in completed list)")
+                continue
+
+            match = self._find_matching_queue_item(nk, cls, predicted, debug_log=debug_log)
+            if match is None:
+                continue  # no observation here -- keep predicting from the last real one
+
+            mk = item_key(match)
+            matched_box = self.progress.get(mk, {}).get("box", match["box"])
+
+            # Update the trajectory from this real observation regardless
+            # of whether we're allowed to act on its decision -- it's
+            # still genuine evidence of where the object is, and using it
+            # keeps predictions further down this chain accurate.
+            if gap != 0:
+                velocity = [(matched_box[i] - last_box[i]) / gap for i in range(4)]
+            last_frame_num, last_box = fnum, matched_box
+
+            cur = self.progress.get(mk, {}).get("decision", "pending")
+            if cur != "pending":
+                if debug_log is not None:
+                    debug_log.append(
+                        f"    {Path(nk).name}: match found but already decided ({cur}) -- "
+                        f"used as a trajectory point only, decision left alone")
+                continue
+
+            results.append((nk, match))
+
+        return results
 
     def _position_already_covered(self, image_key, cls, box) -> bool:
         """(V11) True if a queue box OR manual box of the same
@@ -1738,26 +2107,28 @@ class ReviewApp:
         return touched
 
     def _apply_sync_batch(self, sources):
-        """sources: list of (source_key, cls, box, state) tuples
+        """(V16: motion-predicted chain, see _predict_and_match_chain)
+        sources: list of (source_key, cls, box, state) tuples
         describing decisions just made on QUEUE boxes on the image
-        currently on screen. For each, looks at nearby frames in the
-        same sequence and, for each neighbor within the configured
-        frame window, finds a same-EFFECTIVE-class queue box close to
-        the same position that is STILL PENDING there, and applies the
-        same decision. Never touches a neighbor box that already has a
-        decision (yours or a previous sync's), and never reopens an
-        image already in the completed list. Geometry is never
-        touched, only the decision. Records which neighbor entries
-        each source created (source's "synced_children") so a later
-        change to that SAME source can cleanly retract them (V13 fix
-        B). Returns the set of touched neighbor image_keys."""
+        currently on screen. For each, walks outward from the source
+        frame in both directions (backward, forward), nearest-frame-
+        first, maintaining a running position prediction, and for each
+        neighbor finds a same-EFFECTIVE-class queue box near that
+        prediction that is STILL PENDING there, applying the same
+        decision. Never touches a neighbor box that already has a
+        decision (yours or a previous sync's -- though an already-
+        decided match still refines the trajectory, see
+        _predict_and_match_chain), and never reopens an image already
+        in the completed list. Geometry is never touched, only the
+        decision. Records which neighbor entries each source created
+        (source's "synced_children") so a later change to that SAME
+        source can cleanly retract them (V13 fix B). Returns the set of
+        touched neighbor image_keys."""
         touched_images = set()
         if not self.sync_enabled.get():
             return touched_images
         verbose = self.sync_debug.get()
         applied = []
-        skipped_completed = 0
-        skipped_decided = 0
 
         seq_key = self.image_seq_key.get(self.image_key)
         if seq_key is None:
@@ -1767,8 +2138,8 @@ class ReviewApp:
                 print(f"[sync] '{self.image_key}': not parseable, no neighbors possible.")
             return touched_images
 
-        neighbors = self._neighbor_image_keys(self.image_key)
-        if not neighbors:
+        backward, forward = self._ordered_neighbor_frames(self.image_key)
+        if not backward and not forward:
             self.sync_status_var.set(
                 f"Sync: 0 neighbor frame(s) found for this image (seq={seq_key!r})")
             if verbose:
@@ -1780,28 +2151,25 @@ class ReviewApp:
         if verbose:
             print(f"[sync] '{self.image_key}' seq={seq_key!r} frame="
                   f"{self.image_frame_num.get(self.image_key)}: "
-                  f"{len(neighbors)} neighbor(s) -> {[Path(n).name for n in neighbors]}")
+                  f"{len(backward)} backward + {len(forward)} forward neighbor(s) "
+                  f"(motion-predicted chain)")
+
+        source_frame_num = self.image_frame_num.get(self.image_key)
 
         for source_key, cls, box, state in sources:
             debug_log = [] if verbose else None
             source_entry = self.progress.setdefault(source_key, {})
             children = list(source_entry.get("synced_children", []))
-            for nk in neighbors:
-                if nk in self.completed_set:
-                    skipped_completed += 1
-                    if debug_log is not None:
-                        debug_log.append(f"    {Path(nk).name}: skipped (already in completed list)")
-                    continue
-                match = self._find_matching_queue_item(nk, cls, box, debug_log=debug_log)
-                if match is None:
-                    continue
+
+            chain_results = []
+            if source_frame_num is not None:
+                chain_results.extend(self._predict_and_match_chain(
+                    source_frame_num, box, cls, backward, debug_log=debug_log))
+                chain_results.extend(self._predict_and_match_chain(
+                    source_frame_num, box, cls, forward, debug_log=debug_log))
+
+            for nk, match in chain_results:
                 mk = item_key(match)
-                cur = self.progress.get(mk, {}).get("decision", "pending")
-                if cur != "pending":
-                    skipped_decided += 1
-                    if debug_log is not None:
-                        debug_log.append(f"    {Path(nk).name}: match found but already decided ({cur}) -- skipped")
-                    continue
                 self.progress[mk] = {
                     "decision": state,
                     "image": nk,
@@ -1817,19 +2185,16 @@ class ReviewApp:
                     children.append(mk)
             source_entry["synced_children"] = children
             if debug_log:
-                print(f"[sync] decision={state!r} cls={cls!r} box={[round(v) for v in box]}:")
+                print(f"[sync] decision={state!r} cls={cls!r} box={[round(v) for v in box]} "
+                      f"(motion-predicted chain):")
                 for line in debug_log:
                     print(line)
 
         if not applied:
-            reason = []
-            if skipped_completed:
-                reason.append(f"{skipped_completed} already-completed neighbor(s) skipped")
-            if skipped_decided:
-                reason.append(f"{skipped_decided} already-decided match(es) skipped")
-            suffix = f" ({', '.join(reason)})" if reason else " (no matching class/position found)"
-            self.sync_status_var.set(f"Sync: 0 applied{suffix} -- see console for details" if verbose
-                                      else f"Sync: 0 applied{suffix} -- enable 'Verbose sync log' for detail")
+            self.sync_status_var.set(
+                "Sync: 0 applied (no matching class/position found along the chain)"
+                if not verbose else
+                "Sync: 0 applied -- see console for details")
             return touched_images
 
         for nk in touched_images:
@@ -1845,16 +2210,22 @@ class ReviewApp:
     def _sync_propagate_manual_add(self, mb):
         """(V11) Mirrors the queue-decision sync, but for a manual box
         that was just Accepted (V12: this now happens automatically the
-        moment the box is drawn). There's no detector candidate to
-        match against in a neighbor frame -- so instead of matching,
-        this DIRECTLY CREATES a copy of the box (same class, same pixel
-        position) in each in-window neighbor frame, unless that
-        position is already covered by something (see
+        moment the box is drawn -- or pasted, V14). There's no detector
+        candidate to match against in a neighbor frame -- so instead of
+        matching, this DIRECTLY CREATES a copy of the box (same class,
+        same pixel position) in each in-window neighbor frame, unless
+        that position is already covered by something (see
         _position_already_covered) or the neighbor is already
         completed. Every copy created is tagged "synced_from" and
         recorded onto `mb["_sync_children"]` so a later Reject/Reset/
         Delete of THIS box can cleanly remove exactly the copies it
-        made -- never a box drawn independently elsewhere."""
+        made -- never a box drawn independently elsewhere.
+
+        (V16) NOT motion-predicted, unlike queue-decision sync -- a
+        manual box has no detector candidate anywhere to observe a real
+        position from in a neighbor frame, so there's no second
+        observation to derive a velocity from. It still stamps a
+        same-position copy in every neighbor, same as before V16."""
         if not self.sync_enabled.get():
             return
         neighbors = self._neighbor_image_keys(self.image_key)
@@ -1966,7 +2337,8 @@ class ReviewApp:
                 cls = self.class_overrides.get(k, it["cls"])
                 out.append({"cls": cls, "box": it["box"]})
         # V11: a manual box only reaches output once explicitly Accepted
-        # (V12: this happens automatically the moment it's drawn).
+        # (V12: this happens automatically the moment it's drawn or
+        # pasted, V14).
         out.extend({"cls": mb["cls"], "box": mb["box"]} for mb in self.manual_boxes
                    if mb.get("decision", "pending") == "accepted")
         return out
@@ -2350,12 +2722,13 @@ class ReviewApp:
         streak_txt = f"  |  streak={self.streak}" if self.streak > 1 else ""
         blocked_txt = ("  |  \u26a0 manual pending, can't complete"
                         if n_manual_pending else "")
+        clipboard_txt = ("  |  \U0001f4cb copied" if self.clipboard is not None else "")
         self.status_var.set(
             f"{Path(self.image_key).name}  |  pending={n_pending} accept={n_accept} "
             f"reject={n_reject} deleted={n_deleted} "
             f"manual={len(self.manual_boxes)}(pending={n_manual_pending}) "
             f"orig={len(self.original_boxes)}  |  zoom={int(self.zoom * 100)}%"
-            f"{streak_txt}{blocked_txt}{unsaved}")
+            f"{streak_txt}{blocked_txt}{clipboard_txt}{unsaved}")
         done = len(self.completed_set)
         total = len(self.image_keys) if self.qa_mode else (len(self.image_keys) + done)
         self.progress_var.set(
@@ -2450,17 +2823,18 @@ class ReviewApp:
         self.redraw()
 
     def _add_manual_box(self, cls, box):
-        """Appends a new manually-drawn box. No cap on how many you can
-        add -- call this as many times as you like (one per drag-draw on
-        empty canvas). Each gets its own stable id so adding/deleting
-        others around it never disturbs it.
+        """Appends a new manually-drawn (or, V14, pasted) box. No cap on
+        how many you can add -- call this as many times as you like (one
+        per drag-draw on empty canvas, or one per Ctrl+V). Each gets its
+        own stable id so adding/deleting others around it never
+        disturbs it.
 
         (V12) Auto-accepted immediately: it's included in output and
-        counted toward completing the image the instant you pick its
-        class, and (if sync is on) is propagated to nearby frames right
-        away -- no separate "open its menu and click Accept" step for
-        the common case of a box you meant to add. If you drew it by
-        mistake, open its menu and use Reject / Reset to Pending /
+        counted toward completing the image the instant it's created,
+        and (if sync is on) is propagated to nearby frames right away --
+        no separate "open its menu and click Accept" step for the
+        common case of a box you meant to add. If you drew/pasted one
+        by mistake, open its menu and use Reject / Reset to Pending /
         Delete to correct it."""
         self._push_undo()
         mb = {"cls": cls, "box": box, "_id": self._next_manual_id, "decision": "accepted"}
@@ -2477,9 +2851,91 @@ class ReviewApp:
         self.selected_key = (kind, key)
         self.redraw()
 
+    def _delete_selected(self):
+        """Delete/Backspace handler: deletes whichever box is currently
+        selected (self.selected_key, set whenever a box's menu was
+        opened or it was clicked -- it stays set after the menu closes,
+        including via "Cancel", so selecting a box then pressing Delete
+        works without the menu needing to stay open). Mirrors exactly
+        what the menu's own Delete option does for that box kind, so
+        there's no separate deletion behavior to keep in sync:
+          - queue box  -> same as "Delete (hide from view)": moves to
+            the "deleted" decision state (hidden, fully recoverable via
+            the "Show Deleted/Rejected" checkbox + Reset to Pending).
+          - manual box -> same as its menu's "Delete": removed outright
+            (via _delete_manual, which also retracts any cross-frame
+            sync copies it created).
+        No-op if nothing is selected.
+
+        (V15) Called both from the root-level <Delete>/<BackSpace>
+        bindings AND from the popup menu's own <Delete>/<BackSpace>
+        bindings (see _open_box_context_menu) -- the menu case unposts
+        the menu first, then calls this exact same method, so behavior
+        is identical either way."""
+        if self.selected_key is None:
+            return
+        kind, key = self.selected_key
+        if kind == "queue":
+            if self._queue_item_by_key(key) is None:
+                # Stale selection -- item no longer in this image's queue.
+                # Nothing to delete; just drop the selection.
+                self.selected_key = None
+                return
+            if self.decisions.get(key) != "deleted":
+                self._set_decision(key, "deleted")
+        else:
+            if not any(mb["_id"] == key for mb in self.manual_boxes):
+                # Stale selection -- most likely two Delete/BackSpace
+                # events fired for the same keypress (seen on Windows when
+                # a box's context menu closes at nearly the same moment
+                # the root-level binding also sees the key), so the box
+                # was already removed by the first call before this one
+                # ran. Not an error -- just drop the stale selection
+                # instead of crashing.
+                self.selected_key = None
+                return
+            self._delete_manual(key)
+        self.selected_key = None
+        self.redraw()
+
     # ------------------------------------------------------------------
     # Menus
     # ------------------------------------------------------------------
+
+    def _canvas_to_root(self, canvas_x, canvas_y):
+        """Converts a point in canvas item-coordinate space (the same
+        space box outlines are drawn in -- i.e. already multiplied by
+        self.scale) into root/screen coordinates suitable for
+        tk_popup(), accounting for however far the canvas is currently
+        scrolled."""
+        view_x = canvas_x - self.canvas.canvasx(0)
+        view_y = canvas_y - self.canvas.canvasy(0)
+        return (self.canvas.winfo_rootx() + int(view_x),
+                self.canvas.winfo_rooty() + int(view_y))
+
+    def _menu_pos_clear_of_box(self, box, fallback_root):
+        """Picks a screen position for a box's popup menu that sits
+        just outside the box's edge (offset by MENU_OFFSET_PX) instead
+        of directly on top of it -- so the box itself, and its resize
+        handles once selected, stay fully visible and clickable
+        underneath instead of being covered by the menu. Prefers
+        opening to the right of the box's top-right corner; falls back
+        to the left of the box if there isn't roughly enough room to
+        the right (rough estimate, not exact -- Tk will still nudge an
+        edge-of-screen menu back on screen on its own if this guess is
+        a little off). Falls back to `fallback_root` (the raw click
+        point) if the box can't be resolved for some reason."""
+        if not box:
+            return fallback_root
+        try:
+            x1, y1, x2, y2 = [v * self.scale for v in box]
+        except Exception:
+            return fallback_root
+        canvas_visible_w = self.canvas.winfo_width()
+        right_edge_view_x = x2 - self.canvas.canvasx(0)
+        if right_edge_view_x + MENU_OFFSET_PX + MENU_EST_WIDTH_PX < canvas_visible_w:
+            return self._canvas_to_root(x2 + MENU_OFFSET_PX, y1)
+        return self._canvas_to_root(x1 - MENU_OFFSET_PX - MENU_EST_WIDTH_PX, y1)
 
     def _open_class_menu(self, x_root, y_root, on_pick):
         menu = tk.Menu(self.root, tearoff=0)
@@ -2492,6 +2948,11 @@ class ReviewApp:
     def _open_box_context_menu(self, x_root, y_root, kind, key):
         self.selected_key = (kind, key)
         self.redraw()
+        try:
+            box = self._get_box(kind, key)
+        except KeyError:
+            box = None
+        x_root, y_root = self._menu_pos_clear_of_box(box, (x_root, y_root))
         menu = tk.Menu(self.root, tearoff=0)
         if kind == "queue":
             state = self.decisions[key]
@@ -2509,11 +2970,33 @@ class ReviewApp:
             menu.add_command(label="Enable Reposition/Resize (then drag once)",
                               command=lambda: self._arm_reposition(kind, key))
             menu.add_separator()
+            menu.add_command(label="Copy (Ctrl+C)", command=self._copy_selected)
+            menu.add_command(label="Paste (Ctrl+V)", command=self._paste_clipboard)
+            menu.add_separator()
             if state == "deleted":
                 menu.add_command(label="Undelete (reset to Pending)",
                                   command=lambda: self._set_decision(key, "pending"))
             else:
-                menu.add_command(label="Delete (hide from view)",
+                # (Windows fix) underline=0 registers "D" as this native
+                # popup menu's own accelerator letter for this item. On
+                # Windows, tk_popup() renders a NATIVE Win32 popup menu
+                # that runs its own message loop and owns keyboard input
+                # for as long as it's posted -- Tk-level key bindings
+                # (menu.bind("<Delete>", ...), added below right before
+                # tk_popup()) never receive events while that native loop
+                # has control, so on Windows they silently never fire even
+                # though the exact same binding works on X11/macOS where
+                # Tk draws (and owns input for) the menu itself. A native
+                # single-letter accelerator is handled by Windows' own
+                # menu-accelerator table instead of Tk, so it works
+                # regardless of which platform is drawing the menu -- this
+                # is what actually makes "press D while the menu is open"
+                # delete the box on Windows. Fix 2 (Escape then Delete)
+                # remains a no-code-change workaround: Escape returns
+                # keyboard control to self.root, where the ordinary
+                # <Delete> binding fires normally, exactly as the earlier
+                # crash traceback showed.
+                menu.add_command(label="Delete (hide from view)", underline=0,
                                   command=lambda: self._set_decision(key, "deleted"))
         else:
             # V11: manual boxes get the same Accept/Reject/Reset trio as
@@ -2533,16 +3016,54 @@ class ReviewApp:
                 class_menu.add_command(label=c, command=lambda c=c: self._set_manual_class(key, c))
             menu.add_cascade(label="Change Class", menu=class_menu)
             menu.add_separator()
-            menu.add_command(label="Delete", command=lambda: self._delete_manual(key))
+            menu.add_command(label="Copy (Ctrl+C)", command=self._copy_selected)
+            menu.add_command(label="Paste (Ctrl+V)", command=self._paste_clipboard)
+            menu.add_separator()
+            # (Windows fix, see the queue-box branch above for the full
+            # explanation) underline=0 gives this item a native "D"
+            # accelerator so Delete-while-menu-open works on Windows,
+            # where tk_popup()'s native message loop otherwise swallows
+            # Tk-level <Delete>/<BackSpace> bindings entirely.
+            menu.add_command(label="Delete", underline=0, command=lambda: self._delete_manual(key))
         menu.add_separator()
         menu.add_command(label="Cancel")
+
+        # (V15) Delete/BackSpace bugfix: tk.Menu.tk_popup() takes Tk's
+        # keyboard grab for as long as the menu is posted (that's what
+        # makes arrow-key navigation through the menu itself work), so
+        # while this menu is open, key events -- including Delete and
+        # BackSpace -- go to the MENU widget, never to self.root. The
+        # <Delete>/<BackSpace> bindings in _build_ui are on self.root,
+        # so they simply never fired while a box's menu was open; the
+        # only way to delete was to explicitly click the menu's own
+        # Delete item. Binding the same keys directly on this menu
+        # widget fixes it: unpost the menu first (so it doesn't linger
+        # on screen after the box it referred to is gone/changed), then
+        # call the exact same _delete_selected() the root-level binding
+        # already uses, so the two paths behave identically.
+        #
+        # (Windows note) These two bindings are exactly right for
+        # Linux/macOS, where Tk itself draws and owns input for the
+        # posted menu. On Windows, tk_popup() hands the menu off to a
+        # NATIVE Win32 popup, which runs its own modal message loop and
+        # owns all keyboard input while posted -- these Tk-level
+        # bindings simply never see the keystroke there, regardless of
+        # order or of unposting first. That's a Tk/Windows platform
+        # limitation, not a mistake in how these are wired. The
+        # underline=0 accelerators added above are the actual Windows
+        # fix; these bindings are kept as-is since they're still what
+        # makes Delete/BackSpace work correctly while a menu is open on
+        # Linux/macOS.
+        menu.bind("<Delete>", lambda e: (menu.unpost(), self._delete_selected()))
+        menu.bind("<BackSpace>", lambda e: (menu.unpost(), self._delete_selected()))
+
         menu.tk_popup(x_root, y_root)
 
     def show_help_dialog(self):
         messagebox.showinfo("Controls", (
             "Click a box:                 open its menu -- Accept / Reject / "
             "Reset to Pending / Change Class, plus Delete for boxes you drew and "
-            "for model (queue) boxes\n\n"
+            "for model (queue) boxes, plus Copy/Paste\n\n"
             "Drag ON a box:                only works for boxes YOU drew (cyan). "
             "The model's own proposed boxes can't be bumped by accident -- click "
             "one and use \"Enable Reposition/Resize\" in its menu if it genuinely "
@@ -2562,34 +3083,55 @@ class ReviewApp:
             "pick a class -- it's included in output right away. Open its menu "
             "afterward if you need to Reject / Reset to Pending / Delete it, or "
             "just add as many as you like, one drag at a time.\n\n"
+            "Copy / Paste (Ctrl+C / Ctrl+V):  select any box (manual or model), "
+            "press Ctrl+C to copy its class and size, then Ctrl+V to paste a new "
+            "manual box -- same class, same size -- offset a little from the "
+            "original so you can see and drag it into place, instead of drawing "
+            "a same-sized box from scratch every time. Keep pressing Ctrl+V to "
+            "stamp out more copies, each one offset a bit further; a fresh "
+            "Ctrl+C on any box resets that cascade. Also available from a box's "
+            "right-click menu, and from the toolbar's Copy/Paste buttons. Pasted "
+            "boxes are auto-accepted and undoable just like a hand-drawn one.\n\n"
             "Click on empty area (no drag): deselects whatever box was "
             "selected -- clears its resize handles and disarms an in-progress "
             "\"Enable Reposition/Resize\" arm if one was active.\n\n"
             "Manual box states:            accepted (cyan, in output -- the "
-            "default the instant you draw one) / pending (orange, only seen if "
-            "you Reset one) / rejected (red, hidden unless \"Show Deleted/"
-            "Rejected\" is on). An image CANNOT move to the completed list while "
-            "any manual box on it is still pending -- same rule queue boxes have "
-            "always had.\n\n"
+            "default the instant you draw or paste one) / pending (orange, only "
+            "seen if you Reset one) / rejected (red, hidden unless \"Show "
+            "Deleted/Rejected\" is on). An image CANNOT move to the completed "
+            "list while any manual box on it is still pending -- same rule queue "
+            "boxes have always had.\n\n"
             "Delete (queue boxes):         hides the box from the canvas and "
             "excludes it from output, but it's fully recoverable -- check "
             "\"Show Deleted/Rejected\" to see grey/dashed deleted boxes again and "
             "reset one back to Pending if you deleted it by mistake.\n\n"
+            "Delete (manual boxes):        removed outright (Delete key, "
+            "Backspace, or its menu's Delete) -- also cleans up any cross-frame "
+            "sync copies that box created.\n\n"
             "Fast Mode:                    left-click a queue box = Accept, "
             "right-click = Reject, no menu popup. Toggle it in the toolbar or "
             "View menu. Manual boxes and Enable-Reposition boxes are unaffected.\n\n"
             "Accept All / Reject All Pending:  bulk-decide every still-pending "
             "queue box on the current image at once (confirms first). Counts as "
-            "one undo step. (Manual boxes are auto-accepted on draw, so there's "
-            "normally nothing pending among them to bulk-decide.)\n\n"
+            "one undo step. (Manual boxes are auto-accepted on draw/paste, so "
+            "there's normally nothing pending among them to bulk-decide.)\n\n"
             "Undo / Redo:                  Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z), "
             "also in the Edit menu and toolbar. Covers every edit on the current "
-            "image -- decisions, class changes, manual add/delete, drags and "
-            "resizes. Resets when you move to another image.\n\n"
+            "image -- decisions, class changes, manual add/delete/paste, drags "
+            "and resizes. Resets when you move to another image.\n\n"
             "Esc while dragging:           cancels the drag/resize in progress "
             "and snaps the box back to where it was.\n\n"
             "1-9 keys:                     apply the Nth class (in class-list "
             "order) to whichever box you most recently clicked.\n\n"
+            "Delete / Backspace key:       deletes whichever box is currently "
+            "selected -- a queue box moves to \"deleted\" (hidden, recoverable "
+            "via \"Show Deleted/Rejected\"), a manual box is removed outright "
+            "(and any frames it synced to are cleaned up too). No-op if nothing "
+            "is selected. Works whether or not the box's own menu is currently "
+            "open (on Windows, while a menu is open, press D instead -- see the "
+            "Delete item's underlined accelerator -- since Windows' native popup "
+            "menu doesn't forward Delete/Backspace to this shortcut the way "
+            "Linux/macOS do; Escape-then-Delete also always works).\n\n"
             "Mouse wheel:                  zoom in/out, centered on the cursor\n"
             "+ / - keys:                   zoom in/out\n"
             "0 key / \"Fit\" button:         reset to fit-to-window\n"
@@ -2605,21 +3147,22 @@ class ReviewApp:
             "so a model silently missing an image is obvious.\n\n"
             "Sync nearby frames:           when ON (default), Accept/Reject/"
             "Delete on a queue box, OR Accept/Reject/Reset/Delete on a manual "
-            "box, looks a few frames forward and back in the same sequence and "
-            "applies the same action there too -- for queue boxes, to an "
-            "already-queued box of the SAME EFFECTIVE CLASS (honoring any class "
-            "override) in roughly the SAME POSITION (only if it's still "
-            "pending); for manual boxes, by copying the box itself into the "
-            "neighbor frame (only if nothing of that class already sits near "
-            "that spot there). It never overrides a decision you or a previous "
-            "sync already made, and never touches an already-completed image. "
-            "Synced boxes show a \"[synced]\" tag. Changing your mind on a "
-            "source box later (Accept -> Reject, -> Delete, or -> Reset to "
-            "Pending) automatically retracts exactly the copies THAT box "
-            "created, as long as they haven't since been manually re-decided by "
-            "hand. The \u00b1N spinner controls how many frames out to look; "
-            "\"Undo Last Sync\" reverts exactly the last auto-applied batch, "
-            "everywhere it touched.\n\n"
+            "box, walks outward frame-by-frame in each direction and applies the "
+            "same action there too -- for queue boxes, to an already-queued box "
+            "of the SAME EFFECTIVE CLASS (honoring any class override) near a "
+            "MOTION-PREDICTED position that starts at the source box and is "
+            "refined using real observations further out (only if the matched "
+            "box is still pending); for manual boxes, by copying the box itself "
+            "into the neighbor frame at the same position (only if nothing of "
+            "that class already sits near that spot there). It never overrides "
+            "a decision you or a previous sync already made, and never touches "
+            "an already-completed image. Synced boxes show a \"[synced]\" tag. "
+            "Changing your mind on a source box later (Accept -> Reject, -> "
+            "Delete, or -> Reset to Pending) automatically retracts exactly the "
+            "copies THAT box created, as long as they haven't since been "
+            "manually re-decided by hand. The \u00b1N spinner controls how many "
+            "frames out to look; \"Undo Last Sync\" reverts exactly the last "
+            "auto-applied batch, everywhere it touched.\n\n"
             "Switch to QA / Completed:     swaps the current session, live, "
             "between images still pending review and images that are already "
             "fully decided (same list --qa opens from the command line) -- no "
@@ -2838,7 +3381,15 @@ class ReviewApp:
             if abs(cx - sx) > 6 and abs(cy - sy) > 6:
                 box = [min(sx, cx) / self.scale, min(sy, cy) / self.scale,
                        max(sx, cx) / self.scale, max(sy, cy) / self.scale]
-                self._open_class_menu(event.x_root, event.y_root,
+                # Offset away from the box just drawn (same reasoning as
+                # _menu_pos_clear_of_box for the box-edit context menu) --
+                # otherwise the class-picker opens right on top of the box
+                # you just drew, and picking a class then immediately
+                # wanting to nudge/resize it means fighting the menu for
+                # the same screen space it's still covering.
+                menu_x, menu_y = self._menu_pos_clear_of_box(
+                    box, (event.x_root, event.y_root))
+                self._open_class_menu(menu_x, menu_y,
                                        on_pick=lambda cls: self._add_manual_box(cls, box))
             elif self.selected_key is not None or self.reposition_armed is not None:
                 # (fix) A plain click on empty canvas -- started as "draw"

@@ -129,6 +129,96 @@ run -- review_labels.py's own progress/completed files are untouched
 either way (see boundary note above) -- it's purely informational.
 
 =======================================================================
+[PATCH] --candidates-file / --full-file (added alongside
+resolve_cross_class_conflicts.py): this script always used to read
+cross_reference_candidates.json / cross_reference_full.json by a fixed
+name. Both are now CLI-overridable so this script can consume
+resolve_cross_class_conflicts.py's merged output (cross_reference_
+candidates_resolved.json / cross_reference_full_resolved.json) --
+which cross-class-merges vote clusters that cluster_detections() only
+ever clustered within a single class -- without needing any other
+change here. The resolved files are written in the identical shape
+this script already expects, so nothing else in this file needed to
+change. Defaults are unchanged (the original filenames), so omitting
+these flags reproduces the exact pre-patch behavior.
+=======================================================================
+
+=======================================================================
+V6: per-class single-vote floor + a sensitivity table for it.
+=======================================================================
+--min-single-vote-conf was always a single GLOBAL floor across every
+missing class for a source. In practice one class can dominate the
+queue by an order of magnitude (a real UAVDT run: person at 133,052
+single-vote-tier items vs. motorcycle/other_vehicle in the low tens of
+thousands combined) while sitting on a totally different confidence
+distribution -- raising the global floor enough to meaningfully shrink
+person's share also drags motorcycle/other_vehicle's floor up with it,
+even if THEIR floor was already well-tuned. Two additions fix that:
+
+  1. --min-single-vote-conf-per-class SOURCE:class:threshold
+     (repeatable) overrides --min-single-vote-conf for one specific
+     source+class. Anything not overridden keeps using the global
+     value, unchanged. Always-review classes (e.g. SARD motorcycle)
+     are untouched by this flag -- they only ever respond to
+     --min-always-review-conf, same as before.
+
+  2. Every per_class_summary entry now also carries
+     "single_vote_sensitivity" -- the same shape as the pre-existing
+     "two_vote_sensitivity" (pass_count_by_threshold + min_conf_stats),
+     but built from that class's actual vote_count==1 confidences
+     across the WHOLE dataset (not gated by the current floor). Check
+     this in pseudo_labels_summary.json BEFORE picking a per-class
+     threshold -- e.g. "at 0.55, person drops from 28,355 queued to
+     19,200" -- the same way you'd already check two_vote_sensitivity
+     before touching --min-conf. This is read-only reporting; it does
+     not change what gets discarded on its own, --min-single-vote-
+     conf-per-class does that.
+
+Neither addition changes default behavior: omit both and you get the
+exact same auto/queued/discarded split as before.
+=======================================================================
+
+=======================================================================
+V7: discard floor for the 2-vote tier (was: never discarded).
+=======================================================================
+V3-V6 all treated any vote_count==2 cluster that failed the auto-accept
+gate (min_conf + min_iou) as automatically worth a human look, no
+matter how low its confidence -- "two independent models agreeing at
+all is real corroboration" was the reasoning. In practice this let
+weak two-model agreement (e.g. two models both firing ~0.35-0.40 on
+the same spot, sometimes on nothing at all) flood the queue: on a real
+UAVDT run, person's 2-vote tier alone was 18,662 queued items with zero
+floor, and manual review confirmed a meaningful fraction of those were
+visibly not real objects -- two weak, near-floor detections can agree
+by coincidence in cluttered scenes just as easily as two independent
+models can hallucinate the same near-floor single-vote noise V4's gate
+was already built to catch. The corroboration argument holds up much
+better once BOTH models clear a real confidence bar, not just "both
+fired at all."
+
+  --min-two-vote-review-conf (default 0.0, i.e. off): 2-vote clusters
+      that fail the auto-accept gate are now DISCARDED instead of
+      queued if two_vote_min_conf(cluster) is below this. At/above it,
+      queued as before (reason: "below_threshold" -- unchanged). 0.0
+      preserves exact pre-V7 behavior (nothing discarded here). Check
+      each class's EXISTING two_vote_sensitivity table in pseudo_
+      labels_summary.json before picking a value -- it already reports
+      pass-count-by-threshold for this exact population, no rerun
+      needed to size the cut.
+
+  --min-two-vote-review-conf-per-class SOURCE:class:threshold
+      (repeatable, same SOURCE:class:threshold shape as --min-single-
+      vote-conf-per-class): overrides the global floor for one
+      source+class. Never applies to always_review_classes -- those
+      still only ever respond to --min-always-review-conf.
+
+vote_count>=3 clusters are completely unaffected -- V7 only touches
+the 2-vote "failed auto-accept" branch. Every discarded item here is
+still recorded in pseudo_labels_discarded.json with reason
+"below_two_vote_review_floor", same audit-trail guarantee as every
+other discard path in this script.
+=======================================================================
+
 THREE-TIER SPLIT (auto-accept side, unchanged from V3):
   - AUTO-ACCEPT (vote_count >= 3): written straight to a YOLO-format
     label file, UNCONDITIONALLY -- no confidence floor. Three or four
@@ -214,6 +304,13 @@ USAGE:
     #    review/ -- see V5 note above.
     python generate_pseudo_labels.py
 
+    # 1b. [PATCH] Same, but consuming resolve_cross_class_conflicts.py's
+    #    cross-class-merged output instead of cross_reference_gaps.py's
+    #    raw output:
+    python generate_pseudo_labels.py \
+        --candidates-file cross_reference_candidates_resolved.json \
+        --full-file cross_reference_full_resolved.json
+
     # 2. Check datasets/pseudo_labels_summary.json's per-class
     #    auto/queued/discarded counts and sensitivity table (2-vote
     #    tier only), and a handful of datasets/pseudo_labels_discarded
@@ -230,11 +327,18 @@ USAGE:
     #    IMPORTANT: do this threshold-tuning BEFORE starting manual
     #    review in review_labels.py. Once review_progress.json has real
     #    decisions in it, rerunning this script (even just to tweak a
-    #    threshold) regenerates the queue and can orphan some of that
-    #    progress -- the script will warn you with a count if it
-    #    detects this, but the clean way to work is: tune thresholds
-    #    here first, confirm the summary/discarded files look right,
-    #    THEN start review_labels.py.
+    #    threshold, or to switch to the resolved files) regenerates the
+    #    queue and can orphan some of that progress -- the script will
+    #    warn you with a count if it detects this, but the clean way to
+    #    work is: tune thresholds here first, confirm the summary/
+    #    discarded files look right, THEN start review_labels.py. If
+    #    you've already started reviewing, note that your decisions
+    #    live in datasets/pseudo_labels_reviewed/ + review_progress.json
+    #    -- this script never cleans or writes to either (see the V5
+    #    "WHAT V5 NEVER TOUCHES" section above), so rerunning is safe;
+    #    at worst some already-reviewed items won't reappear in the new
+    #    queue, which is harmless since --apply picks their decisions up
+    #    from pseudo_labels_reviewed/ regardless.
 
     # 3. Once satisfied and manual review (if any) is complete:
     python generate_pseudo_labels.py --apply
@@ -345,6 +449,9 @@ def warn_if_review_in_progress(datasets_dir: Path) -> None:
           f"those decisions referring to items no longer in the new "
           f"queue (harmless, but stale). If you're just tuning "
           f"thresholds, prefer doing that BEFORE manual review starts.")
+    print(f"  Your actual decisions live in datasets/pseudo_labels_"
+          f"reviewed/ and this file -- neither is touched or cleaned "
+          f"by this script, regardless of what you pass it.")
     print(f"  {'!' * 66}\n")
 
 
@@ -396,11 +503,34 @@ def parse_always_review(pairs: list[str]) -> dict[str, list[str]]:
     return out
 
 
+def parse_per_class_conf(triples: list[str]) -> dict[str, dict[str, float]]:
+    """[V6] --min-single-vote-conf-per-class SOURCE:class:threshold ->
+    {source: {cls: threshold}}."""
+    out: dict[str, dict[str, float]] = {}
+    for triple in triples:
+        parts = triple.split(":")
+        if len(parts) != 3:
+            raise SystemExit(
+                f"--min-single-vote-conf-per-class expects "
+                f"SOURCE:class:threshold, got '{triple}'")
+        source, cls, conf_str = parts
+        try:
+            conf = float(conf_str)
+        except ValueError:
+            raise SystemExit(
+                f"--min-single-vote-conf-per-class: '{conf_str}' in "
+                f"'{triple}' is not a number.")
+        out.setdefault(source, {})[cls] = conf
+    return out
+
+
 def load_json(path: Path):
     if not path.exists():
         raise SystemExit(
-            f"{path} not found -- run cross_reference_gaps.py first, "
-            f"this script only consumes its output.")
+            f"{path} not found -- run cross_reference_gaps.py first "
+            f"(or resolve_cross_class_conflicts.py, if using "
+            f"--candidates-file/--full-file to point at its resolved "
+            f"output), this script only consumes their output.")
     with open(path) as f:
         return json.load(f)
 
@@ -433,27 +563,50 @@ def single_vote_conf(cluster: dict) -> float:
     return confs[0] if confs else 0.0
 
 
+def confidence_sensitivity_table(confs: list[float], thresholds: list[float]) -> dict:
+    """Generic 'how many would pass at each threshold' table -- confs is
+    already the one relevant confidence value per item (min-of-two for
+    the 2-vote tier, the lone vote for the 1-vote tier). 'Pass' means
+    the item would stay queued/auto-accepted rather than be discarded/
+    fail the gate at that threshold."""
+    table = {}
+    for t in thresholds:
+        table[str(t)] = sum(1 for c in confs if c >= t)
+    stats = {
+        "n": len(confs),
+        "mean": statistics.mean(confs) if confs else None,
+        "median": statistics.median(confs) if confs else None,
+    }
+    return {"pass_count_by_threshold": table, "min_conf_stats": stats}
+
+
 def sensitivity_table(two_vote_items: list[dict], thresholds: list[float]) -> dict:
     """For the 2-vote tier only: how many would pass min-conf at each
     threshold (IoU gate held fixed at whatever --min-iou is)."""
-    mins = [two_vote_min_conf(it) for it in two_vote_items]
-    table = {}
-    for t in thresholds:
-        table[str(t)] = sum(1 for m in mins if m >= t)
-    stats = {
-        "n": len(mins),
-        "mean": statistics.mean(mins) if mins else None,
-        "median": statistics.median(mins) if mins else None,
-    }
-    return {"pass_count_by_threshold": table, "min_conf_stats": stats}
+    return confidence_sensitivity_table(
+        [two_vote_min_conf(it) for it in two_vote_items], thresholds)
 
 
 def tier_source(source_name: str, candidates: list[dict], full_detections: dict,
                  missing_classes: list[str], always_review_classes: list[str],
                  min_conf: float, min_iou: float,
                  min_single_vote_conf: float = 0.0,
-                 min_always_review_conf: float = 0.0):
+                 min_always_review_conf: float = 0.0,
+                 min_single_vote_conf_overrides: dict[str, float] | None = None,
+                 min_two_vote_review_conf: float = 0.0,
+                 min_two_vote_review_conf_overrides: dict[str, float] | None = None):
     """
+    min_single_vote_conf_overrides [V6]: {cls_name: threshold} for this
+    source only. A class present here uses its own threshold instead of
+    the global min_single_vote_conf for the vote_count==1 gate below --
+    lets one dominant, differently-distributed class (e.g. UAVDT person)
+    get its own floor without moving the floor for every other missing
+    class on the same source. Never consulted for always_review_classes
+    -- those only ever respond to min_always_review_conf.
+
+    min_two_vote_review_conf / _overrides [V7]: same shape and same
+    per-class-override mechanism, but for the vote_count==2 branch --
+    see module docstring's V7 note for why a floor was added there too.
     candidates: this source's vote_count>=2 clusters (from cross_
       reference_candidates.json), each already carrying "image".
     full_detections: {image_key: [cluster, ...]} for this source, ALL
@@ -467,9 +620,10 @@ def tier_source(source_name: str, candidates: list[dict], full_detections: dict,
     Gating:
       - vote_count >= 3: always auto-accepted, unconditional.
       - vote_count == 2: auto-accepted if it clears --min-conf /
-        --min-iou, else queued (reason: "below_threshold"). Never
-        discarded -- two independent models agreeing at all is treated
-        as worth a human look even below the auto-accept bar.
+        --min-iou. Otherwise, queued (reason: "below_threshold") if
+        two_vote_min_conf >= min_two_vote_review_conf, else discarded
+        (reason: "below_two_vote_review_floor") [V7 -- previously
+        always queued regardless of confidence].
       - vote_count == 1, normal class: queued if its lone confidence is
         >= min_single_vote_conf, else discarded (reason:
         "below_single_vote_floor").
@@ -480,6 +634,9 @@ def tier_source(source_name: str, candidates: list[dict], full_detections: dict,
         classes are never silently auto-written, matching V3 behavior
         (SARD motorcycle etc. always goes through a human).
     """
+    min_single_vote_conf_overrides = min_single_vote_conf_overrides or {}
+    min_two_vote_review_conf_overrides = min_two_vote_review_conf_overrides or {}
+
     auto_accepted = []
     queued = []
     discarded = []
@@ -511,6 +668,7 @@ def tier_source(source_name: str, candidates: list[dict], full_detections: dict,
                         queued.append({**item, "reason": "always_review_class"})
             continue
 
+        two_vote_floor = min_two_vote_review_conf_overrides.get(cls_name, min_two_vote_review_conf)
         for c in by_class.get(cls_name, []):
             item = {
                 "source": source_name, "cls": cls_name, "image": c["image"],
@@ -521,11 +679,16 @@ def tier_source(source_name: str, candidates: list[dict], full_detections: dict,
                 # agreeing doesn't need a confidence floor on top.
                 auto_accepted.append(item)
             else:
-                # vote_count == 2 -- gated, never discarded (see docstring).
+                # vote_count == 2 -- gated. [V7] items failing the
+                # auto-accept gate now also check two_vote_floor before
+                # queuing -- below it, discarded rather than queued
+                # (previously always queued regardless of confidence).
                 passes = (two_vote_min_conf(c) >= min_conf
                           and two_vote_pairwise_iou(c) >= min_iou)
                 if passes:
                     auto_accepted.append(item)
+                elif two_vote_min_conf(c) < two_vote_floor:
+                    discarded.append({**item, "reason": "below_two_vote_review_floor"})
                 else:
                     queued.append({**item, "reason": "below_threshold"})
 
@@ -540,6 +703,7 @@ def tier_source(source_name: str, candidates: list[dict], full_detections: dict,
     for cls_name in missing_classes:
         if cls_name in always_review_classes:
             continue
+        floor = min_single_vote_conf_overrides.get(cls_name, min_single_vote_conf)
         for image_key, clusters in full_detections.items():
             for c in clusters:
                 if c["cls"] != cls_name or c["vote_count"] != 1:
@@ -549,7 +713,7 @@ def tier_source(source_name: str, candidates: list[dict], full_detections: dict,
                     "source": source_name, "cls": cls_name, "image": image_key,
                     "box": c["box"], "votes": c["votes"], "vote_count": 1,
                 }
-                if conf < min_single_vote_conf:
+                if conf < floor:
                     discarded.append({**item, "reason": "below_single_vote_floor"})
                 else:
                     queued.append({**item, "reason": "single_model_only"})
@@ -708,6 +872,23 @@ def save_review_images(queued: list[dict], source_name: str, review_dir: Path,
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
+    # [PATCH] input file overrides -- point these at resolve_cross_class_
+    # conflicts.py's output (cross_reference_*_resolved.json) to consume
+    # its cross-class-merged clusters instead of cross_reference_gaps.
+    # py's raw per-class output. Defaults are unchanged from before the
+    # patch, so omitting these flags is identical to the old behavior.
+    p.add_argument("--candidates-file", default="cross_reference_candidates.json",
+                    help="[PATCH] Filename under datasets/ to load "
+                         "vote_count>=2 candidates from. Point at "
+                         "cross_reference_candidates_resolved.json to "
+                         "use resolve_cross_class_conflicts.py's merged "
+                         "set instead of cross_reference_gaps.py's raw "
+                         "output.")
+    p.add_argument("--full-file", default="cross_reference_full.json",
+                    help="[PATCH] Filename under datasets/ for the full "
+                         "per-image vote record. Pair with "
+                         "--candidates-file when pointing at resolved "
+                         "output.")
     p.add_argument("--min-conf", type=float, default=0.40,
                     help="2-vote tier ONLY: auto-accept requires "
                          "min(the two present confidences) >= this. The "
@@ -737,6 +918,29 @@ def parse_args():
                          "all. Pass 0.0 to restore V3 behavior (queue "
                          "every hit for these classes regardless of "
                          "confidence).")
+    p.add_argument("--min-single-vote-conf-per-class", nargs="*", default=[],
+                    help="[V6] SOURCE:class:threshold (repeatable). "
+                         "Overrides --min-single-vote-conf for one "
+                         "specific source+class -- use when one class "
+                         "dominates the queue (check each class's "
+                         "single_vote_sensitivity in pseudo_labels_"
+                         "summary.json first to pick a value). Classes "
+                         "not listed keep using --min-single-vote-conf. "
+                         "Never applies to --always-review classes.")
+    p.add_argument("--min-two-vote-review-conf", type=float, default=0.0,
+                    help="[V7] 2-vote clusters that fail the auto-accept "
+                         "gate (--min-conf/--min-iou) are DISCARDED "
+                         "instead of queued if two_vote_min_conf is "
+                         "below this. 0.0 (default) preserves the old "
+                         "behavior (queue everything regardless of "
+                         "confidence). Check each class's EXISTING "
+                         "two_vote_sensitivity table in pseudo_labels_"
+                         "summary.json before picking a value.")
+    p.add_argument("--min-two-vote-review-conf-per-class", nargs="*", default=[],
+                    help="[V7] SOURCE:class:threshold (repeatable). "
+                         "Overrides --min-two-vote-review-conf for one "
+                         "specific source+class, same shape as "
+                         "--min-single-vote-conf-per-class.")
     p.add_argument("--always-review", nargs="*", default=["SARD:motorcycle"],
                     help="SOURCE:class pairs that are NEVER auto-accepted "
                          "regardless of vote_count, always queued for "
@@ -768,10 +972,18 @@ def parse_args():
 def main():
     args = parse_args()
     always_review = parse_always_review(args.always_review)
+    single_vote_overrides = parse_per_class_conf(args.min_single_vote_conf_per_class)
+    two_vote_review_overrides = parse_per_class_conf(args.min_two_vote_review_conf_per_class)
 
     datasets_dir = prepare_datasets.DATASETS_DIR
-    candidates_by_source = load_json(datasets_dir / "cross_reference_candidates.json")
-    full_by_source = load_json(datasets_dir / "cross_reference_full.json")
+    # [PATCH] was hardcoded to "cross_reference_candidates.json" /
+    # "cross_reference_full.json" -- now reads whichever filenames
+    # args.candidates_file / args.full_file resolve to (same defaults,
+    # so behavior is unchanged unless you pass the new flags).
+    print(f"Loading candidates from: {datasets_dir / args.candidates_file}")
+    print(f"Loading full vote record from: {datasets_dir / args.full_file}")
+    candidates_by_source = load_json(datasets_dir / args.candidates_file)
+    full_by_source = load_json(datasets_dir / args.full_file)
 
     pseudo_root = datasets_dir / "pseudo_labels"
     review_dir = datasets_dir / "pseudo_labels_review"
@@ -798,8 +1010,13 @@ def main():
     all_discarded = []
     summary = {"min_conf": args.min_conf, "min_iou": args.min_iou,
                "min_single_vote_conf": args.min_single_vote_conf,
+               "min_single_vote_conf_overrides": single_vote_overrides,
+               "min_two_vote_review_conf": args.min_two_vote_review_conf,
+               "min_two_vote_review_conf_overrides": two_vote_review_overrides,
                "min_always_review_conf": args.min_always_review_conf,
-               "always_review": always_review, "sources": {}}
+               "always_review": always_review,
+               "candidates_file": args.candidates_file,
+               "full_file": args.full_file, "sources": {}}
 
     for source_name, candidates in candidates_by_source.items():
         full_detections = full_by_source.get(source_name, {})
@@ -817,7 +1034,10 @@ def main():
         auto_accepted, queued, discarded = tier_source(
             source_name, candidates, full_detections, missing_classes,
             always_review.get(source_name, []), args.min_conf, args.min_iou,
-            args.min_single_vote_conf, args.min_always_review_conf)
+            args.min_single_vote_conf, args.min_always_review_conf,
+            single_vote_overrides.get(source_name, {}),
+            args.min_two_vote_review_conf,
+            two_vote_review_overrides.get(source_name, {}))
 
         if auto_accepted:
             sample_img = Path(auto_accepted[0]["image"])
@@ -840,10 +1060,29 @@ def main():
         all_queued.extend(queued)
         all_discarded.extend(discarded)
 
+        source_overrides = single_vote_overrides.get(source_name, {})
+        source_two_vote_overrides = two_vote_review_overrides.get(source_name, {})
         per_class_summary = {}
         for cls_name in missing_classes:
             cls_candidates_2vote = [c for c in candidates
                                      if c["cls"] == cls_name and c["vote_count"] == 2]
+            is_always_review = cls_name in always_review.get(source_name, [])
+            # [V6] single_vote_sensitivity: built from EVERY vote_count==1
+            # cluster for this class, regardless of the current floor --
+            # this is what to check before choosing a --min-single-vote-
+            # conf-per-class value. Skipped for always_review classes,
+            # which use min_always_review_conf instead.
+            cls_singlevote_confs = [] if is_always_review else [
+                single_vote_conf(c)
+                for clusters in full_detections.values()
+                for c in clusters
+                if c["cls"] == cls_name and c["vote_count"] == 1
+            ]
+            effective_floor = (None if is_always_review
+                                else source_overrides.get(cls_name, args.min_single_vote_conf))
+            effective_two_vote_floor = (None if is_always_review
+                                         else source_two_vote_overrides.get(
+                                             cls_name, args.min_two_vote_review_conf))
             per_class_summary[cls_name] = {
                 "auto_accepted": sum(1 for a in auto_accepted if a["cls"] == cls_name),
                 "auto_accepted_unconditional_3_4_vote": sum(
@@ -852,16 +1091,22 @@ def main():
                     1 for a in auto_accepted if a["cls"] == cls_name and a["vote_count"] == 2),
                 "queued": sum(1 for q in queued if q["cls"] == cls_name),
                 "discarded_low_conf": sum(1 for d in discarded if d["cls"] == cls_name),
-                "always_review": cls_name in always_review.get(source_name, []),
+                "always_review": is_always_review,
+                "effective_single_vote_floor": effective_floor,
+                "effective_two_vote_review_floor": effective_two_vote_floor,
                 "two_vote_sensitivity": sensitivity_table(
                     cls_candidates_2vote, args.sensitivity_thresholds) if cls_candidates_2vote else None,
+                "single_vote_sensitivity": confidence_sensitivity_table(
+                    cls_singlevote_confs, args.sensitivity_thresholds) if cls_singlevote_confs else None,
             }
             s = per_class_summary[cls_name]
+            floor_tag = (f"[ALWAYS REVIEW]" if is_always_review
+                         else f"[1v-floor={effective_floor}] [2v-floor={effective_two_vote_floor}]")
             print(f"    {cls_name:15s} auto={s['auto_accepted']:>5}  "
                   f"(3-4vote={s['auto_accepted_unconditional_3_4_vote']:>5} "
                   f"2vote={s['auto_accepted_conditional_2_vote']:>5})  "
                   f"queued={s['queued']:>5}  discarded={s['discarded_low_conf']:>6}  "
-                  f"{'[ALWAYS REVIEW]' if s['always_review'] else ''}")
+                  f"{floor_tag}")
 
         summary["sources"][source_name] = per_class_summary
 
