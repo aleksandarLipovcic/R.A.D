@@ -513,6 +513,40 @@ V18 NOTE -- keyframe-triage sidebar release.
      the source datasets (e.g. UAVDT/VisDrone vehicle boxes) -- this is
      scoped entirely to "which image am I looking at" bookkeeping.
 
+V19 NOTE -- per-set color + inline frame-count release. Workflow has
+shifted from "review every pseudo-label across all ~8,800 images"
+toward "hand-pick a small number of representative keyframes per
+~100-frame burst (set/sequence), label those, and train a small model
+on them" -- so the sidebar's job is now less "track review progress"
+and more "make sure every set gets looked at, and none get missed."
+  1. ADDED: the sidebar now nests a third level -- Section (Remaining/
+     Reviewed) -> Source dataset -> Frame Set (sequence, same grouping
+     parse_seq_frame() / "Check Sequence Coverage" already used) ->
+     individual images. Previously sets were invisible in the tree
+     itself (only visible via the separate coverage report); now each
+     set is its own row you can collapse/expand.
+  2. ADDED: each frame set gets its own DISTINGUISHING color (see
+     _color_for_sequence()), separate from the existing per-source
+     stripe (SOURCE_COLORS) -- deterministically generated from the
+     set's id so the same set is always the same color across a
+     rebuild, and across appearing in both the Remaining and Reviewed
+     sections. This is purely a visual aid for telling one ~100-frame
+     burst apart from the next while scrolling the tree; it changes
+     nothing about review logic or output.
+  3. ADDED: each frame-set row's label is annotated inline with a
+     frame count, e.g. "M0101 (12/23 total)" under Remaining or
+     "M0101 (7/23 total)" under Reviewed -- so you can see, without
+     opening "Check Sequence Coverage", how many frames a set has in
+     total and how many you've gotten to. A small warning marker is
+     appended to a set's row (in both sections) if its overall reviewed
+     count is still below MIN_REVIEWED_FRAMES_PER_SEQUENCE, so a set
+     that's easy to miss (e.g. it has very few remaining images left,
+     but you never actually picked keyframes from it) stays visible as
+     needing attention instead of quietly falling out of sight.
+  4. "Check Sequence Coverage" is unchanged and still useful for a full
+     text report across every set at once; the sidebar annotations are
+     the same underlying numbers, just visible without opening it.
+
 WHAT CHANGED, keyboard command -> new equivalent:
   click box, cycle       -> click box: pops up a menu with Accept /
   pending/accept/reject     Reject / Reset to Pending / Change Class /
@@ -597,7 +631,10 @@ WHAT CHANGED, keyboard command -> new equivalent:
                               Reviewed and color-coded by source set --
                               click one to jump straight to it. "Check
                               sequence coverage" reports reviewed-frame
-                              counts per source/sequence.
+                              counts per source/sequence. V19: the
+                              sidebar now also nests and color-codes by
+                              individual frame SET (sequence), with an
+                              inline "reviewed/total" count per set.
 
 WHY A SEPARATE OUTPUT TREE (see generate_pseudo_labels.py's module
 docstring for the full reasoning): this writes to datasets/
@@ -639,7 +676,9 @@ USAGE:
 """
 
 import argparse
+import colorsys
 import copy
+import hashlib
 import json
 import re
 import shutil
@@ -695,10 +734,11 @@ SOURCE_COLORS = {
 }
 SOURCE_COLOR_OTHER = "#ececec"  # light grey, any source not listed above
 
-# (V18) Threshold used only by the "Check sequence coverage" report --
-# flags a source/sequence combination as needing more manual attention
-# if fewer than this many of its frames are in the Reviewed/completed
-# list yet. Purely informational, changes nothing on disk.
+# (V18) Threshold used by the "Check sequence coverage" report AND
+# (V19) the inline per-set sidebar annotation -- flags a source/
+# sequence combination as needing more manual attention if fewer than
+# this many of its frames are in the Reviewed/completed list yet.
+# Purely informational, changes nothing on disk.
 MIN_REVIEWED_FRAMES_PER_SEQUENCE = 3
 
 DISPLAY_MAX_W = 1280
@@ -843,6 +883,25 @@ def parse_seq_frame(image_key: str):
         if digits:
             return p.parent.name, int(digits[-1])
     return None
+
+
+def _color_for_sequence(seq_key: str) -> str:
+    """(V19) Deterministically generates a light, distinguishable
+    background color for a given frame-SET (sequence) key, so scanning
+    down the sidebar makes it visually obvious where one drone pass/
+    burst ends and the next begins -- separate from (and in addition
+    to) the per-source-dataset stripe already used for SOURCE_COLORS
+    at the section-header level. The same seq_key always produces the
+    same color, across rebuilds and sessions, since it's derived from a
+    stable hash rather than insertion order (insertion order isn't
+    stable once images move between the Remaining and Reviewed
+    sections). Kept light (high lightness, moderate saturation) so
+    black text stays readable on top of it, matching the existing
+    SOURCE_COLORS palette in spirit."""
+    digest = hashlib.md5(seq_key.encode("utf-8")).hexdigest()
+    hue = (int(digest[:8], 16) % 360) / 360.0
+    r, g, b = colorsys.hls_to_rgb(hue, 0.85, 0.55)
+    return "#{:02x}{:02x}{:02x}".format(int(r * 255), int(g * 255), int(b * 255))
 
 
 def item_key(item: dict) -> str:
@@ -1507,12 +1566,18 @@ class ReviewApp:
         itself, only the in-memory self.all_image_keys_filtered /
         self.completed_set / self.image_source ReviewApp already
         maintains. See _build_sidebar_tree() for how it's populated and
-        _on_sidebar_select()/_jump_to_image() for what a click does."""
+        _on_sidebar_select()/_jump_to_image() for what a click does.
+
+        (V19) Now nests a third level per source -- one row per frame
+        SET (sequence), each with its own generated color (see
+        _color_for_sequence) and an inline reviewed/total count -- so
+        the tree itself doubles as the "have I gotten to every set yet"
+        view, not just the separate "Check sequence coverage" report."""
         sidebar = ttk.Frame(parent, width=SIDEBAR_WIDTH_PX)
         sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
         sidebar.pack_propagate(False)  # keep the fixed width even as the tree grows
 
-        ttk.Label(sidebar, text="Images (Remaining / Reviewed)",
+        ttk.Label(sidebar, text="Images by Set (Remaining / Reviewed)",
                   font=("TkDefaultFont", 9, "bold")).pack(side=tk.TOP, anchor="w", pady=(0, 2))
 
         tree_frame = ttk.Frame(sidebar)
@@ -1524,7 +1589,11 @@ class ReviewApp:
         sidebar_vbar.pack(side=tk.LEFT, fill=tk.Y)
 
         # Color tags: one per known source (light stripe, see
-        # SOURCE_COLORS), plus a grey fallback for anything unlisted.
+        # SOURCE_COLORS), plus a grey fallback for anything unlisted --
+        # used on the SOURCE-level group rows. Per-SET (sequence) tags
+        # are configured on the fly in _build_sidebar_tree() as sets are
+        # discovered, since there can be many more of them than there
+        # are known sources.
         for src, color in SOURCE_COLORS.items():
             self.sidebar_tree.tag_configure(f"src_{src}", background=color)
         self.sidebar_tree.tag_configure("src_other", background=SOURCE_COLOR_OTHER)
@@ -1533,12 +1602,15 @@ class ReviewApp:
 
         legend = ttk.Frame(sidebar)
         legend.pack(side=tk.TOP, fill=tk.X, pady=(4, 2))
-        ttk.Label(legend, text="Set colors:", font=("TkDefaultFont", 8)).pack(side=tk.TOP, anchor="w")
+        ttk.Label(legend, text="Source colors:", font=("TkDefaultFont", 8)).pack(side=tk.TOP, anchor="w")
         for src, color in list(SOURCE_COLORS.items()):
             row = tk.Frame(legend)
             row.pack(side=tk.TOP, anchor="w")
             tk.Label(row, text="  ", bg=color, relief="solid", borderwidth=1).pack(side=tk.LEFT)
             tk.Label(row, text=f" {src}", font=("TkDefaultFont", 8)).pack(side=tk.LEFT)
+        ttk.Label(legend, text="Each frame set below also gets its own\ncolor -- expand a source to see them.",
+                  font=("TkDefaultFont", 7), foreground="#555555",
+                  justify="left").pack(side=tk.TOP, anchor="w", pady=(4, 0))
 
         ttk.Button(sidebar, text="Refresh list",
                    command=self._refresh_sidebar).pack(side=tk.TOP, fill=tk.X, pady=(4, 2))
@@ -1586,6 +1658,7 @@ class ReviewApp:
 
     # ------------------------------------------------------------------
     # (V18) Sidebar image list -- build, select, jump, coverage report.
+    # (V19) now also groups/colors by frame SET, not just by source.
     # None of this reads/writes progress/completed files directly; it
     # only reflects the in-memory state ReviewApp already maintains, and
     # is rebuilt (see call sites of _refresh_sidebar) whenever that state
@@ -1595,12 +1668,16 @@ class ReviewApp:
     def _build_sidebar_tree(self):
         """(re)populates the sidebar Treeview from scratch: two top-level
         sections, "Remaining" and "Reviewed", each split into per-source
-        groups (color-tagged, see SOURCE_COLORS), each containing one
-        leaf per image (tagged with its source's color) sorted by
-        filename. Cheap enough to call after every save -- typical
-        session sizes here are in the hundreds to low thousands of
-        images, not enough for a full Treeview rebuild to be noticeable
-        on a debounced ~400ms cadence."""
+        groups (color-tagged, see SOURCE_COLORS), each of THOSE split
+        further into per-frame-SET groups (V19 -- same sequence grouping
+        "Check Sequence Coverage" uses, see parse_seq_frame()), each with
+        its own distinguishing color (see _color_for_sequence) and an
+        inline "n / total" frame-count annotation, and finally one leaf
+        per image (tagged with its set's color) sorted by filename.
+        Cheap enough to call after every save -- typical session sizes
+        here are in the hundreds to low thousands of images, not enough
+        for a full Treeview rebuild to be noticeable on a debounced
+        ~400ms cadence."""
         tree = self.sidebar_tree
         selected_key = self.image_key  # preserve highlight across a rebuild
         tree.delete(*tree.get_children())
@@ -1608,6 +1685,24 @@ class ReviewApp:
 
         remaining = [k for k in self.all_image_keys_filtered if k not in self.completed_set]
         reviewed = [k for k in self.all_image_keys_filtered if k in self.completed_set]
+
+        # (V19) Per (source, set) totals and reviewed-so-far counts,
+        # computed once across the WHOLE filtered session (not just
+        # whichever section is being built) -- so a set's row can always
+        # show "x of N total" regardless of whether that set currently
+        # has more remaining or more reviewed frames, and so the
+        # "needs more" marker reflects the set's real overall progress,
+        # not just what happens to be in front of you in this section.
+        set_totals: dict = {}
+        set_reviewed: dict = {}
+        for k in self.all_image_keys_filtered:
+            src = self.image_source.get(k, "unknown")
+            sf = parse_seq_frame(k)
+            seq = sf[0] if sf else "(unparsed set)"
+            group = (src, seq)
+            set_totals[group] = set_totals.get(group, 0) + 1
+            if k in self.completed_set:
+                set_reviewed[group] = set_reviewed.get(group, 0) + 1
 
         for section_label, keys in (("Remaining", remaining), ("Reviewed", reviewed)):
             section_node = tree.insert(
@@ -1617,14 +1712,37 @@ class ReviewApp:
             for k in keys:
                 by_src.setdefault(self.image_source.get(k, "unknown"), []).append(k)
             for src in sorted(by_src):
-                src_keys = sorted(by_src[src], key=lambda kk: Path(kk).name)
+                src_keys_all = by_src[src]
                 tag = f"src_{src}" if src in SOURCE_COLORS else "src_other"
                 src_node = tree.insert(section_node, "end",
-                                        text=f"{src} ({len(src_keys)})", open=False,
+                                        text=f"{src} ({len(src_keys_all)})", open=False,
                                         tags=(tag,))
-                for k in src_keys:
-                    leaf = tree.insert(src_node, "end", text=Path(k).name, tags=(tag,))
-                    self._sidebar_item_to_key[leaf] = k
+
+                # (V19) Group this source's images (within this section)
+                # by frame set, and give each set its own row + color.
+                by_seq: dict = {}
+                for k in src_keys_all:
+                    sf = parse_seq_frame(k)
+                    seq = sf[0] if sf else "(unparsed set)"
+                    by_seq.setdefault(seq, []).append(k)
+
+                for seq in sorted(by_seq):
+                    seq_keys = sorted(by_seq[seq], key=lambda kk: Path(kk).name)
+                    group = (src, seq)
+                    total = set_totals.get(group, len(seq_keys))
+                    reviewed_overall = set_reviewed.get(group, 0)
+                    needs_more = reviewed_overall < MIN_REVIEWED_FRAMES_PER_SEQUENCE
+                    flag = "  \u26a0" if needs_more else ""
+                    seq_tag = f"seq_{src}_{seq}"
+                    self.sidebar_tree.tag_configure(
+                        seq_tag, background=_color_for_sequence(f"{src}::{seq}"))
+                    seq_node = tree.insert(
+                        src_node, "end",
+                        text=f"{seq}  ({len(seq_keys)}/{total} total){flag}",
+                        open=False, tags=(seq_tag,))
+                    for k in seq_keys:
+                        leaf = tree.insert(seq_node, "end", text=Path(k).name, tags=(seq_tag,))
+                        self._sidebar_item_to_key[leaf] = k
 
         if selected_key is not None:
             self._highlight_sidebar_selection()
@@ -1649,7 +1767,7 @@ class ReviewApp:
             return
         key = self._sidebar_item_to_key.get(sel[0])
         if key is None:
-            return  # a "Remaining (n)" / "Reviewed (n)" / source group node, not a leaf
+            return  # a section/source/set group node, not a leaf image
         if key == self.image_key:
             return
         self._jump_to_image(key)
@@ -1680,10 +1798,10 @@ class ReviewApp:
         the Reviewed/completed list right now, flagging anything under
         MIN_REVIEWED_FRAMES_PER_SEQUENCE. Uses the same parse_seq_frame()
         cross-frame sync relies on, so "sequence" here means the same
-        thing it means everywhere else in this tool. Changes nothing on
-        disk -- purely informational, meant to answer "do we have enough
-        manually reviewed keyframes per set/sequence to start training
-        yet?"."""
+        thing it means everywhere else in this tool (and the same thing
+        the V19 sidebar rows mean). Changes nothing on disk -- purely
+        informational, meant to answer "do we have enough manually
+        reviewed keyframes per set/sequence to start training yet?"."""
         totals: dict = {}
         reviewed_counts: dict = {}
         for k in self.all_image_keys_filtered:
@@ -3595,15 +3713,20 @@ class ReviewApp:
             "\"Back to Pending Review\" while you're in that view.\n\n"
             "Image list sidebar (left side):  every image in the current "
             "--source/--cls filter, split into \"Remaining\" and \"Reviewed\", "
-            "each grouped by source dataset (SARD/UAVDT/VisDrone) with a light "
-            "color stripe per source (see the legend under the list) -- click "
-            "any image to jump straight to it, in either state, without "
+            "each grouped by source dataset (SARD/UAVDT/VisDrone, light color "
+            "stripe -- see the legend under the list), and (V19) each source "
+            "further split into per-frame-SET rows -- one per ~100-frame burst "
+            "(same grouping \"Check Sequence Coverage\" uses) -- each with its "
+            "OWN distinguishing color and an inline \"n/total\" frame count, so "
+            "you can tell at a glance how many frames a set has and how many "
+            "you've gotten to, without opening the coverage report. A small "
+            "warning marker appears on a set's row (in either section) if its "
+            "overall reviewed count is still below a few frames, so an "
+            "easy-to-miss set doesn't quietly fall out of sight. Click any "
+            "image to jump straight to it, in either state, without "
             "Next/Previous-ing your way there. Rebuilds automatically after "
-            "every save. \"Check sequence coverage\" reports, per source and "
-            "sequence, how many frames are currently Reviewed -- flagging any "
-            "sequence with fewer than a few, so you can tell at a glance whether "
-            "every set/sequence has enough manually reviewed keyframes yet to "
-            "start training. Purely informational -- changes nothing on disk.\n\n"
+            "every save. \"Check sequence coverage\" gives the same numbers as "
+            "a single full-text report across every set at once.\n\n"
             "Auto-advance:                 optional -- once every box on the "
             "image (queue AND manual, across the FULL queue, not just what a "
             "--source/--cls filter shows) has a decision, automatically jump to "
