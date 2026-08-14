@@ -58,7 +58,6 @@
     <Compile Include="NNTraining\cross_reference_gaps.py" />
     <Compile Include="NNTraining\check_label_gaps.py" />
     <Compile Include="NNTraining\generate_pseudo_labels.py" />
-    <Compile Include="NNTraining\audit_sync.py" />
     <Compile Include="NNTraining\resolve_cross_class_conflicts.py" />
     <Compile Include="NNTraining\review_labels.py" />
     <Compile Include="NNTraining\verify_pipeline_assumptions.py" />

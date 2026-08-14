@@ -444,6 +444,45 @@ V16 NOTE -- sequence/frame parsing fix + motion-predicted sync release.
      each neighbor frame, so there's nothing to derive a velocity from;
      it still stamps a same-position copy, same as before.
 
+V17 NOTE -- Spinbox crash fix + deferred "sync on save" release.
+  1. FIXED: the "+/- N frames" sync-window Spinbox had no input
+     validation, so a stray keystroke (or a quirk in how Tk's spin
+     buttons script their internal increment/decrement) could leave the
+     field's underlying Tcl value as a non-numeric string. Once that
+     happened, every subsequent self.seq_neighbors_window.get() raised
+     _tkinter.TclError -- and since _neighbor_image_keys() and
+     _ordered_neighbor_frames() both call .get() as their very first
+     line, EVERY sync attempt for the rest of the session silently
+     failed before it ever looked at a neighbor frame (the box's own
+     decision still saved fine -- only propagation broke). Fixed with a
+     new _sync_window_value() helper that never raises: on a bad value
+     it logs a warning, resets the field to the last known-good window,
+     and returns that instead. Both call sites now route through it.
+     Also added validatecommand on the Spinbox itself (digits-only, or
+     empty mid-edit) so the field can't go bad again in the first
+     place -- belt and suspenders.
+  2. CHANGED: cross-frame sync now fires on SAVE, not on every
+     accept/reject/manual-add/bulk-action click. Each of those actions
+     used to call straight into the sync machinery (_sync_after_decision_
+     change / _sync_propagate_manual_add / _sync_propagate_manual_remove
+     / _apply_sync_batch) the instant it happened. They now instead
+     queue a zero-arg callable representing exactly that same call onto
+     self._pending_sync_actions, and the queue is drained -- in order --
+     at the very start of every _flush() (autosave debounce, "Save Now",
+     Next/Previous, window close, or focus-loss). A burst of edits on
+     one image before its next save collapses into a single sync pass;
+     each queued action's own retract-then-reapply logic already makes
+     it safe to run from current state regardless of how many edits
+     happened first. None of the underlying retract/reapply logic
+     changed -- only *when* it runs. Because sync now always happens
+     from inside _flush(), the internal "force-flush-now" calls those
+     functions used to make at the end of themselves (added by V13 fix
+     E, to guarantee the source image's own decision was committed
+     alongside its sync) are redundant and have been removed --
+     calling _flush() from inside _flush() invites trouble, and the
+     guarantee is automatic now that sync runs inside the same flush
+     that commits the decision.
+
 WHAT CHANGED, keyboard command -> new equivalent:
   click box, cycle       -> click box: pops up a menu with Accept /
   pending/accept/reject     Reject / Reset to Pending / Change Class /
@@ -509,7 +548,9 @@ WHAT CHANGED, keyboard command -> new equivalent:
                               Last Sync" reverts just that batch.
                               Changing your mind on a source box (V13)
                               retracts what it previously synced, not
-                              just the most recent batch.
+                              just the most recent batch. (V17: sync
+                              itself now runs on save, not on every
+                              click -- see note above.)
   (nothing before)         -> "Switch to QA / Completed" button (V12):
                               swap between reviewing pending images and
                               browsing/correcting already-completed
@@ -1033,6 +1074,16 @@ class ReviewApp:
         self.clipboard = None
         self._paste_count = 0
 
+        # (V17) Deferred sync: each entry is a zero-arg callable doing
+        # exactly what used to fire immediately on click. Drained in
+        # order at the start of every _flush() -- autosave debounce,
+        # Save Now, Next/Previous, close, or focus-loss -- so a burst
+        # of edits on one image becomes one sync pass, and every save
+        # re-runs from current state (each queued call's own
+        # retract+reapply already supersedes whatever was synced
+        # before).
+        self._pending_sync_actions = []
+
         self.image_key = None
         self.source_name = None
         self.queue_items = []
@@ -1063,6 +1114,10 @@ class ReviewApp:
         # --- Cross-frame sync (V10 / V11) state ---
         self.sync_enabled = tk.BooleanVar(value=sync_enabled_default)
         self.seq_neighbors_window = tk.IntVar(value=sync_window_default)
+        # (V17) Last known-good sync-window value -- used by
+        # _sync_window_value() to recover if the Spinbox's IntVar ever
+        # ends up holding a non-numeric Tcl value.
+        self._last_valid_sync_window = sync_window_default
         self.sync_debug = tk.BooleanVar(value=False)
         self.sync_status_var = tk.StringVar(value="")
         self._last_sync_batch = []     # [{"kind":..., "image_key":..., ...}, ...]
@@ -1248,8 +1303,15 @@ class ReviewApp:
         ttk.Checkbutton(toolbar3, text="Sync nearby frames",
                          variable=self.sync_enabled).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Label(toolbar3, text="\u00b1").pack(side=tk.LEFT)
+        # (V17) validatecommand restricts the field to digits (or empty,
+        # mid-edit) so a stray keystroke can't leave the underlying Tcl
+        # value non-numeric and permanently break every subsequent
+        # .get() for the rest of the session -- see _sync_window_value()
+        # and the V17 module note for the crash this used to cause.
+        vcmd = (self.root.register(self._validate_sync_window_input), "%P")
         ttk.Spinbox(toolbar3, from_=0, to=SYNC_MAX_WINDOW, width=3,
-                    textvariable=self.seq_neighbors_window).pack(side=tk.LEFT, padx=(2, 2))
+                    textvariable=self.seq_neighbors_window,
+                    validate="key", validatecommand=vcmd).pack(side=tk.LEFT, padx=(2, 2))
         ttk.Label(toolbar3, text="frames").pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(toolbar3, text="Undo Last Sync",
                    command=self.undo_last_sync).pack(side=tk.LEFT, padx=2)
@@ -1351,6 +1413,35 @@ class ReviewApp:
         # (now packed first) and a usable slice of canvas can never
         # both be squeezed to nothing.
         self.root.minsize(720, 480)
+
+    def _validate_sync_window_input(self, proposed: str) -> bool:
+        """(V17) Spinbox validatecommand -- only digits or empty
+        (mid-edit) are allowed to land in the field. This is the
+        belt-and-suspenders half of the fix; _sync_window_value() below
+        is what actually guarantees .get() can never raise even if a
+        bad value somehow gets in (e.g. via a Tk spin-button quirk this
+        validation doesn't cover)."""
+        return proposed == "" or proposed.isdigit()
+
+    def _sync_window_value(self) -> int:
+        """(V17) Safe read of the sync-window Spinbox's IntVar. ttk.
+        Spinbox has no built-in validation of its own, so a stray
+        keystroke (or a Tk spin-button quirk) can leave the underlying
+        Tcl value non-numeric -- after that, every .get() on the IntVar
+        raises TclError, silently aborting every sync for the rest of
+        the session (see the V17 module note for the full story). Never
+        raises: on a bad value it resets the field to the last
+        known-good window and returns that instead."""
+        try:
+            val = int(self.seq_neighbors_window.get())
+        except (tk.TclError, ValueError):
+            val = getattr(self, "_last_valid_sync_window", SYNC_DEFAULT_WINDOW)
+            print(f"[sync] WARNING: sync-window field had a bad value, reset to {val}.")
+            self.seq_neighbors_window.set(val)
+            return val
+        val = max(0, min(SYNC_MAX_WINDOW, val))
+        self._last_valid_sync_window = val
+        return val
 
     def _select_all_models(self):
         for v in self.model_vars.values():
@@ -1510,6 +1601,11 @@ class ReviewApp:
         # across a Next/Previous navigation (copy a box on frame N,
         # paste equivalents into frame N+1, N+2, ...), so it persists
         # for the whole session until a fresh Ctrl+C replaces it.
+
+        # (V17) Deferred sync queue reset. Harmless -- by the time you
+        # navigate away, it's already been drained by the flush that
+        # precedes navigation (see go_next/go_prev/_flush_now_if_dirty).
+        self._pending_sync_actions = []
 
         # Undo/redo is scoped per-image -- a fresh image starts with a
         # clean slate rather than carrying over unrelated history.
@@ -1789,7 +1885,8 @@ class ReviewApp:
 
     # ------------------------------------------------------------------
     # Cross-frame sync (V10 queue decisions / V11 manual boxes / V13
-    # retraction / V16 motion-predicted chained matching)
+    # retraction / V16 motion-predicted chained matching / V17 deferred
+    # to save-time)
     # ------------------------------------------------------------------
 
     def _get_image_dims_cached(self, image_key):
@@ -1812,7 +1909,7 @@ class ReviewApp:
         if seq_key is None:
             return []
         frame = self.image_frame_num[image_key]
-        window = max(0, min(SYNC_MAX_WINDOW, self.seq_neighbors_window.get()))
+        window = self._sync_window_value()
         order = self.sequence_frames.get(seq_key, [])
         return [k for (fnum, k) in order if k != image_key and abs(fnum - frame) <= window]
 
@@ -1831,7 +1928,7 @@ class ReviewApp:
         if seq_key is None:
             return [], []
         frame = self.image_frame_num[image_key]
-        window = max(0, min(SYNC_MAX_WINDOW, self.seq_neighbors_window.get()))
+        window = self._sync_window_value()
         order = self.sequence_frames.get(seq_key, [])
         backward = [(fnum, k) for (fnum, k) in order
                     if k != image_key and 0 < frame - fnum <= window]
@@ -2037,7 +2134,13 @@ class ReviewApp:
 
         This is what makes "I changed my mind on this box" propagate
         the same way the original decision did, instead of leaving
-        stale synced copies in neighbor frames forever."""
+        stale synced copies in neighbor frames forever.
+
+        (V17) This now runs from inside _drain_pending_sync() -- called
+        from _flush(), not directly from the click handler -- so it no
+        longer needs to force its own flush at the end (the caller,
+        _flush(), is already in the middle of writing everything to
+        disk)."""
         if not self.sync_enabled.get():
             return
         it = self._queue_item_by_key(source_key)
@@ -2063,15 +2166,6 @@ class ReviewApp:
             save_completed(self.completed_path, self.completed_set)
             if not forward_touched:
                 self.sync_status_var.set(f"Retracted sync on {len(extra)} frame(s)")
-
-        # (V13 fix E) A decision change that had any sync side-effect
-        # touches OTHER images' files immediately; make sure the
-        # SOURCE image's own new decision is committed to disk right
-        # away too, instead of leaving it in the autosave debounce --
-        # otherwise a crash in that window could persist the synced
-        # effect without the decision that caused it.
-        if retracted or forward_touched:
-            self._flush_now_if_dirty()
 
     def _retract_sync_children(self, source_key, prev_state):
         """(V13 fix B) Reverts every neighbor queue box this source item
@@ -2145,7 +2239,7 @@ class ReviewApp:
             if verbose:
                 print(f"[sync] '{self.image_key}' seq={seq_key!r} frame="
                       f"{self.image_frame_num.get(self.image_key)}: 0 neighbors within "
-                      f"\u00b1{self.seq_neighbors_window.get()} frames.")
+                      f"\u00b1{self._sync_window_value()} frames.")
             return touched_images
 
         if verbose:
@@ -2225,7 +2319,11 @@ class ReviewApp:
         manual box has no detector candidate anywhere to observe a real
         position from in a neighbor frame, so there's no second
         observation to derive a velocity from. It still stamps a
-        same-position copy in every neighbor, same as before V16."""
+        same-position copy in every neighbor, same as before V16.
+
+        (V17) Now runs from inside _drain_pending_sync() (called from
+        _flush()), so it no longer needs to force its own flush at the
+        end -- the caller is already mid-flush."""
         if not self.sync_enabled.get():
             return
         neighbors = self._neighbor_image_keys(self.image_key)
@@ -2254,13 +2352,16 @@ class ReviewApp:
             save_completed(self.completed_path, self.completed_set)
             self._last_sync_batch = applied
             self.sync_status_var.set(f"Synced manual box to {len(applied)} nearby frame(s)")
-            self._flush_now_if_dirty()  # V13 fix E: commit the source's own state too
 
     def _sync_propagate_manual_remove(self, mb):
         """(V11) Reverses _sync_propagate_manual_add: removes every
         synced copy this specific box previously created (tracked in
         its own "_sync_children"), wherever they ended up. Only ever
-        touches boxes that trace back to THIS box."""
+        touches boxes that trace back to THIS box.
+
+        (V17) Now runs from inside _drain_pending_sync() (called from
+        _flush()), so it no longer needs to force its own flush at the
+        end -- the caller is already mid-flush."""
         children = mb.pop("_sync_children", [])
         if not children:
             return
@@ -2278,7 +2379,6 @@ class ReviewApp:
             save_json(self.progress_path, self.progress)
             save_completed(self.completed_path, self.completed_set)
             self.sync_status_var.set(f"Removed synced manual box from {len(touched)} frame(s)")
-            self._flush_now_if_dirty()  # V13 fix E
 
     def undo_last_sync(self):
         """Reverts exactly the last auto-applied sync batch (a queue-
@@ -2450,11 +2550,34 @@ class ReviewApp:
         elif not fully_decided and image_key in self.completed_set:
             self.completed_set.discard(image_key)
 
+    def _drain_pending_sync(self):
+        """(V17) Runs every deferred sync action queued since the last
+        flush, in the order they were queued, then clears the queue.
+        Each queued callable is exactly the call that used to fire
+        immediately on click (_sync_after_decision_change /
+        _sync_propagate_manual_add / _sync_propagate_manual_remove /
+        _apply_sync_batch) -- their own retract-then-reapply logic
+        already makes each one safe to run from whatever the current
+        state is, regardless of how many other edits happened first.
+        Called first thing in _flush() so a whole burst of edits on one
+        image collapses into a single sync pass per save instead of one
+        sync call per click."""
+        if not self._pending_sync_actions:
+            return
+        actions, self._pending_sync_actions = self._pending_sync_actions, []
+        for action in actions:
+            action()
+
     def _flush(self):
         """Writes everything for the current image to disk: per-item
         decisions + current box position into progress.json, the
         accepted-boxes label file into pseudo_labels_reviewed/, and
-        updates the completed-images list."""
+        updates the completed-images list.
+
+        (V17) Drains any deferred cross-frame sync actions first, so
+        sync always runs as part of -- and immediately before -- the
+        same save that commits the decisions which triggered it."""
+        self._drain_pending_sync()
         for it in self.queue_items:
             k = item_key(it)
             existing = self.progress.get(k, {})
@@ -2573,9 +2696,9 @@ class ReviewApp:
         self._mark_dirty()
         self.redraw()
         self._maybe_auto_advance()
-        touched = self._apply_sync_batch(sources)
-        if touched:
-            self._flush_now_if_dirty()  # V13 fix E
+        # (V17) Deferred: queued for the next _flush() rather than
+        # applied immediately.
+        self._pending_sync_actions.append(lambda s=sources: self._apply_sync_batch(s))
 
     def bulk_reject_pending(self):
         pending_keys = [k for k, v in self.decisions.items() if v == "pending"]
@@ -2596,9 +2719,9 @@ class ReviewApp:
         self._mark_dirty()
         self.redraw()
         self._maybe_auto_advance()
-        touched = self._apply_sync_batch(sources)
-        if touched:
-            self._flush_now_if_dirty()  # V13 fix E
+        # (V17) Deferred: queued for the next _flush() rather than
+        # applied immediately.
+        self._pending_sync_actions.append(lambda s=sources: self._apply_sync_batch(s))
 
     # ------------------------------------------------------------------
     # Drawing
@@ -2775,11 +2898,14 @@ class ReviewApp:
         self._mark_dirty()
         self.redraw()
         self._maybe_auto_advance()
-        # (V13 fix B) Handles BOTH forward-syncing the new state AND
-        # retracting whatever the box's PREVIOUS state had synced --
-        # covers Accept->Reject, Accept->Delete, ->Reset to Pending,
-        # etc., not just the original "pending->decided" case.
-        self._sync_after_decision_change(key, prev_state, state)
+        # (V17) Deferred: queued for the next _flush() rather than
+        # applied immediately. (V13 fix B) Handles BOTH forward-syncing
+        # the new state AND retracting whatever the box's PREVIOUS
+        # state had synced -- covers Accept->Reject, Accept->Delete,
+        # ->Reset to Pending, etc., not just the original
+        # "pending->decided" case.
+        self._pending_sync_actions.append(
+            lambda k=key, p=prev_state, s=state: self._sync_after_decision_change(k, p, s))
 
     def _override_class(self, key, cls):
         self._push_undo()
@@ -2801,7 +2927,10 @@ class ReviewApp:
         _update_completed_list). Accepting also syncs the box (as a
         fresh copy) into nearby frames; un-accepting (reject or reset
         to pending) removes exactly the copies that specific accept
-        created."""
+        created.
+
+        (V17) Both sync calls are now deferred, queued for the next
+        _flush() rather than applied immediately."""
         self._push_undo()
         mb = self._find_manual(manual_id)
         prev = mb.get("decision", "pending")
@@ -2810,14 +2939,16 @@ class ReviewApp:
         self.redraw()
         self._maybe_auto_advance()
         if state == "accepted" and prev != "accepted":
-            self._sync_propagate_manual_add(mb)
+            self._pending_sync_actions.append(lambda m=mb: self._sync_propagate_manual_add(m))
         elif state != "accepted" and prev == "accepted":
-            self._sync_propagate_manual_remove(mb)
+            self._pending_sync_actions.append(lambda m=mb: self._sync_propagate_manual_remove(m))
 
     def _delete_manual(self, manual_id):
         self._push_undo()
         mb = self._find_manual(manual_id)
-        self._sync_propagate_manual_remove(mb)   # cascade-remove synced copies first
+        # (V17) Deferred: queued for the next _flush() rather than
+        # applied immediately.
+        self._pending_sync_actions.append(lambda m=mb: self._sync_propagate_manual_remove(m))
         self.manual_boxes = [m for m in self.manual_boxes if m["_id"] != manual_id]
         self._mark_dirty()
         self.redraw()
@@ -2835,7 +2966,10 @@ class ReviewApp:
         no separate "open its menu and click Accept" step for the
         common case of a box you meant to add. If you drew/pasted one
         by mistake, open its menu and use Reject / Reset to Pending /
-        Delete to correct it."""
+        Delete to correct it.
+
+        (V17) The sync propagation is now deferred, queued for the
+        next _flush() rather than applied immediately."""
         self._push_undo()
         mb = {"cls": cls, "box": box, "_id": self._next_manual_id, "decision": "accepted"}
         self.manual_boxes.append(mb)
@@ -2844,7 +2978,7 @@ class ReviewApp:
         self._mark_dirty()
         self.redraw()
         self._maybe_auto_advance()
-        self._sync_propagate_manual_add(mb)
+        self._pending_sync_actions.append(lambda m=mb: self._sync_propagate_manual_add(m))
 
     def _arm_reposition(self, kind, key):
         self.reposition_armed = (kind, key)
@@ -3160,9 +3294,13 @@ class ReviewApp:
             "Changing your mind on a source box later (Accept -> Reject, -> "
             "Delete, or -> Reset to Pending) automatically retracts exactly the "
             "copies THAT box created, as long as they haven't since been "
-            "manually re-decided by hand. The \u00b1N spinner controls how many "
-            "frames out to look; \"Undo Last Sync\" reverts exactly the last "
-            "auto-applied batch, everywhere it touched.\n\n"
+            "manually re-decided by hand. As of V17, the actual sync pass runs "
+            "at SAVE time (autosave, Save Now, navigation, close, or focus-"
+            "loss) rather than on every single click, so a burst of edits on "
+            "one image before its next save collapses into one sync pass. The "
+            "\u00b1N spinner controls how many frames out to look; \"Undo Last "
+            "Sync\" reverts exactly the last auto-applied batch, everywhere it "
+            "touched.\n\n"
             "Switch to QA / Completed:     swaps the current session, live, "
             "between images still pending review and images that are already "
             "fully decided (same list --qa opens from the command line) -- no "
@@ -3175,11 +3313,11 @@ class ReviewApp:
             "--source/--cls filter shows) has a decision, automatically jump to "
             "the next image.\n\n"
             "Everything autosaves as you go (within under half a second of any "
-            "change, or instantly if the window loses focus, or instantly right "
-            "after a change that triggers/retracts a cross-frame sync) -- Next/"
-            "Previous/closing/Alt-Tabbing never lose work, and there's no save "
-            "prompt because there's nothing left unsaved to ask about. \"Save "
-            "Now\" / 's' just forces it immediately.\n\n"
+            "change, or instantly if the window loses focus) -- Next/Previous/"
+            "closing/Alt-Tabbing never lose work, and there's no save prompt "
+            "because there's nothing left unsaved to ask about. \"Save Now\" / "
+            "'s' just forces it immediately. Cross-frame sync (see above) runs "
+            "as part of that same save.\n\n"
             "Once every box (queue and manual) on an image has a decision -- "
             "again, across the FULL queue for that image, not just a --source/"
             "--cls filtered view -- that image moves into a separate completed "
