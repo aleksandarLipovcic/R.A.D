@@ -547,6 +547,80 @@ and more "make sure every set gets looked at, and none get missed."
      text report across every set at once; the sidebar annotations are
      the same underlying numbers, just visible without opening it.
 
+V20 NOTE -- sidebar auto-scroll bugfix.
+  1. FIXED: finishing the last pending box on an image (so it moved
+     from Remaining into Reviewed) made the sidebar visibly jump over
+     to, and expand, the Reviewed section on its own -- even though the
+     session was still in ordinary review (qa_mode still False) and
+     nobody asked to look at Reviewed yet. Root cause: after every save
+     the sidebar re-selects and Treeview.see()s whichever leaf
+     represents the currently-open image so the highlight tracks it;
+     see() force-opens every ancestor of the item it scrolls to, so the
+     moment that leaf existed only under "Reviewed" (because the image
+     had just become fully decided), see() yanked that whole branch
+     open and scrolled down into it. _highlight_sidebar_selection() now
+     only does this when the image's Remaining/Reviewed status matches
+     the session's CURRENT mode -- Remaining while reviewing normally,
+     Reviewed while in QA. If they don't match (exactly the "just
+     finished this image" moment), it leaves the sidebar's scroll/
+     expand state alone instead. The tree itself still updates both
+     sections' contents and counts on every save as before; the only
+     thing that changed is that the visible scroll position no longer
+     gets dragged into a section you didn't ask for. The only ways into
+     the Reviewed section remain: the "Switch to QA / Completed"
+     button, or clicking a Reviewed image directly.
+
+V21 NOTE -- resizable sidebar release.
+  1. ADDED: the sidebar is now a draggable pane (a classic
+     tk.PanedWindow, since ttk's panedwindow has no per-pane minsize)
+     instead of a fixed SIDEBAR_WIDTH_PX-wide Frame -- drag the thin
+     handle between the sidebar and the image to widen it and read a
+     long filename in full, or narrow it back down. Both panes have a
+     floor (SIDEBAR_MIN_WIDTH_PX for the sidebar, MIN_CANVAS_W for the
+     image) so the sash can't be dragged far enough to make one
+     pane squeeze the other into nothing -- and since a PanedWindow's
+     panes physically cannot overlap, the sidebar can never be dragged
+     "over" the image canvas either. Resizing the whole app window
+     leaves the sidebar's width alone (stretch="never") and gives all
+     the extra/lost space to the image pane instead, so the sidebar
+     stays wherever you last dragged it.
+  2. _display_size_budget() (which fits the image to the available
+     canvas room) now reads the sidebar's CURRENT width back from the
+     live widget instead of assuming the original SIDEBAR_WIDTH_PX, so
+     a wider or narrower sidebar is accounted for the next time an
+     image loads.
+
+V22 NOTE -- sidebar expand-state persistence bugfix.
+  1. FIXED: finishing an image moved it from Remaining to Reviewed,
+     which (correctly) triggers a full sidebar rebuild -- but every
+     group in the rebuilt tree used to default back to closed
+     regardless of what had been expanded a moment before, so working
+     through a set you'd expanded meant it silently collapsed after
+     EVERY single image, forcing a re-expand back down to where you
+     were on every save. This is what actually produced both symptoms
+     reported: the tree visibly "collapsing" out from under you, and it
+     looking like a jump over to the Reviewed side, since the row you
+     were just looking at vanished from view the instant its parents
+     snapped shut.
+  2. Expand/collapse state now persists across rebuilds
+     (self._sidebar_open_state, kept in sync by binding
+     <<TreeviewOpen>>/<<TreeviewClose>> -- see
+     _on_sidebar_node_open/_close) instead of being recomputed from
+     scratch every time. Source and set group keys are deliberately
+     NOT scoped to the Remaining/Reviewed section -- expanding
+     "UAVDT > M0209" while working through it keeps that same set
+     expanded when an image inside it finishes and quietly moves from
+     its Remaining branch to its Reviewed branch, rather than the set
+     collapsing right as you're in the middle of it. The vertical
+     scroll position is also now preserved across a rebuild (previously
+     every rebuild snapped back to the very top).
+  3. Net effect: completing an image just removes that one row from
+     view under its set's Remaining branch and it reappears under that
+     SAME set's Reviewed branch -- everything else about the tree
+     (what's expanded, where you're scrolled to) stays exactly as it
+     was, matching how the reviewed/remaining split already worked
+     conceptually, just without the visual disruption on every save.
+
 WHAT CHANGED, keyboard command -> new equivalent:
   click box, cycle       -> click box: pops up a menu with Accept /
   pending/accept/reject     Reject / Reset to Pending / Change Class /
@@ -755,8 +829,19 @@ CHROME_RESERVED_W = 60
 MIN_CANVAS_W = 480
 MIN_CANVAS_H = 320
 
-# (V18) Fixed width of the left-hand image-list sidebar, in pixels.
+# (V18) Initial width of the left-hand image-list sidebar, in pixels.
+# (V21) No longer a hard fixed width -- this is now just the STARTING
+# width of a draggable pane; see SIDEBAR_MIN_WIDTH_PX / MIN_CANVAS_W
+# and _build_ui's PanedWindow setup below.
 SIDEBAR_WIDTH_PX = 270
+# (V21) Floor on how narrow the sidebar pane can be dragged -- keeps
+# the resize handle from collapsing it to nothing/unreadable. The
+# image canvas has its own floor, MIN_CANVAS_W below, so the sash can
+# never be dragged far enough to make one pane cover or squeeze out
+# the other -- tk.PanedWindow physically cannot overlap panes; each
+# pane's minsize is what stops the drag before it gets uncomfortably
+# tight, not any overlap risk.
+SIDEBAR_MIN_WIDTH_PX = 160
 
 MIN_ZOOM = 1.0     # can't zoom out past "fit to window"
 MAX_ZOOM = 8.0
@@ -1178,6 +1263,30 @@ class ReviewApp:
         # item id -> the image_key it represents. Group/section nodes are
         # simply absent from this dict.
         self._sidebar_item_to_key = {}
+        # (V22) Populated by _build_sidebar_tree(); maps a Treeview GROUP
+        # node's item id (section/source/set -- never a leaf) to a
+        # STABLE key that survives a rebuild (unlike the item id itself,
+        # which is a fresh Tk-generated id every time the tree is
+        # rebuilt). Used by _on_sidebar_node_open/_close to record which
+        # groups the person has expanded into self._sidebar_open_state,
+        # so a rebuild can restore the same expand state instead of
+        # collapsing everything back to defaults.
+        self._sidebar_node_to_state_key = {}
+        # (V22) Set of stable group keys currently expanded, persisted
+        # ACROSS rebuilds (a full tree rebuild happens after every save
+        # -- see _refresh_sidebar -- since an image moving from
+        # Remaining to Reviewed changes which groups exist at all).
+        # Seeded with the "Remaining" section open by default, matching
+        # the original one-time default; everything else starts closed
+        # until the person expands it, exactly as before -- the only
+        # change is that closing/reopening now STICKS across rebuilds
+        # instead of resetting every time. Source/set keys are
+        # deliberately NOT scoped to Remaining vs Reviewed (see
+        # _build_sidebar_tree) -- expanding "UAVDT > M0209" while
+        # working through it keeps that same set expanded when its last
+        # image finishes and it reappears one level over, under
+        # Reviewed, instead of collapsing right when you're mid-set.
+        self._sidebar_open_state = {"section:Remaining"}
 
         self.idx = 0
         self.dirty = False
@@ -1467,18 +1576,39 @@ class ReviewApp:
             lbl.pack(side=tk.LEFT, padx=8)
             self.model_count_labels[m] = lbl
 
-        # (V18) main_area holds the new left-hand image-list sidebar and
-        # the existing scrollable image canvas side by side. This is the
-        # ONLY structural change to the chrome layout -- nav/status are
-        # still packed to self.root directly, BEFORE main_area, so V12's
-        # "nav bar can never be pushed off-screen" guarantee is untouched.
-        main_area = ttk.Frame(self.root)
+        # (V18) main_area holds the left-hand image-list sidebar and the
+        # scrollable image canvas side by side. This is the ONLY
+        # structural change to the chrome layout -- nav/status are still
+        # packed to self.root directly, BEFORE main_area, so V12's "nav
+        # bar can never be pushed off-screen" guarantee is untouched.
+        #
+        # (V21) Upgraded from a plain Frame to a classic tk.PanedWindow
+        # so the sidebar/canvas split gets a draggable sash -- the sidebar
+        # started as a fixed SIDEBAR_WIDTH_PX with no way to see a long
+        # filename that got elided, and a plain side-by-side pack has no
+        # concept of a resize handle at all. tk.PanedWindow (not ttk's --
+        # ttk::panedwindow panes only support a "weight" option, no
+        # minsize) is used specifically because each pane can be given
+        # its own minsize: the two panes can NEVER overlap or cover one
+        # another (that's a hard property of the widget, not something
+        # this minsize enforces), and minsize on each just stops the
+        # sash from being dragged so far that one pane gets squeezed
+        # into something unusably tiny. stretch="never" on the sidebar
+        # means resizing the whole WINDOW doesn't stretch the sidebar --
+        # extra/lost space goes to the canvas pane instead, so the
+        # sidebar's width stays exactly where you last dragged it until
+        # you drag it again.
+        main_area = tk.PanedWindow(self.root, orient=tk.HORIZONTAL,
+                                    sashwidth=6, sashrelief=tk.RAISED,
+                                    opaqueresize=True, bd=0)
         main_area.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=(4, 0))
 
-        self._build_sidebar(main_area)
+        sidebar = self._build_sidebar(main_area)
+        main_area.add(sidebar, width=SIDEBAR_WIDTH_PX,
+                       minsize=SIDEBAR_MIN_WIDTH_PX, stretch="never")
 
         canvas_frame = ttk.Frame(main_area)
-        canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        main_area.add(canvas_frame, minsize=MIN_CANVAS_W, stretch="always")
 
         self.canvas = tk.Canvas(canvas_frame, bg="#111111", cursor="tcross")
         hbar = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL, command=self.canvas.xview)
@@ -1572,10 +1702,19 @@ class ReviewApp:
         SET (sequence), each with its own generated color (see
         _color_for_sequence) and an inline reviewed/total count -- so
         the tree itself doubles as the "have I gotten to every set yet"
-        view, not just the separate "Check sequence coverage" report."""
-        sidebar = ttk.Frame(parent, width=SIDEBAR_WIDTH_PX)
-        sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
-        sidebar.pack_propagate(False)  # keep the fixed width even as the tree grows
+        view, not just the separate "Check sequence coverage" report.
+
+        (V21) Returns the sidebar Frame instead of packing itself --
+        the caller (_build_ui) now adds it as a pane of a PanedWindow,
+        which owns its placement/sizing, so this method only builds its
+        CONTENTS (which still use plain pack() internally, same as
+        before -- only how the sidebar-as-a-whole is placed by its
+        parent changed). self._sidebar_frame is kept so
+        _display_size_budget() can read back whatever width the sash is
+        CURRENTLY at, rather than assuming the original SIDEBAR_WIDTH_PX,
+        when it sizes the image canvas."""
+        sidebar = ttk.Frame(parent)
+        self._sidebar_frame = sidebar
 
         ttk.Label(sidebar, text="Images by Set (Remaining / Reviewed)",
                   font=("TkDefaultFont", 9, "bold")).pack(side=tk.TOP, anchor="w", pady=(0, 2))
@@ -1599,6 +1738,12 @@ class ReviewApp:
         self.sidebar_tree.tag_configure("src_other", background=SOURCE_COLOR_OTHER)
 
         self.sidebar_tree.bind("<<TreeviewSelect>>", self._on_sidebar_select)
+        # (V22) Track expand/collapse so a rebuild (which happens after
+        # every save) can restore it instead of resetting everything to
+        # closed -- see self._sidebar_open_state and
+        # _on_sidebar_node_open/_close below.
+        self.sidebar_tree.bind("<<TreeviewOpen>>", self._on_sidebar_node_open)
+        self.sidebar_tree.bind("<<TreeviewClose>>", self._on_sidebar_node_close)
 
         legend = ttk.Frame(sidebar)
         legend.pack(side=tk.TOP, fill=tk.X, pady=(4, 2))
@@ -1616,6 +1761,8 @@ class ReviewApp:
                    command=self._refresh_sidebar).pack(side=tk.TOP, fill=tk.X, pady=(4, 2))
         ttk.Button(sidebar, text="Check sequence coverage",
                    command=self._show_sequence_coverage).pack(side=tk.TOP, fill=tk.X)
+
+        return sidebar
 
     def _validate_sync_window_input(self, proposed: str) -> bool:
         """(V17) Spinbox validatecommand -- only digits or empty
@@ -1677,11 +1824,31 @@ class ReviewApp:
         Cheap enough to call after every save -- typical session sizes
         here are in the hundreds to low thousands of images, not enough
         for a full Treeview rebuild to be noticeable on a debounced
-        ~400ms cadence."""
+        ~400ms cadence.
+
+        (V22) A full rebuild is unavoidable -- an image finishing review
+        moves it from Remaining to Reviewed, which can change which
+        source/set GROUPS exist at all (a set that just lost its last
+        remaining image disappears from under Remaining and appears
+        under Reviewed), so incrementally patching the tree in place
+        isn't really simpler than just rebuilding it. What used to make
+        that rebuild disruptive is that every group defaulted back to
+        closed each time -- so finishing one image in a set you had
+        expanded collapsed it, and you had to re-expand your way back
+        down to it, on every single save. Expand state now persists
+        across the rebuild instead (self._sidebar_open_state, kept in
+        sync by _on_sidebar_node_open/_close), and the vertical scroll
+        position is preserved too, so completing an image no longer
+        visibly disturbs whatever part of the tree you were looking
+        at -- the row for that specific image just quietly moves from
+        the Remaining branch of its set to the Reviewed branch of the
+        SAME set, which stays expanded and in view exactly as before."""
         tree = self.sidebar_tree
         selected_key = self.image_key  # preserve highlight across a rebuild
+        scroll_frac = tree.yview()[0] if tree.get_children() else 0.0
         tree.delete(*tree.get_children())
         self._sidebar_item_to_key = {}
+        self._sidebar_node_to_state_key = {}
 
         remaining = [k for k in self.all_image_keys_filtered if k not in self.completed_set]
         reviewed = [k for k in self.all_image_keys_filtered if k in self.completed_set]
@@ -1705,18 +1872,35 @@ class ReviewApp:
                 set_reviewed[group] = set_reviewed.get(group, 0) + 1
 
         for section_label, keys in (("Remaining", remaining), ("Reviewed", reviewed)):
+            # (V22) Section open/closed state persists via a stable key
+            # ("section:Remaining" / "section:Reviewed") rather than
+            # always defaulting Remaining-open/Reviewed-closed -- so if
+            # you manually open "Reviewed" to spot-check something, it
+            # stays open across the next few saves instead of snapping
+            # shut again.
+            sec_state_key = f"section:{section_label}"
             section_node = tree.insert(
                 "", "end", text=f"{section_label} ({len(keys)})",
-                open=(section_label == "Remaining"))
+                open=(sec_state_key in self._sidebar_open_state))
+            self._sidebar_node_to_state_key[section_node] = sec_state_key
+
             by_src: dict = {}
             for k in keys:
                 by_src.setdefault(self.image_source.get(k, "unknown"), []).append(k)
             for src in sorted(by_src):
                 src_keys_all = by_src[src]
                 tag = f"src_{src}" if src in SOURCE_COLORS else "src_other"
+                # (V22) Source state key is deliberately NOT scoped to
+                # section -- expanding "UAVDT" under Remaining keeps
+                # "UAVDT" expanded under Reviewed too, since they're the
+                # same logical group as far as the person is concerned,
+                # just currently showing a different subset of images.
+                src_state_key = f"source:{src}"
                 src_node = tree.insert(section_node, "end",
-                                        text=f"{src} ({len(src_keys_all)})", open=False,
+                                        text=f"{src} ({len(src_keys_all)})",
+                                        open=(src_state_key in self._sidebar_open_state),
                                         tags=(tag,))
+                self._sidebar_node_to_state_key[src_node] = src_state_key
 
                 # (V19) Group this source's images (within this section)
                 # by frame set, and give each set its own row + color.
@@ -1736,25 +1920,80 @@ class ReviewApp:
                     seq_tag = f"seq_{src}_{seq}"
                     self.sidebar_tree.tag_configure(
                         seq_tag, background=_color_for_sequence(f"{src}::{seq}"))
+                    # (V22) Same reasoning as the source key above -- NOT
+                    # scoped to section, so a set you're actively working
+                    # through stays expanded as its images individually
+                    # cross over from Remaining to Reviewed one at a
+                    # time, instead of collapsing on every single one.
+                    set_state_key = f"set:{src}:{seq}"
                     seq_node = tree.insert(
                         src_node, "end",
                         text=f"{seq}  ({len(seq_keys)}/{total} total){flag}",
-                        open=False, tags=(seq_tag,))
+                        open=(set_state_key in self._sidebar_open_state), tags=(seq_tag,))
+                    self._sidebar_node_to_state_key[seq_node] = set_state_key
                     for k in seq_keys:
                         leaf = tree.insert(seq_node, "end", text=Path(k).name, tags=(seq_tag,))
                         self._sidebar_item_to_key[leaf] = k
 
         if selected_key is not None:
             self._highlight_sidebar_selection()
+        # (V22) Restore roughly the same scroll position the tree was at
+        # before this rebuild -- without this, every rebuild snapped the
+        # view back to the very top (the "Remaining" header), which read
+        # as the list jumping around even once expand state itself
+        # stopped resetting.
+        tree.yview_moveto(scroll_frac)
 
     def _refresh_sidebar(self):
         self._build_sidebar_tree()
+
+    def _on_sidebar_node_open(self, event=None):
+        """(V22) Records that a group node (section/source/set) was
+        expanded, keyed by its STABLE key (see _sidebar_node_to_state_key)
+        rather than its Tk item id, so the state survives the next full
+        tree rebuild instead of being lost the moment the old item id
+        stops existing. Tk sets the tree's focus to the node that
+        triggered <<TreeviewOpen>> just before generating the event,
+        which is the standard way to identify it."""
+        item_id = self.sidebar_tree.focus()
+        state_key = self._sidebar_node_to_state_key.get(item_id)
+        if state_key:
+            self._sidebar_open_state.add(state_key)
+
+    def _on_sidebar_node_close(self, event=None):
+        """(V22) Mirror of _on_sidebar_node_open for <<TreeviewClose>>."""
+        item_id = self.sidebar_tree.focus()
+        state_key = self._sidebar_node_to_state_key.get(item_id)
+        if state_key:
+            self._sidebar_open_state.discard(state_key)
 
     def _highlight_sidebar_selection(self):
         """Selects (and scrolls to) whichever sidebar leaf corresponds to
         self.image_key, without triggering another jump -- _on_sidebar_
         select() below no-ops when the clicked/selected leaf is already
-        the current image."""
+        the current image.
+
+        (V20 FIX) Only does this within the section matching the CURRENT
+        mode (Remaining while reviewing normally, Reviewed while in QA).
+        Treeview.see() force-opens every ancestor of whatever item it
+        scrolls to -- so previously, the instant the image on screen
+        became fully decided (its last pending box got a decision) and
+        moved from Remaining into Reviewed, this would call see() on its
+        NEW leaf under the "Reviewed" branch, which yanked that section
+        open and scrolled the sidebar down into it -- even though you
+        were still in ordinary review (qa_mode still False) and never
+        asked to look at Reviewed. That's the "list auto-switches to the
+        completed view when I finish an image" bug. Now, if the image's
+        Remaining/Reviewed status doesn't match the session's current
+        mode, this just leaves the sidebar's scroll/expand state alone --
+        the tree still contains and updates both sections underneath
+        (the counts and per-set annotations are unaffected), it just
+        won't be dragged over to show one you didn't ask for. The only
+        ways into the Reviewed section remain explicit: the "Switch to
+        QA / Completed" button, or clicking a Reviewed image directly."""
+        is_reviewed = self.image_key in self.completed_set
+        if is_reviewed != self.qa_mode:
+            return
         for item_id, key in self._sidebar_item_to_key.items():
             if key == self.image_key:
                 self.sidebar_tree.see(item_id)
@@ -1896,10 +2135,22 @@ class ReviewApp:
         except tk.TclError:
             pass
 
-        # (V18) The sidebar now also eats into available width -- widen
-        # the reserved-width allowance to account for it so the canvas
-        # doesn't try to claim space the sidebar is already using.
-        reserved_w = CHROME_RESERVED_W + SIDEBAR_WIDTH_PX
+        # (V18) The sidebar eats into available width -- reserve enough
+        # that the canvas doesn't try to claim space the sidebar is
+        # using. (V21) Since the sidebar is now a resizable pane, this
+        # reads back its CURRENT width (wherever the sash has been
+        # dragged to) rather than assuming it's still at the original
+        # SIDEBAR_WIDTH_PX -- falls back to that constant before the
+        # window has ever been drawn (winfo_width() returns 1).
+        sidebar_w = SIDEBAR_WIDTH_PX
+        if hasattr(self, "_sidebar_frame"):
+            try:
+                measured = self._sidebar_frame.winfo_width()
+                if measured > 1:
+                    sidebar_w = measured
+            except tk.TclError:
+                pass
+        reserved_w = CHROME_RESERVED_W + sidebar_w
 
         max_w = min(DISPLAY_MAX_W, max(MIN_CANVAS_W, screen_w - reserved_w))
         max_h = min(DISPLAY_MAX_H, max(MIN_CANVAS_H, screen_h - reserved_h))
