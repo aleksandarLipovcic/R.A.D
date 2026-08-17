@@ -219,6 +219,106 @@ still recorded in pseudo_labels_discarded.json with reason
 other discard path in this script.
 =======================================================================
 
+=======================================================================
+V8 (2026-08-16): --apply now holds back partially-reviewed images.
+=======================================================================
+Before V8, --apply merged EVERY box currently sitting in pseudo_labels/
+(auto-accept) and pseudo_labels_reviewed/ (manual review output) into
+the real dataset, regardless of whether every box on that image had
+actually been decided yet. That's a real correctness problem, not just
+an ordering inconvenience: an image can easily have SOME boxes already
+auto-accepted (e.g. a 3/4-vote person) and OTHER boxes on the exact
+same frame still sitting untouched in the review queue (e.g. a 1-vote
+motorcycle nobody has looked at yet). YOLO training treats anything
+absent from a label file as confirmed background -- so merging that
+image's auto-accepted boxes alone, before the still-pending box is
+decided, silently teaches the model "that region is empty" when really
+it's just unreviewed.
+
+V8 fixes this by holding back BOTH trees' boxes for an image, together,
+until review_labels.py's own review_completed.json says every box on
+that image -- across BOTH the auto-accept tier and the manual-review
+tier, queue items AND hand-drawn boxes -- has a real decision. This is
+READ, not recomputed here -- review_completed.json is already self-
+healing (see review_labels.py's V11/V13 notes) and is the one place
+that already accounts for --source/--cls filters, manual boxes, and
+cross-frame sync correctly, so there's no reason to duplicate that
+logic in this script.
+
+Concretely:
+  - compute_pending_review_images(): every image with at least one item
+    in THIS run's NEEDS-REVIEW queue that ISN'T yet in
+    review_completed.json.
+  - pending_images_to_label_paths(): maps each of those images to the
+    real dataset label path merge_pseudo_trees_into_dataset() would
+    otherwise write to (same image_path_to_label_path() convention
+    used everywhere else in this script).
+  - merge_pseudo_trees_into_dataset() now takes pending_label_paths and
+    skips ANY .txt file (from EITHER root) that would land on one of
+    those paths this run -- not partially merged, not touched at all.
+    A per-run summary of how many boxes / images were held back is
+    printed so this is never silent.
+
+An image that was ONLY EVER auto-accepted (never queued for review at
+all) is unaffected -- there's nothing on it to be "pending," so it
+merges immediately, same as before V8.
+
+This is naturally incremental, which is the actual point: rerunning
+--apply after reviewing more images in review_labels.py picks up
+exactly the newly-completed ones and merges them, while continuing to
+hold back whatever's still pending -- there's no separate "add these
+new images now" step, --apply itself IS that step, and it's safe to
+rerun as often as you like (V5's clean-regeneration of pseudo_labels/
+plus the existing dedup-safe append logic are both unchanged). This is
+the intended workflow for a large backlog: run --apply now to build a
+database from whatever's already fully reviewed (all of VisDrone/SARD,
+plus however much of UAVDT is done), keep reviewing UAVDT in the
+background, and rerun the exact same --apply command later -- each
+image that newly finishes review is picked up automatically the next
+time you run it, nothing else needs to change.
+
+Note this only ever ADDS coverage over time -- if an already-merged
+image's decision is later reset back to pending in review_labels.py
+(e.g. a QA pass reopens it), V8 does not retroactively remove what was
+already merged for it in a PAST run; it just won't be re-merged again
+until it's re-completed. Not a concern for the common case (finishing
+more images), but worth knowing if you ever walk a decision backward
+after already running --apply on it.
+=======================================================================
+
+=======================================================================
+V9 (2026-08-17): pending-review images excluded from train/val/test
+entirely, not just held back from label merging.
+=======================================================================
+V8 stopped merging boxes for a still-pending image, but the image
+itself stayed inside the trainable dataset regardless -- an image
+awaiting review kept whatever labels it already had (e.g. UAVDT's
+native vehicle boxes) and was still picked up by prepare_datasets.py's
+directory/auto-split scan exactly like a fully-reviewed image. Fine for
+some workflows, but not this project's actual requirement: only images
+with NOTHING left pending should be usable at all -- in train, and
+especially in val/test, where an incomplete-ground-truth image scores a
+model's correct detection as a false positive and quietly corrupts the
+per-class mAP numbers report_per_class_map()/evaluate_per_source() in
+train.py exist to give a clean read on.
+
+V9 adds datasets/pending_review_images.json -- the exact same
+compute_pending_review_images() set V8 already computes, written out
+(as resolved absolute path strings) on EVERY run of this script, dry-
+run or --apply, so it always reflects the current queue regardless of
+whether --apply was passed. prepare_datasets.py (V9 there too) reads
+this file and drops any matching image from every train/val/test list
+it builds for UAVDT/SARD/external sources -- not just skips merging
+their boxes, excludes the image entirely. See that module's matching
+V9 note for the filtering mechanics.
+
+Written unconditionally (not gated on --apply) so prepare_datasets.py
+always has an up-to-date exclusion list even if it's run between
+generate_pseudo_labels.py passes without --apply -- same staleness
+caveat as everything else derived from review_completed.json: rerun
+this script after more review happens to refresh it.
+=======================================================================
+
 THREE-TIER SPLIT (auto-accept side, unchanged from V3):
   - AUTO-ACCEPT (vote_count >= 3): written straight to a YOLO-format
     label file, UNCONDITIONALLY -- no confidence floor. Three or four
@@ -290,11 +390,14 @@ component with "labels" and swapping the extension to .txt. The script
 prints the first derived (image -> label) pair per source at startup --
 confirm that path is a real, existing file before trusting --apply.
 
---apply: unchanged -- merges datasets/pseudo_labels/ (this script's
-auto-accept tier, freshly regenerated this run) and datasets/
-pseudo_labels_reviewed/ (review_labels.py's output, if present, NEVER
-modified by this script -- read-only at merge time) into the real
-dataset, appending and skipping byte-identical duplicate lines.
+--apply: merges datasets/pseudo_labels/ (this script's auto-accept
+tier, freshly regenerated this run) and datasets/pseudo_labels_
+reviewed/ (review_labels.py's output, if present, NEVER modified by
+this script -- read-only at merge time) into the real dataset,
+appending and skipping byte-identical duplicate lines. [V8] Now also
+holds back every image that still has an undecided review item in
+EITHER tree -- see the V8 docstring note above. Rerun --apply any time
+to pick up newly-completed images.
 
 USAGE:
     # 1. Dry run with the new discard gate at its defaults (0.40 single-
@@ -340,8 +443,21 @@ USAGE:
     #    queue, which is harmless since --apply picks their decisions up
     #    from pseudo_labels_reviewed/ regardless.
 
-    # 3. Once satisfied and manual review (if any) is complete:
-    python generate_pseudo_labels.py --apply
+    # 3. Build (or update) the trainable database from whatever's fully
+    #    reviewed so far -- safe to run at any point, and safe to rerun
+    #    repeatedly as more images finish review (V8):
+    python generate_pseudo_labels.py \
+        --candidates-file cross_reference_candidates_resolved.json \
+        --full-file cross_reference_full_resolved.json \
+        --min-single-vote-conf 0.45 --min-always-review-conf 0.0 \
+        --apply
+    #    Images still waiting on a decision anywhere (auto-accept OR
+    #    manual-review tier) are held back automatically and reported
+    #    by name/count -- nothing partially-labeled ever gets merged.
+    #    Review more images in review_labels.py whenever you have time,
+    #    then run this EXACT same command again -- newly-completed
+    #    images are picked up and merged, everything else is untouched
+    #    (existing lines are never duplicated, see V5/merge notes).
 """
 
 import argparse
@@ -768,17 +884,84 @@ def write_auto_accept_labels(auto_accepted: list[dict], source_name: str,
     return by_label_path
 
 
-def merge_pseudo_trees_into_dataset(roots: list[Path], datasets_dir: Path):
-    """Unchanged -- see V2/V3 docstring for the two-tree merge reasoning
-    (auto-accept tree gets wholesale-rewritten every run, reviewed tree
-    doesn't, so they're merged at apply time instead of being the same
-    tree). Read-only against every root passed in -- only rglob() and
-    read_text() are called on them, nothing is ever deleted or modified
-    here. The only writes in this function target the REAL dataset
-    label files under datasets_dir, never the pseudo_labels* trees
-    themselves."""
-    written, skipped_dupe = 0, 0
+# ---------------------------------------------------------------------
+# [V8] Pending-review gating for --apply
+# ---------------------------------------------------------------------
+
+def compute_pending_review_images(all_queued: list[dict], datasets_dir: Path) -> set[str]:
+    """
+    Images that have at least one item in THIS run's NEEDS-REVIEW queue
+    (all_queued, in-memory -- not re-read from disk, since the on-disk
+    pseudo_labels_review_queue.json still holds the PREVIOUS run's
+    contents until this run's tiering has finished) that ISN'T yet
+    fully decided according to datasets/review_completed.json.
+
+    review_completed.json is review_labels.py's own self-healing
+    "every box on this image -- queue AND manual -- has a real
+    decision" signal (see review_labels.py's V11/V13 notes); it's
+    trusted as-is here rather than re-derived, so this script doesn't
+    need to duplicate review_labels.py's item_key()/reconciliation
+    logic.
+
+    An image that was ONLY ever auto-accepted (never queued at all) is
+    never in this set -- there's nothing on it that could be
+    "pending," so it's free to merge immediately.
+    """
+    completed_path = datasets_dir / "review_completed.json"
+    completed = set()
+    if completed_path.exists():
+        with open(completed_path) as f:
+            completed = set(json.load(f))
+    queued_images = {item["image"] for item in all_queued}
+    return queued_images - completed
+
+
+def pending_images_to_label_paths(pending_images: set[str]) -> set[Path]:
+    """Maps each still-pending image to the REAL dataset label path it
+    would eventually land in -- the same destination
+    merge_pseudo_trees_into_dataset() computes for every .txt file it
+    considers (see image_path_to_label_path()). Used to skip merging
+    ANY box for that destination, from EITHER tree, until the image is
+    fully decided. Images that don't match the images->labels
+    convention are skipped here too (image_path_to_label_path() raises
+    ValueError for those) -- there's nothing sensible to hold back for
+    a path this script can't resolve in the first place."""
+    paths = set()
+    for image_key in pending_images:
+        try:
+            paths.add(image_path_to_label_path(Path(image_key)))
+        except ValueError:
+            continue
+    return paths
+
+
+def merge_pseudo_trees_into_dataset(roots: list[Path], datasets_dir: Path,
+                                     pending_label_paths: set[Path] | None = None):
+    """Merges datasets/pseudo_labels/ (this script's auto-accept tier,
+    freshly regenerated this run) and datasets/pseudo_labels_reviewed/
+    (review_labels.py's output, if present) into the real dataset label
+    files, appending and skipping byte-identical duplicate lines -- see
+    V2/V3 docstring for the two-tree merge reasoning. Read-only against
+    every root passed in -- only rglob() and read_text() are called on
+    them, nothing is ever deleted or modified here. The only writes in
+    this function target the REAL dataset label files under
+    datasets_dir, never the pseudo_labels* trees themselves.
+
+    [V8] pending_label_paths: real dataset label paths (see
+    image_path_to_label_path() / pending_images_to_label_paths()) for
+    every image that STILL has at least one undecided review item right
+    now. A .txt file from EITHER root that would land on one of these
+    paths is skipped ENTIRELY this run -- not partially merged, not
+    touched at all -- so a still-in-progress image never ends up with a
+    label file that's missing boxes the model would then learn are
+    background. Rerunning --apply after more images finish review picks
+    them up automatically the next time this function runs; nothing
+    special has to happen on the review_labels.py side for that to
+    work."""
+    pending_label_paths = pending_label_paths or set()
+    written, skipped_dupe, skipped_pending = 0, 0, 0
     per_root_counts = {}
+    pending_paths_seen = set()
 
     for root in roots:
         if not root.exists():
@@ -787,6 +970,13 @@ def merge_pseudo_trees_into_dataset(roots: list[Path], datasets_dir: Path):
         for txt_path in root.rglob("*.txt"):
             rel = txt_path.relative_to(root)
             real_label_path = datasets_dir / rel
+
+            if real_label_path in pending_label_paths:
+                n_lines = sum(1 for l in txt_path.read_text().splitlines() if l.strip())
+                skipped_pending += n_lines
+                pending_paths_seen.add(real_label_path)
+                continue
+
             new_lines = [l.strip() for l in txt_path.read_text().splitlines() if l.strip()]
             if not new_lines:
                 continue
@@ -811,6 +1001,27 @@ def merge_pseudo_trees_into_dataset(roots: list[Path], datasets_dir: Path):
           f"(skipped {skipped_dupe} already-present duplicates):")
     for root_str, count in per_root_counts.items():
         print(f"    {count:>6} from {root_str}")
+    if pending_label_paths:
+        print(f"  [V8] Held back {skipped_pending} box(es) across "
+              f"{len(pending_paths_seen)} image(s) that still have an "
+              f"undecided review item -- rerun --apply once they're "
+              f"fully reviewed to pick them up. Nothing else needs to "
+              f"change; this is the same command each time.")
+
+
+def write_pending_review_images(pending_images: set[str], datasets_dir: Path) -> Path:
+    """[V9] Writes datasets/pending_review_images.json -- every image
+    with at least one undecided review item, as resolved absolute path
+    strings, so prepare_datasets.py can exclude them from train/val/
+    test entirely (not just skip merging their boxes -- see V8/V9
+    docstring notes). Whole-file overwrite every run, same as every
+    other summary file here -- always reflects the CURRENT queue,
+    regardless of whether this run used --apply."""
+    path = datasets_dir / "pending_review_images.json"
+    resolved = sorted(str(Path(p).resolve()) for p in pending_images)
+    with open(path, "w") as f:
+        json.dump(resolved, f, indent=2)
+    return path
 
 
 # ---------------------------------------------------------------------
@@ -953,10 +1164,17 @@ def parse_args():
                     help="Cap on rendered review images per source (all "
                          "queued items are still in the JSON regardless).")
     p.add_argument("--apply", action="store_true",
-                    help="Actually append auto-accepted labels to the "
-                         "real dataset label files. Without this flag, "
-                         "output only goes to datasets/pseudo_labels/ "
-                         "(a dry run).")
+                    help="Actually append auto-accepted + fully-reviewed "
+                         "labels to the real dataset label files. "
+                         "Without this flag, output only goes to "
+                         "datasets/pseudo_labels/ (a dry run). [V8] Any "
+                         "image that still has an undecided item in "
+                         "EITHER tier (auto-accept queue or manual "
+                         "review) is held back automatically and "
+                         "reported by name/count -- safe, and intended, "
+                         "to rerun this exact command again later once "
+                         "more images finish review; newly-completed "
+                         "images are picked up each time.")
     p.add_argument("--keep-existing-outputs", action="store_true",
                     help="[V5] Skip wiping datasets/pseudo_labels/ and "
                          "datasets/pseudo_labels_review/ before this "
@@ -1110,9 +1328,36 @@ def main():
 
         summary["sources"][source_name] = per_class_summary
 
+    # [V9] Computed unconditionally (not just under --apply) -- every
+    # image that still has an undecided review item anywhere, from THIS
+    # run's in-memory all_queued (not the stale on-disk queue file,
+    # which hasn't been overwritten yet at this point) plus review_
+    # labels.py's own self-healing review_completed.json. Written to
+    # datasets/pending_review_images.json every run so prepare_
+    # datasets.py always has a current exclusion list, whether or not
+    # this particular run used --apply.
+    pending_images = compute_pending_review_images(all_queued, datasets_dir)
+    pending_path = write_pending_review_images(pending_images, datasets_dir)
+
     if args.apply:
         reviewed_root = datasets_dir / "pseudo_labels_reviewed"
-        merge_pseudo_trees_into_dataset([pseudo_root, reviewed_root], datasets_dir)
+        pending_label_paths = pending_images_to_label_paths(pending_images)
+        if pending_images:
+            by_source = {}
+            for img in pending_images:
+                src = next((it["source"] for it in all_queued if it["image"] == img), "?")
+                by_source[src] = by_source.get(src, 0) + 1
+            print(f"\n  [V8] {len(pending_images)} image(s) still have an "
+                  f"undecided review item -- none of their boxes (from "
+                  f"either tier) will be merged this run:")
+            for src, n in sorted(by_source.items()):
+                print(f"    {src:10s} {n}")
+        else:
+            print(f"\n  [V8] No pending review items outstanding -- every "
+                  f"queued image has already been fully reviewed.")
+
+        merge_pseudo_trees_into_dataset([pseudo_root, reviewed_root], datasets_dir,
+                                          pending_label_paths=pending_label_paths)
 
     # Whole-file overwrites -- were already safe pre-V5 (mode "w" fully
     # replaces prior contents), noted here for completeness.
@@ -1129,6 +1374,8 @@ def main():
     print(f"Discarded, below confidence floor ({len(all_discarded)} items): {discarded_path}")
     print(f"Review images (freshly regenerated this run): {review_dir}/<source>/")
     print(f"Summary + sensitivity table: {summary_path}")
+    print(f"Pending-review images ({len(pending_images)}, excluded from "
+          f"train/val/test entirely by prepare_datasets.py): {pending_path}")
     if not args.apply:
         print(f"\nDRY RUN -- real dataset label files were NOT modified. "
               f"Rerun with --apply once you've checked the above.")

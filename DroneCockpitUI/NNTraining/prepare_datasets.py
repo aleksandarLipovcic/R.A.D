@@ -82,6 +82,62 @@ What it does:
      UAVDT/SARD are folded in -- "person" is this project's stated
      priority class but isn't in that default list.
 
+=======================================================================
+V9 (2026-08-17): pending pseudo-label review images are EXCLUDED from
+every train/val/test list entirely, not merely left with fewer boxes.
+=======================================================================
+generate_pseudo_labels.py's --apply already refuses to merge boxes for
+an image that still has an undecided review item (V8) -- but before
+V9, the IMAGE ITSELF was untouched by that: it stayed in whatever
+train/val/test split it would normally fall into, carrying only
+whatever labels it already had (e.g. UAVDT's native vehicle boxes,
+missing person/motorcycle/other_vehicle until reviewed). That's a real
+problem, not just an inconsistency -- most importantly for VAL: an
+image with incomplete ground truth scores a model's correct detection
+on the missing class as a false positive, which quietly corrupts
+exactly the per-class mAP numbers train.py's report_per_class_map() /
+evaluate_per_source() exist to give a clean read on. Training on it is
+a softer cost (some frames imply "nothing here" where review just
+hasn't happened yet) but still not what this project wants: only
+images with NOTHING left pending should be usable anywhere in the
+pipeline.
+
+V9 fixes this at the source: _load_pending_review_images() reads
+datasets/pending_review_images.json (written by generate_pseudo_
+labels.py on EVERY run, dry-run or --apply -- see that module's V9
+note) and every prepare_*() function below drops any matching image
+from every train/val/test list it builds, for every Roboflow-style
+source (UAVDT, SARD, datasets/external/*). VisDrone and xView are
+untouched -- they never go through pseudo-labeling at all, so the
+exclusion set never intersects them.
+
+Mechanically: for a directory-based split (an existing valid/ split on
+disk, e.g. SARD today), _build_train_val_entry() lists that directory's
+images, and ONLY IF something needs excluding writes a filtered .txt
+list of the survivors and returns THAT path instead of the plain
+directory -- with nothing to exclude (the common case for a source once
+it's fully reviewed), it returns the directory unchanged, identical to
+pre-V9 behavior, no new file written. For UAVDT's auto-split-by-
+sequence path (no valid/ on disk yet), _auto_split_by_sequence() now
+filters the raw image list BEFORE grouping into sequences, so an
+excluded image never even factors into which sequences get chosen for
+val -- a sequence that loses all its images to exclusion simply
+contributes nothing, rather than surviving as a mostly-empty group.
+
+Backward compatible in every direction: no datasets/pending_review_
+images.json (e.g. generate_pseudo_labels.py has never been run, or
+nothing is currently pending) means an empty exclusion set, which means
+every function below behaves EXACTLY as it did before V9 -- this is
+purely additive gating, not a rewrite of the split logic itself.
+
+EXPECT SMALLER UAVDT COUNTS RIGHT NOW: with most of UAVDT's pseudo-
+label review still outstanding, a large share of its images are
+currently excluded from train/val/test -- this is the fix working as
+intended, not a bug. The usable pool grows automatically as more images
+get reviewed and generate_pseudo_labels.py is rerun (with or without
+--apply) to refresh pending_review_images.json.
+=======================================================================
+
 Remapping is idempotent and reversible: each dataset's ORIGINAL labels are
 backed up once (labels_backup_original_<split>/), and re-applied fresh from
 that backup any time class_map.py's taxonomy signature changes -- so
@@ -123,6 +179,11 @@ SARD_ROOT = DATASETS_DIR / "SARD"
 UNIFIED_YAML_PATH = DATASETS_DIR / "unified.yaml"
 PER_SOURCE_MANIFEST_PATH = DATASETS_DIR / "per_source_val.json"
 OVERSAMPLE_LIST_PATH = DATASETS_DIR / "oversample_train.txt"
+# [V9] Written by generate_pseudo_labels.py on every run (dry-run or
+# --apply) -- see that module's V9 note. Every image listed here still
+# has at least one undecided pseudo-label review item and is excluded
+# from every train/val/test list this module builds.
+PENDING_REVIEW_PATH = DATASETS_DIR / "pending_review_images.json"
 
 SIGNATURE_FILENAME = ".taxonomy_signature"
 BACKUP_DIRNAME = "labels_backup_original"
@@ -191,7 +252,8 @@ def _write_signature(root: Path, signature: str) -> None:
 
 def _count_images_in(path_str: str) -> int:
     """Counts images referenced by a train/val entry, whether it's a
-    directory or a txt list file (auto-split / oversample output)."""
+    directory or a txt list file (auto-split / oversample / [V9]
+    pending-review-filtered output)."""
     p = Path(path_str)
     if p.is_dir():
         return sum(1 for f in p.iterdir() if f.suffix.lower() in IMAGE_EXTS)
@@ -234,6 +296,60 @@ def _label_path_for_image(img_path: Path) -> Path | None:
     label_parts = parts[:idx] + ["labels"] + parts[idx + 1:]
     label_path = Path(*label_parts).with_suffix(".txt")
     return label_path if label_path.exists() else None
+
+
+# ---------------------------------------------------------------------
+# [V9] Pending-review image exclusion
+# ---------------------------------------------------------------------
+
+def _load_pending_review_images() -> set[str]:
+    """[V9] Reads datasets/pending_review_images.json (written by
+    generate_pseudo_labels.py every run -- see that module's V9 note)
+    -- every image with at least one undecided pseudo-label review item
+    right now. Returns resolved absolute path strings so filtering below
+    can compare directly against Path.resolve() output regardless of how
+    each image path was originally constructed elsewhere in the
+    pipeline. Returns an empty set (not an error) if the file doesn't
+    exist yet -- this project works fine without ever having run
+    generate_pseudo_labels.py (e.g. before pseudo-labeling starts, or a
+    source with no missing classes at all), and an empty exclusion set
+    is a correct, safe default for that case: nothing is excluded,
+    identical to pre-V9 behavior."""
+    if not PENDING_REVIEW_PATH.exists():
+        return set()
+    with open(PENDING_REVIEW_PATH) as f:
+        raw = json.load(f)
+    return set(raw)
+
+
+def _build_train_val_entry(images_dir: Path, exclude_images: set[str],
+                             list_filename: str) -> str:
+    """[V9] Returns the string to use as a train:/val:/test: yaml entry
+    for one split's image directory -- the directory itself, UNLESS
+    pending-review images need excluding, in which case this writes a
+    filtered file list (one resolved absolute image path per line, same
+    format _auto_split_by_sequence() already produces) alongside the
+    dataset and returns THAT path instead.
+
+    Backward compatible: with no exclusions at all (exclude_images is
+    empty, or none of this split's images happen to be in it -- the
+    ONLY case that existed before V9), this returns the plain directory
+    string exactly as before -- no new file is written unless one is
+    actually needed, so a fully-reviewed source (e.g. SARD today) sees
+    zero behavior change."""
+    if not exclude_images:
+        return str(images_dir.resolve())
+    all_images = [p for p in images_dir.iterdir() if p.suffix.lower() in IMAGE_EXTS]
+    kept = [p for p in all_images if str(p.resolve()) not in exclude_images]
+    n_excluded = len(all_images) - len(kept)
+    if n_excluded == 0:
+        return str(images_dir.resolve())
+    list_path = images_dir.parent / list_filename
+    list_path.write_text("\n".join(str(p.resolve()) for p in kept) + "\n")
+    print(f"    [pending-review exclude] {n_excluded}/{len(all_images)} images "
+          f"in {images_dir} still have an undecided review item -- excluded; "
+          f"{len(kept)} usable image(s) written to {list_path.name}")
+    return str(list_path)
 
 
 # ---------------------------------------------------------------------
@@ -300,6 +416,10 @@ def _oversample_sparse_classes(train_dirs: list[str], target_classes: list[str],
     any label file -- purely a sampling-frequency change over existing
     (image, label) pairs. Idempotent: reruns overwrite
     oversample_train.txt fresh rather than compounding.
+
+    train_dirs is expected to already be pending-review-filtered (V9) --
+    this function itself does no exclusion of its own, it just samples
+    from whatever image paths it's handed.
 
     target_classes=[] or multiplier<=1 is a no-op (returns [] without
     writing anything), so this is safe to call unconditionally from
@@ -394,16 +514,40 @@ def _infer_sequence_key(image_name: str) -> str:
 
 
 def _auto_split_by_sequence(images_dir: Path, out_train: Path, out_val: Path,
-                              val_fraction: float = 0.1, seed: int = 42) -> None:
+                              val_fraction: float = 0.1, seed: int = 42,
+                              exclude_images: set[str] | None = None) -> None:
     """
     Writes out_train/out_val as txt files (one absolute image path per
     line -- Ultralytics accepts these directly as train:/val: entries,
     same mechanism xView's autosplit_*.txt already used), splitting
     whole video SEQUENCES (not individual frames) between them so no
     clip leaks near-duplicate frames across train and val.
+
+    [V9] exclude_images: resolved absolute path strings (see
+    _load_pending_review_images()) to drop BEFORE grouping into
+    sequences -- an image still waiting on pseudo-label review never
+    enters either split. Filtering happens at THIS level, not by post-
+    processing the written txt files afterward, so val_fraction's
+    sequence selection is computed over the already-clean pool rather
+    than being skewed by sequences that lose most of their frames to
+    exclusion after the split was already chosen. A sequence that has
+    zero remaining images after filtering simply never appears in
+    `sequences` below -- no empty-group artifacts.
     """
+    exclude_images = exclude_images or set()
     images = sorted(p for p in images_dir.iterdir()
                      if p.suffix.lower() in IMAGE_EXTS)
+
+    if exclude_images:
+        before = len(images)
+        images = [p for p in images if str(p.resolve()) not in exclude_images]
+        n_excluded = before - len(images)
+        if n_excluded:
+            print(f"    [pending-review exclude] {n_excluded}/{before} images "
+                  f"in {images_dir} still have an undecided review item -- "
+                  f"excluded from this auto-split entirely ({len(images)} "
+                  f"usable image(s) remain).")
+
     if not images:
         print(f"    [auto-split] No images found in {images_dir}, skipping.")
         return
@@ -440,7 +584,12 @@ def _auto_split_by_sequence(images_dir: Path, out_train: Path, out_val: Path,
 def prepare_visdrone(signature: str) -> dict:
     """Downloads VisDrone (no-op if already present) and remaps its
     labels into the unified taxonomy. Returns {"train": [...], "val": [...]}
-    absolute image-dir paths for the merged yaml."""
+    absolute image-dir paths for the merged yaml.
+
+    [V9] Never touches pending-review exclusion -- VisDrone doesn't go
+    through the pseudo-labeling/review pipeline at all (it's remapped
+    directly from its own real labels), so no image of its could ever
+    appear in datasets/pending_review_images.json in the first place."""
     from ultralytics.data.utils import check_det_dataset
 
     print("\n[VisDrone] Checking dataset (auto-downloads on first run)...")
@@ -481,6 +630,9 @@ def prepare_xview(signature: str) -> dict:
     first re-adding building/shed/parking_lot to UNIFIED_CLASSES, this
     fails with a clear message rather than a cryptic error three calls
     deep in xview_index_remap().
+
+    [V9] Never touches pending-review exclusion -- same reasoning as
+    prepare_visdrone(), xView never goes through pseudo-labeling.
     """
     xview_root = DATASETS_DIR / "xView"
     if not xview_root.exists():
@@ -535,7 +687,8 @@ def prepare_xview(signature: str) -> dict:
 # ---------------------------------------------------------------------
 
 def prepare_roboflow_dataset(display_name: str, root: Path,
-                               remap_key: str, signature: str) -> dict:
+                               remap_key: str, signature: str,
+                               exclude_images: set[str] | None = None) -> dict:
     """
     Handles one Roboflow-exported dataset folder. Returns
     {"train": [...], "val": [...], "test": [...]} -- test is remapped
@@ -550,8 +703,17 @@ def prepare_roboflow_dataset(display_name: str, root: Path,
     dataset's own folder. Instead this uses the fixed convention
     directly: root/<split>/images, root/<split>/labels. data.yaml is
     only read for nc/names.
+
+    [V9] exclude_images: resolved absolute path strings (see
+    _load_pending_review_images()) -- any image still awaiting pseudo-
+    label review is dropped from every split's output entirely, not
+    just left with fewer boxes. See _build_train_val_entry() (for the
+    existing-valid/-split branch) and _auto_split_by_sequence() (for
+    the no-valid/-split branch) for the actual filtering. Empty/None
+    exclude_images reproduces pre-V9 behavior exactly.
     """
     empty = {"train": [], "val": [], "test": []}
+    exclude_images = exclude_images or set()
 
     if not root.exists():
         return empty
@@ -616,23 +778,32 @@ def prepare_roboflow_dataset(display_name: str, root: Path,
         "val" if "val" in split_image_dirs else None)
 
     if val_key:
-        train_out = [str(split_image_dirs["train"].resolve())]
-        val_out = [str(split_image_dirs[val_key].resolve())]
+        # [V9] _build_train_val_entry() returns the plain directory
+        # unchanged when nothing needs excluding (the common case once a
+        # source is fully reviewed) -- only writes a filtered list file
+        # when there's actually something to filter out.
+        train_out = [_build_train_val_entry(
+            split_image_dirs["train"], exclude_images, "train_filtered.txt")]
+        val_out = [_build_train_val_entry(
+            split_image_dirs[val_key], exclude_images, f"{val_key}_filtered.txt")]
         print(f"  [{display_name}] Using existing {val_key}/ split "
-              f"({_count_images_in(val_out[0])} images).")
+              f"({_count_images_in(val_out[0])} images"
+              f"{', after excluding pending-review images' if exclude_images else ''}).")
     else:
         print(f"  [{display_name}] No valid/val split found on disk -- "
               f"auto-splitting train/ by sequence instead of training "
               f"with zero validation data.")
         out_train = root / "auto_split_train.txt"
         out_val = root / "auto_split_val.txt"
-        _auto_split_by_sequence(split_image_dirs["train"], out_train, out_val)
+        _auto_split_by_sequence(split_image_dirs["train"], out_train, out_val,
+                                  exclude_images=exclude_images)
         train_out = [str(out_train)] if out_train.exists() else []
         val_out = [str(out_val)] if out_val.exists() else []
 
     test_out: list[str] = []
     if "test" in split_image_dirs:
-        test_out = [str(split_image_dirs["test"].resolve())]
+        test_out = [_build_train_val_entry(
+            split_image_dirs["test"], exclude_images, "test_filtered.txt")]
         print(f"  [{display_name}] test/ split found "
               f"({_count_images_in(test_out[0])} images) -- labels "
               f"remapped but held out, not used for training/val.")
@@ -640,15 +811,17 @@ def prepare_roboflow_dataset(display_name: str, root: Path,
     return {"train": train_out, "val": val_out, "test": test_out}
 
 
-def prepare_uavdt(signature: str) -> dict:
-    return prepare_roboflow_dataset("UAVDT", UAVDT_ROOT, "uavdt", signature)
+def prepare_uavdt(signature: str, exclude_images: set[str] | None = None) -> dict:
+    return prepare_roboflow_dataset("UAVDT", UAVDT_ROOT, "uavdt", signature,
+                                      exclude_images)
 
 
-def prepare_sard(signature: str) -> dict:
-    return prepare_roboflow_dataset("SARD", SARD_ROOT, "sard", signature)
+def prepare_sard(signature: str, exclude_images: set[str] | None = None) -> dict:
+    return prepare_roboflow_dataset("SARD", SARD_ROOT, "sard", signature,
+                                      exclude_images)
 
 
-def prepare_external(signature: str) -> dict:
+def prepare_external(signature: str, exclude_images: set[str] | None = None) -> dict:
     """Scans datasets/external/<key>/ for any additional manually-added
     datasets in the same Roboflow-style format UAVDT/SARD use. Each
     folder needs a matching class_map.EXTERNAL_REMAPS[key] entry --
@@ -663,7 +836,8 @@ def prepare_external(signature: str) -> dict:
         if not folder.is_dir():
             continue
         result = prepare_roboflow_dataset(f"external/{folder.name}", folder,
-                                            folder.name, signature)
+                                            folder.name, signature,
+                                            exclude_images)
         train_dirs.extend(result["train"])
         val_dirs.extend(result["val"])
 
@@ -714,6 +888,12 @@ def main(oversample_classes: list[str] | None = None,
     reflect the actual sparsest class once UAVDT/SARD are folded in.
     "person" is this project's stated priority class and is NOT in the
     default oversample list.
+
+    [V9] Loads datasets/pending_review_images.json once (see
+    _load_pending_review_images()) and threads it through UAVDT/SARD/
+    external -- any image still awaiting pseudo-label review is excluded
+    from every train/val/test list built below, not just left with
+    fewer boxes. See this module's V9 docstring note.
     """
     if oversample_classes is None:
         oversample_classes = DEFAULT_OVERSAMPLE_CLASSES
@@ -722,11 +902,27 @@ def main(oversample_classes: list[str] | None = None,
     print(f"Taxonomy signature: {signature}")
     print(f"Unified classes ({len(UNIFIED_CLASSES)}): {UNIFIED_CLASSES}")
 
+    # [V9] Loaded once, up front, so every source below excludes the
+    # exact same current snapshot of pending images -- empty set (no-op,
+    # identical to pre-V9 behavior) if generate_pseudo_labels.py has
+    # never been run or nothing is currently pending.
+    exclude_images = _load_pending_review_images()
+    if exclude_images:
+        print(f"\n[pending-review] {len(exclude_images)} image(s) listed in "
+              f"{PENDING_REVIEW_PATH.name} still have an undecided pseudo-"
+              f"label review item -- excluded from every train/val/test "
+              f"list built below until fully reviewed. Rerun generate_"
+              f"pseudo_labels.py (with or without --apply) after more "
+              f"review happens to shrink this list.")
+    else:
+        print(f"\n[pending-review] No {PENDING_REVIEW_PATH.name} found (or "
+              f"it's empty) -- nothing excluded on that basis.")
+
     visdrone_dirs = prepare_visdrone(signature)
     xview_dirs = prepare_xview(signature)
-    uavdt_dirs = prepare_uavdt(signature)
-    sard_dirs = prepare_sard(signature)
-    external_dirs = prepare_external(signature)
+    uavdt_dirs = prepare_uavdt(signature, exclude_images)
+    sard_dirs = prepare_sard(signature, exclude_images)
+    external_dirs = prepare_external(signature, exclude_images)
 
     train_dirs = (visdrone_dirs["train"] + xview_dirs["train"]
                   + uavdt_dirs["train"] + sard_dirs["train"]
@@ -739,7 +935,9 @@ def main(oversample_classes: list[str] | None = None,
     # oversampling duplicates anything, so this reflects the real,
     # naturally-occurring class balance across the merged dataset. This
     # is what should actually drive --oversample-classes, not an assumed
-    # default -- see this function's docstring.
+    # default -- see this function's docstring. [V9] train_dirs here is
+    # already pending-review-filtered, so these counts reflect only
+    # fully-reviewed (or never-queued) images.
     print(f"\n{'=' * 70}")
     print("Per-class instance counts (train, before oversampling)")
     print(f"{'=' * 70}")
