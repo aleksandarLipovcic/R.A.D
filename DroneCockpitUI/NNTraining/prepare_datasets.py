@@ -211,7 +211,16 @@ def _remap_label_file(path: Path, index_remap: list) -> None:
         if not line.strip():
             continue
         parts = line.split()
-        old_idx = int(parts[0])
+        try:
+            old_idx = int(parts[0])
+        except (ValueError, IndexError):
+            # Malformed line (e.g. non-numeric class token, or an empty
+            # split) -- drop it rather than letting dataset prep crash
+            # on one bad annotation. Matches the defensive parsing
+            # already used in _count_instances_per_class() and
+            # _oversample_sparse_classes(); this was the one line-
+            # parsing spot in the file that wasn't guarded the same way.
+            continue
         if old_idx >= len(index_remap):
             continue  # unexpected class id, drop rather than crash
         new_idx = index_remap[old_idx]

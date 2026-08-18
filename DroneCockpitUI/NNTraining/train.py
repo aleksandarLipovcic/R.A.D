@@ -1,376 +1,132 @@
 """
 train.py — Fine-tune YOLO26 for Project R.A.D's aerial detection model
 =======================================================================
-Defaults are tuned for a 6GB laptop RTX 3060. If `nvidia-smi` shows more
-VRAM available, see the comments below for what to bump.
+Defaults are tuned for a 6GB laptop RTX 3060.
 
-Pipeline: trains against a UNIFIED class taxonomy (see class_map.py) --
-person/car/large_vehicle/motorcycle/other_vehicle -- spanning VisDrone,
-UAVDT, and SARD (see prepare_datasets.py). All three are genuinely
-drone-native, low-altitude footage, so letting Ultralytics' Mosaic
-augmentation freely composite across them is intentional -- unlike the
-now-inactive xView (satellite) addition, which mixed a fundamentally
-different visual domain into the same batches and measurably hurt
-vehicle/person accuracy (see class_map.py's module docstring). UAVDT
-adds vehicle diversity (no person labels); SARD adds SAR-relevant person
-poses (standing/sitting/lying/exhausted/injured) that VisDrone's general
-pedestrian labels don't cover.
+PIPELINE: trains a UNIFIED taxonomy (person/car/large_vehicle/motorcycle/
+other_vehicle, see class_map.py) spanning VisDrone + UAVDT + SARD (see
+prepare_datasets.py) -- all genuine drone-native low-altitude footage, so
+free Mosaic compositing across them is intentional (unlike the now-
+inactive xView satellite addition, which hurt accuracy by mixing in a
+different visual domain). generate_pseudo_labels.py --apply cross-labels
+each source's originally-missing classes (UAVDT: person; SARD: vehicles)
+once an image is fully reviewed, so per-source/per-class numbers below
+are no longer purely "native-only" -- see evaluate_per_source()'s own
+docstring before drawing conclusions from a near-zero class row.
 
-Model size: --model defaults to "yolo26s.pt". Pass --model auto to
-re-enable the yolo26m -> yolo26s -> yolo26n fallback search.
+MODEL SIZE: --model defaults to "yolo26s.pt" (fast, known-fitting, good
+for validating the dataset itself). --model auto re-enables the
+yolo26m -> yolo26s -> yolo26n fallback search, each candidate checked by
+the VRAM probes below. yolo26m @ 960px is the real target once a yolo26s
+smoke test confirms the data pipeline looks right -- a yolo26s smoke-test
+mAP is not a stand-in for yolo26m's eventual accuracy (capacity differs).
 
-DEGRADATION AUGMENTATION -- why this exists, and calibrated against what:
-  Every dataset in this pipeline (VisDrone/UAVDT/SARD) is clean,
-  high-resolution, digitally-captured footage. The real deployment
-  camera (E5-FPV, per its datasheet) is a 1/2.8" sensor outputting
-  analog CVBS composite video: 1500TVL horizontal resolution, NTSC/PAL
-  switchable, 0.0001 lux minimum illumination, 100 degree FOV, 6mm
-  lens, transmitted over a 5.8GHz analog link. None of the three
-  training sources have ever seen anything like that signal chain --
-  a genuine train/deploy domain gap, structurally the same category of
-  problem as the xView satellite-vs-drone mismatch (see class_map.py),
-  just from the capture pipeline rather than the camera angle.
+DEGRADATION AUGMENTATION: every training source is clean digital footage;
+the real deployment camera (E5-FPV) is analog CVBS (1500TVL, NTSC/PAL,
+0.0001 lux min, 6mm/100deg lens, 5.8GHz link) -- a genuine train/deploy
+domain gap. install_degradation_augment() monkeypatches Ultralytics'
+Albumentations wrapper (train split only) with transforms calibrated
+against that specific datasheet (bandwidth-limited downscale, motion/ISO/
+Gauss noise, gamma range, 1px interlace combing, small RF-dropout holes,
+mild lens barrel distortion, compression artifacts) rather than generic
+noise. See build_degradation_transform()'s and install_degradation_
+augment()'s own docstrings for the per-transform reasoning, the
+version-robustness handling across albumentations 1.x/2.x, and why
+CoarseDropout/OpticalDistortion are kept deliberately weak (this pipeline
+runs image-only, no bbox_params, so an aggressive spatial transform here
+would corrupt labels rather than just add noise).
 
-  install_degradation_augment() monkeypatches Ultralytics'
-  Albumentations wrapper (the class model.train() instantiates
-  internally, TRAIN split only -- see the "augmentation stays train-
-  only" note below) with a pipeline where each artifact maps to a
-  specific spec-sheet limitation, not a generic "add some noise" guess:
-    - Downscale: 1500TVL is a genuine bandwidth ceiling on a composite
-      signal, not a blur -- CVBS literally cannot carry detail finer
-      than that regardless of sensor resolution. Downscale-then-
-      upscale reproduces a resolving-power ceiling more faithfully than
-      a blur kernel (blur softens edges; bandwidth-limiting also
-      destroys fine texture, closer to what actually happens).
-    - Motion/Gaussian blur: covers physical motion blur (0.0001 lux
-      minimum illumination implies slow shutter speeds in real low-
-      light SAR conditions, on a moving airframe) plus general analog
-      softening.
-    - ISO/Gauss noise (combined, not just one): 0.0001 lux is extreme
-      low light -- even a good sensor needs real gain to expose
-      anything down there, and gain means grain. Two noise models
-      because ISONoise's color-correlated noise and GaussNoise's
-      uncorrelated noise cover different parts of what a gain-amplified
-      analog signal actually looks like.
-    - Gamma / brightness-contrast: real SAR ops run at dusk, in
-      shadowed rubble/wilderness, and everywhere the 0.0001-to-daylight
-      range in between -- wider than Ultralytics' own RandomHSV covers,
-      since HSV doesn't touch gamma curve shape.
-    - NTSC/PAL interlace combing (custom, see _interlace_combing):
-      deliberately tiny -- a 1px alternating-row shift at low
-      probability. Larger shifts were considered and rejected: this
-      project's objects of interest can be a handful of pixels wide, so
-      anything beyond ~1px risks measurably displacing an already-tight
-      box, which would REDUCE precision -- the opposite of the goal.
-    - CoarseDropout (RF dropout burst): deliberately small holes at low
-      probability, for the same reason -- this pipeline runs
-      degradation augmentation image-only (contains_spatial forced to
-      False, see install_degradation_augment()'s docstring), so
-      Albumentations never sees bboxes when it runs this transform --
-      a dropout hole large enough to fully cover a tiny labeled person
-      creates a genuine label/image mismatch (the box says "person,"
-      the pixels say nothing). This is the one transform in this
-      pipeline that can actually corrupt training signal rather than
-      just add noise to it, so it's kept intentionally weak rather than
-      tuned for realism. NOTE: Albumentations' CoarseDropout does
-      support bbox-aware handling (auto-dropping boxes below a
-      min_visibility threshold) when given bbox_params -- that's a
-      more rigorous fix than "keep the hole small" and is a valid
-      future upgrade, but it requires restructuring this pipeline into
-      a spatial-aware Compose plus re-wiring Ultralytics' __call__
-      contract (bboxes/class_labels in, filtered ones back out), not
-      just the __init__ patch used here. Not implemented -- flagging as
-      a known available upgrade, not a bug in the current approach.
-    - ImageCompression: generic proxy for whatever the downstream
-      capture chain (VideoLink's MSMF/DSHOW grab path) does to the
-      digitized signal -- not characterized precisely here, kept broad.
+REAL-TIME is deprioritized (precision on a noisy feed matters more than
+fps), which is why --multi-scale and a higher --imgsz are worth trying
+once a baseline is stable, and why nothing here is tuned for inference
+speed. IMAGE SIZE: 960px is the recommended default -- this project's own
+baseline history (below) shows 640px plateaus on small/rare classes while
+960px fixed that ceiling, and mosaic_guard.py's instance cap has since
+confirmed real headroom (~2GB/6GB) at 960px. imgsz doesn't need to match
+any source's native resolution; Ultralytics letterboxes everything to one
+square size regardless.
 
-  VERSION ROBUSTNESS: albumentations' API has changed meaningfully
-  across versions (e.g. Downscale's scale_min/scale_max became
-  scale_range in 2.x; CoarseDropout's parameter names changed too).
-  Each transform above is built independently and wrapped in its own
-  try/except in build_degradation_transform() -- if one doesn't match
-  your installed version, THAT ONE is dropped with a printed warning
-  and every other transform still applies. A version mismatch degrades
-  one artifact type, never the whole pipeline, and never crashes
-  training. If every transform fails to build, degradation augmentation
-  is disabled for the run (also non-fatal) rather than leaving you with
-  a silently-broken partial pipeline.
+WDDM / VRAM: on Windows, an over-budget CUDA allocation silently spills
+into system RAM instead of raising OOM, causing catastrophic (not clean)
+slowdowns that can develop well after training looks healthy. Two
+callbacks guard against this, both raising VRAMBudgetExceeded (handled
+like a real OOM): make_startup_probe_callback() (first few batches -- see
+its docstring for the AutoBatch false-positive it now avoids) and
+make_ongoing_watchdog_callback() (every epoch, for the whole run -- see
+its docstring). mosaic_guard.py's --max-mosaic-instances is the proactive
+half of the same fix: dense mosaic composites (1000+ instances in one
+slot) were the actual root cause of the VRAM "staircase" this project hit
+twice; capping composite density keeps the caching allocator from
+ratcheting its reserved pool up permanently. See each function's own
+docstring for version history and confirmed numbers -- not duplicated
+here to avoid this docstring drifting out of sync with the code.
 
-  AUGMENTATION STAYS TRAIN-ONLY (verified, not just assumed): Ultralytics
-  only builds an Albumentations instance inside its train-time transform
-  pipeline (v8_transforms) -- the val dataset's build_transforms() never
-  instantiates one. That means the val split is never touched by this
-  patch, so val metrics stay a clean, undegraded measure of real
-  performance -- exactly what you want to trust when deciding whether a
-  training run actually improved things. make_augmentation_scope_check_
-  callback() (new) verifies this empirically at the start of every run
-  by walking each loader's actual transform tree, rather than relying on
-  the paragraph above staying true forever -- see its docstring.
+CRASH-SAFETY: last.pt/best.pt are overwritten every epoch (not just every
+N), so --resume (via the most recent runs/detect/*/weights/last.pt, full
+optimizer state) loses at most one in-progress epoch. --save-period adds
+numbered snapshots as extra insurance. See _is_resumable_checkpoint()'s
+docstring for why a completed run's last.pt can't be resumed, and what to
+do instead.
 
-  NOTE: the monkeypatch itself targets a third-party internal class
-  (ultralytics.data.augment.Albumentations.__init__), not a stable
-  public API -- if an Ultralytics upgrade changes that class's
-  signature, the patch may silently stop applying. The scope-check
-  callback below will report "absent" from the train loader if that
-  ever happens, so you'll see it in the log rather than finding out
-  later from unexpectedly-clean-looking val curves.
-  Safe with --workers 0 (the current default) since the patch is
-  applied once in the main process before training starts, no
-  per-worker re-import race to worry about.
+OVERFITTING / EVALUATION: --patience (30) is the main guard -- best.pt is
+always the best-val epoch. check_overfitting() flags aggregate box-loss
+divergence; report_per_class_map() and evaluate_per_source() are the
+per-class/per-source breakdowns that catch what an aggregate can hide
+(e.g. person -- the SAR priority class -- lagging while vehicles improve).
+--copy-paste is currently a no-op on this pipeline (Ultralytics' CopyPaste
+needs segmentation polygons this bbox-only data doesn't have) -- left on
+because it's harmless; mixup and --oversample-classes are what's actually
+protecting the sparse classes. See each function's docstring for detail.
 
-  PATCH SIGNATURE ROBUSTNESS (fixed): patched_init() below now accepts
-  *args/**kwargs and forwards them all to orig_init(), rather than
-  declaring only `p=1.0`. This was previously a hardcoded signature
-  match against the Ultralytics version this was written against;
-  a newer Ultralytics release (confirmed against 8.4.116) added a
-  `transforms=` kwarg to Albumentations.__init__ (used internally to
-  pass hyp-driven augmentations in), which the old hardcoded signature
-  couldn't accept, causing a hard TypeError at dataloader build time
-  ("got an unexpected keyword argument 'transforms'") before training
-  ever started. Forwarding *args/**kwargs makes this patch resilient to
-  that kind of additive signature change going forward -- orig_init
-  still runs with whatever Ultralytics passes, and this project's own
-  transform/contains_spatial overrides are still applied afterward,
-  same intent as before.
+BASELINE HISTORY (for reference; update after each real run):
+  yolo26n, 640px, VisDrone-10cls        -> mAP50 ~0.31 (plateaued)
+  yolo26s, 960px, VisDrone-10cls        -> mAP50 ~0.465 (every class up)
+  yolo26m, 960px, unified               -> never fit (WDDM spillover)
+  yolo26s, 960px, unified+xView         -> WDDM spillover epoch 2
+  yolo26m, 640px, unified, 3ep smoke    -> mAP50 0.380 (STALE, predates
+                                            pseudo-label --apply merge)
+  yolo26s, 640px, unified, post-mosaic_guard -> ~2GB VRAM, full-run
+                                                 mAP: TBD
 
-REAL-TIME DEPRIORITIZED (project decision): inference-side latency is
-  not a hard constraint for this deployment -- precision/robustness on
-  a noisy analog feed matters more than 30fps. This module's VRAM/time
-  ceilings (WDDM, the 6GB card) are unaffected by that decision --
-  those are still real limits during TRAINING regardless of how the
-  final model gets deployed -- but it does mean two things once yolo26s
-  @960px is a working, WDDM-safe baseline: (1) --multi-scale is worth
-  turning on for scale robustness across SAR altitude variation, since
-  the existing WDDM probes/fallback will catch it gracefully if it
-  pushes past the VRAM ceiling rather than failing silently; (2) it's
-  worth trying an even higher --imgsz (e.g. 1280) as a follow-up
-  experiment purely for small-object accuracy, once 960px is confirmed
-  stable, since nothing downstream needs this to run fast.
-
-WDDM / silent shared-memory spillover -- IMPORTANT, read this:
-  On Windows, when a CUDA allocation would exceed the card's physical
-  VRAM, the WDDM driver does NOT throw an out-of-memory error the way
-  Linux does -- it silently spills the excess into system RAM over PCIe
-  and reports success. Training then "runs" but every excess allocation
-  round-trips over PCIe each step, so it gets catastrophically slower.
-  Confirmed twice now on this project:
-    - yolo26m never fit at all, even at batch=1/960px.
-    - yolo26s (the "known good" size) STILL hit it, but only ~2800
-      batches into training (GPU_mem reported 7.71G against a 6144MiB
-      card) -- i.e. it can develop well after training looks healthy,
-      once denser batches / disk cache / allocator fragmentation build
-      up. A single check at startup is NOT enough.
-  Fix: two layers of monitoring, both raising VRAMBudgetExceeded (caught
-  the same way a real OOM is, triggering fallback to a smaller model):
-    1. make_startup_probe_callback() -- on_train_batch_end, checks the
-       first few real batches (memory + per-batch wall time) so an
-       obviously-too-big model gets caught in seconds, not hours.
-    2. make_ongoing_watchdog_callback() -- on_train_epoch_end, re-checks
-       peak allocated memory (cumulative high-water mark) and that
-       epoch's wall-clock time against --max-epoch-minutes (if set)
-       EVERY epoch for the whole run, since spillover can develop later.
-  Neither reads trainer-internal attributes beyond the callback firing
-  and the epoch number Ultralytics passes in (a stable, documented
-  field) -- everything else is tracked in the closure.
-
-  Root-cause refinement (confirmed against the per-batch log of this
-  project's actual run): the jumps aren't random -- they correlate
-  exactly with the "Instances" column (batch 44: 378 -> 3632 instances,
-  GPU_mem 2.78G -> 4.94G; batch 61: -> 4864 instances, 4.94G -> 8.72G,
-  the exact moment it/s dropped). Ultralytics' mosaic augmentation
-  (mosaic=1.0) composites up to 4 source images into one training sample
-  before batching even happens; a composite that happens to pull in a
-  few dense frames can carry 1000+ instances in a single slot instead of
-  the usual couple hundred, and loss/target-assignment memory scales
-  with instance count, not image size. Combined with PyTorch's caching
-  allocator -- which keeps a batch's peak reservation as a permanent
-  floor rather than returning it to the driver right away, to avoid slow
-  cudaFree calls every step -- each unlucky dense batch permanently
-  ratchets the reserved pool up one step: a staircase, not a leak. This
-  doesn't replace the WDDM explanation above, it completes it: the
-  staircase is why reserved memory keeps climbing over the course of a
-  run; WDDM spillover is what happens once that climb crosses the card's
-  physical 6GB ceiling (silent slowdown instead of a clean crash).
-    3. PYTORCH_CUDA_ALLOC_CONF now also sets
-       garbage_collection_threshold:0.8 -- PyTorch's own allocator knob
-       for exactly this pattern: once reserved memory exceeds 80% of
-       what's actually allocated, it proactively releases blocks back
-       to the driver instead of hoarding the post-spike high-water mark
-       forever. This addresses the STAIRCASE (the permanently elevated
-       floor); it does NOT reduce the genuine peak a single very-dense
-       mosaic batch needs -- if one composite's real memory requirement
-       alone exceeds 6GB, no allocator setting saves it, which is
-       exactly why probes 1 and 2 above stay in place as the actual
-       safety net, not just this env var.
-    4. --mosaic (default 1.0, Ultralytics' own default) lets you lower
-       the composite probability (e.g. 0.5-0.7) if the watchdog keeps
-       tripping on dense composited batches -- trades away some
-       augmentation strength for fewer extreme-instance-count batches.
-       Leave at default unless probes 1/2 are firing repeatedly.
-    5. mosaic_guard.py / --max-mosaic-instances (default 800) --
-       PROACTIVE version of the fix, not just reactive monitoring.
-       Patches Ultralytics' Mosaic to steer partner-image selection away
-       from combinations that would exceed this instance budget, instead
-       of picking partners uniformly at random. Does NOT reduce the
-       mosaic grid size, and can't fully protect against a single source
-       image that's dense enough on its own -- probes 1/2 stay in place
-       as the reactive backstop underneath this. NOTE: the cap counts
-       TOTAL instances regardless of class, so it doesn't specifically
-       protect or disadvantage person vs. vehicle-dense frames -- it's
-       class-agnostic by design, which is the right behavior here since
-       the goal is a VRAM safety net, not a class-balancing mechanism
-       (that's what oversampling below is for).
-  Given it recurred even on yolo26s at 960px with the combined dataset:
-  recommend trying --imgsz 640 for the real run (see Usage below) --
-  more VRAM headroom AND it should let --batch go above 1, which batch=1
-  itself is a major speed tax (no batching efficiency at all).
-
-CLOSE-MOSAIC / MULTI-SCALE (new CLI exposure, not new behavior for
-close_mosaic -- it was already Ultralytics' default, just not tunable
-without editing code mid-run):
-  --close-mosaic (default 10, matches Ultralytics' own default): the
-  last N epochs train WITHOUT mosaic compositing, seeing clean
-  single-source images. This matters specifically for small/tiny-object
-  recall (e.g. a person at altitude reduced to a handful of pixels) --
-  letting the model converge on undistorted geometry right before
-  training ends tends to sharpen exactly that failure mode. Raise it if
-  final-epoch val samples still show weak small-object recall.
-  --multi-scale (default off): varies input size +/-50% per batch.
-  Improves robustness to the scale variation between low- and
-  high-altitude passes, at the cost of extra VRAM headroom -- another
-  reason to prefer --imgsz 640 over 960 if you turn this on, given the
-  WDDM history above.
-
-Crash-safety / pause-and-resume (no separate "temp file" mechanism
-needed -- Ultralytics already does this, it just wasn't surfaced before):
-  - last.pt and best.pt are overwritten after EVERY completed epoch by
-    default, not just every N -- so a crash, a closed terminal, or a
-    Ctrl+C mid-epoch loses at most the current in-progress epoch, never
-    more.
-  - `python train.py --resume` picks up the most recently modified
-    runs/detect/*/weights/last.pt and continues with full optimizer
-    state (epoch count, LR schedule position, etc.) -- NOT a from-scratch
-    restart.
-  - --save-period (default 5) additionally asks Ultralytics to also
-    write out numbered snapshots (epoch5.pt, epoch10.pt, ...) instead of
-    only ever having the single latest last.pt -- extra insurance if you
-    ever want to roll back further than one epoch, or in case last.pt
-    itself gets corrupted by an interruption mid-write. Set to -1 to
-    disable and save disk space.
-  - --max-epoch-minutes (optional) is a second failsafe: if any one
-    epoch takes longer than this, the ongoing watchdog raises and this
-    model size is abandoned in favor of a smaller one, rather than
-    silently eating an entire time budget on a run that's thrashing.
-
-Overfitting / "fast but low error" controls, given the dataset is still
-fairly small/imbalanced and time is limited:
-  - --patience (default 30, raised from 15 -- see its --help text): early
-    stopping on val mAP. This is the main overfitting guard already --
-    best.pt is always the best-val epoch, not whatever epoch training
-    happens to stop on.
-  - --cos-lr (default on): cosine LR decay, tends to generalize slightly
-    better late in training than linear.
-  - --label-smoothing: kept for forward-compat only (reported deprecated/
-    no-op on the installed Ultralytics version) -- only forwarded if you
-    explicitly set it non-zero, with a one-time printed reminder.
-  - copy_paste/mixup: mixup is genuinely active and helps here. copy_paste
-    (VERIFIED against Ultralytics' actual implementation, not assumed):
-    Ultralytics' CopyPaste augmentation only pastes objects using
-    segmentation polygons (labels["instances"].segments) -- it is
-    documented as working for segmentation tasks only. VisDrone, UAVDT,
-    and SARD are all bounding-box-only YOLO labels with no polygons, so
-    --copy-paste is currently a no-op on this pipeline regardless of its
-    value. It's left on by default below because it's harmless (costs
-    nothing when inert), but don't count on it for the sparser classes --
-    oversampling and mixup are the augmentation actually doing that job
-    right now. A real bbox-level copy-paste (pasting a cropped box region
-    rather than a polygon) would need a custom transform; not implemented
-    here.
-  - Sparse-class oversampling (see prepare_datasets.py's
-    _oversample_sparse_classes()): duplicates motorcycle/other_vehicle
-    image paths in the train list so those classes are seen more often
-    per epoch. --oversample-classes defaults to motorcycle,other_vehicle
-    -- check prepare_datasets.py's new "Per-class instance counts" log
-    block (printed every run) before assuming that's still the right
-    list once UAVDT/SARD are folded in. "person" is this project's
-    stated priority class and is NOT in the default list; it may or may
-    not need to be, depending on the actual counts.
-  - check_overfitting() after every run reads results.csv and flags it if
-    val loss is rising while train loss keeps falling over the last N
-    epochs -- a heuristic, not a verdict. This only looks at aggregate
-    box loss, not per-class -- it can't tell you if person specifically
-    is diverging while vehicles improve. See report_per_class_map() below
-    for that.
-  - evaluate_per_source() reports mAP separately for VisDrone/UAVDT/SARD's
-    own val sets after training (now including a per-class breakdown,
-    see below), not just the blended unified.yaml number -- a blended
-    average can hide one source regressing while another improves.
-  - report_per_class_map() (new) reports mAP50-95 PER CLASS on the full
-    blended val set -- the direct check for "one class detected well,
-    another degraded." A healthy overall mAP can hide e.g. vehicles
-    scoring well while person -- the actual SAR priority -- lags far
-    behind. This is the single most direct tool in this file for
-    catching that failure mode; check it after every real run.
-  - The most reliable fix for overfitting on a dataset this size is still
-    more/varied data, not more knobs -- prepare_datasets.py covers
-    adding more datasets.
-
-Baseline history, for reference:
-  yolo26n, 640px, VisDrone's original 10 classes -> mAP50 ~0.31 (plateaued,
-    small/rare classes missed outright -- a resolution/capacity ceiling)
-  yolo26s, 960px, VisDrone's original 10 classes -> mAP50 ~0.465 (confirmed
-    the ceiling diagnosis; every class improved)
-  yolo26m, 960px, unified taxonomy -> never actually trained at a usable
-    speed: silently spilled into shared system RAM immediately.
-  yolo26s, 960px, unified taxonomy, VisDrone+xView -> spilled into WDDM
-    partway through epoch 2 -- prompted the 640px recommendation below,
-    the ongoing (not just startup) watchdog, and (separately) the later
-    decision to drop xView entirely for accuracy reasons, not just VRAM.
-  yolo26s, unified taxonomy (5 classes), VisDrone+UAVDT+SARD -> current
-    run, not yet complete.
-
-Usage:
-    python train.py                    # yolo26s, unified taxonomy (default)
-    python train.py --model auto       # re-enable yolo26m->s->n search,
-                                        # each candidate checked by both
-                                        # the startup probe and the
-                                        # ongoing per-epoch watchdog
+USAGE:
+    python train.py                             # yolo26s, unified taxonomy
+    python train.py --model auto                # yolo26m->s->n fallback search
+    python train.py --model yolo26s.pt --imgsz 640 --batch -1 --epochs 2
+                                                  # smoke test: validates the
+                                                  # DATASET, not yolo26m's
+                                                  # eventual accuracy
     python train.py --imgsz 960 --batch 1 --epochs 5   # smoke test at the
-                                        # resolution that actually helps
-                                        # tiny/small-object recall --
-                                        # always run a short smoke test
-                                        # before committing to a full run
-    python train.py --imgsz 640 --batch 4   # fallback starting point if
-                                        # 960px trips the WDDM probes --
-                                        # see note above
-    python train.py --model yolo26m.pt --imgsz 640   # try more capacity
-                                        # only AFTER a 960px yolo26s run
-                                        # is your known baseline -- m
-                                        # never fit at 960px previously
+                                                         # real target imgsz
+    python train.py --imgsz 640 --batch 4        # fallback if 960px trips
+                                                  # the WDDM probes
+    python train.py --model yolo26m.pt --imgsz 960     # real target run --
+                                                         # after a yolo26s
+                                                         # smoke test passes
     python train.py --data VisDrone.yaml --model yolo26n.pt --imgsz 640
-                                        # reproduce the ORIGINAL 10-class
-                                        # baseline exactly, bypassing the
-                                        # unified taxonomy entirely
-    python train.py --resume           # continue the most recent
-                                        # interrupted/completed run from
-                                        # its last.pt, full optimizer
-                                        # state preserved -- NOT a restart
-    python train.py --epochs 5         # smoke test first, always worth it
+                                                  # original 10-class baseline
+    python train.py --resume [--name RUN_NAME]   # continue most recent (or
+                                                  # named) run's last.pt
+    python train.py --export-only [--weights PATH]     # ONNX export only
 """
 
 import argparse
 import csv
 import json
 import os
+import platform
 import time
 from pathlib import Path
 
 # Must be set before torch is imported (it reads this at CUDA init time).
-os.environ.setdefault(
-    "PYTORCH_CUDA_ALLOC_CONF",
-    "expandable_segments:True,garbage_collection_threshold:0.8",
-)
+# NOTE: expandable_segments is not supported on Windows (confirmed by the
+# "expandable_segments not supported on this platform" UserWarning torch
+# prints on this project's setup) -- it's silently a no-op there, so it's
+# only included on non-Windows to avoid printing a warning for a flag
+# that isn't doing anything. garbage_collection_threshold works on both.
+_alloc_conf_parts = ["garbage_collection_threshold:0.8"]
+if platform.system() != "Windows":
+    _alloc_conf_parts.insert(0, "expandable_segments:True")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", ",".join(_alloc_conf_parts))
 
 import yaml
 from ultralytics import YOLO
@@ -430,11 +186,57 @@ def make_startup_probe_callback(device, warmup_batches=2, probe_batches=3,
     def callback(trainer):
         import torch
 
+        if not torch.cuda.is_available():
+            # BUG FIX: this callback previously assumed CUDA is always
+            # present and called torch.cuda.* unconditionally. --device
+            # cpu is an explicitly documented, supported option (for
+            # sanity-checking the script runs -- see --device's --help
+            # text), and on a CPU-only run every torch.cuda.* call here
+            # either raises or is meaningless. Skip cleanly instead of
+            # crashing a CPU run with an unrelated CUDA error, and say
+            # so once so it's clear this run has no VRAM safety net.
+            if not state["checked"]:
+                state["checked"] = True
+                print("[startup probe] CUDA not available (--device cpu?) "
+                      "-- VRAM probe skipped. This run has no WDDM "
+                      "shared-memory safety net; fine for a sanity check, "
+                      "not recommended for a real training run.")
+            return
+
         if state["checked"]:
             return
 
         now = time.time()
         state["count"] += 1
+
+        if state["count"] == 1:
+            # FIX (see "KNOWN FALSE-POSITIVE, FIXED" in the module
+            # docstring): torch.cuda.max_memory_allocated() is a
+            # cumulative high-water mark for the WHOLE PROCESS, not
+            # "what the current batch used." --batch -1 (AutoBatch)
+            # deliberately profiles forward+backward at several
+            # candidate batch sizes BEFORE real training starts,
+            # intentionally probing past the card's physical ceiling to
+            # find where it breaks (a real, self-handled OOM -- see the
+            # "AutoBatch: Using batch-size N" line printed just before
+            # training begins). Without this reset, that exploratory
+            # peak was still sitting in the counter a few real batches
+            # later and got misread as something the real training
+            # loop did, tripping a false VRAMBudgetExceeded on a run
+            # that was actually healthy (confirmed against Ultralytics'
+            # own progress bar showing ~0.5GB GPU_mem on the exact
+            # batch this previously aborted on). Resetting here -- the
+            # first time this callback fires, i.e. right after
+            # AutoBatch has already finished and real training has
+            # begun -- makes every peak reading from this point on
+            # reflect only real training, which is what both this
+            # probe and the ongoing watchdog below are actually meant
+            # to monitor. Runs with an explicit --batch (no AutoBatch
+            # probing) were never affected by the bug, and are
+            # unaffected by this reset too -- there's nothing stale to
+            # clear for them.
+            torch.cuda.reset_peak_memory_stats(device)
+
         prev_t = state["last_t"]
         state["last_t"] = now
 
@@ -476,6 +278,13 @@ def make_ongoing_watchdog_callback(device, max_epoch_minutes=None,
     card's physical total after every epoch, for the whole run -- not
     just at startup. Also flags any single epoch that takes longer than
     --max-epoch-minutes, if set.
+
+    Reads the same process-wide counter make_startup_probe_callback()
+    resets on its first firing -- since that reset happens before this
+    callback's first on_train_epoch_end (epoch end always comes after
+    at least one batch end), this watchdog's "cumulative peak since
+    training really started" tracking is correct without needing its
+    own reset: it inherits the already-cleared baseline.
     """
     state = {"last_epoch_start": None}
 
@@ -486,6 +295,19 @@ def make_ongoing_watchdog_callback(device, max_epoch_minutes=None,
         epoch_seconds = (now - state["last_epoch_start"]
                           if state["last_epoch_start"] else None)
         state["last_epoch_start"] = now  # reset for the next epoch
+
+        if not torch.cuda.is_available():
+            # Same CPU-only guard as the startup probe above -- still
+            # honor --max-epoch-minutes (that check has nothing to do
+            # with CUDA), just skip the VRAM half of the check.
+            if (max_epoch_minutes is not None and epoch_seconds is not None
+                    and epoch_seconds > max_epoch_minutes * 60):
+                raise VRAMBudgetExceeded(
+                    f"[ongoing watchdog, epoch "
+                    f"{getattr(trainer, 'epoch', '?')}] epoch took "
+                    f"{epoch_seconds / 60:.1f} min, over the "
+                    f"{max_epoch_minutes} min budget")
+            return
 
         total = torch.cuda.get_device_properties(device).total_memory
         peak = torch.cuda.max_memory_allocated(device)
@@ -541,50 +363,88 @@ def _interlace_combing(image, **kwargs):
     return img
 
 
-def _try_build_transform(name, builder):
+def _try_build_transform(name, *builders):
     """
-    Builds one Albumentations transform, catching any exception (most
-    commonly a TypeError from a parameter that was renamed/removed
-    between albumentations versions -- e.g. Downscale's scale_min/
-    scale_max became scale_range in 2.x). Returns None on failure
-    instead of propagating, so one incompatible transform never takes
-    down the whole degradation pipeline -- see the VERSION ROBUSTNESS
-    note in this module's docstring.
+    Tries each candidate builder in order (most-current API shape
+    first, falling back to older shapes) and returns the first one that
+    builds with zero warnings.
+
+    BUG FIX -- this used to take a single builder and only catch hard
+    exceptions (a TypeError from a renamed/removed parameter). That's
+    not the only failure mode: some albumentations parameter-name
+    mismatches are silently ACCEPTED and ignored, reported only via a
+    UserWarning, not an exception. CONFIRMED on this project's actual
+    run: build_optical_distortion()'s alb_major>=2 branch assumed
+    distort_range was the correct kwarg for "any albumentations 2.x",
+    but the installed 2.0.8 rejected it with only a UserWarning
+    ("Argument(s) 'distort_range' are not valid for transform
+    OpticalDistortion") -- the old single-builder version of this
+    function returned a real, successfully-constructed object anyway,
+    silently running OpticalDistortion at the LIBRARY'S OWN DEFAULT
+    distortion strength instead of this project's deliberately small
+    +/-0.03 one. That's exactly the label-corruption risk the module
+    docstring warns about for this transform (image-only, no
+    bbox_params, so a stronger warp shifts pixels while label boxes
+    stay put) -- and it was happening every run without ever being
+    reported as a skip.
+
+    Passing multiple builders and treating ANY warning as a build
+    failure (via warnings.filterwarnings("error")) means whichever
+    variant the installed version actually accepts cleanly wins, rather
+    than depending on alb_major guessing right for every point release.
+    Returns None (with a printed message) if every builder fails.
     """
-    try:
-        return builder()
-    except Exception as e:
-        print(f"[degradation aug] Skipping '{name}' -- not compatible with "
-              f"the installed albumentations version ({e}). Every other "
-              f"degradation transform is unaffected.")
-        return None
+    import warnings
+    for i, builder in enumerate(builders):
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("error", category=UserWarning)
+                result = builder()
+            if i > 0:
+                print(f"[degradation aug] '{name}': installed "
+                      f"albumentations version needed fallback parameter "
+                      f"set #{i + 1} of {len(builders)} (newer-API name(s) "
+                      f"were rejected).")
+            return result
+        except Exception:
+            continue
+    print(f"[degradation aug] Skipping '{name}' -- none of {len(builders)} "
+          f"candidate parameter set(s) were accepted cleanly by the "
+          f"installed albumentations version. Every other degradation "
+          f"transform is unaffected.")
+    return None
 
 
 def build_degradation_transform():
     """
     Builds an Albumentations pipeline calibrated against the E5-FPV
     camera's actual datasheet (1500TVL CVBS analog, NTSC/PAL, 0.0001 lux
-    minimum illumination) rather than a generic noise guess -- see the
-    module docstring for what each transform maps to and why. Returns
-    None (with a printed warning) if albumentations isn't installed, or
-    if every individual transform fails to build against the installed
-    version -- both cases are non-fatal, training proceeds without
-    degradation augmentation rather than crashing.
+    minimum illumination, 6mm lens / 100 degree FOV) rather than a
+    generic noise guess -- see the module docstring for what each
+    transform maps to and why. Returns None (with a printed warning) if
+    albumentations isn't installed, or if every individual transform
+    fails to build against the installed version -- both cases are
+    non-fatal, training proceeds without degradation augmentation rather
+    than crashing.
 
-    VERSION-AWARE, not just version-TOLERANT: four of these transforms
-    (Downscale, GaussNoise, CoarseDropout, ImageCompression) had their
-    parameter names changed between albumentations 1.x and 2.x --
-    confirmed directly against an installed 2.0.8: the OLD 1.x kwarg
-    names don't raise an error under 2.x, they get silently accepted and
-    IGNORED, falling back to the library's own defaults. That's worse
-    than a crash for one transform specifically -- CoarseDropout's 2.x
-    default hole size is 10-20% of the image per side, which is large
-    enough to fully blank out a tiny labeled person, exactly the
-    label-corruption risk this transform was deliberately kept small to
-    avoid (see module docstring). So this isn't just wrapped in
-    try/except: the correct kwarg names for the detected major version
-    are used directly, with try/except kept underneath as a second-line
-    defense for any future API shape neither branch anticipates.
+    VERSION-AWARE, not just version-TOLERANT: five of these transforms
+    (Downscale, GaussNoise, CoarseDropout, ImageCompression,
+    OpticalDistortion) had their parameter names changed between
+    albumentations 1.x and 2.x -- confirmed directly against an
+    installed 2.0.8 (and against albumentations' own 2.x API reference
+    for OpticalDistortion specifically, whose shift_limit was dropped
+    entirely and distort_limit renamed to distort_range): the OLD 1.x
+    kwarg names don't raise an error under 2.x, they get silently
+    accepted and IGNORED, falling back to the library's own defaults.
+    That's worse than a crash for one transform specifically --
+    CoarseDropout's 2.x default hole size is 10-20% of the image per
+    side, which is large enough to fully blank out a tiny labeled
+    person, exactly the label-corruption risk this transform was
+    deliberately kept small to avoid (see module docstring). So this
+    isn't just wrapped in try/except: the correct kwarg names for the
+    detected major version are used directly, with try/except kept
+    underneath as a second-line defense for any future API shape
+    neither branch anticipates.
     """
     try:
         import albumentations as A
@@ -605,14 +465,11 @@ def build_degradation_transform():
 
     pieces = []
 
-    def build_downscale():
-        if alb_major >= 2:
-            return A.Downscale(scale_range=(0.35, 0.75), p=0.4)
-        return A.Downscale(scale_min=0.35, scale_max=0.75,
-                             interpolation=1, p=0.4)
-
     downscale = _try_build_transform(
-        "Downscale (1500TVL bandwidth ceiling)", build_downscale)
+        "Downscale (1500TVL bandwidth ceiling)",
+        lambda: A.Downscale(scale_range=(0.35, 0.75), p=0.4),
+        lambda: A.Downscale(scale_min=0.35, scale_max=0.75,
+                             interpolation=1, p=0.4))
     if downscale is not None:
         pieces.append(downscale)
 
@@ -630,9 +487,25 @@ def build_degradation_transform():
         # std_range (2.x) is std as a fraction of the 0-1 normalized
         # range. (10.0, 60.0) var -> std ~ sqrt(var)/255 ~ (0.012, 0.030)
         # -- widened slightly below for comparable visible effect.
-        if alb_major >= 2:
-            return A.GaussNoise(std_range=(0.015, 0.05), p=1.0)
-        return A.GaussNoise(var_limit=(10.0, 60.0), p=1.0)
+        # Tries the 2.x name first, falls back to 1.x -- same
+        # warning-as-error safety net as _try_build_transform (see its
+        # docstring for why a silent-accept-and-ignore parameter name
+        # is a real failure mode here, confirmed on OpticalDistortion),
+        # applied locally since GaussNoise is nested inside another
+        # transform's OneOf rather than registered as its own
+        # top-level piece.
+        import warnings
+        for candidate in (
+            lambda: A.GaussNoise(std_range=(0.015, 0.05), p=1.0),
+            lambda: A.GaussNoise(var_limit=(10.0, 60.0), p=1.0),
+        ):
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("error", category=UserWarning)
+                    return candidate()
+            except Exception:
+                continue
+        raise ValueError("no GaussNoise parameter set was accepted cleanly")
 
     noise = _try_build_transform(
         "low-light sensor noise (0.0001 lux gain grain)",
@@ -656,37 +529,63 @@ def build_degradation_transform():
     if brightness is not None:
         pieces.append(brightness)
 
-    def build_coarse_dropout():
-        # Deliberately weak -- see module docstring: this is the one
-        # transform here that can corrupt a label (not just add noise
-        # to it) if a hole fully covers a tiny object. Small/rare on
-        # purpose, and (critically) the exact pixel sizes below are
-        # confirmed to mean literal pixels under 2.x when given as
-        # plain ints, not a fraction of image size -- verified directly
-        # (5 holes of (4,4)/(10,10) produced exactly 200 zeroed pixels
-        # = 5*4*10) before relying on it here.
-        if alb_major >= 2:
-            return A.CoarseDropout(num_holes_range=(1, 3),
-                                     hole_height_range=(4, 4),
-                                     hole_width_range=(10, 10),
-                                     fill=0, p=0.08)
-        return A.CoarseDropout(max_holes=3, max_height=4, max_width=10,
-                                 fill_value=0, p=0.08)
-
+    # Deliberately weak -- see module docstring: this is one of the two
+    # transforms here (along with OpticalDistortion below) that can
+    # corrupt a label (not just add noise to it) if it isn't kept
+    # small, since this pipeline runs image-only with no bbox_params.
+    # Small/rare on purpose, and (critically) the exact pixel sizes
+    # below are confirmed to mean literal pixels under 2.x when given
+    # as plain ints, not a fraction of image size -- verified directly
+    # (5 holes of (4,4)/(10,10) produced exactly 200 zeroed pixels =
+    # 5*4*10) before relying on it here.
     dropout = _try_build_transform(
         "RF dropout burst (deliberately small/rare, see docstring)",
-        build_coarse_dropout)
+        lambda: A.CoarseDropout(num_holes_range=(1, 3),
+                                  hole_height_range=(4, 4),
+                                  hole_width_range=(10, 10),
+                                  fill=0, p=0.08),
+        lambda: A.CoarseDropout(max_holes=3, max_height=4, max_width=10,
+                                  fill_value=0, p=0.08))
     if dropout is not None:
         pieces.append(dropout)
 
-    def build_compression():
-        if alb_major >= 2:
-            return A.ImageCompression(quality_range=(30, 65), p=0.25)
-        return A.ImageCompression(quality_lower=30, quality_upper=65, p=0.25)
+    # Barrel distortion for the E5-FPV's 6mm/100-degree-FOV lens -- see
+    # the "OpticalDistortion (lens barrel distortion, NEW)" bullet in
+    # the module docstring for the full reasoning, including why this
+    # is kept deliberately weak (same image-only/no-bbox_params
+    # corruption risk as CoarseDropout above, but across the whole
+    # frame instead of a small hole). distort_range/distort_limit
+    # +/-0.03 is roughly a third of albumentations' own 0.05 default --
+    # enough to bow lines slightly toward the frame edge, not enough to
+    # meaningfully displace a tight box anywhere but the extreme edge.
+    #
+    # BUG FIX -- CONFIRMED on this project's actual run log: the
+    # alb_major>=2 branch below (distort_range, mode="camera") was
+    # rejected by the installed albumentations 2.0.8 with a UserWarning
+    # ("Argument(s) 'distort_range' are not valid for transform
+    # OpticalDistortion"), NOT an exception -- so the old code silently
+    # got back a working OpticalDistortion object that had actually
+    # fallen through to the library's own default distortion strength
+    # instead of this project's deliberately small +/-0.03 one, on
+    # every single run, with the log claiming "Built 9/9 planned
+    # transforms with version-correct parameters" the whole time.
+    # _try_build_transform now tries both parameter sets and only
+    # accepts whichever one the installed version builds without any
+    # warning -- see its docstring.
+    optical_distortion = _try_build_transform(
+        "lens barrel distortion (6mm/100deg FOV, deliberately weak, "
+        "see docstring)",
+        lambda: A.OpticalDistortion(distort_range=(-0.03, 0.03),
+                                      mode="camera", p=0.15),
+        lambda: A.OpticalDistortion(distort_limit=0.03, shift_limit=0.0,
+                                      p=0.15))
+    if optical_distortion is not None:
+        pieces.append(optical_distortion)
 
     compression = _try_build_transform(
         "downstream compression artifacts (generic capture-chain proxy)",
-        build_compression)
+        lambda: A.ImageCompression(quality_range=(30, 65), p=0.25),
+        lambda: A.ImageCompression(quality_lower=30, quality_upper=65, p=0.25))
     if compression is not None:
         pieces.append(compression)
 
@@ -706,7 +605,7 @@ def build_degradation_transform():
               "or `pip install \"albumentations<2\"` if this keeps happening.")
         return None
 
-    print(f"[degradation aug] Built {len(pieces)}/8 planned transforms "
+    print(f"[degradation aug] Built {len(pieces)}/9 planned transforms "
           f"with version-correct parameters (any gap above is a genuine "
           f"unexpected-API skip, logged individually).")
     return A.Compose(pieces)
@@ -723,16 +622,18 @@ def install_degradation_augment():
 
     self.contains_spatial is forced to False regardless of what
     Ultralytics' own spatial-transform heuristic would say (it classifies
-    both CoarseDropout and Lambda as "spatial" transforms, since
-    Albumentations CAN make them bbox-aware given bbox_params). This
-    pipeline's own A.Compose(pieces) call deliberately has no bbox_params
-    set, so it MUST be called image-only (contains_spatial=False) or the
-    call would break -- this is intentional, not an oversight, but it
-    does mean CoarseDropout/Lambda run here without any bbox awareness at
-    all, relying entirely on small hole size to avoid label corruption
-    rather than Albumentations' own visibility-based box filtering. See
-    the CoarseDropout bullet in the module docstring for the more
-    rigorous (not implemented) alternative.
+    CoarseDropout, OpticalDistortion, and Lambda as "spatial" transforms,
+    since Albumentations CAN make them bbox-aware given bbox_params).
+    This pipeline's own A.Compose(pieces) call deliberately has no
+    bbox_params set, so it MUST be called image-only
+    (contains_spatial=False) or the call would break -- this is
+    intentional, not an oversight, but it does mean CoarseDropout/
+    OpticalDistortion/Lambda run here without any bbox awareness at all,
+    relying entirely on small hole size / small distortion magnitude to
+    avoid label corruption rather than Albumentations' own
+    visibility-based box filtering or geometric box remapping. See the
+    CoarseDropout and OpticalDistortion bullets in the module docstring
+    for the more rigorous (not implemented) alternative.
 
     NOTE: this patches an internal (non-public-API) class. If an
     Ultralytics upgrade changes Albumentations' __init__ signature or
@@ -765,8 +666,8 @@ def install_degradation_augment():
     aug_mod.Albumentations.__init__ = patched_init
     print("[degradation aug] Installed analog-feed degradation transform "
           "(motion/gaussian blur, compression artifacts, ISO noise, gamma "
-          "shift) -- closes some of the train/deploy domain gap against "
-          "the real FPV analog feed.")
+          "shift, lens barrel distortion) -- closes some of the "
+          "train/deploy domain gap against the real FPV analog feed.")
 
 
 def _contains_albumentations(transform_obj, aug_mod, _depth=0, _max_depth=6) -> bool:
@@ -871,6 +772,30 @@ def make_augmentation_scope_check_callback():
     return callback
 
 
+def _device_arg_type(value: str):
+    """
+    BUG FIX: --device's default is the int 0, but argparse gives you a
+    bare STRING when the flag is actually typed on the command line (no
+    type= was previously set). torch.cuda.get_device_properties()/
+    torch.device() accept an int (0), 'cpu', or a full 'cuda:0'-style
+    string -- but NOT a bare numeric string like '0'
+    (torch.device('0') raises "Invalid device string"). So the default
+    (never touches this function) worked fine, but anyone who explicitly
+    passed --device 0 on the CLI -- the single most common thing to
+    type -- would crash the startup probe/watchdog with an unrelated-
+    looking torch device-parsing error. 'cpu' and already-qualified
+    strings ('cuda:0', '0,1') are passed through unchanged; anything
+    that parses as a bare int is converted so it matches the untouched
+    default's type.
+    """
+    if value.lower() == "cpu":
+        return value
+    try:
+        return int(value)
+    except ValueError:
+        return value  # e.g. "cuda:0", "0,1" -- already unambiguous to torch
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", default="yolo26s.pt",
@@ -886,21 +811,44 @@ def parse_args():
                          "original 10-class baseline instead.")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--imgsz", type=int, default=960,
-                    help="960 is the historical default -- objects are "
-                         "small even at native resolution. BUT: this "
-                         "combo has shown WDDM spillover even on yolo26s "
-                         "at 960px/batch=1 (see WDDM note). Try 640 first "
-                         "-- more headroom, and lets --batch go above 1.")
+                    help="960 is the RECOMMENDED default for this project "
+                         "-- this project's own baseline history shows "
+                         "640px plateaus with small/rare classes missed "
+                         "outright, while the same model at 960px fixed "
+                         "that ceiling and every class improved (see the "
+                         "IMAGE SIZE note in the module docstring). Note "
+                         "imgsz does NOT need to match any source "
+                         "dataset's native resolution -- Ultralytics "
+                         "letterboxes every image (VisDrone/UAVDT/SARD "
+                         "alike) to this single square size regardless. "
+                         "960px HAS shown WDDM spillover in the past on "
+                         "this card (see WDDM note) but mosaic_guard.py's "
+                         "instance cap has since confirmed real VRAM "
+                         "headroom (~2GB/6GB) at this size -- fall back "
+                         "to 640 only if the startup probe/watchdog still "
+                         "trip for you.")
     p.add_argument("--batch", type=int, default=1,
                     help="Explicit batch size. batch=1 has zero batching "
-                         "efficiency and is a major speed tax by itself, "
-                         "on top of the VRAM issues -- once you find "
-                         "settings that leave real headroom (e.g. "
-                         "--imgsz 640), test raising this via a short "
-                         "--epochs 5 run before committing. Pass -1 for "
-                         "AutoBatch -- unreliable at 960px on this card in "
-                         "earlier testing, more likely to work at 640px.")
-    p.add_argument("--device", default=0,
+                         "efficiency and is a major speed tax by itself. "
+                         "UPDATE: with mosaic_guard.py's instance cap "
+                         "installed, a real run is now staying around "
+                         "~2GB/6GB VRAM -- there is likely significant "
+                         "headroom to raise this. Test via a short "
+                         "--epochs 3-5 run before committing to a full "
+                         "run: watch nvidia-smi / the printed VRAM probe "
+                         "messages, and increase --batch until either "
+                         "gets close to the 6GB ceiling. Pass -1 for "
+                         "AutoBatch -- was unreliable at 960px in earlier "
+                         "testing (pre-mosaic_guard), may be worth "
+                         "retrying now given the lower actual usage. NOTE: "
+                         "AutoBatch's own pre-training profiling pass "
+                         "(the 'GPU_mem (GB)' table it prints, batch "
+                         "sizes 1/2/4/8...) deliberately probes past the "
+                         "card's physical VRAM to find the ceiling -- a "
+                         "printed 'AutoBatch: Using batch-size N' line "
+                         "means that already resolved cleanly on its own; "
+                         "it is not a sign anything is wrong.")
+    p.add_argument("--device", default=0, type=_device_arg_type,
                     help="GPU index. 0 = first (only, on a laptop) GPU. "
                          "Use 'cpu' only to sanity-check the script runs, "
                          "never for a real training run.")
@@ -983,9 +931,10 @@ def parse_args():
                     action="store_false", default=True,
                     help="Disable the analog-feed degradation "
                          "augmentation pipeline (blur/compression/noise/"
-                         "gamma). On by default -- see module docstring. "
-                         "Requires albumentations; auto-skips with a "
-                         "warning if it isn't installed.")
+                         "gamma/lens distortion). On by default -- see "
+                         "module docstring. Requires albumentations; "
+                         "auto-skips with a warning if it isn't "
+                         "installed.")
     p.add_argument("--oversample-classes", default="motorcycle,other_vehicle",
                     help="Comma-separated UNIFIED_CLASSES names to "
                          "oversample in the train split (see "
@@ -1238,7 +1187,8 @@ def check_overfitting(run_dir: Path, lookback: int = 10) -> None:
         print("  No clear divergence in this window.")
 
 
-def report_per_class_map(model: YOLO, data_path: str) -> None:
+def report_per_class_map(model: YOLO, data_path: str, batch: int,
+                           workers: int = 0) -> None:
     """
     Runs model.val() on the full (blended) val set from data_path and
     prints mAP50-95 PER CLASS -- not just the single averaged number
@@ -1252,11 +1202,46 @@ def report_per_class_map(model: YOLO, data_path: str) -> None:
     val set, which is the number that actually answers this project's
     core accuracy question. Check this after every real run, not just
     the aggregate mAP Ultralytics prints during training.
+
+    FIX (OOM on 6GB card): model.val() defaults to Ultralytics' own
+    validation batch size when none is given -- much larger than the
+    --batch 1 this project actually needs on this card. batch is now
+    passed through explicitly, and the CUDA cache is cleared right
+    before the call so memory left reserved by training (or by a prior
+    val() call, e.g. evaluate_per_source() running just before this)
+    can't stack on top of it.
+
+    FIX (real crash, CONFIRMED from an actual run log -- "paging file
+    too small" OSError loading cublas64_13.dll, right after training
+    finished and its own automatic post-train validation had already
+    succeeded cleanly): unlike model.train() -- which this project
+    always calls with workers=args.workers (0 by default, specifically
+    because Windows reloads the ENTIRE CUDA DLL stack per spawned
+    worker process, see --workers's --help text) -- model.val() was
+    being called here with no workers= argument at all, so it fell back
+    to Ultralytics' own (nonzero) validation default. On Windows that
+    spawns a real subprocess via multiprocessing.spawn, which
+    re-imports this whole script from scratch (import torch -> reload
+    the full CUDA DLL stack a second time, while the parent process
+    still has its own copy resident) -- exactly the failure mode
+    --workers=0 exists to avoid for training, just not previously
+    applied to eval too. workers now defaults to 0 to match, and is
+    threaded through from args.workers by the caller in main() so a
+    deliberately-raised --workers value (once the paging file is
+    resized, per that flag's own help text) applies consistently to
+    both training and eval instead of only half of the pipeline.
     """
+    import gc
+    import torch
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     print(f"\n{'=' * 70}")
     print("Per-class mAP (blended val set, all sources combined)")
     print(f"{'=' * 70}")
-    metrics = model.val(data=data_path, split="val", verbose=False)
+    metrics = model.val(data=data_path, split="val", batch=batch,
+                         workers=workers, verbose=False)
     per_class = metrics.box.maps  # array indexed by class, mAP50-95
     for idx, name in enumerate(UNIFIED_CLASSES):
         if idx < len(per_class):
@@ -1268,7 +1253,8 @@ def report_per_class_map(model: YOLO, data_path: str) -> None:
           "-- not a sign the model or pipeline is broken.")
 
 
-def evaluate_per_source(model: YOLO, run_dir: Path) -> None:
+def evaluate_per_source(model: YOLO, run_dir: Path, batch: int,
+                          workers: int = 0) -> None:
     """
     Runs a SEPARATE model.val() pass against each source dataset's own
     val set (VisDrone/UAVDT/SARD individually), reading
@@ -1279,12 +1265,51 @@ def evaluate_per_source(model: YOLO, run_dir: Path) -> None:
     if the manifest doesn't exist (e.g. --data was set manually to
     bypass prepare_datasets.py).
 
-    Now also prints a per-class breakdown for each source (new) --
-    remember a source's per-class numbers are only meaningful for
-    classes that source actually labels (see the printed note at the
-    end): UAVDT never labels person, SARD never labels vehicles, so
-    those rows will read as 0/undefined for that source and should be
-    ignored, not read as "the model can't detect X."
+    Now also prints a per-class breakdown for each source. Historically
+    (pre generate_pseudo_labels.py), a source's per-class numbers were
+    only meaningful for classes that source natively annotated -- UAVDT
+    had no person labels, SARD had no vehicle labels -- with the other
+    rows reading as 0/undefined and safe to ignore.
+
+    UPDATE -- this is no longer unconditionally true. generate_pseudo_
+    labels.py cross-references the other three detection models against
+    exactly the classes a source didn't originally label, and --apply
+    merges those pseudo-labels into the real dataset for any image
+    that's been FULLY reviewed (see that script's V8/V9 notes on
+    pending_review_images.json -- still-pending images are excluded from
+    every train/val/test list entirely, not partially merged). So a
+    source's own val set drawn here CAN now genuinely contain ground
+    truth for a class it didn't originally annotate: a UAVDT val image
+    may have a real person box, a SARD val image may have a real vehicle
+    box. A row reading 0.000 (or very low) is therefore no longer proof
+    that class is structurally absent from that source -- it may simply
+    mean few/none of that source's images carrying that class have
+    cleared review and been merged yet. Cross-check against
+    datasets/pending_review_images.json and pseudo_labels_summary.json's
+    per-class auto/queued/discarded counts before drawing a conclusion
+    from a near-zero row here.
+
+    FIX (real crash, CONFIRMED from an actual run log -- "paging file
+    too small" OSError loading cublas64_13.dll, striking on the FIRST
+    source (VisDrone) right after training finished and its own
+    automatic post-train validation had already succeeded cleanly):
+    model.val() here was being called with no workers= argument, unlike
+    every model.train() call in this project, which always passes
+    workers=args.workers (0 by default) specifically because Windows
+    reloads the entire CUDA DLL stack per spawned dataloader worker
+    process (see --workers's --help text). Without an explicit
+    workers=0 here, model.val() fell back to Ultralytics' own nonzero
+    validation default, which spawns a real subprocess via
+    multiprocessing.spawn on Windows -- that subprocess re-imports this
+    whole script from scratch (import torch -> reload the full CUDA DLL
+    stack a SECOND time, while the parent process still has its own
+    copy resident), and that second load is what actually exhausted the
+    paging file. This is a different resource than the GPU-VRAM OOM the
+    gc.collect()/empty_cache() calls below guard against -- those two
+    fixes address separate failure modes that happened to surface in
+    the same function, not the same bug twice. workers now defaults to
+    0 to match training, and is threaded through from args.workers by
+    the caller in main().
     """
     if not PER_SOURCE_MANIFEST_PATH.exists():
         print(f"\n[per-source eval] No {PER_SOURCE_MANIFEST_PATH} found "
@@ -1301,10 +1326,28 @@ def evaluate_per_source(model: YOLO, run_dir: Path) -> None:
     print("Per-source validation (isolating each dataset's contribution)")
     print(f"{'=' * 70}")
 
+    import gc
+    import torch
+
     tmp_dir = run_dir / "per_source_eval"
     tmp_dir.mkdir(exist_ok=True)
 
     for name, val_dirs in per_source.items():
+        # FIX (OOM on 6GB card, confirmed root cause of the UAVDT
+        # crash): clear the caching allocator BEFORE each source's
+        # val() call. Without this, memory reserved by the previous
+        # source's val() (VisDrone ran fine here) -- or by training
+        # itself -- can still be held when the next call starts, even
+        # though it's logically done being used. By the time UAVDT's
+        # turn came up the card had "free: 0, total: 6441926656" left;
+        # an allocation failure that severe can crash the CUDA context
+        # hard enough that the `except Exception` below never gets a
+        # clean shot at it, which is why it died silently instead of
+        # printing "[skipped: ...]".
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         tmp_yaml = tmp_dir / f"{name.lower()}.yaml"
         with open(tmp_yaml, "w") as f:
             yaml.safe_dump({
@@ -1315,7 +1358,14 @@ def evaluate_per_source(model: YOLO, run_dir: Path) -> None:
                 "names": UNIFIED_CLASSES,
             }, f, sort_keys=False)
         try:
-            metrics = model.val(data=str(tmp_yaml), split="val", verbose=False)
+            # FIX: batch=batch -- without this, model.val() fell back to
+            # Ultralytics' own (much larger) default validation batch
+            # size instead of the --batch 1 this project actually needs.
+            # FIX: workers=workers -- see the module-level fix note in
+            # this function's docstring; this is what stops Windows from
+            # spawning a paging-file-exhausting subprocess here.
+            metrics = model.val(data=str(tmp_yaml), split="val",
+                                 batch=batch, workers=workers, verbose=False)
             print(f"  {name:10s}  mAP50={metrics.box.map50:.3f}  "
                   f"mAP50-95={metrics.box.map:.3f}  "
                   f"precision={metrics.box.mp:.3f}  recall={metrics.box.mr:.3f}")
@@ -1325,12 +1375,21 @@ def evaluate_per_source(model: YOLO, run_dir: Path) -> None:
                     print(f"      {cls_name:15s} mAP50-95={per_class[cls_idx]:.3f}")
         except Exception as e:
             print(f"  {name:10s}  [skipped: {e}]")
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     print(f"{'=' * 70}")
-    print("Note: each source's classes are limited to what that dataset "
-          "actually labels (e.g. UAVDT has no person labels, SARD has no "
-          "vehicle labels) -- per-class numbers for classes a source "
-          "never annotated aren't meaningful for that source's row.")
+    print("Note: each source's ORIGINAL native classes are limited (UAVDT "
+          "had no person labels, SARD had no vehicle labels) -- but "
+          "generate_pseudo_labels.py --apply merges cross-source pseudo-"
+          "labels into any image that has been FULLY reviewed, so a "
+          "source can now genuinely carry boxes for a class it didn't "
+          "originally annotate. A 0.000 (or near-zero) row above may mean "
+          "'not enough of this source has been reviewed/merged for this "
+          "class yet', not 'this source can never have this class' -- "
+          "check datasets/pending_review_images.json and pseudo_labels_"
+          "summary.json's per-class counts before assuming the latter.")
 
 
 def train_with_model_fallback(args, data_path: str):
@@ -1340,6 +1399,7 @@ def train_with_model_fallback(args, data_path: str):
     startup probe AND the ongoing watchdog without tripping
     VRAMBudgetExceeded, and without a real CUDA OOM either.
     """
+    import gc
     import torch
 
     candidates = MODEL_SIZE_CANDIDATES if args.model == "auto" else [args.model]
@@ -1371,6 +1431,7 @@ def train_with_model_fallback(args, data_path: str):
         this_run_name = (args.name or default_run_name(model_name, args.imgsz))
         print(f"\n{'=' * 70}\nAttempting: {model_name} @ {args.imgsz}px, "
               f"batch={args.batch}\n{'=' * 70}")
+        model = None
         try:
             model = YOLO(model_name)
             model.add_callback(
@@ -1395,6 +1456,24 @@ def train_with_model_fallback(args, data_path: str):
             is_vram_issue = isinstance(e, VRAMBudgetExceeded) or is_oom_error(e)
             if not is_vram_issue:
                 raise
+            # BUG FIX: empty_cache() used to run here while `model` (this
+            # candidate's weights, optimizer state, EMA shadow copy, and
+            # dataloader) was STILL referenced by the local variable --
+            # empty_cache() only releases blocks the allocator considers
+            # idle, and none of this candidate's memory was idle yet,
+            # it was just about to become unreachable on the next loop
+            # iteration's reassignment. That meant the next (smaller)
+            # candidate was loading while the failed one's memory was
+            # still fully resident -- exactly the kind of accumulation
+            # this fallback path exists to avoid. Explicitly drop the
+            # reference and run a real gc.collect() first so PyTorch's
+            # allocator has something to actually give back before the
+            # next candidate asks for VRAM. `model = None` above (before
+            # the try) guards the case where YOLO(model_name) itself is
+            # what raised, so there's nothing yet to delete.
+            if model is not None:
+                del model
+            gc.collect()
             torch.cuda.empty_cache()
             if i + 1 < len(candidates):
                 print(f"\n[VRAM] {model_name} doesn't fit ({e}). Falling "
@@ -1411,16 +1490,22 @@ def train_with_model_fallback(args, data_path: str):
 def main():
     args = parse_args()
 
+    if args.export_only:
+        # MINOR FIX: this check used to run AFTER installing the
+        # training-only monkeypatches below, so a pure --export-only
+        # invocation (which never calls model.train() at all) still
+        # patched Ultralytics' Mosaic/Albumentations internals and
+        # printed their banners for no reason. Export doesn't touch
+        # either, so there's nothing to gain from installing them here.
+        weights = Path(args.weights) if args.weights else find_latest_best_pt()
+        export_for_cpp(weights)
+        return
+
     install_instance_cap(max_instances=args.max_mosaic_instances,
                           max_tries=args.mosaic_max_tries)
 
     if args.degradation_aug:
         install_degradation_augment()
-
-    if args.export_only:
-        weights = Path(args.weights) if args.weights else find_latest_best_pt()
-        export_for_cpp(weights)
-        return
 
     data_path = None  # only set on a fresh (non-resume) run -- see guard below
 
@@ -1449,7 +1534,50 @@ def main():
 
         print(f"\nResuming training from {last_pt}...")
         model = YOLO(str(last_pt))
-        model.train(resume=True)
+
+        # BUG FIX: this branch used to call model.train(resume=True)
+        # with no callbacks attached at all -- train_with_model_fallback()
+        # (the fresh-run path, below) adds the startup probe, the
+        # ongoing watchdog, and the augmentation-scope check, but this
+        # resume path skipped all three. That meant every resumed run
+        # had NO WDDM safety net whatsoever -- exactly the failure mode
+        # this file's whole WDDM section exists to catch, and resumed
+        # runs are not less likely to hit it (they pick up mid-training,
+        # right where the staircase/mosaic-density issue was already
+        # underway). install_degradation_augment()/install_instance_cap()
+        # in main() are global monkeypatches so they already applied
+        # here regardless -- it was specifically the per-Trainer
+        # add_callback() calls that were missing.
+        model.add_callback(
+            "on_train_batch_end",
+            make_startup_probe_callback(args.device))
+        model.add_callback(
+            "on_train_epoch_end",
+            make_ongoing_watchdog_callback(
+                args.device, max_epoch_minutes=args.max_epoch_minutes))
+        if args.degradation_aug:
+            model.add_callback(
+                "on_train_start",
+                make_augmentation_scope_check_callback())
+
+        try:
+            model.train(resume=True)
+        except VRAMBudgetExceeded as e:
+            # Unlike the fresh-run path, there's no smaller model size to
+            # fall back to here -- the checkpoint's architecture is
+            # fixed. Fail loudly with a concrete next step instead of
+            # silently falling back to Ultralytics' own defaults (see
+            # _is_resumable_checkpoint's docstring for why a silent
+            # fallback is specifically dangerous on this project).
+            raise SystemExit(
+                f"\n[VRAM] Resumed run at {last_pt} hit the VRAM budget "
+                f"check ({e}). Resuming can't fall back to a smaller "
+                f"model size -- the checkpoint's architecture is fixed. "
+                f"Free up VRAM, or start a fresh (non-resume) run with a "
+                f"smaller --imgsz/--batch or --model, using this "
+                f"checkpoint as a warm start (see the resumability error "
+                f"message above for that pattern).")
+
         run_name = last_pt.parent.parent.name
         used_model_name = None
     else:
@@ -1474,18 +1602,47 @@ def main():
               f"whether --imgsz 640 (more VRAM headroom) lets the larger "
               f"model fit instead of silently accepting the fallback.")
 
+    # BUG FIX: this is the piece the earlier "reload fresh for eval" fix
+    # was missing. `model` (with its full .trainer -- optimizer state,
+    # EMA shadow copy, dataloader buffers, often larger than the model
+    # weights themselves) was never released here -- it stayed
+    # referenced by this variable for the REST of main(), straight
+    # through eval and export. So `eval_model = YOLO(str(best_pt))`
+    # below wasn't actually giving eval a clean VRAM footprint; it was
+    # adding a second model's memory on top of the first one, which was
+    # still fully resident the whole time. Only `best_pt`'s path is
+    # needed from here on, so free everything else now.
+    import gc
+    import torch
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     check_overfitting(run_dir)
 
     if not args.skip_per_source_eval:
-        evaluate_per_source(model, run_dir)
+        eval_model = YOLO(str(best_pt))
+        evaluate_per_source(eval_model, run_dir, args.batch,
+                             workers=args.workers)
         if data_path is not None:
-            report_per_class_map(model, data_path)
+            report_per_class_map(eval_model, data_path, args.batch,
+                                  workers=args.workers)
         else:
             print("\n[per-class report] Skipped -- no data_path available "
                   "for a --resume run in this process. Run "
                   "`python train.py --export-only` style follow-up, or "
-                  "call report_per_class_map(model, 'datasets/unified.yaml') "
-                  "manually if you want it after a resumed run.")
+                  "call report_per_class_map(model, 'datasets/unified.yaml', "
+                  "args.batch) manually if you want it after a resumed run.")
+
+        # Same reasoning as above: eval_model isn't needed once eval is
+        # done, and export_for_cpp() loads its own fresh model from
+        # best_pt -- free eval_model first so export doesn't have to
+        # compete with it.
+        del eval_model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     export_for_cpp(best_pt)
 
