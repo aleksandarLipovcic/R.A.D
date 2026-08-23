@@ -1,151 +1,89 @@
 """
 prepare_datasets.py — Multi-dataset prep for Project R.A.D detection
 =======================================================================
-Run automatically by train.py before every training run (safe/fast to
-call every time -- each step checks whether it's already done). Can also
-be run standalone to inspect what's currently included:
-
-    python prepare_datasets.py
+Run automatically by train.py before every training run (cheap -- each
+step checks whether it's already done). Can also run standalone to
+inspect what's currently included: `python prepare_datasets.py`.
 
 What it does:
-  1. Ensures VisDrone2019-DET is downloaded (auto), then remaps its 10
-     original classes into the shared taxonomy from class_map.py.
+  1. Ensures VisDrone2019-DET is downloaded, remaps its 10 classes into
+     the shared taxonomy (class_map.py).
   2. If datasets/xView/ exists, triggers xView conversion+remap.
-     CURRENTLY INACTIVE BY PROJECT DECISION -- see class_map.py's module
-     docstring for why.
-  3. UAVDT (datasets/UAVDT/) and SARD (datasets/SARD/) -- both first-class
-     top-level dataset folders, same convention as VisDrone: a data.yaml
-     (used only to read nc/names, NOT its train/val/test paths -- see
-     the note in prepare_roboflow_dataset() below for why) plus
-     {train,valid,test}/{images,labels} subfolders. Both are genuinely
-     drone-native low-altitude footage (unlike xView's satellite
-     imagery), so mosaic-compositing them together with VisDrone is
-     intentional -- see class_map.py's module docstring.
-       - UAVDT ships train/ only (no valid/test) -- auto-split by video
-         sequence (see _auto_split_by_sequence()) rather than training
-         with zero validation data.
-       - SARD ships a real train/valid/test split already -- used as-is.
-     MANUAL DOWNLOAD REQUIRED for both (Roboflow gates downloads behind
-     a free account, no public direct-download API):
+     CURRENTLY INACTIVE -- see class_map.py's docstring.
+  3. UAVDT (datasets/UAVDT/) and SARD (datasets/SARD/) -- Roboflow-style
+     folders (data.yaml + {train,valid,test}/{images,labels}), genuinely
+     drone-native so mosaic-mixing with VisDrone is fine.
+       - UAVDT ships train/ only -> auto-split by video sequence.
+       - SARD ships a real train/valid/test split, used as-is.
+     MANUAL DOWNLOAD REQUIRED (Roboflow gates downloads):
        UAVDT: https://universe.roboflow.com/kfupm-v0syf/uavdt-4g4uv
        SARD:  https://universe.roboflow.com/animesh-shastry/sard_yolo
-              (pick version "v1 Original" specifically -- other versions
-              on that project are grayscale/resized/augmented, which you
-              don't want stacked under train.py's own augmentation, or
-              mismatched against VisDrone/UAVDT's color imagery)
-     Steps for either: sign in, Download Dataset -> export format
-     "YOLOv8", skip/minimize Roboflow's own augmentation multiplier
-     (raw/1x), extract so data.yaml sits directly at datasets/UAVDT/ or
-     datasets/SARD/ (not nested inside an extra wrapper folder).
-  4. Scans datasets/external/ for any additional manually-added datasets
-     in the same data.yaml + split-folder format. Each one needs a
-     matching entry in class_map.EXTERNAL_REMAPS -- datasets without one
-     are listed but skipped, not guessed at.
-  5. Writes datasets/unified.yaml: the merged dataset config train.py
-     trains against by default, spanning every included dataset with a
-     single consistent class list. Also writes datasets/per_source_val.json
-     -- a manifest of each source's own val dir, used by train.py's
-     evaluate_per_source() to report per-dataset accuracy after training
-     (not just the blended number).
-  6. SPARSE-CLASS OVERSAMPLING -- see _oversample_sparse_classes() below.
-     Scans the assembled train image dirs for images containing any of a
-     configurable set of under-represented classes (default: motorcycle,
-     other_vehicle) and duplicates those image paths into a synthetic
-     datasets/oversample_train.txt list, appended to unified.yaml's
-     train: entries. This does NOT touch val -- only train dirs are ever
-     passed in, so val stays a clean, untouched measurement of
-     real-world distribution. Also does not modify any label files; it
-     only affects how often existing (image, label) pairs are sampled
-     per epoch. copy_paste/mixup augmentation still apply on top of
-     oversampled images same as any other -- oversampling fixes "seen
-     too rarely," copy_paste/mixup fix "not enough variety once seen."
-       NOTE (verified against Ultralytics' actual CopyPaste
-       implementation): CopyPaste only pastes objects using segmentation
-       polygons (labels["instances"].segments). VisDrone/UAVDT/SARD are
-       all bounding-box-only YOLO labels -- no polygons -- so
-       --copy-paste is currently a no-op on this pipeline regardless of
-       its value. Oversampling and mixup are the augmentation actually
-       doing sparse-class protection right now; --copy-paste is left on
-       in train.py only because it's harmless (costs nothing when
-       inert), not because it's contributing anything.
-  7. PER-CLASS INSTANCE COUNTING (new) -- see _count_instances_per_class()
-     below. Unlike the per-SOURCE counts already printed at the end of
-     main() (which tell you how many images each dataset contributed),
-     this counts total labeled INSTANCES per class across the assembled
-     train set, before oversampling. This is the number that actually
-     tells you whether a class is sparse -- a class can appear in plenty
-     of images but still trail badly in total boxes if instance density
-     per image differs (SARD frames typically have a handful of people;
-     VisDrone traffic scenes can have dozens of vehicles each). Use it to
-     sanity-check --oversample-classes rather than assuming the default
-     list (motorcycle, other_vehicle) is still the right one once
-     UAVDT/SARD are folded in -- "person" is this project's stated
-     priority class but isn't in that default list.
+              (pick "v1 Original" -- other versions are pre-augmented)
+     Export format "YOLOv8", raw/1x, extract directly into
+     datasets/UAVDT/ or datasets/SARD/ (no extra wrapper folder).
+  4. Scans datasets/external/ for extra manually-added datasets in the
+     same format -- each needs a class_map.EXTERNAL_REMAPS entry.
+  5. Writes datasets/unified.yaml (the merged training config) and
+     datasets/per_source_val.json (per-dataset val manifest, used by
+     train.py's evaluate_per_source()).
+  6. SPARSE-CLASS OVERSAMPLING -- see _oversample_sparse_classes().
+     Duplicates image paths (not labels) for under-represented classes
+     into datasets/oversample_train.txt, an extra train: entry. val is
+     never touched. NOTE: Ultralytics' CopyPaste needs segmentation
+     polygons this bbox-only data doesn't have, so --copy-paste is
+     currently a no-op regardless of value -- oversampling + mixup are
+     what's actually protecting sparse classes.
+  7. PER-CLASS INSTANCE COUNTING -- see _count_instances_per_class().
+     Total labeled instances per class across train, before
+     oversampling -- the real sparsity signal (a class can appear in
+     many images but still trail in boxes if density-per-image
+     differs). Use this to sanity-check --oversample-classes rather
+     than trusting the default (motorcycle/other_vehicle) once
+     UAVDT/SARD are folded in -- "person" (the priority class) isn't
+     in that default.
 
-=======================================================================
-V9 (2026-08-17): pending pseudo-label review images are EXCLUDED from
-every train/val/test list entirely, not merely left with fewer boxes.
-=======================================================================
-generate_pseudo_labels.py's --apply already refuses to merge boxes for
-an image that still has an undecided review item (V8) -- but before
-V9, the IMAGE ITSELF was untouched by that: it stayed in whatever
-train/val/test split it would normally fall into, carrying only
-whatever labels it already had (e.g. UAVDT's native vehicle boxes,
-missing person/motorcycle/other_vehicle until reviewed). That's a real
-problem, not just an inconsistency -- most importantly for VAL: an
-image with incomplete ground truth scores a model's correct detection
-on the missing class as a false positive, which quietly corrupts
-exactly the per-class mAP numbers train.py's report_per_class_map() /
-evaluate_per_source() exist to give a clean read on. Training on it is
-a softer cost (some frames imply "nothing here" where review just
-hasn't happened yet) but still not what this project wants: only
-images with NOTHING left pending should be usable anywhere in the
-pipeline.
+PENDING PSEUDO-LABEL REVIEW EXCLUSION: generate_pseudo_labels.py writes
+datasets/pending_review_images.json every run (dry-run or --apply) --
+every image with at least one undecided review item. Every prepare_*()
+function below drops matching images from every train/val/test list it
+builds (Roboflow-style sources only; VisDrone/xView never go through
+pseudo-labeling). This matters most for val: an image with incomplete
+ground truth would score a correct detection on the missing class as a
+false positive, corrupting per-class mAP. See _load_pending_review_images()
+/ _build_train_val_entry() / _auto_split_by_sequence(). Path comparisons
+are normcased (os.path.normcase) so a Windows separator/case mismatch
+can't let a pending image slip through silently -- see _norm_path().
+No pending_review_images.json (pseudo-labeling never run) means an
+empty exclusion set, i.e. unchanged pre-existing behavior.
 
-V9 fixes this at the source: _load_pending_review_images() reads
-datasets/pending_review_images.json (written by generate_pseudo_
-labels.py on EVERY run, dry-run or --apply -- see that module's V9
-note) and every prepare_*() function below drops any matching image
-from every train/val/test list it builds, for every Roboflow-style
-source (UAVDT, SARD, datasets/external/*). VisDrone and xView are
-untouched -- they never go through pseudo-labeling at all, so the
-exclusion set never intersects them.
+  [FIX -- review item] prepare_roboflow_dataset()'s "Using existing
+  <split>/ split (...)" summary line used to decide whether to print
+  ", after excluding pending-review images" by checking whether the
+  GLOBAL pending-review set was non-empty, not whether *this specific
+  split* actually lost any images to it. With pending-review images
+  concentrated in one source (e.g. all of them in UAVDT/train, as in
+  the first real run), every OTHER split -- including ones with zero
+  exclusions, like SARD's valid/ -- printed the "after excluding..."
+  qualifier anyway, which is simply false for those splits.
+  _build_train_val_entry() now returns the actual per-split excluded
+  count alongside the path, and the summary line's wording is driven
+  by that count instead of the global set. The per-split
+  "[pending-review exclude] N/M images ... excluded" line (printed
+  inside _build_train_val_entry() itself, unconditionally accurate)
+  was never affected by this bug -- only the one-line dataset summary
+  was misleading.
 
-Mechanically: for a directory-based split (an existing valid/ split on
-disk, e.g. SARD today), _build_train_val_entry() lists that directory's
-images, and ONLY IF something needs excluding writes a filtered .txt
-list of the survivors and returns THAT path instead of the plain
-directory -- with nothing to exclude (the common case for a source once
-it's fully reviewed), it returns the directory unchanged, identical to
-pre-V9 behavior, no new file written. For UAVDT's auto-split-by-
-sequence path (no valid/ on disk yet), _auto_split_by_sequence() now
-filters the raw image list BEFORE grouping into sequences, so an
-excluded image never even factors into which sequences get chosen for
-val -- a sequence that loses all its images to exclusion simply
-contributes nothing, rather than surviving as a mostly-empty group.
-
-Backward compatible in every direction: no datasets/pending_review_
-images.json (e.g. generate_pseudo_labels.py has never been run, or
-nothing is currently pending) means an empty exclusion set, which means
-every function below behaves EXACTLY as it did before V9 -- this is
-purely additive gating, not a rewrite of the split logic itself.
-
-EXPECT SMALLER UAVDT COUNTS RIGHT NOW: with most of UAVDT's pseudo-
-label review still outstanding, a large share of its images are
-currently excluded from train/val/test -- this is the fix working as
-intended, not a bug. The usable pool grows automatically as more images
-get reviewed and generate_pseudo_labels.py is rerun (with or without
---apply) to refresh pending_review_images.json.
-=======================================================================
-
-Remapping is idempotent and reversible: each dataset's ORIGINAL labels are
-backed up once (labels_backup_original_<split>/), and re-applied fresh from
-that backup any time class_map.py's taxonomy signature changes -- so
-editing the taxonomy and rerunning this script is always safe, never
-cumulative.
+Remapping is idempotent and reversible: each dataset's ORIGINAL labels
+are backed up once (labels_backup_original_<split>/) and re-applied
+fresh from that backup whenever class_map.py's taxonomy signature
+changes. IMPORTANT CAVEAT: that backup predates pseudo-labeling, so a
+taxonomy-triggered restore reverts to pre-pseudo-label state -- see the
+loud warning in _ensure_backup_safe_restore() below before that happens,
+and rerun generate_pseudo_labels.py --apply afterward to re-merge.
 """
 
 import json
+import os
 import random
 import re
 import shutil
@@ -163,10 +101,8 @@ from class_map import (
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# Use Ultralytics' own global datasets_dir setting rather than guessing a
-# path relative to this script -- VisDrone and any manually-added datasets
-# are downloaded/placed according to THAT setting, which may not be this
-# script's own directory.
+# Use Ultralytics' own global datasets_dir setting rather than guessing
+# a path relative to this script.
 try:
     from ultralytics.utils import SETTINGS
     DATASETS_DIR = Path(SETTINGS.get("datasets_dir", SCRIPT_DIR / "datasets"))
@@ -179,10 +115,6 @@ SARD_ROOT = DATASETS_DIR / "SARD"
 UNIFIED_YAML_PATH = DATASETS_DIR / "unified.yaml"
 PER_SOURCE_MANIFEST_PATH = DATASETS_DIR / "per_source_val.json"
 OVERSAMPLE_LIST_PATH = DATASETS_DIR / "oversample_train.txt"
-# [V9] Written by generate_pseudo_labels.py on every run (dry-run or
-# --apply) -- see that module's V9 note. Every image listed here still
-# has at least one undecided pseudo-label review item and is excluded
-# from every train/val/test list this module builds.
 PENDING_REVIEW_PATH = DATASETS_DIR / "pending_review_images.json"
 
 SIGNATURE_FILENAME = ".taxonomy_signature"
@@ -190,20 +122,16 @@ BACKUP_DIRNAME = "labels_backup_original"
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
-# Default classes to oversample if train.py doesn't pass an explicit list
-# (e.g. when this module is run standalone). Matches train.py's
-# --oversample-classes default -- keep these in sync if you change one.
-# See _count_instances_per_class() -- check real per-class counts before
-# assuming this list still covers the actual sparse classes once
-# UAVDT/SARD are folded in.
+# Matches train.py's --oversample-classes default -- keep in sync.
+# Check _count_instances_per_class()'s printed output before assuming
+# this is still the right list once UAVDT/SARD are folded in.
 DEFAULT_OVERSAMPLE_CLASSES = ["motorcycle", "other_vehicle"]
 DEFAULT_OVERSAMPLE_MULTIPLIER = 3
 
 
 def _remap_label_file(path: Path, index_remap: list) -> None:
-    """Rewrites one YOLO label .txt in place using index_remap (a list
-    where position = original class index, value = new index or None to
-    drop that line entirely)."""
+    """Rewrites one YOLO label .txt in place using index_remap (position
+    = original class index, value = new index or None to drop the line)."""
     if not path.exists():
         return
     kept_lines = []
@@ -214,18 +142,12 @@ def _remap_label_file(path: Path, index_remap: list) -> None:
         try:
             old_idx = int(parts[0])
         except (ValueError, IndexError):
-            # Malformed line (e.g. non-numeric class token, or an empty
-            # split) -- drop it rather than letting dataset prep crash
-            # on one bad annotation. Matches the defensive parsing
-            # already used in _count_instances_per_class() and
-            # _oversample_sparse_classes(); this was the one line-
-            # parsing spot in the file that wasn't guarded the same way.
-            continue
+            continue  # malformed line -- drop rather than crash prep
         if old_idx >= len(index_remap):
             continue  # unexpected class id, drop rather than crash
         new_idx = index_remap[old_idx]
         if new_idx is None:
-            continue  # this class isn't in our taxonomy -- drop it
+            continue
         kept_lines.append(" ".join([str(new_idx)] + parts[1:]))
     path.write_text("\n".join(kept_lines) + ("\n" if kept_lines else ""))
 
@@ -245,7 +167,75 @@ def _ensure_backup(labels_dir: Path, backup_dir: Path) -> None:
     shutil.copytree(labels_dir, backup_dir)
 
 
-def _restore_from_backup(labels_dir: Path, backup_dir: Path) -> None:
+def _count_label_lines(labels_dir: Path) -> int:
+    total = 0
+    if not labels_dir.exists():
+        return 0
+    for txt in labels_dir.glob("*.txt"):
+        total += sum(1 for l in txt.read_text().splitlines() if l.strip())
+    return total
+
+
+def _labels_differ_from_backup(labels_dir: Path, backup_dir: Path) -> bool:
+    """True if labels_dir's content differs from backup_dir's at all --
+    file added/removed, or any file's content changed.
+
+    [FIX -- review item #4] The original detection here was `current
+    total label lines > backup total label lines`, which is only a
+    heuristic: it misses a merge that changes content without changing
+    the total count (e.g. pseudo-labels added to some files while an
+    unrelated edit removed the same number of lines from others), and
+    it misses a merge that nets FEWER total lines than the backup
+    (e.g. pseudo-labels only touched a handful of sparse-class files).
+    Either way the loud pre-restore warning could silently fail to
+    fire on a run that genuinely has merged pseudo-labels about to be
+    discarded. Comparing actual file contents (which file names exist,
+    and each shared file's exact text) catches any of these instead of
+    only the "more total lines" case."""
+    if not backup_dir.exists():
+        return False
+    current_files = ({f.name: f for f in labels_dir.glob("*.txt")}
+                      if labels_dir.exists() else {})
+    backup_files = {f.name: f for f in backup_dir.glob("*.txt")}
+    if set(current_files) != set(backup_files):
+        return True
+    return any(cur.read_text() != backup_files[name].read_text()
+               for name, cur in current_files.items())
+
+
+def _restore_from_backup(labels_dir: Path, backup_dir: Path,
+                           dataset_label: str = "") -> None:
+    """Restores labels_dir from its pristine pre-pseudo-labeling backup.
+
+    [FIX -- review item #2] The backup is taken once, BEFORE any
+    generate_pseudo_labels.py --apply merge ever runs, but --apply
+    writes merged pseudo-labels directly into labels_dir, never into
+    the backup. So a later taxonomy change here would silently discard
+    every merged pseudo-label and revert to the pristine snapshot,
+    with nothing warning that happened. Recoverable (rerun
+    generate_pseudo_labels.py --apply -- it's idempotent and reads from
+    pseudo_labels_reviewed/, which this never touches), but only if you
+    know to do it. This now prints a loud warning BEFORE restoring
+    whenever labels_dir's content differs at all from the backup (see
+    _labels_differ_from_backup()) -- the signature of merged content
+    having been added/changed since the backup was taken."""
+    before = _count_label_lines(labels_dir)
+    backup_before = _count_label_lines(backup_dir)
+    if _labels_differ_from_backup(labels_dir, backup_dir):
+        print(f"\n  {'!' * 66}")
+        print(f"  WARNING [{dataset_label}]: about to restore {labels_dir} "
+              f"from its pre-pseudo-labeling backup ({backup_dir.name}/).")
+        print(f"  Current label files have {before} lines vs {backup_before} "
+              f"in the backup -- this looks like generate_pseudo_labels.py "
+              f"--apply has merged pseudo-labels in since the backup was "
+              f"taken. Those merged boxes are about to be DISCARDED by "
+              f"this restore (the taxonomy remap always starts from the "
+              f"original backup).")
+        print(f"  This is recoverable: rerun `python generate_pseudo_labels.py "
+              f"--apply` right after this finishes to re-merge everything "
+              f"(that merge is idempotent and reads from "
+              f"pseudo_labels_reviewed/, which is untouched by this).")
+        print(f"  {'!' * 66}\n")
     shutil.rmtree(labels_dir)
     shutil.copytree(backup_dir, labels_dir)
 
@@ -261,8 +251,7 @@ def _write_signature(root: Path, signature: str) -> None:
 
 def _count_images_in(path_str: str) -> int:
     """Counts images referenced by a train/val entry, whether it's a
-    directory or a txt list file (auto-split / oversample / [V9]
-    pending-review-filtered output)."""
+    directory or a txt list file."""
     p = Path(path_str)
     if p.is_dir():
         return sum(1 for f in p.iterdir() if f.suffix.lower() in IMAGE_EXTS)
@@ -276,8 +265,8 @@ def _count_all(paths: list[str]) -> int:
 
 
 def _iter_images_in_entry(entry: str):
-    """Yields image Paths referenced by one train/val yaml entry, whether
-    it's a directory of images or a txt list file (one path per line)."""
+    """Yields image Paths referenced by one train/val yaml entry (a dir
+    of images, or a txt list file, one path per line)."""
     p = Path(entry)
     if p.is_dir():
         for f in p.iterdir():
@@ -290,100 +279,112 @@ def _iter_images_in_entry(entry: str):
                 yield Path(line)
 
 
-def _label_path_for_image(img_path: Path) -> Path | None:
-    """
-    Best-effort mapping from an image path to its YOLO label .txt,
-    covering both dataset conventions used in this project:
-      - VisDrone-style:   .../images/<split>/x.jpg -> .../labels/<split>/x.txt
-      - Roboflow-style:   .../<split>/images/x.jpg  -> .../<split>/labels/x.txt
-    Returns None if neither pattern matches, rather than guessing wrong.
-    """
-    parts = list(img_path.parts)
-    if "images" not in parts:
+def _find_last_images_index(parts: tuple) -> int | None:
+    """[FIX -- review item #3] Shared, case-insensitive scan for the
+    LAST "images" path component in a tuple of path parts. This is the
+    single implementation both this module and generate_pseudo_labels.py
+    use for the images<->labels convention (generate_pseudo_labels.py
+    imports and calls this directly). Previously this module had its
+    own independent, exact-case copy of this scan (inside
+    _label_path_for_image below) while generate_pseudo_labels.py's copy
+    was already case-insensitive -- on Windows, where .resolve() can
+    normalize a path to its actual on-disk casing, that mismatch made
+    this module's copy silently skip real images from instance counts /
+    oversampling. One shared implementation means that can't drift out
+    of sync again. Returns None if no "images" component is found."""
+    lowered = [p.lower() for p in parts]
+    if "images" not in lowered:
         return None
-    idx = len(parts) - 1 - parts[::-1].index("images")  # last "images" segment
+    return len(parts) - 1 - lowered[::-1].index("images")
+
+
+def _label_path_for_image(img_path: Path) -> Path | None:
+    """Maps an image path to its YOLO label .txt, covering both dataset
+    conventions used in this project (VisDrone: .../images/<split>/x.jpg
+    -> .../labels/<split>/x.txt; Roboflow: .../<split>/images/x.jpg ->
+    .../<split>/labels/x.txt). Returns None if no "images" component is
+    found, or if the resulting label file doesn't exist, rather than
+    guessing wrong. Case-insensitive -- see _find_last_images_index()."""
+    parts = list(img_path.parts)
+    idx = _find_last_images_index(tuple(parts))
+    if idx is None:
+        return None
     label_parts = parts[:idx] + ["labels"] + parts[idx + 1:]
     label_path = Path(*label_parts).with_suffix(".txt")
     return label_path if label_path.exists() else None
 
 
 # ---------------------------------------------------------------------
-# [V9] Pending-review image exclusion
+# Pending-review image exclusion
 # ---------------------------------------------------------------------
 
+def _norm_path(path_str: str) -> str:
+    """Single shared normalization point for pending-review path
+    comparisons -- os.path.normcase() so a Windows path compares equal
+    regardless of '/' vs '\\' or drive-letter casing. Mirrors
+    mosaic_guard.py's InstanceCappedMosaic._dedupe_key(). No-op on
+    POSIX."""
+    return os.path.normcase(path_str)
+
+
 def _load_pending_review_images() -> set[str]:
-    """[V9] Reads datasets/pending_review_images.json (written by
-    generate_pseudo_labels.py every run -- see that module's V9 note)
-    -- every image with at least one undecided pseudo-label review item
-    right now. Returns resolved absolute path strings so filtering below
-    can compare directly against Path.resolve() output regardless of how
-    each image path was originally constructed elsewhere in the
-    pipeline. Returns an empty set (not an error) if the file doesn't
-    exist yet -- this project works fine without ever having run
-    generate_pseudo_labels.py (e.g. before pseudo-labeling starts, or a
-    source with no missing classes at all), and an empty exclusion set
-    is a correct, safe default for that case: nothing is excluded,
-    identical to pre-V9 behavior."""
+    """Reads datasets/pending_review_images.json (written by
+    generate_pseudo_labels.py every run) -- every image with at least
+    one undecided pseudo-label review item right now. Returns normcased
+    resolved absolute path strings. Empty set (not an error) if the
+    file doesn't exist yet -- a safe default meaning nothing is
+    excluded."""
     if not PENDING_REVIEW_PATH.exists():
         return set()
     with open(PENDING_REVIEW_PATH) as f:
         raw = json.load(f)
-    return set(raw)
+    return {_norm_path(p) for p in raw}
 
 
 def _build_train_val_entry(images_dir: Path, exclude_images: set[str],
-                             list_filename: str) -> str:
-    """[V9] Returns the string to use as a train:/val:/test: yaml entry
-    for one split's image directory -- the directory itself, UNLESS
-    pending-review images need excluding, in which case this writes a
-    filtered file list (one resolved absolute image path per line, same
-    format _auto_split_by_sequence() already produces) alongside the
-    dataset and returns THAT path instead.
+                             list_filename: str) -> tuple[str, int]:
+    """Returns (yaml_entry, n_excluded) for one split's image directory.
+    yaml_entry is the directory itself, unless pending-review images
+    need excluding for THIS split, in which case this writes a filtered
+    file list (one resolved absolute path per line) and returns that
+    path instead. With no exclusions for this split, returns the plain
+    directory string (no new file written) -- identical to
+    pre-exclusion behavior.
 
-    Backward compatible: with no exclusions at all (exclude_images is
-    empty, or none of this split's images happen to be in it -- the
-    ONLY case that existed before V9), this returns the plain directory
-    string exactly as before -- no new file is written unless one is
-    actually needed, so a fully-reviewed source (e.g. SARD today) sees
-    zero behavior change."""
+    [FIX -- review item] n_excluded is now returned to the caller
+    (previously this only printed its own per-split exclusion line and
+    returned the path). Callers were checking the GLOBAL exclude_images
+    set's truthiness to decide whether to mention exclusion in their
+    own summary messages, which is wrong whenever pending-review images
+    are concentrated in some OTHER split/dataset -- e.g. every pending
+    review image being in UAVDT/train doesn't mean SARD's valid/ split
+    excluded anything, but the old code's summary line claimed it did.
+    Returning the real per-split count lets callers get this right."""
     if not exclude_images:
-        return str(images_dir.resolve())
+        return str(images_dir.resolve()), 0
     all_images = [p for p in images_dir.iterdir() if p.suffix.lower() in IMAGE_EXTS]
-    kept = [p for p in all_images if str(p.resolve()) not in exclude_images]
+    kept = [p for p in all_images
+            if _norm_path(str(p.resolve())) not in exclude_images]
     n_excluded = len(all_images) - len(kept)
     if n_excluded == 0:
-        return str(images_dir.resolve())
+        return str(images_dir.resolve()), 0
     list_path = images_dir.parent / list_filename
     list_path.write_text("\n".join(str(p.resolve()) for p in kept) + "\n")
     print(f"    [pending-review exclude] {n_excluded}/{len(all_images)} images "
           f"in {images_dir} still have an undecided review item -- excluded; "
           f"{len(kept)} usable image(s) written to {list_path.name}")
-    return str(list_path)
+    return str(list_path), n_excluded
 
 
 # ---------------------------------------------------------------------
-# Per-class instance counting (new) -- see module docstring point 7.
+# Per-class instance counting
 # ---------------------------------------------------------------------
 
 def _count_instances_per_class(dirs: list[str]) -> dict[str, int]:
-    """
-    Scans every label file referenced by `dirs` (dataset dirs or txt list
-    files -- covers both VisDrone/Roboflow-style dirs and UAVDT's
-    auto-split txt lists) and counts total labeled INSTANCES per class
-    name -- not images.
-
-    This is deliberately separate from the per-SOURCE image counts
-    already printed at the end of main(): a source's image count doesn't
-    tell you which CLASS is actually sparse once everything is merged.
-    A class can appear in plenty of images but still trail badly in
-    total boxes if instance density per image differs -- e.g. SARD
-    frames typically contain a handful of people each, while VisDrone
-    traffic scenes can have dozens of vehicles in one frame. Only a
-    direct instance count across the merged set answers "is person
-    actually underrepresented relative to the vehicle classes."
-
-    Read-only -- does not touch any label file, purely a reporting pass.
-    """
+    """Scans every label file referenced by `dirs` and counts total
+    labeled INSTANCES per class name (not images) -- the actual signal
+    for whether a class is sparse, since instance density per image
+    varies by source. Read-only reporting pass."""
     counts = {name: 0 for name in UNIFIED_CLASSES}
     for entry in dirs:
         for img_path in _iter_images_in_entry(entry):
@@ -410,30 +411,15 @@ def _count_instances_per_class(dirs: list[str]) -> dict[str, int]:
 def _oversample_sparse_classes(train_dirs: list[str], target_classes: list[str],
                                  multiplier: int = DEFAULT_OVERSAMPLE_MULTIPLIER
                                  ) -> list[str]:
-    """
-    Scans every image referenced by train_dirs (directories OR txt list
-    files -- covers both VisDrone/Roboflow-style dirs and UAVDT's
-    auto-split txt lists) for labels containing any class in
-    target_classes, and writes datasets/oversample_train.txt containing
-    (multiplier - 1) EXTRA copies of each matching image's absolute path.
-    That txt is added as an additional train: entry -- Ultralytics
-    accepts repeated image paths across multiple train: list entries,
-    each occurrence sampled independently per epoch, which is what
-    actually increases how often the model sees these classes.
-
-    Does NOT touch val_dirs (never passed in here) and does NOT modify
-    any label file -- purely a sampling-frequency change over existing
-    (image, label) pairs. Idempotent: reruns overwrite
-    oversample_train.txt fresh rather than compounding.
-
-    train_dirs is expected to already be pending-review-filtered (V9) --
-    this function itself does no exclusion of its own, it just samples
-    from whatever image paths it's handed.
-
-    target_classes=[] or multiplier<=1 is a no-op (returns [] without
-    writing anything), so this is safe to call unconditionally from
-    main().
-    """
+    """Scans every train image for labels containing any target class
+    and writes datasets/oversample_train.txt with (multiplier-1) extra
+    copies of each matching image's path, added as an extra train:
+    entry -- Ultralytics samples repeated paths independently per
+    epoch. Never touches val_dirs or any label file -- pure sampling-
+    frequency change. Idempotent (overwrites fresh each run). train_dirs
+    is expected to already be pending-review-filtered; this does no
+    exclusion of its own. No-op (returns []) if target_classes is empty
+    or multiplier<=1."""
     if not target_classes or multiplier <= 1:
         return []
 
@@ -475,9 +461,7 @@ def _oversample_sparse_classes(train_dirs: list[str], target_classes: list[str],
 
     if not extra_paths:
         print(f"  [oversample] Scanned {scanned} images, found none "
-              f"matching {target_names} -- nothing to oversample "
-              f"(datasets not prepared yet, or these classes are truly "
-              f"absent from the current train set).")
+              f"matching {target_names} -- nothing to oversample.")
         if OVERSAMPLE_LIST_PATH.exists():
             OVERSAMPLE_LIST_PATH.unlink()
         return []
@@ -486,36 +470,26 @@ def _oversample_sparse_classes(train_dirs: list[str], target_classes: list[str],
     OVERSAMPLE_LIST_PATH.write_text("\n".join(extra_paths) + "\n")
     print(f"  [oversample] {matched}/{scanned} train images contained a "
           f"target class -- wrote {len(extra_paths)} duplicate entries to "
-          f"{OVERSAMPLE_LIST_PATH.name} ({multiplier}x total exposure for "
-          f"those images).")
+          f"{OVERSAMPLE_LIST_PATH.name} ({multiplier}x total exposure).")
     return [str(OVERSAMPLE_LIST_PATH)]
 
 
 # ---------------------------------------------------------------------
 # Sequence-aware auto-split (used when a Roboflow dataset ships train/
-# only, no valid/test -- currently UAVDT, but shared for anything else
-# that ends up in this situation).
+# only, no valid/test -- currently UAVDT).
 # ---------------------------------------------------------------------
 
-# Roboflow appends "_<ext>.rf.<hash>" to the original filename on export
-# (e.g. "M0101_000203_jpg.rf.ab12cd34ef1234567890.jpg"). Strip that before
-# trying to find the original sequence/frame-number structure underneath.
+# Roboflow appends "_<ext>.rf.<hash>" on export -- strip before finding
+# the original sequence/frame-number structure.
 _ROBOFLOW_SUFFIX_RE = re.compile(r"_(?:jpg|jpeg|png)\.rf\.[0-9a-fA-F]+$")
 
 
 def _infer_sequence_key(image_name: str) -> str:
-    """
-    Best-effort grouping key for a video-frame filename, so a train/val
-    split can keep whole sequences together instead of splitting
-    consecutive near-duplicate frames across both sets.
-
-    'M0101_000203_jpg.rf.ab12cd34ef.jpg' -> 'M0101'
-    Falls back to the full (de-suffixed) stem if no trailing digit run
-    is found. Verified against real UAVDT filenames from this project's
-    actual export -- if a different mirror/export names things
-    differently, check a handful of real filenames under train/images/
-    and adjust the regex if grouping looks wrong.
-    """
+    """Best-effort grouping key for a video-frame filename, so a
+    train/val split keeps whole sequences together instead of splitting
+    consecutive near-duplicate frames across both. Falls back to the
+    de-suffixed stem if no trailing digit run is found. Verified against
+    real UAVDT filenames from this project's export."""
     stem = Path(image_name).stem
     stem = _ROBOFLOW_SUFFIX_RE.sub("", stem)
     m = re.match(r"^(.*?)[\-_]?(\d+)$", stem)
@@ -525,31 +499,24 @@ def _infer_sequence_key(image_name: str) -> str:
 def _auto_split_by_sequence(images_dir: Path, out_train: Path, out_val: Path,
                               val_fraction: float = 0.1, seed: int = 42,
                               exclude_images: set[str] | None = None) -> None:
-    """
-    Writes out_train/out_val as txt files (one absolute image path per
-    line -- Ultralytics accepts these directly as train:/val: entries,
-    same mechanism xView's autosplit_*.txt already used), splitting
-    whole video SEQUENCES (not individual frames) between them so no
-    clip leaks near-duplicate frames across train and val.
+    """Writes out_train/out_val as txt files (one absolute image path
+    per line), splitting whole video SEQUENCES between them so no clip
+    leaks near-duplicate frames across train and val.
 
-    [V9] exclude_images: resolved absolute path strings (see
-    _load_pending_review_images()) to drop BEFORE grouping into
-    sequences -- an image still waiting on pseudo-label review never
-    enters either split. Filtering happens at THIS level, not by post-
-    processing the written txt files afterward, so val_fraction's
-    sequence selection is computed over the already-clean pool rather
-    than being skewed by sequences that lose most of their frames to
-    exclusion after the split was already chosen. A sequence that has
-    zero remaining images after filtering simply never appears in
-    `sequences` below -- no empty-group artifacts.
-    """
+    exclude_images (normcased resolved paths) is filtered out BEFORE
+    grouping into sequences, so a still-pending image never enters
+    either split and val_fraction's sequence selection isn't skewed by
+    sequences that lose most frames to exclusion after the fact. A
+    sequence with zero remaining images after filtering simply doesn't
+    appear -- no empty-group artifacts."""
     exclude_images = exclude_images or set()
     images = sorted(p for p in images_dir.iterdir()
                      if p.suffix.lower() in IMAGE_EXTS)
 
     if exclude_images:
         before = len(images)
-        images = [p for p in images if str(p.resolve()) not in exclude_images]
+        images = [p for p in images
+                  if _norm_path(str(p.resolve())) not in exclude_images]
         n_excluded = before - len(images)
         if n_excluded:
             print(f"    [pending-review exclude] {n_excluded}/{before} images "
@@ -585,20 +552,14 @@ def _auto_split_by_sequence(images_dir: Path, out_train: Path, out_val: Path,
 
 
 # ---------------------------------------------------------------------
-# VisDrone (Ultralytics auto-download convention: images/<split>,
-# labels/<split> -- different shape from the Roboflow datasets below,
-# handled separately for that reason).
+# VisDrone (Ultralytics auto-download convention).
 # ---------------------------------------------------------------------
 
 def prepare_visdrone(signature: str) -> dict:
-    """Downloads VisDrone (no-op if already present) and remaps its
-    labels into the unified taxonomy. Returns {"train": [...], "val": [...]}
-    absolute image-dir paths for the merged yaml.
-
-    [V9] Never touches pending-review exclusion -- VisDrone doesn't go
-    through the pseudo-labeling/review pipeline at all (it's remapped
-    directly from its own real labels), so no image of its could ever
-    appear in datasets/pending_review_images.json in the first place."""
+    """Downloads VisDrone (no-op if present) and remaps its labels.
+    Returns {"train": [...], "val": [...]} absolute image-dir paths.
+    Never touches pending-review exclusion -- VisDrone doesn't go
+    through the pseudo-labeling pipeline at all."""
     from ultralytics.data.utils import check_det_dataset
 
     print("\n[VisDrone] Checking dataset (auto-downloads on first run)...")
@@ -614,7 +575,7 @@ def prepare_visdrone(signature: str) -> dict:
             if not labels_dir.exists():
                 continue
             _ensure_backup(labels_dir, backup_dir)
-            _restore_from_backup(labels_dir, backup_dir)
+            _restore_from_backup(labels_dir, backup_dir, f"VisDrone/{split}")
             n = _apply_remap_to_split(labels_dir, index_remap)
             print(f"  [{split}] remapped {n} label files")
         _write_signature(root, signature)
@@ -632,17 +593,12 @@ def prepare_visdrone(signature: str) -> dict:
 # ---------------------------------------------------------------------
 
 def prepare_xview(signature: str) -> dict:
-    """
-    INACTIVE by project decision -- see class_map.py's module docstring.
-    Still gracefully skips if datasets/xView/ doesn't exist (the normal
-    case now). If someone DOES drop datasets/xView/ back in without
-    first re-adding building/shed/parking_lot to UNIFIED_CLASSES, this
-    fails with a clear message rather than a cryptic error three calls
-    deep in xview_index_remap().
-
-    [V9] Never touches pending-review exclusion -- same reasoning as
-    prepare_visdrone(), xView never goes through pseudo-labeling.
-    """
+    """INACTIVE by project decision. Skips cleanly if datasets/xView/
+    doesn't exist. Fails with a clear message (rather than a cryptic
+    error deep in xview_index_remap()) if xView IS present but
+    building/shed/parking_lot aren't in the current taxonomy. Never
+    touches pending-review exclusion -- xView never goes through
+    pseudo-labeling."""
     xview_root = DATASETS_DIR / "xView"
     if not xview_root.exists():
         return {"train": [], "val": []}
@@ -650,16 +606,13 @@ def prepare_xview(signature: str) -> dict:
     if "building" not in UNIFIED_CLASSES:
         raise RuntimeError(
             "datasets/xView/ is present, but building/shed/parking_lot "
-            "were removed from UNIFIED_CLASSES (see class_map.py's module "
-            "docstring for why). Either remove datasets/xView/, or "
-            "re-add matching target classes to UNIFIED_CLASSES first if "
-            "you're intentionally re-enabling satellite structure data."
+            "were removed from UNIFIED_CLASSES (see class_map.py). Either "
+            "remove datasets/xView/, or re-add matching classes first."
         )
 
     from ultralytics.data.utils import check_det_dataset
 
-    print("\n[xView] Found dataset -- checking/converting (one-time "
-          "GeoJSON->YOLO conversion + autosplit on first run)...")
+    print("\n[xView] Found dataset -- checking/converting...")
     try:
         data = check_det_dataset("xView.yaml")
     except Exception as e:
@@ -674,7 +627,7 @@ def prepare_xview(signature: str) -> dict:
         backup_dir = root / BACKUP_DIRNAME / "train"
         if labels_dir.exists():
             _ensure_backup(labels_dir, backup_dir)
-            _restore_from_backup(labels_dir, backup_dir)
+            _restore_from_backup(labels_dir, backup_dir, "xView/train")
             n = _apply_remap_to_split(labels_dir, xview_index_remap())
             print(f"  [train] remapped {n} label files")
         _write_signature(root, signature)
@@ -691,36 +644,26 @@ def prepare_xview(signature: str) -> dict:
 
 # ---------------------------------------------------------------------
 # Shared handler for Roboflow-style datasets (data.yaml + {train,valid,
-# test}/{images,labels}) -- used by UAVDT, SARD, and anything under
-# datasets/external/.
+# test}/{images,labels}) -- used by UAVDT, SARD, datasets/external/.
 # ---------------------------------------------------------------------
 
 def prepare_roboflow_dataset(display_name: str, root: Path,
                                remap_key: str, signature: str,
                                exclude_images: set[str] | None = None) -> dict:
-    """
-    Handles one Roboflow-exported dataset folder. Returns
+    """Handles one Roboflow-exported dataset folder. Returns
     {"train": [...], "val": [...], "test": [...]} -- test is remapped
-    (so it's ready if you ever want it) but never folded into train/val,
-    kept as a genuinely untouched held-out set.
+    but never folded into train/val.
 
-    Deliberately does NOT trust data.yaml's own train:/val:/test: path
-    entries -- Roboflow writes these as "../train/images" etc, which
-    assumes data.yaml sits one directory level deeper than it actually
-    does when extracted directly into root/ (the convention this
-    project uses). Resolving that literally would walk OUT of the
-    dataset's own folder. Instead this uses the fixed convention
-    directly: root/<split>/images, root/<split>/labels. data.yaml is
-    only read for nc/names.
+    Deliberately ignores data.yaml's own train:/val:/test: entries
+    (Roboflow writes "../train/images", which assumes an extra nesting
+    level this project doesn't use) -- uses the fixed convention
+    root/<split>/images, root/<split>/labels instead. data.yaml is only
+    read for nc/names.
 
-    [V9] exclude_images: resolved absolute path strings (see
-    _load_pending_review_images()) -- any image still awaiting pseudo-
-    label review is dropped from every split's output entirely, not
-    just left with fewer boxes. See _build_train_val_entry() (for the
-    existing-valid/-split branch) and _auto_split_by_sequence() (for
-    the no-valid/-split branch) for the actual filtering. Empty/None
-    exclude_images reproduces pre-V9 behavior exactly.
-    """
+    exclude_images (normcased resolved paths): any image still awaiting
+    pseudo-label review is dropped from every split entirely, not just
+    left with fewer boxes -- see _build_train_val_entry() and
+    _auto_split_by_sequence(). Empty/None reproduces unfiltered behavior."""
     empty = {"train": [], "val": [], "test": []}
     exclude_images = exclude_images or set()
 
@@ -742,7 +685,14 @@ def prepare_roboflow_dataset(display_name: str, root: Path,
         meta = yaml.safe_load(f)
     names = meta.get("names")
     if isinstance(names, dict):
-        names = [names[i] for i in sorted(names.keys())]
+        # [FIX -- review item] sorted(names.keys()) sorts lexicographically
+        # when Roboflow/YAML writes the keys as strings ("0","1","10","2",
+        # ...), producing 0,1,10,2,... instead of 0,1,2,...,10 -- silently
+        # scrambling the class-index<->name mapping used to build
+        # index_remap below. Sort by the keys' integer value instead so
+        # this is correct regardless of whether YAML parsed the keys as
+        # int or str.
+        names = [names[k] for k in sorted(names.keys(), key=lambda k: int(k))]
     if not names:
         print(f"\n[{display_name}] data.yaml has no usable 'names' list -- skipping.")
         return empty
@@ -775,7 +725,8 @@ def prepare_roboflow_dataset(display_name: str, root: Path,
                 continue
             backup_dir = images_dir.parent / f"{BACKUP_DIRNAME}_{split}"
             _ensure_backup(labels_dir, backup_dir)
-            _restore_from_backup(labels_dir, backup_dir)
+            _restore_from_backup(labels_dir, backup_dir,
+                                   f"{display_name}/{split}")
             n = _apply_remap_to_split(labels_dir, index_remap)
             print(f"    [{split}] remapped {n} label files")
         _write_signature(root, signature)
@@ -787,21 +738,26 @@ def prepare_roboflow_dataset(display_name: str, root: Path,
         "val" if "val" in split_image_dirs else None)
 
     if val_key:
-        # [V9] _build_train_val_entry() returns the plain directory
-        # unchanged when nothing needs excluding (the common case once a
-        # source is fully reviewed) -- only writes a filtered list file
-        # when there's actually something to filter out.
-        train_out = [_build_train_val_entry(
-            split_image_dirs["train"], exclude_images, "train_filtered.txt")]
-        val_out = [_build_train_val_entry(
-            split_image_dirs[val_key], exclude_images, f"{val_key}_filtered.txt")]
+        train_path, _train_excluded = _build_train_val_entry(
+            split_image_dirs["train"], exclude_images, "train_filtered.txt")
+        train_out = [train_path]
+        val_path, val_excluded = _build_train_val_entry(
+            split_image_dirs[val_key], exclude_images, f"{val_key}_filtered.txt")
+        val_out = [val_path]
+        # [FIX -- review item] this used to check truthiness of the
+        # GLOBAL exclude_images set here, which made every dataset's
+        # summary line claim "after excluding pending-review images"
+        # whenever ANY pending-review images existed anywhere in the
+        # whole run -- even for a split (like SARD's valid/ when every
+        # pending image was in UAVDT/train) that excluded zero images.
+        # val_excluded is this split's actual excluded count, so the
+        # qualifier now only appears when it's true for this split.
         print(f"  [{display_name}] Using existing {val_key}/ split "
               f"({_count_images_in(val_out[0])} images"
-              f"{', after excluding pending-review images' if exclude_images else ''}).")
+              f"{', after excluding pending-review images' if val_excluded else ''}).")
     else:
         print(f"  [{display_name}] No valid/val split found on disk -- "
-              f"auto-splitting train/ by sequence instead of training "
-              f"with zero validation data.")
+              f"auto-splitting train/ by sequence instead.")
         out_train = root / "auto_split_train.txt"
         out_val = root / "auto_split_val.txt"
         _auto_split_by_sequence(split_image_dirs["train"], out_train, out_val,
@@ -811,11 +767,13 @@ def prepare_roboflow_dataset(display_name: str, root: Path,
 
     test_out: list[str] = []
     if "test" in split_image_dirs:
-        test_out = [_build_train_val_entry(
-            split_image_dirs["test"], exclude_images, "test_filtered.txt")]
+        test_path, test_excluded = _build_train_val_entry(
+            split_image_dirs["test"], exclude_images, "test_filtered.txt")
+        test_out = [test_path]
         print(f"  [{display_name}] test/ split found "
-              f"({_count_images_in(test_out[0])} images) -- labels "
-              f"remapped but held out, not used for training/val.")
+              f"({_count_images_in(test_out[0])} images"
+              f"{', after excluding pending-review images' if test_excluded else ''}) "
+              f"-- labels remapped but held out, not used for training/val.")
 
     return {"train": train_out, "val": val_out, "test": test_out}
 
@@ -831,26 +789,45 @@ def prepare_sard(signature: str, exclude_images: set[str] | None = None) -> dict
 
 
 def prepare_external(signature: str, exclude_images: set[str] | None = None) -> dict:
-    """Scans datasets/external/<key>/ for any additional manually-added
-    datasets in the same Roboflow-style format UAVDT/SARD use. Each
-    folder needs a matching class_map.EXTERNAL_REMAPS[key] entry --
-    folders without one are reported and skipped, not guessed at."""
+    """Scans datasets/external/<key>/ for extra manually-added datasets
+    in the same Roboflow-style format. Folders without a matching
+    class_map.EXTERNAL_REMAPS entry are reported and skipped.
+
+    Returns {"train": [...], "val": [...], "sources": {...}} -- "train"/
+    "val" are the flattened lists (unchanged shape, so existing callers
+    that just fold external_dirs["train"]/["val"] into the overall
+    train_dirs/val_dirs keep working). "sources" additionally keys each
+    non-empty external dataset individually as "external/<folder name>"
+    -> {"train":[...], "val":[...], "test":[...]}.
+
+    [FIX -- review item] Previously this only returned the flattened
+    "train"/"val" lists, so every external dataset's val split was
+    merged into one anonymous blob before reaching
+    write_per_source_manifest() -- external datasets participated in
+    training/validation but never appeared individually in
+    datasets/per_source_val.json, so train.py's evaluate_per_source()
+    had no way to report accuracy for e.g. datasets/external/foo/ on
+    its own. "sources" lets main() merge these into named_sources
+    without losing each dataset's identity."""
     train_dirs: list[str] = []
     val_dirs: list[str] = []
+    sources: dict[str, dict] = {}
 
     if not EXTERNAL_DIR.exists():
-        return {"train": train_dirs, "val": val_dirs}
+        return {"train": train_dirs, "val": val_dirs, "sources": sources}
 
     for folder in sorted(EXTERNAL_DIR.iterdir()):
         if not folder.is_dir():
             continue
-        result = prepare_roboflow_dataset(f"external/{folder.name}", folder,
-                                            folder.name, signature,
+        key = f"external/{folder.name}"
+        result = prepare_roboflow_dataset(key, folder, folder.name, signature,
                                             exclude_images)
         train_dirs.extend(result["train"])
         val_dirs.extend(result["val"])
+        if result["train"] or result["val"] or result.get("test"):
+            sources[key] = result
 
-    return {"train": train_dirs, "val": val_dirs}
+    return {"train": train_dirs, "val": val_dirs, "sources": sources}
 
 
 def write_unified_yaml(train_dirs: list, val_dirs: list) -> Path:
@@ -868,15 +845,9 @@ def write_unified_yaml(train_dirs: list, val_dirs: list) -> Path:
 
 
 def write_per_source_manifest(sources: dict[str, dict]) -> None:
-    """
-    Writes datasets/per_source_val.json: {source_name: [val_dir_or_txt,
-    ...]} for every source that has a val set. train.py's
-    evaluate_per_source() reads this after training to report accuracy
-    per DATASET (VisDrone/UAVDT/SARD individually), not just the single
-    blended unified.yaml number -- the only way to actually tell whether
-    adding UAVDT/SARD helped, since a gain on one source can hide a
-    regression on another in a blended average.
-    """
+    """Writes datasets/per_source_val.json: {source: [val_dir_or_txt,
+    ...]} -- train.py's evaluate_per_source() reads this to report
+    accuracy per dataset, not just the blended unified.yaml number."""
     manifest = {name: d["val"] for name, d in sources.items() if d["val"]}
     with open(PER_SOURCE_MANIFEST_PATH, "w") as f:
         json.dump(manifest, f, indent=2)
@@ -884,26 +855,18 @@ def write_per_source_manifest(sources: dict[str, dict]) -> None:
 
 def main(oversample_classes: list[str] | None = None,
          oversample_multiplier: int = DEFAULT_OVERSAMPLE_MULTIPLIER) -> Path:
-    """
-    oversample_classes: UNIFIED_CLASSES names to duplicate train image
-    paths for (see _oversample_sparse_classes()). Defaults to
-    DEFAULT_OVERSAMPLE_CLASSES (motorcycle/other_vehicle) when this
-    module is run standalone (`python prepare_datasets.py`); train.py
-    passes its own --oversample-classes value explicitly. Pass [] to
-    disable oversampling entirely.
+    """oversample_classes: UNIFIED_CLASSES names to duplicate train
+    image paths for. Defaults to DEFAULT_OVERSAMPLE_CLASSES when run
+    standalone; train.py passes its own --oversample-classes. Pass []
+    to disable.
 
-    Check the "Per-class instance counts" block this prints (new) before
-    trusting that default -- it's based on VisDrone alone and may not
-    reflect the actual sparsest class once UAVDT/SARD are folded in.
-    "person" is this project's stated priority class and is NOT in the
-    default oversample list.
+    Check the "Per-class instance counts" block this prints before
+    trusting the default -- "person" (the priority class) isn't in it.
 
-    [V9] Loads datasets/pending_review_images.json once (see
-    _load_pending_review_images()) and threads it through UAVDT/SARD/
-    external -- any image still awaiting pseudo-label review is excluded
-    from every train/val/test list built below, not just left with
-    fewer boxes. See this module's V9 docstring note.
-    """
+    Loads datasets/pending_review_images.json once and threads it
+    through UAVDT/SARD/external -- any image still awaiting pseudo-
+    label review is excluded from every train/val/test list built
+    below."""
     if oversample_classes is None:
         oversample_classes = DEFAULT_OVERSAMPLE_CLASSES
 
@@ -911,18 +874,12 @@ def main(oversample_classes: list[str] | None = None,
     print(f"Taxonomy signature: {signature}")
     print(f"Unified classes ({len(UNIFIED_CLASSES)}): {UNIFIED_CLASSES}")
 
-    # [V9] Loaded once, up front, so every source below excludes the
-    # exact same current snapshot of pending images -- empty set (no-op,
-    # identical to pre-V9 behavior) if generate_pseudo_labels.py has
-    # never been run or nothing is currently pending.
     exclude_images = _load_pending_review_images()
     if exclude_images:
         print(f"\n[pending-review] {len(exclude_images)} image(s) listed in "
               f"{PENDING_REVIEW_PATH.name} still have an undecided pseudo-"
               f"label review item -- excluded from every train/val/test "
-              f"list built below until fully reviewed. Rerun generate_"
-              f"pseudo_labels.py (with or without --apply) after more "
-              f"review happens to shrink this list.")
+              f"list built below until fully reviewed.")
     else:
         print(f"\n[pending-review] No {PENDING_REVIEW_PATH.name} found (or "
               f"it's empty) -- nothing excluded on that basis.")
@@ -940,13 +897,6 @@ def main(oversample_classes: list[str] | None = None,
                 + uavdt_dirs["val"] + sard_dirs["val"]
                 + external_dirs["val"])
 
-    # Per-class instance counts (new) -- computed on train_dirs BEFORE
-    # oversampling duplicates anything, so this reflects the real,
-    # naturally-occurring class balance across the merged dataset. This
-    # is what should actually drive --oversample-classes, not an assumed
-    # default -- see this function's docstring. [V9] train_dirs here is
-    # already pending-review-filtered, so these counts reflect only
-    # fully-reviewed (or never-queued) images.
     print(f"\n{'=' * 70}")
     print("Per-class instance counts (train, before oversampling)")
     print(f"{'=' * 70}")
@@ -954,14 +904,11 @@ def main(oversample_classes: list[str] | None = None,
     for name, n in class_counts.items():
         flag = "  <- in --oversample-classes" if name in oversample_classes else ""
         print(f"  {name:15s}  {n:>7}{flag}")
-    print("Use this to sanity-check --oversample-classes -- a class can "
-          "be the stated priority (e.g. 'person') and still end up the "
-          "most underrepresented one if it isn't in that list.")
+    print("Use this to sanity-check --oversample-classes -- a stated "
+          "priority class can still be the most underrepresented one if "
+          "it isn't in that list.")
     print(f"{'=' * 70}")
 
-    # Oversampling only ever ADDS extra train: entries (duplicate image
-    # paths) -- val_dirs is never touched, so val stays a clean,
-    # untouched measurement of real-world class distribution.
     oversample_dirs = _oversample_sparse_classes(
         train_dirs, target_classes=oversample_classes,
         multiplier=oversample_multiplier)
@@ -969,10 +916,19 @@ def main(oversample_classes: list[str] | None = None,
 
     yaml_path = write_unified_yaml(train_dirs, val_dirs)
 
+    # [FIX -- review item] external datasets used to be missing from
+    # named_sources entirely -- write_per_source_manifest() (and the
+    # per-source summary printed below) only ever saw VisDrone/UAVDT/
+    # SARD, so anything under datasets/external/ participated in
+    # training/val but never got its own line in per_source_val.json.
+    # external_dirs["sources"] keys each one individually as
+    # "external/<name>", so **-unpacking it here gives every external
+    # dataset the same per-source visibility as the built-in ones.
     named_sources = {
         "VisDrone": visdrone_dirs,
         "UAVDT": uavdt_dirs,
         "SARD": sard_dirs,
+        **external_dirs["sources"],
     }
     write_per_source_manifest(named_sources)
 

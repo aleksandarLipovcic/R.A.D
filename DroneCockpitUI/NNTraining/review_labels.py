@@ -4,711 +4,92 @@ generate_pseudo_labels.py produces (datasets/pseudo_labels_review_queue.
 json). Shows one image at a time with its queued boxes overlaid; click
 a box to accept/reject/reclassify it, or drag on empty space to draw a
 new box the queue missed entirely. Progress autosaves as you go --
-close it anytime, rerun later, it picks up where you left off.
+close it anytime, rerun later, it picks up where you left off. Tkinter
+GUI (+ Pillow for image display).
 
-V5 NOTE: full rewrite of the interaction layer, OpenCV's highgui window
-+ keyboard commands (V1-V4) replaced with a Tkinter GUI. Same
-review_progress.json shape, same pseudo_labels_reviewed/ output tree,
-same --source/--cls/--show-all/--show-original flags. New runtime
-dependency: Pillow (PIL).
+FEATURES
+  Queue (model) boxes -- click opens a menu: Accept / Reject / Reset to
+  Pending / Change Class / "Delete (hide from view, recoverable)".
+  Click-only by default; a menu option "Enable Reposition" arms exactly
+  one drag (move or resize) on that box, then re-locks. Deleted boxes
+  are hidden unless "Show deleted" is checked, and can be reset back to
+  pending from there.
 
-V6 NOTE -- bugfix + zoom/pan release.
-  1. FIXED: item_key() used to hash a queue item's CURRENT "box" field.
-     Dragging a box changed its own key mid-session, so self.decisions
-     (and the progress file) still had the OLD key -> KeyError on the
-     next redraw(), which cascaded into _get_box() returning garbage
-     for manual boxes too (TypeError: list indices ... not str). Fixed
-     by deriving item_key() from item["_orig_box"] -- captured once,
-     read-only, right after the queue JSON loads -- instead of the
-     live/editable "box" field.
-  2. FIXED: _get_box()/_set_box() silently fell through to the wrong
-     branch on a lookup miss instead of failing loudly.
-  3. ADDED: queue-item box positions now actually persist across
-     relaunches (previously only the decision did).
-  4. ADDED: zoom (mouse wheel / +/- / 0-to-fit) + pan (scrollbars,
-     middle-click-drag).
+  Manual boxes (cyan, hand-drawn) -- drag on empty canvas to draw one;
+  picking its class auto-accepts it. Freely draggable and resizable (8
+  handles: 4 corners + 4 edge midpoints, min size MIN_BOX_PX). Ctrl+C /
+  Ctrl+V copies the selected box as a new manual box, offset by
+  PASTE_OFFSET_PX; repeated Ctrl+V without a new Ctrl+C cascades
+  further each time.
 
-V7 NOTE -- workflow/safety release.
-  1. DRAGGING IS NOW LOCKED DOWN. Only boxes YOU drew (cyan, "manual")
-     can be dragged by default. The model's own proposed boxes (queue
-     items) can no longer be bumped out of place by an accidental
-     click-drag -- clicking one always just opens its menu. If a queue
-     box genuinely needs repositioning before you accept it, its menu
-     has an explicit "Enable Reposition (then drag once)" -- one
-     deliberate click arms exactly one drag on that one box, then it
-     locks again. Original dataset labels (magenta) were never
-     clickable/draggable in the first place (no code path registers
-     them as interactive) -- that's unchanged, and is exactly the
-     guarantee you asked for: nothing you didn't explicitly draw can be
-     moved by mistake.
-  2. ADDED: a small per-model detection-count panel under the toolbar
-     ("this image: yv=3 rf=2 yc=0 dn=4") so a model contributing
-     nothing to an image is visible at a glance (shown in red) instead
-     of just... not being there. Counts are independent of the
-     show/hide checkboxes -- they reflect what's actually in the queue
-     for this image, not just what's currently displayed.
-  3. ADDED: real autosave. Every accept/reject/class-change/manual add/
-     delete/reposition writes to disk automatically (debounced ~1s so
-     rapid clicking doesn't thrash the file; navigating to another
-     image or closing the window always flushes immediately,
-     un-debounced). The old "save before continuing?" prompt is gone --
-     there's nothing left to prompt about, your work is already on
-     disk. A manual Save button/File>Save/'s' key still exist if you
-     just want the reassurance.
-  4. ADDED: a genuinely separate "done" list. Once every box in an
-     image has a decision (nothing pending), that image's path is
-     written to datasets/review_completed.json. The normal review
-     session never shows images from that list (so you can't
-     accidentally re-review something someone else should QA), and a
-     new --qa flag opens a session sourced ONLY from that list, for a
-     second person to check over already-decided images. An image
-     drops back out of the completed list automatically if you (or the
-     QA reviewer) reset something back to pending.
-  5. CHANGED DEFAULT: original dataset labels are now shown by default
-     (they used to require --show-original). Since the whole point of
-     showing them is "don't manually re-label something that's already
-     in the real dataset", defaulting to hidden worked against that.
-     Pass --hide-original if you want the old default back.
+  Original dataset labels (magenta) -- reference only, shown by default
+  (--hide-original to hide), never selectable/draggable.
 
-V8 NOTE -- deletion, undo/redo, and speed release.
-  1. ADDED: queue (model) boxes can now be genuinely DELETED, not just
-     rejected. Reject already excluded a box from the accepted output,
-     but kept it on screen forever as a red box -- there was no way to
-     get it out of your visual field the way manual boxes could be
-     removed with their menu's Delete option. "Delete" is now a new
-     decision state that behaves exactly like reject for output
-     purposes (never in accepted_items()) but is hidden from the
-     canvas by default. A "Show deleted (recoverable)" checkbox in the
-     toolbar reveals them again (drawn grey/dashed) so you can hit
-     "Reset to Pending" on one if you deleted it by mistake -- nothing
-     is ever unrecoverable short of you never re-showing the checkbox.
-     Original dataset labels (magenta) are UNCHANGED by this -- they
-     still have no decision state at all and still cannot be selected,
-     dragged, or deleted; this whole feature only applies to the 4
-     models' queue boxes, exactly as asked.
-  2. ADDED: full undo/redo. Every mutation (accept/reject/delete/reset,
-     class override, manual add/delete/class-change, and box drags)
-     snapshots the per-image state onto an undo stack first via
-     _push_undo(). Ctrl+Z / Ctrl+Y (and Ctrl+Shift+Z) walk backward and
-     forward through it; also in File menu. Deliberately scoped PER
-     IMAGE -- the stack resets on navigation, since undoing across
-     images you've already left would be more confusing than useful
-     for a "fix my last few clicks" tool. Undoing/redoing counts as an
-     edit and autosaves like anything else.
-  3. ADDED: fast mode. Left-click a queue box = Accept, right-click =
-     Reject, no menu popup -- for images where you're mostly rubber-
-     stamping. Off by default (View menu / toolbar checkbox); when off,
-     both clicks open the normal menu as before. Middle-click and drag
-     behavior are unaffected either way.
-  4. ADDED: bulk actions. "Accept all pending" / "Reject all pending"
-     buttons act on every currently-pending queue box in the image at
-     once (asks for confirmation first), each pushing a single undo
-     step so one Ctrl+Z reverts the whole bulk action.
-  5. ADDED: number keys 1-9 apply the corresponding class (in
-     CLASS_NAMES order) to the currently selected box, if any --
-     avoids the cascading Change Class menu for common classes.
-  6. ADDED: optional auto-advance -- when the last pending queue box on
-     an image gets a decision, automatically move to the next image
-     after a short delay. Toggle in the toolbar, off by default.
-  7. ADDED: a small session streak counter in the status bar ("5 in a
-     row") that increments on consecutive accept/reject decisions and
-     resets on undo, mostly so long sessions have some small feedback
-     loop.
+  Per-model panel -- visibility checkboxes + a detection-count readout
+  per model for the current image (models with zero detections shown
+  in red), independent of what's currently displayed.
 
-V9 NOTE -- resize + crash-safety release.
-  1. ADDED: manual (cyan) boxes can now be RESIZED, not just moved.
-     Selecting one shows 8 small square handles (4 corners + 4 edge
-     midpoints); drag any handle to stretch that edge/corner. Opposite
-     edges never cross -- a box can't be dragged past zero/negative
-     width or height, it just clamps to a minimum size (MIN_BOX_PX)
-     instead. Corner handles resize both axes at once, edge handles
-     resize one axis. This is the fix for "hard to get the right size
-     when drawing" -- draw it roughly, then nudge the edges to fit
-     instead of deleting and redrawing.
-  2. ADDED: an armed queue box ("Enable Reposition") can now ALSO be
-     resized via the same handles, not just moved -- still a single
-     one-shot arm that disarms itself the instant you release the
-     mouse, same guarantee as before (accidental clicks can't touch a
-     queue box's geometry, only a deliberate arm-then-drag can, and it
-     locks again immediately after).
-  3. ADDED: cursor changes to the matching resize arrow (or move
-     cursor, or crosshair) when hovering a handle / draggable box /
-     empty canvas, so the resize handles are discoverable without
-     opening the Help dialog.
-  4. CHANGED: Escape now also cancels an in-progress move OR resize
-     (restores the box to where it was before the drag started), not
-     just an in-progress draw as before.
-  5. CHANGED: autosave debounce shortened 1000ms -> 400ms, and the
-     current image is now ALSO force-flushed to disk immediately on
-     window focus-loss (Alt-Tab, OS sleep, another window stealing
-     focus) in addition to the existing navigate/close flush points.
-     This closes almost all of the old "last click before a crash
-     inside the debounce window could be lost" gap -- the only
-     remaining exposure is a crash inside the same fraction of a
-     second as a click AND before you ever change focus, which is a
-     much smaller window than before.
+  Autosave -- every mutation writes to disk (debounced ~400ms; an
+  immediate un-debounced flush happens on navigate, close, or window
+  focus-loss). Manual "Save Now" also available.
 
-V10 NOTE -- cross-frame sync release.
-  1. ADDED: cross-frame decision sync. Drone sequences are heavily
-     overlapping frame-to-frame, and all 4 models already ran on every
-     frame independently -- so most of the time, deciding a box on one
-     frame means a near-identical candidate box is already sitting
-     pending a few frames away. When you Accept / Reject / Delete a
-     queue box (menu, Fast Mode click, or a bulk action), the tool now
-     looks at nearby frames in the same sequence (parsed from the
-     filename, e.g. "..._M1201_img000322_..." -> sequence "M1201",
-     frame 322) and, for each neighbor within the configured frame
-     window, looks for an already-queued box of the SAME CLASS whose
-     position is close to the same spot. If it finds one AND that
-     neighbor box is still pending (never a box you, or a previous
-     sync, already decided), it applies the same decision there too --
-     writing straight into review_progress.json and that neighbor's
-     pseudo_labels_reviewed/ output, exactly as if you'd clicked it
-     yourself.
-  2. Deliberately conservative: same class only, position within a
-     tolerance scaled to image size, one nearest match per neighbor
-     frame, and it will NEVER overwrite an existing decision (yours or
-     a prior sync's) or reopen an image already in the completed list.
-     Geometry (box position) is never synced, only the decision --
-     resizing/repositioning a box never touches its neighbors.
-  3. (V10 behavior; CHANGED in V11 -- see below.) Manual boxes used to
-     be excluded from sync entirely.
-  4. Synced boxes are tagged "[synced]" in their on-canvas label so
-     you can spot-check them, and "Undo Last Sync" (toolbar / Edit
-     menu) reverts exactly the last batch of auto-applied decisions
-     back to pending, across every frame it touched.
-  5. ADDED: a toolbar row -- "Sync nearby frames" checkbox (on by
-     default) and a "+/- N frames" window spinner -- plus matching
-     --sync-window / --no-sync startup flags. Turn it off entirely, or
-     widen/narrow the window, per session.
+  Undo/redo -- Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z, scoped per image (stack
+  resets on navigation).
 
-V11 NOTE -- manual-box safety, self-healing progress, sync-everything
-release. This addresses a real incident: a full review session's worth
-of accepted/deleted boxes and hand-drawn manual boxes looked "gone" on
-reopening the tool. Root cause: item_key() is derived from each queue
-item's box coordinates, and generate_pseudo_labels.py getting rerun
-between sessions shifted those coordinates by a fraction of a pixel --
-enough to change the rounded key, so saved decisions stopped matching
-on load (they were never deleted, just orphaned under a key that no
-longer existed in the freshly-loaded queue). Four changes:
+  Fast Mode -- left-click a queue box = Accept, right-click = Reject,
+  no menu (toggle in View menu/toolbar).
 
-  1. ADDED: manual (hand-drawn) boxes now go through the same
-     pending -> accept/reject workflow as queue boxes, instead of being
-     silently included in output the instant you draw them. A freshly
-     drawn box is "pending" (orange) until you explicitly Accept it
-     (cyan) or Reject it (red, hidden unless "Show Deleted" is on) from
-     its right-click menu -- same Accept / Reject / Reset to Pending
-     options queue boxes already had. accepted_items() (and therefore
-     the pseudo_labels_reviewed/ output) only includes manual boxes
-     with decision == "accepted". An image can no longer move into
-     review_completed.json while ANY manual box on it is still
-     "pending" -- _update_completed_list() now checks manual box
-     decisions in addition to queue item decisions. Manual boxes saved
-     by a version before this one have no "decision" field; those are
-     treated as "accepted" on load (they were already being written to
-     output unconditionally at the time, so this preserves what you'd
-     already finished instead of retroactively un-completing it).
-  2. ADDED (the actual long-term fix, not a one-off script): every
-     launch now runs reconcile_progress() against the CURRENTLY loaded
-     queue before the window even opens. For every saved box-decision
-     entry, it tries an exact item_key() match first; on a miss (the
-     bug above), it falls back to same-image/same-class nearest-box-
-     center matching within a small tolerance -- the same idea the
-     cross-frame sync matcher already used, just applied to the load
-     step instead of only to syncing across frames. Matches get
-     re-keyed to whatever the current queue computes, so decisions
-     stop silently going stale every time the queue is regenerated.
-     Anything that still can't be matched (image genuinely gone from
-     the queue, or truly no candidate within tolerance) is kept under
-     its OLD key rather than dropped -- nothing this step touches is
-     ever deleted, only re-labeled or left alone -- and is printed to
-     the console so you can look at it by hand. review_completed.json
-     is then recomputed from the reconciled progress + the full
-     (unfiltered) queue rather than trusted as-is, so the "done" list
-     self-heals too. Disable with --no-key-reconcile if you ever need
-     to debug this step itself.
-  3. ADDED: an automatic timestamped backup of review_progress.json and
-     review_completed.json into datasets/review_backups/<timestamp>/
-     on every single launch, before reconciliation or anything else
-     touches them. This is the actual safety net -- even if
-     reconciliation above ever mismatches something, the exact
-     on-disk state from the start of the session is sitting right
-     there to restore from. Disable with --no-backup (not recommended).
-  4. ADDED: cross-frame sync now also covers manual boxes, not just
-     queue-item decisions. When you Accept a manual box, the tool
-     copies it (same class, same pixel position) into every in-window
-     neighbor frame that (a) isn't already completed and (b) doesn't
-     already have a queue or manual box of that class sitting near
-     that position -- tagged "[synced]" like everything else sync
-     creates. If you later Reject/Reset/Delete that source box, every
-     copy it created is removed the same way (tracked per-box, so this
-     only ever touches copies that trace back to that specific box --
-     never a box someone drew independently in another frame). "Undo
-     Last Sync" reverts the most recent batch either way, whether it
-     was queue-decision syncs, manual-box syncs, or a mix.
+  Bulk actions -- "Accept all pending" / "Reject all pending" for the
+  current image (confirms first; one undo step reverts the whole
+  batch).
 
-V12 NOTE -- workflow/layout release, based on real usage feedback.
-  1. ADDED: in-app access to the completed queue. Previously the only
-     way to open a QA pass over already-decided images was to quit and
-     relaunch with --qa. There's now a "Switch to QA / Completed"
-     button (toolbar + View menu) that swaps the current session's
-     image list, live, between "still pending" and "already completed"
-     for the current --source/--cls filters, without restarting the
-     app or losing any autosaved work. This is also how you get back
-     to a box you decided by mistake: switch to QA, find the image
-     (still fully editable -- Accept/Reject/Reset/Delete/Change Class
-     all work exactly as in normal review), fix it, switch back. An
-     image automatically drops out of the completed list the instant
-     any box on it is reset to pending, exactly as before.
-  2. FIXED: the bottom toolbar (Previous / Next / Save Now / progress
-     counter) and the status bar could get pushed off the bottom of
-     the window and stay invisible even after resizing, because they
-     were packed AFTER the (expand=True) image canvas -- so the canvas
-     claimed all remaining space before the nav bar ever got a slice
-     of it. Nav + status are now packed FIRST (before the canvas), so
-     they always reserve their space and are always visible; the
-     canvas (which already has zoom + scrollbars for exactly this
-     situation) simply gets whatever room is left. The initial image
-     display size is now also computed from the actual screen size
-     (leaving room for every toolbar row + nav + status), instead of a
-     fixed 1280x860 that could already be taller than a laptop screen
-     before the nav bar was even accounted for.
-  3. CHANGED: the four models are now labelled with their full names
-     (e.g. "DINO", "RF-DETR", "YOLO-VisDrone", "YOLO-COCO") everywhere
-     in the UI -- toolbar checkboxes, the per-image detection-count
-     panel, and the sync console log -- instead of two-letter codes.
-  4. CHANGED: a hand-drawn (manual) box is now auto-accepted the
-     instant you draw it and pick its class -- no separate "open its
-     menu and click Accept" step. It's included in output and can
-     trigger cross-frame sync immediately, the same as it worked
-     before V11. If you draw one by mistake, its menu still has
-     Reject / Reset to Pending / Delete, so correcting a bad manual box
-     is still one click away -- this only removes the *extra* click
-     that used to be required for the common case of a box you meant
-     to add.
+  Number keys 1-9 -- apply the Nth class (CLASS_NAMES order) to the
+  selected box.
 
-V13 NOTE -- correctness release (review + bugfix pass). Five issues
-found on review, in order of importance:
-  1. FIXED (completion status used a filtered view): when running with
-     --source/--cls, ReviewApp only ever saw the FILTERED by_image
-     dict. _update_completed_list() / _recompute_completed_for_image()
-     checked completeness against that filtered set, so an image with
-     e.g. all "person" boxes decided but pending "car" boxes outside
-     the filter could get written into review_completed.json mid-
-     session -- prematurely marking it done, and (worse) causing cross-
-     frame sync to skip it as a neighbor from then on, since synced
-     neighbors are never applied to an already-"completed" image. Fix:
-     the FULL, unfiltered by_image_full dict is now threaded into
-     ReviewApp and used for every completeness check, so "done" always
-     means every box on the image (matching this filter or not) has a
-     real decision, exactly as the on-disk reconciliation at startup
-     already did.
-  2. FIXED (reversing a queue-box decision didn't retract what it had
-     already synced): syncing forward (Accept -> propagate Accept to
-     neighbors) worked, but if you later changed your mind on the
-     SOURCE box (Accept -> Reject, or -> Delete, or -> Reset to
-     Pending), the neighbor copies that earlier sync created were left
-     exactly as they were -- _apply_sync_batch only ever skipped
-     already-decided neighbors, it never revisited them. Manual boxes
-     already tracked which synced copies belonged to which box
-     (_sync_children) and cleanly retracted them on Reject/Reset/
-     Delete; queue items had no equivalent. Every queue decision now
-     tracks its own "synced_children" (which neighbor box, in which
-     frame, it most recently synced) on its progress.json entry.
-     Changing that decision first retracts any synced child still
-     sitting in the state it was synced to (never touches a neighbor
-     that's since been manually re-decided by hand), then re-applies
-     the new decision forward as before. "Undo Last Sync" also cleans
-     up the source's synced_children bookkeeping so it can't point at
-     a match_key that no longer exists.
-  3. FIXED (Enable-Reposition/Resize could disarm on a plain click):
-     the one-shot "arm exactly one drag" guarantee on a queue box was
-     being cleared on ANY mouse-up on that box, including a click that
-     never actually dragged (which just reopens the box's menu). A
-     queue box armed for reposition would silently disarm itself the
-     moment you clicked it again to check its menu, before you ever
-     got to drag it. Now it only disarms once an actual move/resize
-     drag happened.
-  4. FIXED (cross-frame class matching ignored the neighbor's class
-     override): when looking for a same-class match in a neighbor
-     frame, the matcher compared against the neighbor box's raw queue
-     class, not any class override saved for it -- so a neighbor box
-     you'd already relabelled (Change Class) could be missed as a sync
-     target, or wrongly matched under its original class. Both the
-     decision-sync matcher and the manual-box "is this position
-     already covered" check now resolve each candidate's class through
-     that neighbor image's own saved __override__ dict first.
-  5. MITIGATED (small save-ordering race): a sync could write a
-     neighbor frame's decision to disk immediately while the SOURCE
-     box's own new decision was still sitting in the ~400ms autosave
-     debounce -- a crash in that window could persist the synced
-     effect without the cause. Whenever a decision change actually
-     triggers (or retracts) a sync, the source image is now force-
-     flushed immediately afterward instead of waiting out the
-     debounce, the same way navigation/close/focus-loss already did.
+  Zoom/pan -- mouse wheel or +/-/0 to zoom (0 = fit to window),
+  middle-click-drag or scrollbars to pan.
 
-V14 NOTE -- copy/paste release.
-  1. ADDED: copy/paste for boxes. Select any box (a manual box, or a
-     queue box -- selecting just means it was the last one you
-     clicked/right-clicked/fast-mode-clicked; you don't need its menu
-     open), press Ctrl+C to copy it, then Ctrl+V to paste a new manual
-     box with the same class and the same size, offset diagonally by
-     PASTE_OFFSET_PX (image pixels) from the copied position. This is
-     the "multiply an existing box instead of redrawing it every time"
-     workflow -- handy for repeated objects of the same size (e.g. a
-     row of parked cars) without drag-drawing each one from scratch.
-     A pasted box goes through the exact same path as a hand-drawn one
-     (_add_manual_box): auto-accepted, undoable (Ctrl+Z removes it like
-     any other edit), autosaved, and cross-frame synced if sync is on.
-  2. Repeated Ctrl+V without a new Ctrl+C in between keeps cascading --
-     each paste offsets another PASTE_OFFSET_PX from the last, so
-     pasting 5 times in a row visibly staircases 5 new boxes across the
-     image instead of stacking them invisibly on top of each other.
-     A fresh Ctrl+C on a (possibly different) box resets the cascade
-     back to a single PASTE_OFFSET_PX step from that new copy.
-  3. The copied box is clamped to the image bounds on paste (same
-     clamping resize already uses) so repeated pasting near an edge
-     can't push a box's coordinates negative or past the image size.
-  4. Copy is a no-op if nothing is selected (nothing to copy); paste is
-     a no-op if nothing has been copied yet this session. Both print
-     nothing and just quietly do nothing -- there's no dialog for what
-     is meant to be a fast, repeatable shortcut.
+  Completed list -- once every box on an image has a decision, its
+  path moves to datasets/review_completed.json and it's excluded from
+  normal review. --qa opens a session sourced only from that list (a
+  second pass/reviewer); "Switch to QA / Completed" in the toolbar
+  swaps between the two live, without restarting. Resetting any box
+  back to pending drops the image out of the completed list again.
 
-V15 NOTE -- Delete-key bugfix release.
-  1. FIXED: pressing Delete/BackSpace while a box's right-click context
-     menu was open did nothing. Root cause: tk.Menu.tk_popup() takes an
-     internal keyboard grab while the menu is posted (that's what makes
-     arrow-key navigation through the menu work), so key events -- like
-     Delete -- stop reaching the <Delete>/<BackSpace> bindings on
-     self.root while any menu is open; they only worked again once the
-     menu had already been dismissed. Fixed by ALSO binding Delete /
-     BackSpace directly on the popup menu itself (in
-     _open_box_context_menu, right before tk_popup()) so they fire
-     immediately even while the menu has the grab, unposting the menu
-     first and then calling the same _delete_selected() the root-level
-     binding already used -- so deleting behaves identically either
-     way, menu open or closed.
+  Sidebar -- image list split into Remaining/Reviewed, grouped by
+  source dataset then by frame set/sequence (color-coded), each set
+  annotated with a "reviewed/total" count and a warning marker if it's
+  below MIN_REVIEWED_FRAMES_PER_SEQUENCE. Click an image to jump to it.
+  "Check sequence coverage" gives the same numbers as a full text
+  report. Resizable pane; expand/scroll state persists across rebuilds.
+  Purely a navigation aid -- never affects decisions or output.
 
-V16 NOTE -- sequence/frame parsing fix + motion-predicted sync release.
-  1. FIXED (SEQ_FRAME_RE never matched filenames without a leading
-     underscore before the sequence id): the regex required a literal
-     "_" immediately before the sequence name (e.g. "..._M1201_img
-     000322_..."), but this dataset's actual filenames start directly
-     with the sequence id ("M0101_img000005_jpg.rf.<hash>.jpg" -- no
-     leading underscore). That meant this branch NEVER matched here,
-     and parse_seq_frame() silently fell through to its folder-per-
-     sequence fallback -- which also doesn't apply to this dataset
-     (everything sits flat in one "images" folder per split), so every
-     image collapsed into ONE fake "sequence" keyed by that folder
-     name, with a bogus "frame number" pulled from a digit run inside
-     the Roboflow export hash suffix rather than the real
-     "img<FRAME>" counter. Cross-frame sync was therefore matching
-     "neighbors" essentially at random across the whole dataset, not
-     actual nearby video frames -- confirmed against real
-     review_progress.json data: ~99.8% of previously-synced manual
-     boxes pointed at an image with a DIFFERENT real sequence id or a
-     real frame number hundreds of frames away. Fixed by allowing the
-     match at the START of the filename too (see the updated regex
-     below) -- this now correctly parses "M0101_img000005_..." as
-     sequence "M0101", frame 5, matching this dataset's real layout.
-     ACTION REQUIRED: this fix only changes matching going forward.
-     Entries already written under the old, broken sequence grouping
-     are not automatically corrected -- audit review_progress.json's
-     "synced_from" entries against each box's REAL (regex-parsed)
-     sequence/frame before trusting them, and treat any mismatch as
-     unverified rather than reviewed.
-  2. ADDED: motion-predicted cross-frame matching. Previously, syncing
-     a decision to frame N+k always searched for a same-class box near
-     the SOURCE frame's box position, regardless of k -- fine for k=1,
-     increasingly wrong for a panning/moving shot as k grows, since the
-     object has actually moved. Sync now walks OUTWARD from the source
-     frame, nearest-frame-first, independently in each direction
-     (backward toward lower frame numbers, forward toward higher), and
-     maintains a running position PREDICTION: it starts at the source
-     box, and the moment it has found the object in two real frames, it
-     derives a per-frame velocity from those two observations and uses
-     it to extrapolate where the object should be in the next frame out
-     -- updating that estimate every time it gets a new real
-     observation, and coasting on the last known velocity through any
-     frame where no candidate box was found at all (e.g. a frame that
-     failed the review-queue's own confidence gate). This is a simple
-     constant-velocity ("dead reckoning") predictor, not a full tracker
-     -- it has no notion of acceleration, turns, or occlusion, and a
-     fast direction change will still throw it off within a frame or
-     two -- but it materially improves match accuracy over a static
-     "same pixel spot" assumption on the smooth, mostly-linear motion
-     typical of drone footage over a handful of frames. See
-     _predict_and_match_chain() / _ordered_neighbor_frames() below.
-     Manual-box sync (_sync_propagate_manual_add) is UNCHANGED by this
-     -- it has no detector candidate to observe a real position from in
-     each neighbor frame, so there's nothing to derive a velocity from;
-     it still stamps a same-position copy, same as before.
+  Cross-frame sync -- deciding a queue or manual box (accept/reject/
+  delete) looks at nearby frames in the same sequence (parsed from the
+  filename, e.g. "M1201_img000322_..." -> sequence M1201, frame 322)
+  and applies the same decision to a same-class box at a matched
+  position, within the configured window (--sync-window / --no-sync,
+  toolbar checkbox). Same class only, one nearest match per neighbor
+  frame, never overwrites an existing decision or reopens a completed
+  image; only the decision is synced, never geometry. Uses a simple
+  constant-velocity (dead-reckoning) position predictor as it walks
+  outward frame-by-frame, so matches track a moving/panning object
+  rather than assuming a fixed pixel spot. Synced boxes are tagged
+  "[synced]" on canvas. Runs on save (not on every click), so a burst
+  of edits collapses into one sync pass. Changing your mind on a
+  source box's decision retracts exactly what it had synced (tracked
+  per-box) before applying the new decision forward. "Undo Last Sync"
+  reverts the most recent sync batch.
 
-V17 NOTE -- Spinbox crash fix + deferred "sync on save" release.
-  1. FIXED: the "+/- N frames" sync-window Spinbox had no input
-     validation, so a stray keystroke (or a quirk in how Tk's spin
-     buttons script their internal increment/decrement) could leave the
-     field's underlying Tcl value as a non-numeric string. Once that
-     happened, every subsequent self.seq_neighbors_window.get() raised
-     _tkinter.TclError -- and since _neighbor_image_keys() and
-     _ordered_neighbor_frames() both call .get() as their very first
-     line, EVERY sync attempt for the rest of the session silently
-     failed before it ever looked at a neighbor frame (the box's own
-     decision still saved fine -- only propagation broke). Fixed with a
-     new _sync_window_value() helper that never raises: on a bad value
-     it logs a warning, resets the field to the last known-good window,
-     and returns that instead. Both call sites now route through it.
-     Also added validatecommand on the Spinbox itself (digits-only, or
-     empty mid-edit) so the field can't go bad again in the first
-     place -- belt and suspenders.
-  2. CHANGED: cross-frame sync now fires on SAVE, not on every
-     accept/reject/manual-add/bulk-action click. Each of those actions
-     used to call straight into the sync machinery (_sync_after_decision_
-     change / _sync_propagate_manual_add / _sync_propagate_manual_remove
-     / _apply_sync_batch) the instant it happened. They now instead
-     queue a zero-arg callable representing exactly that same call onto
-     self._pending_sync_actions, and the queue is drained -- in order --
-     at the very start of every _flush() (autosave debounce, "Save Now",
-     Next/Previous, window close, or focus-loss). A burst of edits on
-     one image before its next save collapses into a single sync pass;
-     each queued action's own retract-then-reapply logic already makes
-     it safe to run from current state regardless of how many edits
-     happened first. None of the underlying retract/reapply logic
-     changed -- only *when* it runs. Because sync now always happens
-     from inside _flush(), the internal "force-flush-now" calls those
-     functions used to make at the end of themselves (added by V13 fix
-     E, to guarantee the source image's own decision was committed
-     alongside its sync) are redundant and have been removed --
-     calling _flush() from inside _flush() invites trouble, and the
-     guarantee is automatic now that sync runs inside the same flush
-     that commits the decision.
-
-V18 NOTE -- keyframe-triage sidebar release.
-  1. ADDED: a left-hand image list/sidebar, split into two sections --
-     "Remaining" and "Reviewed" -- each grouped by source dataset
-     (SARD / UAVDT / VisDrone), with every leaf color-tagged by its
-     source (a light background stripe, see SOURCE_COLORS) so the mix
-     of sets in the current filter is visible at a glance. Clicking any
-     image jumps straight to it in the main viewer -- no more Next/
-     Next/Next to get somewhere specific. This does NOT touch the
-     existing accept/reject/decision machinery in any way -- it is
-     purely a navigation aid built on top of data ReviewApp already
-     tracks (self.all_image_keys_filtered, self.completed_set,
-     self.by_image_full). Rebuilt automatically after every save (i.e.
-     whenever the completed/remaining split could have changed) and
-     when Switch-to-QA/Completed is used, so it never goes stale for
-     long.
-  2. ADDED: "Check sequence coverage" (sidebar button + View menu) --
-     a read-only report, grouped by source and parsed sequence id (the
-     same parse_seq_frame() used by cross-frame sync), of how many
-     frames in each sequence are currently in the Reviewed/completed
-     list, flagging any sequence with fewer than
-     MIN_REVIEWED_FRAMES_PER_SEQUENCE (default 3) reviewed frames --
-     this is the "does every set/sequence have enough manually
-     reviewed keyframes to start training" check. Purely informational;
-     changes nothing on disk.
-  3. Neither addition changes review_progress.json / review_completed.
-     json / pseudo_labels_reviewed/ output in any way, and neither
-     touches decisions on boxes that are already correctly labeled in
-     the source datasets (e.g. UAVDT/VisDrone vehicle boxes) -- this is
-     scoped entirely to "which image am I looking at" bookkeeping.
-
-V19 NOTE -- per-set color + inline frame-count release. Workflow has
-shifted from "review every pseudo-label across all ~8,800 images"
-toward "hand-pick a small number of representative keyframes per
-~100-frame burst (set/sequence), label those, and train a small model
-on them" -- so the sidebar's job is now less "track review progress"
-and more "make sure every set gets looked at, and none get missed."
-  1. ADDED: the sidebar now nests a third level -- Section (Remaining/
-     Reviewed) -> Source dataset -> Frame Set (sequence, same grouping
-     parse_seq_frame() / "Check Sequence Coverage" already used) ->
-     individual images. Previously sets were invisible in the tree
-     itself (only visible via the separate coverage report); now each
-     set is its own row you can collapse/expand.
-  2. ADDED: each frame set gets its own DISTINGUISHING color (see
-     _color_for_sequence()), separate from the existing per-source
-     stripe (SOURCE_COLORS) -- deterministically generated from the
-     set's id so the same set is always the same color across a
-     rebuild, and across appearing in both the Remaining and Reviewed
-     sections. This is purely a visual aid for telling one ~100-frame
-     burst apart from the next while scrolling the tree; it changes
-     nothing about review logic or output.
-  3. ADDED: each frame-set row's label is annotated inline with a
-     frame count, e.g. "M0101 (12/23 total)" under Remaining or
-     "M0101 (7/23 total)" under Reviewed -- so you can see, without
-     opening "Check Sequence Coverage", how many frames a set has in
-     total and how many you've gotten to. A small warning marker is
-     appended to a set's row (in both sections) if its overall reviewed
-     count is still below MIN_REVIEWED_FRAMES_PER_SEQUENCE, so a set
-     that's easy to miss (e.g. it has very few remaining images left,
-     but you never actually picked keyframes from it) stays visible as
-     needing attention instead of quietly falling out of sight.
-  4. "Check Sequence Coverage" is unchanged and still useful for a full
-     text report across every set at once; the sidebar annotations are
-     the same underlying numbers, just visible without opening it.
-
-V20 NOTE -- sidebar auto-scroll bugfix.
-  1. FIXED: finishing the last pending box on an image (so it moved
-     from Remaining into Reviewed) made the sidebar visibly jump over
-     to, and expand, the Reviewed section on its own -- even though the
-     session was still in ordinary review (qa_mode still False) and
-     nobody asked to look at Reviewed yet. Root cause: after every save
-     the sidebar re-selects and Treeview.see()s whichever leaf
-     represents the currently-open image so the highlight tracks it;
-     see() force-opens every ancestor of the item it scrolls to, so the
-     moment that leaf existed only under "Reviewed" (because the image
-     had just become fully decided), see() yanked that whole branch
-     open and scrolled down into it. _highlight_sidebar_selection() now
-     only does this when the image's Remaining/Reviewed status matches
-     the session's CURRENT mode -- Remaining while reviewing normally,
-     Reviewed while in QA. If they don't match (exactly the "just
-     finished this image" moment), it leaves the sidebar's scroll/
-     expand state alone instead. The tree itself still updates both
-     sections' contents and counts on every save as before; the only
-     thing that changed is that the visible scroll position no longer
-     gets dragged into a section you didn't ask for. The only ways into
-     the Reviewed section remain: the "Switch to QA / Completed"
-     button, or clicking a Reviewed image directly.
-
-V21 NOTE -- resizable sidebar release.
-  1. ADDED: the sidebar is now a draggable pane (a classic
-     tk.PanedWindow, since ttk's panedwindow has no per-pane minsize)
-     instead of a fixed SIDEBAR_WIDTH_PX-wide Frame -- drag the thin
-     handle between the sidebar and the image to widen it and read a
-     long filename in full, or narrow it back down. Both panes have a
-     floor (SIDEBAR_MIN_WIDTH_PX for the sidebar, MIN_CANVAS_W for the
-     image) so the sash can't be dragged far enough to make one
-     pane squeeze the other into nothing -- and since a PanedWindow's
-     panes physically cannot overlap, the sidebar can never be dragged
-     "over" the image canvas either. Resizing the whole app window
-     leaves the sidebar's width alone (stretch="never") and gives all
-     the extra/lost space to the image pane instead, so the sidebar
-     stays wherever you last dragged it.
-  2. _display_size_budget() (which fits the image to the available
-     canvas room) now reads the sidebar's CURRENT width back from the
-     live widget instead of assuming the original SIDEBAR_WIDTH_PX, so
-     a wider or narrower sidebar is accounted for the next time an
-     image loads.
-
-V22 NOTE -- sidebar expand-state persistence bugfix.
-  1. FIXED: finishing an image moved it from Remaining to Reviewed,
-     which (correctly) triggers a full sidebar rebuild -- but every
-     group in the rebuilt tree used to default back to closed
-     regardless of what had been expanded a moment before, so working
-     through a set you'd expanded meant it silently collapsed after
-     EVERY single image, forcing a re-expand back down to where you
-     were on every save. This is what actually produced both symptoms
-     reported: the tree visibly "collapsing" out from under you, and it
-     looking like a jump over to the Reviewed side, since the row you
-     were just looking at vanished from view the instant its parents
-     snapped shut.
-  2. Expand/collapse state now persists across rebuilds
-     (self._sidebar_open_state, kept in sync by binding
-     <<TreeviewOpen>>/<<TreeviewClose>> -- see
-     _on_sidebar_node_open/_close) instead of being recomputed from
-     scratch every time. Source and set group keys are deliberately
-     NOT scoped to the Remaining/Reviewed section -- expanding
-     "UAVDT > M0209" while working through it keeps that same set
-     expanded when an image inside it finishes and quietly moves from
-     its Remaining branch to its Reviewed branch, rather than the set
-     collapsing right as you're in the middle of it. The vertical
-     scroll position is also now preserved across a rebuild (previously
-     every rebuild snapped back to the very top).
-  3. Net effect: completing an image just removes that one row from
-     view under its set's Remaining branch and it reappears under that
-     SAME set's Reviewed branch -- everything else about the tree
-     (what's expanded, where you're scrolled to) stays exactly as it
-     was, matching how the reviewed/remaining split already worked
-     conceptually, just without the visual disruption on every save.
-
-WHAT CHANGED, keyboard command -> new equivalent:
-  click box, cycle       -> click box: pops up a menu with Accept /
-  pending/accept/reject     Reject / Reset to Pending / Change Class /
-                             (queue boxes only) Delete
-  drag-draw + digit key   -> drag-draw on empty canvas -> release opens
-                              a class-picker menu at the cursor (works
-                              for any number of boxes, one at a time).
-                              The new box is auto-accepted (V12) as
-                              soon as you pick its class -- open its
-                              menu afterward if you need to Reject /
-                              Reset to Pending / Delete it.
-  (nothing before)        -> click-and-drag ON a manual (cyan) box
-                              moves it. Queue boxes are click-only
-                              unless explicitly armed for one reposition
-                              via their menu (see V7 note above).
-  (nothing before)        -> drag one of the 8 square handles on a
-                              SELECTED manual box (or an armed queue
-                              box) to resize it instead of moving it
-                              (see V9 note #1-2).
-  (nothing before)        -> per-box menu also offers "Change Class"
-                              and, for manual boxes, "Delete"; queue
-                              boxes now also get "Delete (hide from
-                              view)" (see V8 note #1)
-  a / r (accept/reject     -> still available: the per-box menu's
-    all pending)              Accept/Reject apply to one box at a time,
-                              or use Fast Mode (V8) / bulk buttons (V8)
-  u (undo last manual box) -> real per-image undo/redo now exists
-                              (Ctrl+Z / Ctrl+Y, see V8 note #2); manual
-                              boxes still also have a direct Delete
-                              option in their menu
-  o (toggle original)      -> "Original labels" checkbox, ON by default
-                              (magenta, non-clickable, reference-only,
-                              reloaded fresh from disk each time an
-                              image opens -- see load_original_labels())
-  (nothing before)         -> per-model visibility checkboxes + a
-                              detection-count readout per model for the
-                              current image, plus "All"/"None" buttons
-  n/p (next/prev)          -> Next / Previous buttons / Left / Right
-                              arrow keys. Autosaves before moving, no
-                              prompt needed. Can also happen
-                              automatically -- see Auto-advance (V8).
-  q/Esc (save+quit)        -> File > Save & Quit, or the window's close
-                              button (autosaves either way)
-  h (toggle help)          -> Help > Controls
-  (nothing before)         -> mouse wheel = zoom (centered on cursor),
-                              '+'/'-' = zoom, '0' = fit to window,
-                              middle-click-drag or scrollbars = pan
-  (nothing before)         -> Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z = undo/redo
-  (nothing before)         -> 1-9 = apply Nth class to selected box
-  (nothing before)         -> Ctrl+C / Ctrl+V = copy / paste-with-offset
-                              the selected box as a new manual box
-                              (V14, see note above)
-  (nothing before)         -> Fast Mode: left-click queue box = accept,
-                              right-click = reject (no menu popup)
-  (nothing before)         -> Esc while dragging a move/resize cancels
-                              it and snaps the box back (V9 note #4)
-  (nothing before)         -> Accept/Reject/Delete on a queue box, OR
-                              Accept/Reject/Reset/Delete on a manual
-                              box, syncs the same action to matching
-                              (or newly-created) boxes in nearby frames
-                              of the same sequence (V10 + V11 note
-                              above, motion-predicted per V16); "Undo
-                              Last Sync" reverts just that batch.
-                              Changing your mind on a source box (V13)
-                              retracts what it previously synced, not
-                              just the most recent batch. (V17: sync
-                              itself now runs on save, not on every
-                              click -- see note above.)
-  (nothing before)         -> "Switch to QA / Completed" button (V12):
-                              swap between reviewing pending images and
-                              browsing/correcting already-completed
-                              ones, without restarting the app.
-  Delete / BackSpace       -> deletes whichever box is currently
-                              selected (queue box -> "deleted" state,
-                              hidden + recoverable; manual box ->
-                              removed outright, including any synced
-                              copies it created). No-op if nothing is
-                              selected. (V15: now also works while that
-                              box's own context menu is still open.)
-  (nothing before)         -> V18: left sidebar lists every image in
-                              the current filter, split into Remaining/
-                              Reviewed and color-coded by source set --
-                              click one to jump straight to it. "Check
-                              sequence coverage" reports reviewed-frame
-                              counts per source/sequence. V19: the
-                              sidebar now also nests and color-codes by
-                              individual frame SET (sequence), with an
-                              inline "reviewed/total" count per set.
+  Startup self-healing -- every launch backs up review_progress.json
+  and review_completed.json to datasets/review_backups/<timestamp>/
+  (--no-backup to skip), then reconciles saved decisions against the
+  current queue: exact key match first, falling back to same-image/
+  same-class nearest-box matching within a tolerance if a box's stored
+  key no longer matches (e.g. the queue was regenerated with slightly
+  shifted coordinates). Unresolved entries are kept under their old
+  key (never deleted) and printed for manual review. Skip with
+  --no-key-reconcile.
 
 WHY A SEPARATE OUTPUT TREE (see generate_pseudo_labels.py's module
 docstring for the full reasoning): this writes to datasets/
@@ -732,9 +113,9 @@ USAGE:
                                              # hidden once complete)
     python review_labels.py --qa            # QA pass: only images a
                                              # first reviewer already
-                                             # fully decided (can also
-                                             # be reached live from the
-                                             # toolbar -- see V12 note)
+                                             # fully decided (also
+                                             # reachable live from the
+                                             # toolbar)
     python review_labels.py --hide-original # don't overlay existing
                                              # real-dataset labels
     python review_labels.py --no-sync       # start with cross-frame
@@ -747,6 +128,56 @@ USAGE:
     python review_labels.py --no-key-reconcile  # skip the automatic
                                                  # startup key-repair
                                                  # pass (debugging only)
+
+HISTORY (one line per release -- see git log for full detail):
+  V5  -- rewrite: OpenCV/keyboard UI -> Tkinter GUI.
+  V6  -- fixed item_key() using the live (not original) box; added
+         zoom/pan and box-position persistence.
+  V7  -- locked down dragging to manual boxes only (queue boxes need
+         explicit "Enable Reposition"); added per-model detection
+         counts, real autosave, separate completed list, original
+         labels shown by default.
+  V8  -- added recoverable delete, full per-image undo/redo, Fast
+         Mode, bulk accept/reject, number-key class shortcuts,
+         auto-advance, streak counter.
+  V9  -- added resize handles for manual/armed boxes, resize-aware
+         cursors, Escape cancels drag, faster autosave + focus-loss
+         flush.
+  V10 -- added cross-frame decision sync (same class, position
+         tolerance, never overwrites) with per-session on/off + window
+         controls.
+  V11 -- fixed a real incident (decisions "disappearing" after a queue
+         regen): manual boxes now go through pending->decided like
+         queue boxes; added startup reconciliation, automatic
+         per-launch backups, and sync coverage for manual boxes.
+  V12 -- added live "Switch to QA / Completed"; fixed toolbar/status
+         bar layout getting pushed off-window; full model names in UI;
+         manual boxes auto-accept on draw again.
+  V13 -- correctness pass: completion checks now use the full
+         unfiltered queue, reversing a synced decision now retracts
+         what it synced, reposition-arm no longer disarmed by a
+         non-drag click, sync now respects class overrides, sync
+         writes force-flush immediately.
+  V14 -- added Ctrl+C/Ctrl+V box copy/paste with cascading offset.
+  V15 -- fixed Delete/BackSpace not working while a box's context menu
+         was open.
+  V16 -- fixed sequence/frame parsing for filenames without a leading
+         underscore (was effectively randomizing sync neighbors);
+         added motion-predicted (constant-velocity) cross-frame
+         matching. NOTE: sync entries written before this fix may be
+         mismatched -- verify synced_from against the corrected regex
+         before trusting old data.
+  V17 -- fixed a Spinbox crash that could silently break sync for the
+         rest of a session; sync now runs on save instead of on every
+         click.
+  V18 -- added the Remaining/Reviewed sidebar and "Check sequence
+         coverage" report (navigation only, no effect on decisions).
+  V19 -- sidebar now nests by frame set/sequence with per-set color
+         and inline reviewed/total counts + low-coverage warning.
+  V20 -- fixed the sidebar auto-jumping to Reviewed the moment an
+         image was finished during normal review.
+  V21 -- sidebar is now a resizable pane instead of a fixed width.
+  V22 -- fixed sidebar expand/scroll state resetting on every rebuild.
 """
 
 import argparse
@@ -1015,6 +446,34 @@ def load_json_dict(path: Path) -> dict:
 def save_json(path: Path, data) -> None:
     with open(path, "w") as f:
         json.dump(data, f, indent=2, default=str)
+
+
+def _clamp_box_to_image(box, w, h):
+    """(fix) Last-resort safety net before handing a box to
+    gpl.box_to_yolo_line(), which raises ValueError for anything even a
+    fraction of a pixel outside (0,0)-(w,h). Boxes SHOULD already be
+    clamped wherever they're created/edited (drawing, resizing, moving,
+    pasting, cross-frame sync) -- see on_mouse_up's "draw" branch,
+    _apply_resize, and _paste_clipboard -- but this catches anything
+    that slips through anyway (e.g. a box saved by an older version of
+    this script before that clamping existed, sitting in progress.json).
+    Without this, one bad box makes _write_reviewed_labels() raise on
+    every autosave forever: _flush() never reaches "self.dirty = False"
+    when it throws, so the image stays dirty, and every later action
+    that flushes (navigating, closing, losing focus...) re-raises the
+    same exception -- which is what looks like the whole app freezing."""
+    x1, y1, x2, y2 = box
+    x1 = max(0.0, min(x1, w))
+    x2 = max(0.0, min(x2, w))
+    y1 = max(0.0, min(y1, h))
+    y2 = max(0.0, min(y2, h))
+    if x2 <= x1:
+        x2 = min(w, x1 + 1.0)
+        x1 = max(0.0, x2 - 1.0)
+    if y2 <= y1:
+        y2 = min(h, y1 + 1.0)
+        y1 = max(0.0, y2 - 1.0)
+    return [x1, y1, x2, y2]
 
 
 def load_completed(path: Path) -> set:
@@ -1363,6 +822,8 @@ class ReviewApp:
         self.sync_status_var = tk.StringVar(value="")
         self._last_sync_batch = []     # [{"kind":..., "image_key":..., ...}, ...]
         self._img_dims_cache = {}
+        self._orig_boxes_cache = {}
+        self._orig_hidden_count = 0
         self.synced_from_map = {}      # key -> source image_key, for the CURRENT image
 
         # Precompute (sequence_key -> sorted [(frame_num, image_key), ...])
@@ -2542,6 +2003,27 @@ class ReviewApp:
             self._img_dims_cache[image_key] = dims
         return dims
 
+    def _get_original_boxes_cached(self, image_key):
+        """(fix) Same idea as _get_image_dims_cached, but for the
+        real-dataset "orig, read-only" reference labels of an arbitrary
+        (not-currently-loaded) neighbor image. _position_already_covered
+        needs this: a neighbor frame can already carry a correct
+        original ground-truth label for an object even when it has no
+        queue item and no manual box for it (e.g. the original dataset
+        labeled that frame directly instead of relying on the
+        detector). Without checking this too, manual-box sync would
+        stamp a fresh duplicate copy right on top of an already-correct
+        original label the instant it propagated into that frame --
+        which is exactly the kind of doubled labeling on one object
+        that this cache exists to prevent."""
+        boxes = self._orig_boxes_cache.get(image_key)
+        if boxes is None:
+            img_w, img_h = self._get_image_dims_cached(image_key)
+            real_label_path = gpl.image_path_to_label_path(Path(image_key))
+            boxes = load_original_labels(real_label_path, img_w, img_h)
+            self._orig_boxes_cache[image_key] = boxes
+        return boxes
+
     def _neighbor_image_keys(self, image_key):
         """Flat (unordered-by-distance) list of every neighbor frame
         within the sync window, in ascending-frame order. Still used by
@@ -2738,7 +2220,18 @@ class ReviewApp:
         `image_key`. Used to stop manual-box sync from stacking a
         duplicate on top of something already there -- a queue box you
         already accepted, or a manual box drawn independently in that
-        frame."""
+        frame.
+
+        (fix) ALSO checks that neighbor's real-dataset "orig, read-only"
+        labels (see _get_original_boxes_cached). A manual box exists to
+        cover an object the detector missed on ONE frame -- it doesn't
+        mean every neighbor frame is missing it too. Plenty of neighbor
+        frames may already carry a correct original ground-truth label
+        for that same object even though they have no queue item or
+        manual box for it at all (nothing for the earlier two checks to
+        find). Without this, syncing stamped a fresh duplicate copy
+        right on top of an already-correctly-labeled object every time
+        that happened -- the doubled-labeling-on-one-object symptom."""
         try:
             img_w, img_h = self._get_image_dims_cached(image_key)
         except Exception:
@@ -2761,6 +2254,18 @@ class ReviewApp:
             if mb["cls"] != cls:
                 continue
             bb = mb["box"]
+            bcx, bcy = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+            if ((bcx - cx) ** 2 + (bcy - cy) ** 2) ** 0.5 <= tol:
+                return True
+
+        try:
+            orig_boxes = self._get_original_boxes_cached(image_key)
+        except Exception:
+            orig_boxes = []
+        for ob in orig_boxes:
+            if ob["cls"] != cls:
+                continue
+            bb = ob["box"]
             bcx, bcy = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
             if ((bcx - cx) ** 2 + (bcy - cy) ** 2) ** 0.5 <= tol:
                 return True
@@ -3102,7 +2607,8 @@ class ReviewApp:
             return
 
         w, h = gpl.get_image_dims(self.image_key)
-        lines = [gpl.box_to_yolo_line(a["cls"], a["box"], w, h) for a in accepted]
+        lines = [gpl.box_to_yolo_line(a["cls"], _clamp_box_to_image(a["box"], w, h), w, h)
+                 for a in accepted]
         reviewed_label_path.parent.mkdir(parents=True, exist_ok=True)
         reviewed_label_path.write_text("\n".join(lines) + "\n")
 
@@ -3146,7 +2652,8 @@ class ReviewApp:
             return
 
         w, h = self._get_image_dims_cached(image_key)
-        lines = [gpl.box_to_yolo_line(a["cls"], a["box"], w, h) for a in accepted]
+        lines = [gpl.box_to_yolo_line(a["cls"], _clamp_box_to_image(a["box"], w, h), w, h)
+                 for a in accepted]
         reviewed_label_path.parent.mkdir(parents=True, exist_ok=True)
         reviewed_label_path.write_text("\n".join(lines) + "\n")
 
@@ -3440,6 +2947,59 @@ class ReviewApp:
             if selected and self._box_is_resizable(kind, key):
                 self._draw_handles(box, kind, key)
 
+    def _current_covered_by_review(self, cls, box) -> bool:
+        """(fix) True if the CURRENT image already has an accepted queue
+        item or accepted manual box of the same class sitting within the
+        sync position tolerance of `box`. Used to hide an "orig,
+        read-only" reference box once it's redundant with a decision
+        the review tool itself already made for that same object.
+
+        This is exactly what happens once a manual/accepted box has been
+        through --apply: that run merges the box straight into the real
+        dataset label file, and the NEXT time this image is opened,
+        load_original_labels() reads that same merged file back in as
+        "original" reference content -- so the same object then gets
+        drawn twice: once as the still-live accepted decision (colored
+        by its state) and once as a magenta "orig, read-only" box
+        sitting almost exactly on top of it. Nothing is actually
+        double-counted in the output (accepted_items() never reads
+        original_boxes at all), but it LOOKS like a duplicate label on
+        screen, and it's what prompted the original double-labeling bug
+        report. Checked against the LIVE in-memory decisions/manual
+        boxes for the image currently on screen, not the saved
+        progress.json snapshot, so it reflects edits made this instant
+        even before the next autosave."""
+        try:
+            img_w, img_h = self.img_w, self.img_h
+        except Exception:
+            return False
+        diag = (img_w ** 2 + img_h ** 2) ** 0.5
+        tol = diag * SYNC_POS_TOLERANCE_FRAC
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+
+        for it in self.queue_items:
+            k = item_key(it)
+            if self.decisions.get(k) != "accept":
+                continue
+            eff_cls = self.class_overrides.get(k, it["cls"])
+            if eff_cls != cls:
+                continue
+            bb = it["box"]
+            bcx, bcy = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+            if ((bcx - cx) ** 2 + (bcy - cy) ** 2) ** 0.5 <= tol:
+                return True
+
+        for mb in self.manual_boxes:
+            if mb.get("decision", "pending") != "accepted":
+                continue
+            if mb["cls"] != cls:
+                continue
+            bb = mb["box"]
+            bcx, bcy = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+            if ((bcx - cx) ** 2 + (bcy - cy) ** 2) ** 0.5 <= tol:
+                return True
+        return False
+
     def redraw(self):
         self.canvas.delete("all")
         self.item_map = {}
@@ -3452,8 +3012,18 @@ class ReviewApp:
         # one. That's what guarantees they can't be moved OR deleted by
         # mistake -- the V8 delete feature only touches queue items,
         # which are the only boxes that ever get registered here.
+        #
+        # (fix) Skip drawing one that's already covered by a decision
+        # the review tool itself has accepted for this image -- see
+        # _current_covered_by_review. Tracked in self._orig_hidden_count
+        # purely for the status bar, so hiding these doesn't look like
+        # original labels silently vanished.
+        self._orig_hidden_count = 0
         if self.show_original.get():
             for ob in self.original_boxes:
+                if self._current_covered_by_review(ob["cls"], ob["box"]):
+                    self._orig_hidden_count += 1
+                    continue
                 self._draw_box(ob["box"], COLOR_ORIGINAL, f"{ob['cls']} [orig, read-only]", dash=(3, 2))
 
         for it in self.queue_items:
@@ -3504,7 +3074,9 @@ class ReviewApp:
             f"{Path(self.image_key).name}  |  pending={n_pending} accept={n_accept} "
             f"reject={n_reject} deleted={n_deleted} "
             f"manual={len(self.manual_boxes)}(pending={n_manual_pending}) "
-            f"orig={len(self.original_boxes)}  |  zoom={int(self.zoom * 100)}%"
+            f"orig={len(self.original_boxes)}"
+            + (f"(hidden={self._orig_hidden_count})" if self._orig_hidden_count else "")
+            + f"  |  zoom={int(self.zoom * 100)}%"
             f"{streak_txt}{blocked_txt}{clipboard_txt}{unsaved}")
         done = len(self.completed_set)
         total = len(self.image_keys) if self.qa_mode else (len(self.image_keys) + done)
@@ -4187,8 +3759,31 @@ class ReviewApp:
             self.canvas.delete(self._rubber_id)
             sx, sy = self.drag["start"]
             if abs(cx - sx) > 6 and abs(cy - sy) > 6:
-                box = [min(sx, cx) / self.scale, min(sy, cy) / self.scale,
-                       max(sx, cx) / self.scale, max(sy, cy) / self.scale]
+                x1, y1 = min(sx, cx) / self.scale, min(sy, cy) / self.scale
+                x2, y2 = max(sx, cx) / self.scale, max(sy, cy) / self.scale
+                # (fix) Clamp to image bounds -- same clamping _apply_resize
+                # and _paste_clipboard already do -- so a box drawn with its
+                # start/end near the canvas edge can't end up a fraction of
+                # a pixel outside the image (e.g. x1 = -0.3). An out-of-
+                # bounds manual box auto-accepts immediately (V12) and then
+                # blows up box_to_yolo_line() on every single autosave from
+                # then on, which -- since _flush() never reaches
+                # "self.dirty = False" when it raises -- makes EVERY later
+                # navigation/flush attempt (they all call
+                # _flush_now_if_dirty first) throw the same exception again.
+                # That's what looks like the app "freezing": it's actually
+                # failing to save and re-failing on every subsequent action.
+                x1 = max(0.0, min(x1, self.img_w))
+                x2 = max(0.0, min(x2, self.img_w))
+                y1 = max(0.0, min(y1, self.img_h))
+                y2 = max(0.0, min(y2, self.img_h))
+                if x2 - x1 < MIN_BOX_PX:
+                    x2 = min(self.img_w, x1 + MIN_BOX_PX)
+                    x1 = max(0.0, x2 - MIN_BOX_PX)
+                if y2 - y1 < MIN_BOX_PX:
+                    y2 = min(self.img_h, y1 + MIN_BOX_PX)
+                    y1 = max(0.0, y2 - MIN_BOX_PX)
+                box = [x1, y1, x2, y2]
                 # Offset away from the box just drawn (same reasoning as
                 # _menu_pos_clear_of_box for the box-edit context menu) --
                 # otherwise the class-picker opens right on top of the box
@@ -4290,6 +3885,17 @@ def main():
 
     with open(queue_path) as f:
         all_items_full = json.load(f)
+
+    # Per-person packages (from review_batch_assigner.py) store "image"
+    # relative to DATASETS_DIR so the queue file is portable across
+    # machines with different absolute project paths -- resolve those
+    # against THIS machine's DATASETS_DIR here, once, up front. The
+    # master queue (straight from generate_pseudo_labels.py) already
+    # uses absolute paths and is left untouched.
+    for it in all_items_full:
+        p = Path(it["image"])
+        if not p.is_absolute():
+            it["image"] = str((datasets_dir / p).resolve())
 
     # Capture each item's original, immutable box up front -- item_key()
     # depends on this, not on the (editable) "box" field. Must happen

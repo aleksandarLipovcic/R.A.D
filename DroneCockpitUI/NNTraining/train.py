@@ -5,80 +5,89 @@ Defaults are tuned for a 6GB laptop RTX 3060.
 
 PIPELINE: trains a UNIFIED taxonomy (person/car/large_vehicle/motorcycle/
 other_vehicle, see class_map.py) spanning VisDrone + UAVDT + SARD (see
-prepare_datasets.py) -- all genuine drone-native low-altitude footage, so
-free Mosaic compositing across them is intentional (unlike the now-
-inactive xView satellite addition, which hurt accuracy by mixing in a
-different visual domain). generate_pseudo_labels.py --apply cross-labels
-each source's originally-missing classes (UAVDT: person; SARD: vehicles)
-once an image is fully reviewed, so per-source/per-class numbers below
-are no longer purely "native-only" -- see evaluate_per_source()'s own
-docstring before drawing conclusions from a near-zero class row.
+prepare_datasets.py) -- all genuine drone-native footage, so free Mosaic
+compositing across them is intentional (unlike the now-inactive xView
+satellite addition, which hurt accuracy by mixing domains).
+generate_pseudo_labels.py --apply cross-labels each source's originally-
+missing classes (UAVDT: person; SARD: vehicles) once an image is fully
+reviewed -- see evaluate_per_source()'s docstring before drawing
+conclusions from a near-zero per-class row.
 
 MODEL SIZE: --model defaults to "yolo26s.pt" (fast, known-fitting, good
-for validating the dataset itself). --model auto re-enables the
+for validating the pipeline itself). --model auto re-enables the
 yolo26m -> yolo26s -> yolo26n fallback search, each candidate checked by
 the VRAM probes below. yolo26m @ 960px is the real target once a yolo26s
-smoke test confirms the data pipeline looks right -- a yolo26s smoke-test
-mAP is not a stand-in for yolo26m's eventual accuracy (capacity differs).
+smoke test looks right.
 
-DEGRADATION AUGMENTATION: every training source is clean digital footage;
-the real deployment camera (E5-FPV) is analog CVBS (1500TVL, NTSC/PAL,
-0.0001 lux min, 6mm/100deg lens, 5.8GHz link) -- a genuine train/deploy
+DEGRADATION AUGMENTATION: training sources are clean digital footage;
+the deployment camera (E5-FPV) is analog CVBS (1500TVL, NTSC/PAL,
+0.0001 lux min, 6mm/100deg lens, 5.8GHz link) -- a real train/deploy
 domain gap. install_degradation_augment() monkeypatches Ultralytics'
 Albumentations wrapper (train split only) with transforms calibrated
-against that specific datasheet (bandwidth-limited downscale, motion/ISO/
-Gauss noise, gamma range, 1px interlace combing, small RF-dropout holes,
-mild lens barrel distortion, compression artifacts) rather than generic
-noise. See build_degradation_transform()'s and install_degradation_
-augment()'s own docstrings for the per-transform reasoning, the
-version-robustness handling across albumentations 1.x/2.x, and why
-CoarseDropout/OpticalDistortion are kept deliberately weak (this pipeline
-runs image-only, no bbox_params, so an aggressive spatial transform here
-would corrupt labels rather than just add noise).
+against that datasheet instead of generic noise -- see
+build_degradation_transform()/install_degradation_augment() for the
+per-transform reasoning and version handling across albumentations
+1.x/2.x.
 
-REAL-TIME is deprioritized (precision on a noisy feed matters more than
-fps), which is why --multi-scale and a higher --imgsz are worth trying
-once a baseline is stable, and why nothing here is tuned for inference
-speed. IMAGE SIZE: 960px is the recommended default -- this project's own
-baseline history (below) shows 640px plateaus on small/rare classes while
-960px fixed that ceiling, and mosaic_guard.py's instance cap has since
-confirmed real headroom (~2GB/6GB) at 960px. imgsz doesn't need to match
-any source's native resolution; Ultralytics letterboxes everything to one
-square size regardless.
+  [FIX -- review item] OpticalDistortion (the lens-barrel-distortion
+  piece) was silently skipping on the installed albumentations 2.0.8:
+  the two candidate parameter sets covered the pre-2.0 API
+  (distort_limit + shift_limit) and the 2.2+ API (distort_range + mode),
+  but not the actual 2.0.x-era API in between, which already dropped
+  shift_limit in favor of `mode` but hadn't yet renamed distort_limit
+  to distort_range. A third, version-correct candidate
+  (distort_limit + mode, no shift_limit) has been added below so this
+  transform now builds cleanly on 2.0.8 instead of being skipped.
 
 WDDM / VRAM: on Windows, an over-budget CUDA allocation silently spills
-into system RAM instead of raising OOM, causing catastrophic (not clean)
-slowdowns that can develop well after training looks healthy. Two
-callbacks guard against this, both raising VRAMBudgetExceeded (handled
-like a real OOM): make_startup_probe_callback() (first few batches -- see
-its docstring for the AutoBatch false-positive it now avoids) and
-make_ongoing_watchdog_callback() (every epoch, for the whole run -- see
-its docstring). mosaic_guard.py's --max-mosaic-instances is the proactive
-half of the same fix: dense mosaic composites (1000+ instances in one
-slot) were the actual root cause of the VRAM "staircase" this project hit
-twice; capping composite density keeps the caching allocator from
-ratcheting its reserved pool up permanently. See each function's own
-docstring for version history and confirmed numbers -- not duplicated
-here to avoid this docstring drifting out of sync with the code.
+into system RAM instead of raising OOM, causing catastrophic slowdowns
+well after training looked healthy. Two callbacks guard this, both
+raising VRAMBudgetExceeded like a real OOM: make_startup_probe_callback()
+(first few batches) and make_ongoing_watchdog_callback() (every epoch,
+whole run). mosaic_guard.py's --max-mosaic-instances is the proactive
+half -- dense mosaic composites were the actual root cause of the VRAM
+"staircase" this project hit twice. --vram-safety-margin controls the
+threshold both callbacks trip at (default 0.90).
 
-CRASH-SAFETY: last.pt/best.pt are overwritten every epoch (not just every
-N), so --resume (via the most recent runs/detect/*/weights/last.pt, full
-optimizer state) loses at most one in-progress epoch. --save-period adds
-numbered snapshots as extra insurance. See _is_resumable_checkpoint()'s
-docstring for why a completed run's last.pt can't be resumed, and what to
-do instead.
+  [FIX -- review item] Both callbacks used to check only
+  max_memory_allocated() (actual tensor bytes) against a 90% safety
+  margin. Confirmed on a --batch 3 run: reserved VRAM (GPU_mem in the
+  progress bar -- the allocator's pool, and the closer proxy for what
+  actually drives WDDM's page-out decision) hit 94.6% while allocated
+  apparently stayed under the trip line, and the run oscillated
+  0.4-2.4 it/s between epochs (textbook staircase) for 10.7 hours
+  without either probe firing. Both now also check
+  max_memory_reserved() against the same margin.
 
-OVERFITTING / EVALUATION: --patience (30) is the main guard -- best.pt is
+DISK CACHE DRIVE: --cache disk caches decoded images between epochs as
+.npy files, but Ultralytics writes those files next to the original
+source images -- i.e. onto whatever drive the dataset itself lives on,
+with no built-in way to point them elsewhere (an open, unimplemented
+feature request: https://github.com/ultralytics/ultralytics/issues/18285).
+On a laptop where the dataset drive is nearly full but another mounted
+drive has room to spare, this silently disables caching entirely rather
+than using the free space that's actually available. install_disk_cache_
+redirect() retargets the .npy cache files onto whichever mounted drive
+currently has the most free space, BEFORE Ultralytics' own disk-space
+check runs -- so that check still makes the real pass/fail call, just
+against a drive with room. See its docstring for the mechanism.
+
+CRASH-SAFETY: last.pt/best.pt are overwritten every epoch, so --resume
+loses at most one in-progress epoch. --save-period adds numbered
+snapshots. See _is_resumable_checkpoint() for why a completed run's
+last.pt can't be resumed, and _verify_resume_taxonomy() for why a
+completed OR in-progress run's taxonomy is checked before resuming.
+
+EVALUATION: --patience (30) is the main early-stop guard; best.pt is
 always the best-val epoch. check_overfitting() flags aggregate box-loss
-divergence; report_per_class_map() and evaluate_per_source() are the
-per-class/per-source breakdowns that catch what an aggregate can hide
-(e.g. person -- the SAR priority class -- lagging while vehicles improve).
---copy-paste is currently a no-op on this pipeline (Ultralytics' CopyPaste
-needs segmentation polygons this bbox-only data doesn't have) -- left on
-because it's harmless; mixup and --oversample-classes are what's actually
-protecting the sparse classes. See each function's docstring for detail.
+divergence; report_per_class_map()/evaluate_per_source() catch what an
+aggregate can hide (e.g. person -- the SAR priority class -- lagging
+while vehicles improve). --copy-paste is currently a no-op on this
+pipeline (needs segmentation polygons this bbox-only data doesn't
+have) -- mixup and --oversample-classes are what actually protects
+sparse classes.
 
-BASELINE HISTORY (for reference; update after each real run):
+BASELINE HISTORY (update after each real run):
   yolo26n, 640px, VisDrone-10cls        -> mAP50 ~0.31 (plateaued)
   yolo26s, 960px, VisDrone-10cls        -> mAP50 ~0.465 (every class up)
   yolo26m, 960px, unified               -> never fit (WDDM spillover)
@@ -87,42 +96,39 @@ BASELINE HISTORY (for reference; update after each real run):
                                             pseudo-label --apply merge)
   yolo26s, 640px, unified, post-mosaic_guard -> ~2GB VRAM, full-run
                                                  mAP: TBD
+  yolo26m, 960px, unified, 5ep smoke (2026-08-19) -> mAP50 0.576,
+                                            mAP50-95 0.336 (all 8/9
+                                            degradation transforms now
+                                            build cleanly, incl. the
+                                            previously-skipped optical
+                                            distortion -- see FIX note
+                                            above)
 
 USAGE:
     python train.py                             # yolo26s, unified taxonomy
     python train.py --model auto                # yolo26m->s->n fallback search
     python train.py --model yolo26s.pt --imgsz 640 --batch -1 --epochs 2
-                                                  # smoke test: validates the
-                                                  # DATASET, not yolo26m's
-                                                  # eventual accuracy
-    python train.py --imgsz 960 --batch 1 --epochs 5   # smoke test at the
-                                                         # real target imgsz
-    python train.py --imgsz 640 --batch 4        # fallback if 960px trips
-                                                  # the WDDM probes
-    python train.py --model yolo26m.pt --imgsz 960     # real target run --
-                                                         # after a yolo26s
-                                                         # smoke test passes
+    python train.py --imgsz 960 --batch 1 --epochs 5   # smoke test at target imgsz
+    python train.py --imgsz 640 --batch 4        # fallback if 960px trips WDDM probes
+    python train.py --model yolo26m.pt --imgsz 960     # real target run
     python train.py --data VisDrone.yaml --model yolo26n.pt --imgsz 640
-                                                  # original 10-class baseline
-    python train.py --resume [--name RUN_NAME]   # continue most recent (or
-                                                  # named) run's last.pt
-    python train.py --export-only [--weights PATH]     # ONNX export only
+    python train.py --resume [--name RUN_NAME]
+    python train.py --export-only [--weights PATH]
 """
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import platform
+import shutil
 import time
 from pathlib import Path
 
-# Must be set before torch is imported (it reads this at CUDA init time).
-# NOTE: expandable_segments is not supported on Windows (confirmed by the
-# "expandable_segments not supported on this platform" UserWarning torch
-# prints on this project's setup) -- it's silently a no-op there, so it's
-# only included on non-Windows to avoid printing a warning for a flag
-# that isn't doing anything. garbage_collection_threshold works on both.
+# Must be set before torch is imported (read at CUDA init time).
+# expandable_segments isn't supported on Windows (silent no-op there,
+# but prints a warning) -- only included on non-Windows.
 _alloc_conf_parts = ["garbage_collection_threshold:0.8"]
 if platform.system() != "Windows":
     _alloc_conf_parts.insert(0, "expandable_segments:True")
@@ -140,15 +146,8 @@ RUNS_PROJECT = SCRIPT_DIR / "runs" / "detect"
 
 # per_source_val.json is written by prepare_datasets.py into ITS
 # DATASETS_DIR, which follows Ultralytics' own global 'datasets_dir'
-# setting -- NOT necessarily a "datasets" folder next to this script.
-# Confirmed on this project: that setting resolves one level above
-# NNTraining/ (i.e. .../DroneCockpitUI/datasets/), so a hardcoded
-# SCRIPT_DIR / "datasets" here silently looked in the wrong folder and
-# evaluate_per_source() was skipped on every run ("no per_source_val.json
-# found ... wasn't run this session?") even though prepare_datasets.py
-# had, in fact, just run and written it -- just somewhere else. Resolving
-# via the same Ultralytics SETTINGS lookup prepare_datasets.py itself
-# uses keeps both scripts pointed at the same actual location.
+# setting, not necessarily a "datasets" folder next to this script --
+# resolve the same way prepare_datasets.py does so both scripts agree.
 try:
     from ultralytics.utils import SETTINGS
     DATASETS_DIR = Path(SETTINGS.get("datasets_dir", SCRIPT_DIR / "datasets"))
@@ -157,84 +156,100 @@ except Exception:
 
 PER_SOURCE_MANIFEST_PATH = DATASETS_DIR / "per_source_val.json"
 
-# Tried in this order when --model auto is used. Biggest first -- more
-# capacity generally means better accuracy, so we only give it up if it
-# genuinely doesn't fit (checked directly by the probes below instead of
-# waiting on an exception Windows won't throw).
+# Tried in this order for --model auto. Biggest first -- only given up
+# on if the probes below confirm it genuinely doesn't fit.
 MODEL_SIZE_CANDIDATES = ["yolo26m.pt", "yolo26s.pt", "yolo26n.pt"]
 
 
 class VRAMBudgetExceeded(Exception):
     """Raised by either preflight callback when memory/timing signals
-    indicate this model size doesn't actually fit -- see the WDDM note in
-    this module's docstring for why we can't just wait for a normal CUDA
-    OOM exception on Windows, and why one check at startup isn't enough."""
+    indicate this model size doesn't fit -- see WDDM note above for why
+    we can't just wait for a normal CUDA OOM on Windows.
+
+    reason is "memory" (peak allocated/reserved over the safety margin,
+    or the startup probe's per-batch time heuristic -- both genuine
+    "this model size doesn't fit" signals) or "epoch_time" (the ongoing
+    watchdog's --max-epoch-minutes ceiling on its own, with no memory
+    signal alongside it).
+
+    [FIX -- review item] Only "memory" should trigger --model auto's
+    fallback to a smaller size. A slow epoch on its own isn't evidence
+    a model doesn't fit -- it can just as easily be disk I/O
+    contention, a competing process, or a one-off slow epoch, none of
+    which "try a smaller model" actually fixes. Previously both reasons
+    were treated identically, so --max-epoch-minutes could silently
+    downgrade model size for a problem a smaller model wouldn't solve.
+    See train_with_model_fallback()'s handling of this distinction."""
+
+    def __init__(self, message, reason="memory"):
+        super().__init__(message)
+        self.reason = reason
 
 
 def make_startup_probe_callback(device, warmup_batches=2, probe_batches=3,
                                   max_batch_seconds=5.0, safety_margin=0.90):
-    """
-    on_train_batch_end callback: watches the first few real training
-    batches so an obviously-too-big model size gets caught in seconds
-    rather than hours. See make_ongoing_watchdog_callback() for the
-    complementary check that keeps watching for the rest of the run --
-    this one alone is NOT sufficient (confirmed: yolo26s passed this
+    """on_train_batch_end callback: watches the first few real training
+    batches so an obviously-too-big model size gets caught in seconds,
+    not hours. Complements make_ongoing_watchdog_callback(), which keeps
+    watching for the rest of the run (confirmed: yolo26s passed this
     check cleanly and still spilled ~2800 batches later).
-    """
+
+    [FIX -- review item] Both VRAM checks here used to look only at
+    max_memory_allocated() (actual tensor bytes) against the 90%
+    safety margin. Confirmed on a --batch 3 run: GPU_mem (the
+    allocator's *reserved* pool, which is what the progress bar shows
+    and what actually governs whether WDDM decides to page out) hit
+    5.81/6.14GB (94.6%) while allocated apparently stayed under the
+    90% trip line -- the run oscillated 0.4-2.4 it/s between epochs
+    (the exact WDDM "staircase" this module's docstring already
+    describes) for 10.7 hours without either probe firing. Both checks
+    now also compare max_memory_reserved() against the same margin --
+    reserved is the closer proxy for what WDDM actually reacts to.
+    torch.cuda.reset_peak_memory_stats() (called below) resets both
+    the allocated *and* reserved peak trackers, so no extra reset is
+    needed for this."""
     state = {"count": 0, "checked": False, "last_t": None}
 
     def callback(trainer):
         import torch
 
         if not torch.cuda.is_available():
-            # BUG FIX: this callback previously assumed CUDA is always
-            # present and called torch.cuda.* unconditionally. --device
-            # cpu is an explicitly documented, supported option (for
-            # sanity-checking the script runs -- see --device's --help
-            # text), and on a CPU-only run every torch.cuda.* call here
-            # either raises or is meaningless. Skip cleanly instead of
-            # crashing a CPU run with an unrelated CUDA error, and say
-            # so once so it's clear this run has no VRAM safety net.
+            # --device cpu is a supported sanity-check option; every
+            # torch.cuda.* call below is meaningless there.
             if not state["checked"]:
                 state["checked"] = True
                 print("[startup probe] CUDA not available (--device cpu?) "
-                      "-- VRAM probe skipped. This run has no WDDM "
-                      "shared-memory safety net; fine for a sanity check, "
-                      "not recommended for a real training run.")
+                      "-- VRAM probe skipped. No WDDM safety net this run.")
             return
 
         if state["checked"]:
             return
 
+        # [FIX -- review item] CUDA execution is async: without a sync
+        # here, time.time() can measure how fast the CPU issues queued
+        # kernels rather than how long the GPU actually took on this
+        # batch. Ultralytics' own progress-bar update (loss.item())
+        # usually forces a sync anyway, but that's an implementation
+        # detail this probe shouldn't quietly depend on for a
+        # correctness-sensitive timing measurement. Only runs for the
+        # first warmup_batches + probe_batches calls (5 by default), so
+        # this sync is not a meaningful training-speed cost.
+        torch.cuda.synchronize(device)
         now = time.time()
         state["count"] += 1
 
         if state["count"] == 1:
-            # FIX (see "KNOWN FALSE-POSITIVE, FIXED" in the module
-            # docstring): torch.cuda.max_memory_allocated() is a
-            # cumulative high-water mark for the WHOLE PROCESS, not
-            # "what the current batch used." --batch -1 (AutoBatch)
-            # deliberately profiles forward+backward at several
-            # candidate batch sizes BEFORE real training starts,
-            # intentionally probing past the card's physical ceiling to
-            # find where it breaks (a real, self-handled OOM -- see the
-            # "AutoBatch: Using batch-size N" line printed just before
-            # training begins). Without this reset, that exploratory
-            # peak was still sitting in the counter a few real batches
-            # later and got misread as something the real training
-            # loop did, tripping a false VRAMBudgetExceeded on a run
-            # that was actually healthy (confirmed against Ultralytics'
-            # own progress bar showing ~0.5GB GPU_mem on the exact
-            # batch this previously aborted on). Resetting here -- the
-            # first time this callback fires, i.e. right after
-            # AutoBatch has already finished and real training has
-            # begun -- makes every peak reading from this point on
-            # reflect only real training, which is what both this
-            # probe and the ongoing watchdog below are actually meant
-            # to monitor. Runs with an explicit --batch (no AutoBatch
-            # probing) were never affected by the bug, and are
-            # unaffected by this reset too -- there's nothing stale to
-            # clear for them.
+            # torch.cuda.max_memory_allocated() is a cumulative
+            # process-wide high-water mark, not "this batch's usage".
+            # --batch -1 (AutoBatch) intentionally profiles past the
+            # card's physical ceiling before real training starts (a
+            # real, self-handled probe -- see the "AutoBatch: Using
+            # batch-size N" line). Without resetting here, that
+            # exploratory peak got misread as real training and tripped
+            # a false VRAMBudgetExceeded on a healthy run. Reset once,
+            # right after AutoBatch finishes, so every later peak
+            # reflects only real training. Runs with an explicit
+            # --batch are unaffected either way.
             torch.cuda.reset_peak_memory_stats(device)
 
         prev_t = state["last_t"]
@@ -247,17 +262,21 @@ def make_startup_probe_callback(device, warmup_batches=2, probe_batches=3,
 
         state["checked"] = True
         total = torch.cuda.get_device_properties(device).total_memory
-        peak = torch.cuda.max_memory_allocated(device)
+        peak_allocated = torch.cuda.max_memory_allocated(device)
+        peak_reserved = torch.cuda.max_memory_reserved(device)
         batch_seconds = (now - prev_t) if prev_t else 0.0
 
-        mem_bad = peak > total * safety_margin
+        allocated_bad = peak_allocated > total * safety_margin
+        reserved_bad = peak_reserved > total * safety_margin
+        mem_bad = allocated_bad or reserved_bad
         time_bad = batch_seconds > max_batch_seconds
 
         if mem_bad or time_bad:
             reasons = []
             if mem_bad:
                 reasons.append(
-                    f"peak VRAM {peak / 1e9:.2f}GB vs "
+                    f"peak allocated {peak_allocated / 1e9:.2f}GB / peak "
+                    f"reserved {peak_reserved / 1e9:.2f}GB vs "
                     f"{total / 1e9:.2f}GB physical (WDDM shared-memory "
                     f"spillover signature)")
             if time_bad:
@@ -272,20 +291,22 @@ def make_startup_probe_callback(device, warmup_batches=2, probe_batches=3,
 
 def make_ongoing_watchdog_callback(device, max_epoch_minutes=None,
                                      safety_margin=0.90):
-    """
-    on_train_epoch_end callback: re-checks the CUMULATIVE peak allocated
-    memory (the high-water mark since training started) against the
-    card's physical total after every epoch, for the whole run -- not
-    just at startup. Also flags any single epoch that takes longer than
-    --max-epoch-minutes, if set.
+    """on_train_epoch_end callback: re-checks cumulative peak allocated
+    AND peak reserved memory against the card's physical total after
+    every epoch, for the whole run (see the [FIX] note in
+    make_startup_probe_callback()'s docstring for why reserved was
+    added -- same fix applied here). Also flags any epoch over
+    --max-epoch-minutes. Reads the same process-wide counters the
+    startup probe resets on its first firing (which always happens
+    before this callback's first on_train_epoch_end), so no separate
+    reset is needed here.
 
-    Reads the same process-wide counter make_startup_probe_callback()
-    resets on its first firing -- since that reset happens before this
-    callback's first on_train_epoch_end (epoch end always comes after
-    at least one batch end), this watchdog's "cumulative peak since
-    training really started" tracking is correct without needing its
-    own reset: it inherits the already-cleared baseline.
-    """
+    [FIX -- review item] The exception raised here now carries
+    reason="epoch_time" when only the time ceiling tripped (no memory
+    signal alongside it) vs reason="memory" otherwise -- see
+    VRAMBudgetExceeded's docstring for why train_with_model_fallback()
+    needs that distinction to avoid downgrading model size for a
+    problem a smaller model wouldn't actually fix."""
     state = {"last_epoch_start": None}
 
     def callback(trainer):
@@ -294,24 +315,25 @@ def make_ongoing_watchdog_callback(device, max_epoch_minutes=None,
         now = time.time()
         epoch_seconds = (now - state["last_epoch_start"]
                           if state["last_epoch_start"] else None)
-        state["last_epoch_start"] = now  # reset for the next epoch
+        state["last_epoch_start"] = now
 
         if not torch.cuda.is_available():
-            # Same CPU-only guard as the startup probe above -- still
-            # honor --max-epoch-minutes (that check has nothing to do
-            # with CUDA), just skip the VRAM half of the check.
             if (max_epoch_minutes is not None and epoch_seconds is not None
                     and epoch_seconds > max_epoch_minutes * 60):
                 raise VRAMBudgetExceeded(
                     f"[ongoing watchdog, epoch "
                     f"{getattr(trainer, 'epoch', '?')}] epoch took "
                     f"{epoch_seconds / 60:.1f} min, over the "
-                    f"{max_epoch_minutes} min budget")
+                    f"{max_epoch_minutes} min budget",
+                    reason="epoch_time")
             return
 
         total = torch.cuda.get_device_properties(device).total_memory
-        peak = torch.cuda.max_memory_allocated(device)
-        mem_bad = peak > total * safety_margin
+        peak_allocated = torch.cuda.max_memory_allocated(device)
+        peak_reserved = torch.cuda.max_memory_reserved(device)
+        allocated_bad = peak_allocated > total * safety_margin
+        reserved_bad = peak_reserved > total * safety_margin
+        mem_bad = allocated_bad or reserved_bad
 
         time_bad = (max_epoch_minutes is not None
                     and epoch_seconds is not None
@@ -321,7 +343,8 @@ def make_ongoing_watchdog_callback(device, max_epoch_minutes=None,
             reasons = []
             if mem_bad:
                 reasons.append(
-                    f"cumulative peak VRAM {peak / 1e9:.2f}GB vs "
+                    f"cumulative peak allocated {peak_allocated / 1e9:.2f}GB "
+                    f"/ peak reserved {peak_reserved / 1e9:.2f}GB vs "
                     f"{total / 1e9:.2f}GB physical (WDDM shared-memory "
                     f"spillover signature)")
             if time_bad:
@@ -331,32 +354,247 @@ def make_ongoing_watchdog_callback(device, max_epoch_minutes=None,
                     f"{max_epoch_minutes} min budget")
             raise VRAMBudgetExceeded(
                 f"[ongoing watchdog, epoch "
-                f"{getattr(trainer, 'epoch', '?')}] " + " and ".join(reasons))
+                f"{getattr(trainer, 'epoch', '?')}] " + " and ".join(reasons),
+                reason="memory" if mem_bad else "epoch_time")
 
     return callback
 
 
 # ---------------------------------------------------------------------
-# Degradation augmentation -- see module docstring for the full "why"
-# and the per-artifact reasoning tied to the E5-FPV datasheet.
+# Disk cache drive redirect -- see module docstring's "DISK CACHE DRIVE"
+# paragraph for the full "why".
+# ---------------------------------------------------------------------
+
+def _windows_drive_roots():
+    """Every currently-mounted drive letter as a Path root ('C:\\',
+    'D:\\', ...). Uses os.listdrives() (Python 3.12+, Windows-only,
+    confirmed available on this project's Python 3.14 interpreter) so a
+    new/changed drive letter is picked up automatically; falls back to
+    manually probing C:-H: on an older interpreter."""
+    try:
+        return [Path(d) for d in os.listdrives()]
+    except AttributeError:
+        return [Path(f"{letter}:\\") for letter in "CDEFGH"
+                if Path(f"{letter}:\\").exists()]
+
+
+def _pick_best_cache_drive(preferred_drive=None):
+    """Returns (Path root, free_bytes) for the cache drive to use, or
+    None if no drive's free space could be read.
+
+    If preferred_drive is given (--cache-drive), that drive is used
+    as long as it's actually mounted and its free space is readable --
+    no "most free space" comparison overrides an explicit choice.
+    Falls back to "most free space" (with a printed note) if the
+    preferred drive isn't found.
+
+    [note -- reviewed, not changed] "Most free space" is a capacity
+    heuristic, not a speed one -- a spinning HDD with more free space
+    would still be picked over a fuller SSD. --cache-drive exists so
+    that can be overridden explicitly once it's known which mounted
+    drive is actually fastest on this machine; auto-detecting drive
+    speed reliably (SSD vs HDD, USB vs internal) isn't attempted here.
+
+    Deliberately doesn't try to precompute how many bytes the disk
+    cache will actually need -- that math (image count x resized size x
+    safety margin) is exactly what Ultralytics' check_cache_disk()
+    already does, and install_disk_cache_redirect() lets that check run
+    for real against the chosen drive. Picking the single largest-free-
+    space drive (or the explicitly preferred one) is sufficient either
+    way: if that drive doesn't have enough room, no smaller one would
+    either, so the existing "not caching images to disk" fallback still
+    applies cleanly."""
+    roots = _windows_drive_roots()
+
+    if preferred_drive is not None:
+        preferred_root = Path(preferred_drive)
+        matched = next(
+            (r for r in roots if r.resolve() == preferred_root.resolve()
+             or str(r).rstrip("\\").lower()
+             == str(preferred_root).rstrip("\\").lower()),
+            None)
+        if matched is not None:
+            try:
+                free = shutil.disk_usage(matched).free
+                return (matched, free)
+            except OSError:
+                print(f"[disk cache redirect] --cache-drive {preferred_drive} "
+                      f"is mounted but its free space couldn't be read -- "
+                      f"falling back to auto-selection by free space.")
+        else:
+            print(f"[disk cache redirect] --cache-drive {preferred_drive} "
+                  f"isn't among the currently mounted drives "
+                  f"({[str(r) for r in roots]}) -- falling back to "
+                  f"auto-selection by free space.")
+
+    best = None
+    for root in roots:
+        try:
+            free = shutil.disk_usage(root).free
+        except OSError:
+            continue
+        if best is None or free > best[1]:
+            best = (root, free)
+    return best
+
+
+def install_disk_cache_redirect(preferred_drive=None):
+    """Redirects Ultralytics' --cache disk .npy files onto a mounted
+    drive with room to spare, instead of Ultralytics' default of
+    writing them alongside each source image -- i.e. onto whatever
+    drive the dataset itself happens to live on. There's no built-in
+    Ultralytics option for this (open feature request, unimplemented as
+    of this project's installed version:
+    https://github.com/ultralytics/ultralytics/issues/18285).
+
+    Picks --cache-drive if given and mounted, otherwise whichever
+    mounted drive currently has the most free space -- see
+    _pick_best_cache_drive()'s docstring for why "most free space" is a
+    capacity heuristic, not a speed one, and why --cache-drive exists
+    to let that be overridden.
+
+    MECHANISM: BaseDataset.__init__ sets self.npy_files (one .npy path
+    per source image) before calling self.check_cache_disk() to decide
+    whether disk caching is viable at all.
+
+    [FIX -- review item] The first version of this function patched
+    check_cache_disk() to rewrite self.npy_files onto the chosen drive
+    and then DELEGATE to the original check_cache_disk() for the actual
+    pass/fail call. That looked right but wasn't: Ultralytics' real
+    check_cache_disk() hardcodes its free-space probe against
+    shutil.disk_usage(Path(self.im_files[0]).parent) -- the SOURCE
+    image directory -- not self.npy_files at all (confirmed by reading
+    the installed ultralytics package's ultralytics/data/base.py
+    directly). So the delegated call kept measuring free space on the
+    dataset's own drive regardless of where npy_files pointed, kept
+    failing there, and the redirect was a silent no-op end to end
+    (confirmed: a run with 173GB free on the redirected drive still
+    printed the same "only 121GB free" warning, measured against the
+    original 474GB drive). check_cache_disk() is therefore fully
+    REPLACED below (same 30-image sample-and-extrapolate math and
+    safety-margin formula as Ultralytics' version, so behavior still
+    tracks a future safety_margin/dataset-size change identically) with
+    its free-space probe pointed at cache_dir instead.
+
+    Cache filenames are flat and content-hashed (md5 of the original
+    image path) under a single '<drive>\\RAD_disk_cache\\' folder,
+    rather than mirroring each source image's full directory structure
+    -- avoids both Windows MAX_PATH issues from deeply nested mirrored
+    paths and any filename collisions between sources that happen to
+    share a base filename (VisDrone/UAVDT/SARD all use different naming
+    conventions, but nothing enforces that going forward). MD5 here is
+    purely a deterministic filename generator, not a security boundary
+    -- collision resistance at this scale is not a concern worth
+    upgrading to sha256 for.
+
+    Windows-only (this project's only target platform) -- a no-op with
+    a printed note on any other OS or if no drive's free space can be
+    read. If the chosen drive still doesn't have enough room,
+    Ultralytics' own check disables caching exactly as it did before,
+    just having checked the best available drive instead of a fixed
+    one.
+    """
+    if platform.system() != "Windows":
+        print("[disk cache redirect] Not on Windows -- skipping, disk "
+              "cache (if used) stays at Ultralytics' default location.")
+        return
+
+    picked = _pick_best_cache_drive(preferred_drive)
+    if picked is None:
+        print("[disk cache redirect] Could not read free space on any "
+              "mounted drive -- skipping, disk cache (if used) stays at "
+              "Ultralytics' default location.")
+        return
+
+    cache_root, free_bytes = picked
+    cache_dir = cache_root / "RAD_disk_cache"
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"[disk cache redirect] {cache_root} has the most free "
+              f"space ({free_bytes / 1e9:.1f}GB) but its cache folder "
+              f"couldn't be created ({e}) -- skipping, disk cache (if "
+              f"used) stays at Ultralytics' default location.")
+        return
+
+    print(f"[disk cache redirect] {cache_root} "
+          f"({free_bytes / 1e9:.1f}GB free) -- disk cache .npy files (if "
+          f"--cache disk fits there) will be written to {cache_dir} "
+          f"instead of alongside the source images.")
+
+    import ultralytics.data.base as base_mod
+    orig_check_cache_disk = base_mod.BaseDataset.check_cache_disk
+
+    def patched_check_cache_disk(self, safety_margin: float = 0.5) -> bool:
+        """Full replacement for BaseDataset.check_cache_disk() -- see
+        install_disk_cache_redirect()'s [FIX] docstring note for why a
+        redirect-then-delegate wrapper didn't work. Mirrors Ultralytics'
+        own sample-30-images-and-extrapolate math exactly, but checks
+        free space at cache_dir (the redirected drive) instead of
+        Path(self.im_files[0]).parent, and points self.npy_files at
+        cache_dir so cache_images_to_disk() (called right after this,
+        unmodified) writes there for real."""
+        if not hasattr(self, "im_files") or not hasattr(self, "ni"):
+            # Unexpected BaseDataset shape (future Ultralytics version?)
+            # -- fall back to stock behavior rather than guessing.
+            return orig_check_cache_disk(self, safety_margin)
+
+        self.npy_files = [
+            cache_dir / (hashlib.md5(str(f).encode()).hexdigest() + ".npy")
+            for f in self.im_files
+        ]
+
+        if not os.access(cache_dir, os.W_OK):
+            self.cache = None
+            print(f"[disk cache redirect] {cache_dir} is not writable -- "
+                  f"not caching images to disk.")
+            return False
+
+        import random
+        b, gb = 0, 1 << 30
+        n = min(self.ni, 30)
+        for _ in range(n):
+            im = base_mod.imread(random.choice(self.im_files))
+            if im is None:
+                continue
+            b += im.nbytes
+        if b == 0:
+            # Couldn't successfully sample a single image -- something
+            # else is wrong; defer to the stock check rather than
+            # dividing by a meaningless zero below.
+            return orig_check_cache_disk(self, safety_margin)
+
+        disk_required = b * self.ni / n * (1 + safety_margin)
+        total, _used, free = shutil.disk_usage(cache_dir)
+        prefix = getattr(self, "prefix", "")
+        if disk_required > free:
+            self.cache = None
+            print(f"{prefix}{disk_required / gb:.1f}GB disk space "
+                  f"required, with {int(safety_margin * 100)}% safety "
+                  f"margin but only {free / gb:.1f}/{total / gb:.1f}GB "
+                  f"free on {cache_dir} (redirected drive) -- not "
+                  f"caching images to disk.")
+            return False
+
+        print(f"{prefix}{disk_required / gb:.1f}GB disk space required "
+              f"-- {free / gb:.1f}/{total / gb:.1f}GB free on "
+              f"{cache_dir}, proceeding with disk cache there.")
+        return True
+
+    base_mod.BaseDataset.check_cache_disk = patched_check_cache_disk
+    print("[disk cache redirect] Installed -- the disk-space check now "
+          "runs against the redirected drive for real.")
+
+
+# ---------------------------------------------------------------------
+# Degradation augmentation -- see module docstring for the full "why".
 # ---------------------------------------------------------------------
 
 def _interlace_combing(image, **kwargs):
-    """
-    Custom Albumentations Lambda: mimics NTSC/PAL interlace 'combing' --
-    alternate scanlines slightly horizontally misaligned, as happens
-    when successive interlaced fields are captured during airframe
-    motion. Deliberately minimal: a 1px row shift. This project's
-    objects of interest (a person at altitude) can be only a handful of
-    pixels wide, so anything beyond ~1px risks measurably displacing an
-    already-tight label box -- which would hurt precision, the opposite
-    of the goal. Kept at low probability in the Compose pipeline for the
-    same reason. If your capture chain already deinterlaces cleanly
-    before frames reach the training pipeline, this artifact may simply
-    never fire in practice on your real footage -- that's fine, it costs
-    nothing to leave in as a low-probability guard for capture chains
-    that don't.
-    """
+    """Albumentations Lambda: mimics NTSC/PAL interlace 'combing' (a 1px
+    row shift). Kept minimal -- this project's objects of interest can
+    be only a handful of pixels wide, so anything beyond ~1px risks
+    displacing an already-tight label box."""
     import numpy as np
     img = image.copy()
     img[1::2] = np.roll(img[1::2], 1, axis=1)
@@ -364,36 +602,22 @@ def _interlace_combing(image, **kwargs):
 
 
 def _try_build_transform(name, *builders):
-    """
-    Tries each candidate builder in order (most-current API shape
-    first, falling back to older shapes) and returns the first one that
-    builds with zero warnings.
+    """Tries each candidate builder in order (newest API shape first),
+    treating ANY warning as a build failure (not just a hard exception)
+    -- some albumentations parameter mismatches are silently accepted
+    and ignored with only a UserWarning, not an error, which previously
+    let a transform silently run at the library's default strength
+    instead of this project's deliberately small one. Returns None (with
+    a printed message) if every builder fails.
 
-    BUG FIX -- this used to take a single builder and only catch hard
-    exceptions (a TypeError from a renamed/removed parameter). That's
-    not the only failure mode: some albumentations parameter-name
-    mismatches are silently ACCEPTED and ignored, reported only via a
-    UserWarning, not an exception. CONFIRMED on this project's actual
-    run: build_optical_distortion()'s alb_major>=2 branch assumed
-    distort_range was the correct kwarg for "any albumentations 2.x",
-    but the installed 2.0.8 rejected it with only a UserWarning
-    ("Argument(s) 'distort_range' are not valid for transform
-    OpticalDistortion") -- the old single-builder version of this
-    function returned a real, successfully-constructed object anyway,
-    silently running OpticalDistortion at the LIBRARY'S OWN DEFAULT
-    distortion strength instead of this project's deliberately small
-    +/-0.03 one. That's exactly the label-corruption risk the module
-    docstring warns about for this transform (image-only, no
-    bbox_params, so a stronger warp shifts pixels while label boxes
-    stay put) -- and it was happening every run without ever being
-    reported as a skip.
-
-    Passing multiple builders and treating ANY warning as a build
-    failure (via warnings.filterwarnings("error")) means whichever
-    variant the installed version actually accepts cleanly wins, rather
-    than depending on alb_major guessing right for every point release.
-    Returns None (with a printed message) if every builder fails.
-    """
+    [note -- reviewed, not changed] this does mean an UNRELATED
+    UserWarning raised during a builder's construction (not just a
+    "parameter ignored" one) would also count as a rejection for that
+    candidate. In practice each builder is a single constructor call
+    with no other work happening in that scope, so this is a low-risk
+    trade-off -- but if a future albumentations version starts emitting
+    an unrelated warning here, the printed "Skipping '...'" message will
+    say so and is the thing to check first."""
     import warnings
     for i, builder in enumerate(builders):
         try:
@@ -403,62 +627,69 @@ def _try_build_transform(name, *builders):
             if i > 0:
                 print(f"[degradation aug] '{name}': installed "
                       f"albumentations version needed fallback parameter "
-                      f"set #{i + 1} of {len(builders)} (newer-API name(s) "
-                      f"were rejected).")
+                      f"set #{i + 1} of {len(builders)}.")
             return result
         except Exception:
             continue
     print(f"[degradation aug] Skipping '{name}' -- none of {len(builders)} "
           f"candidate parameter set(s) were accepted cleanly by the "
-          f"installed albumentations version. Every other degradation "
-          f"transform is unaffected.")
+          f"installed albumentations version.")
     return None
 
 
 def build_degradation_transform():
-    """
-    Builds an Albumentations pipeline calibrated against the E5-FPV
-    camera's actual datasheet (1500TVL CVBS analog, NTSC/PAL, 0.0001 lux
-    minimum illumination, 6mm lens / 100 degree FOV) rather than a
-    generic noise guess -- see the module docstring for what each
-    transform maps to and why. Returns None (with a printed warning) if
-    albumentations isn't installed, or if every individual transform
-    fails to build against the installed version -- both cases are
-    non-fatal, training proceeds without degradation augmentation rather
-    than crashing.
+    """Builds an Albumentations pipeline calibrated against the E5-FPV
+    camera's datasheet (1500TVL CVBS analog, NTSC/PAL, 0.0001 lux min,
+    6mm/100deg FOV) rather than generic noise. Returns None (with a
+    warning) if albumentations isn't installed or every transform fails
+    to build -- non-fatal, training proceeds without degradation aug.
 
-    VERSION-AWARE, not just version-TOLERANT: five of these transforms
-    (Downscale, GaussNoise, CoarseDropout, ImageCompression,
-    OpticalDistortion) had their parameter names changed between
-    albumentations 1.x and 2.x -- confirmed directly against an
-    installed 2.0.8 (and against albumentations' own 2.x API reference
-    for OpticalDistortion specifically, whose shift_limit was dropped
-    entirely and distort_limit renamed to distort_range): the OLD 1.x
-    kwarg names don't raise an error under 2.x, they get silently
-    accepted and IGNORED, falling back to the library's own defaults.
-    That's worse than a crash for one transform specifically --
-    CoarseDropout's 2.x default hole size is 10-20% of the image per
-    side, which is large enough to fully blank out a tiny labeled
-    person, exactly the label-corruption risk this transform was
-    deliberately kept small to avoid (see module docstring). So this
-    isn't just wrapped in try/except: the correct kwarg names for the
-    detected major version are used directly, with try/except kept
-    underneath as a second-line defense for any future API shape
-    neither branch anticipates.
+    Five transforms (Downscale, GaussNoise, CoarseDropout,
+    ImageCompression, OpticalDistortion) have different parameter names
+    between albumentations 1.x/2.x, and some 1.x names are silently
+    accepted-and-ignored under 2.x rather than erroring -- worst case
+    for CoarseDropout, whose 2.x default hole size is large enough to
+    blank out a tiny labeled person. So version-correct kwargs are used
+    directly per detected major version, with _try_build_transform's
+    warning-as-error check as a second-line defense.
+
+    NOTE on OpticalDistortion specifically: albumentations went through
+    THREE distinct signatures for this transform, not two --
+      pre-2.0:  distort_limit + shift_limit
+      2.0.x:    distort_limit + mode (shift_limit removed, mode added)
+      2.2+:     distort_range + mode (distort_limit renamed to
+                distort_range in the "every range param ends in _range"
+                cleanup)
+    An installed 2.0.x/2.1.x version (like 2.0.8) matches NEITHER the
+    pre-2.0 nor the 2.2+ shape, so all three candidates are tried below,
+    newest-first.
+
+    [note -- reviewed, not changed] CoarseDropout/OpticalDistortion/the
+    interlace Lambda are image-only (no bbox_params -- see
+    install_degradation_augment()'s docstring), so in principle they can
+    displace a labeled object by a pixel or two without moving its box.
+    This pipeline's parameters were deliberately kept weak specifically
+    to bound that risk (CoarseDropout: <=3 holes of 4x10px each,
+    p=0.08; OpticalDistortion: +/-0.03, roughly a third of
+    albumentations' own 0.05 default, p=0.15) rather than removed
+    outright -- a bbox-aware version would need segmentation-free box
+    remapping logic this project doesn't have yet. Worth re-examining
+    if per-class mAP for tiny/rare classes (report_per_class_map())
+    looks worse with degradation aug on than off, but not changed here
+    since that's an empirical question, not a code bug.
     """
     try:
         import albumentations as A
     except ImportError:
         print("[degradation aug] albumentations not installed -- skipping. "
-              "Run: pip install albumentations   to enable analog-feed "
-              "degradation augmentation (recommended before the real run, "
-              "not required).")
+              "Run: pip install albumentations   to enable it (recommended "
+              "before the real run, not required).")
         return None
 
     try:
         alb_major = int(str(A.__version__).split(".")[0])
     except Exception:
-        alb_major = 1  # unknown -- assume the older (pre-2.0) API shape
+        alb_major = 1
     print(f"[degradation aug] Detected albumentations {A.__version__} "
           f"(using {'2.x' if alb_major >= 2 else '1.x'}-style parameter "
           f"names).")
@@ -483,17 +714,9 @@ def build_degradation_transform():
         pieces.append(blur)
 
     def build_gauss_noise():
-        # var_limit (1.x) is raw pixel-value variance (0-255 scale);
-        # std_range (2.x) is std as a fraction of the 0-1 normalized
-        # range. (10.0, 60.0) var -> std ~ sqrt(var)/255 ~ (0.012, 0.030)
-        # -- widened slightly below for comparable visible effect.
-        # Tries the 2.x name first, falls back to 1.x -- same
-        # warning-as-error safety net as _try_build_transform (see its
-        # docstring for why a silent-accept-and-ignore parameter name
-        # is a real failure mode here, confirmed on OpticalDistortion),
-        # applied locally since GaussNoise is nested inside another
-        # transform's OneOf rather than registered as its own
-        # top-level piece.
+        # var_limit (1.x) is raw pixel variance; std_range (2.x) is std
+        # as a fraction of the 0-1 range. (10,60) var ~ (0.012,0.030)
+        # std, widened slightly for a comparable visible effect.
         import warnings
         for candidate in (
             lambda: A.GaussNoise(std_range=(0.015, 0.05), p=1.0),
@@ -505,16 +728,30 @@ def build_degradation_transform():
                     return candidate()
             except Exception:
                 continue
-        raise ValueError("no GaussNoise parameter set was accepted cleanly")
+        return None  # [FIX] see note below -- was `raise ValueError(...)`
 
-    noise = _try_build_transform(
-        "low-light sensor noise (0.0001 lux gain grain)",
-        lambda: A.OneOf([
-            A.ISONoise(color_shift=(0.01, 0.06), intensity=(0.15, 0.5), p=1.0),
-            build_gauss_noise(),
-        ], p=0.35))
-    if noise is not None:
-        pieces.append(noise)
+    # [FIX -- robustness] build_gauss_noise() used to raise if neither of
+    # its own candidates built cleanly, which propagated up through this
+    # single lambda and made ISONoise's fate depend on GaussNoise's --
+    # if GaussNoise ever stopped matching a future albumentations
+    # version, the whole noise transform (including a perfectly good
+    # ISONoise) would silently disappear too. ISONoise and GaussNoise
+    # are now built independently and combined only if at least one
+    # succeeds, the same "graceful partial degradation" the rest of
+    # this file already uses.
+    iso_noise = _try_build_transform(
+        "low-light sensor noise: ISONoise (0.0001 lux gain grain)",
+        lambda: A.ISONoise(color_shift=(0.01, 0.06), intensity=(0.15, 0.5),
+                            p=1.0))
+    gauss_noise = build_gauss_noise()
+    if gauss_noise is None:
+        print("[degradation aug] Skipping GaussNoise fallback within the "
+              "low-light noise transform -- none of its candidate "
+              "parameter sets were accepted cleanly by the installed "
+              "albumentations version.")
+    noise_options = [t for t in (iso_noise, gauss_noise) if t is not None]
+    if noise_options:
+        pieces.append(A.OneOf(noise_options, p=0.35))
 
     gamma = _try_build_transform(
         "exposure/gamma variation (dusk-to-daylight SAR range)",
@@ -529,17 +766,18 @@ def build_degradation_transform():
     if brightness is not None:
         pieces.append(brightness)
 
-    # Deliberately weak -- see module docstring: this is one of the two
-    # transforms here (along with OpticalDistortion below) that can
-    # corrupt a label (not just add noise to it) if it isn't kept
-    # small, since this pipeline runs image-only with no bbox_params.
-    # Small/rare on purpose, and (critically) the exact pixel sizes
-    # below are confirmed to mean literal pixels under 2.x when given
-    # as plain ints, not a fraction of image size -- verified directly
-    # (5 holes of (4,4)/(10,10) produced exactly 200 zeroed pixels =
-    # 5*4*10) before relying on it here.
+    # Deliberately weak -- image-only pipeline (no bbox_params), so a
+    # large hole/distortion would corrupt a label rather than just add
+    # noise. Confirmed under 2.x with num_holes_range=(1, 3): worst case
+    # 3 holes of (4,4)/(10,10) => at most 120 zeroed pixels, i.e.
+    # literal pixels, not a fraction of image size.
+    # [FIX -- doc/code mismatch] this comment previously said "5 holes
+    # ... 200 zeroed pixels", which doesn't match num_holes_range=(1, 3)
+    # below (max 3 holes, max 120px). The code was already correct and
+    # intentionally weak; only the stale comment has been corrected here
+    # to describe what num_holes_range=(1, 3) actually produces.
     dropout = _try_build_transform(
-        "RF dropout burst (deliberately small/rare, see docstring)",
+        "RF dropout burst (deliberately small/rare)",
         lambda: A.CoarseDropout(num_holes_range=(1, 3),
                                   hole_height_range=(4, 4),
                                   hole_width_range=(10, 10),
@@ -549,33 +787,23 @@ def build_degradation_transform():
     if dropout is not None:
         pieces.append(dropout)
 
-    # Barrel distortion for the E5-FPV's 6mm/100-degree-FOV lens -- see
-    # the "OpticalDistortion (lens barrel distortion, NEW)" bullet in
-    # the module docstring for the full reasoning, including why this
-    # is kept deliberately weak (same image-only/no-bbox_params
-    # corruption risk as CoarseDropout above, but across the whole
-    # frame instead of a small hole). distort_range/distort_limit
-    # +/-0.03 is roughly a third of albumentations' own 0.05 default --
-    # enough to bow lines slightly toward the frame edge, not enough to
-    # meaningfully displace a tight box anywhere but the extreme edge.
+    # Barrel distortion for the E5-FPV's 6mm/100deg lens. +/-0.03 is
+    # roughly a third of albumentations' own 0.05 default -- enough to
+    # bow lines slightly, not enough to meaningfully displace a tight
+    # box except at the extreme edge. Same image-only corruption risk
+    # as CoarseDropout above -- kept weak on purpose.
     #
-    # BUG FIX -- CONFIRMED on this project's actual run log: the
-    # alb_major>=2 branch below (distort_range, mode="camera") was
-    # rejected by the installed albumentations 2.0.8 with a UserWarning
-    # ("Argument(s) 'distort_range' are not valid for transform
-    # OpticalDistortion"), NOT an exception -- so the old code silently
-    # got back a working OpticalDistortion object that had actually
-    # fallen through to the library's own default distortion strength
-    # instead of this project's deliberately small +/-0.03 one, on
-    # every single run, with the log claiming "Built 9/9 planned
-    # transforms with version-correct parameters" the whole time.
-    # _try_build_transform now tries both parameter sets and only
-    # accepts whichever one the installed version builds without any
-    # warning -- see its docstring.
+    # [FIX] Three candidates now, not two -- see the OpticalDistortion
+    # note in this function's docstring. The installed 2.0.8 needs the
+    # middle one (distort_limit + mode, no shift_limit); the previous
+    # two candidates (2.2+'s distort_range+mode, and pre-2.0's
+    # distort_limit+shift_limit) both failed to build on 2.0.8, which
+    # is why this transform was being skipped every run.
     optical_distortion = _try_build_transform(
-        "lens barrel distortion (6mm/100deg FOV, deliberately weak, "
-        "see docstring)",
+        "lens barrel distortion (6mm/100deg FOV, deliberately weak)",
         lambda: A.OpticalDistortion(distort_range=(-0.03, 0.03),
+                                      mode="camera", p=0.15),
+        lambda: A.OpticalDistortion(distort_limit=(-0.03, 0.03),
                                       mode="camera", p=0.15),
         lambda: A.OpticalDistortion(distort_limit=0.03, shift_limit=0.0,
                                       p=0.15))
@@ -589,8 +817,6 @@ def build_degradation_transform():
     if compression is not None:
         pieces.append(compression)
 
-    # Deliberately minimal -- see _interlace_combing's docstring for why
-    # this is capped at a 1px shift rather than tuned for visual realism.
     interlace = _try_build_transform(
         "NTSC/PAL interlace combing (1px, low-probability by design)",
         lambda: A.Lambda(image=_interlace_combing, p=0.12))
@@ -600,55 +826,37 @@ def build_degradation_transform():
     if not pieces:
         print("[degradation aug] No transforms could be built against the "
               "installed albumentations version -- degradation "
-              "augmentation is disabled for this run. Check `pip show "
-              "albumentations` and consider `pip install -U albumentations` "
-              "or `pip install \"albumentations<2\"` if this keeps happening.")
+              "augmentation is disabled for this run.")
         return None
 
     print(f"[degradation aug] Built {len(pieces)}/9 planned transforms "
-          f"with version-correct parameters (any gap above is a genuine "
-          f"unexpected-API skip, logged individually).")
+          f"with version-correct parameters.")
     return A.Compose(pieces)
 
 
 def install_degradation_augment():
-    """
-    Monkeypatches ultralytics.data.augment.Albumentations.__init__ so the
-    transform it builds internally is replaced with
-    build_degradation_transform()'s analog-feed-biased pipeline, instead
-    of Ultralytics' own very-low-probability defaults (p=0.01 per op,
-    tuned for generic robustness, not for this project's specific
-    train/deploy domain gap).
+    """Monkeypatches ultralytics.data.augment.Albumentations.__init__ so
+    the transform it builds is replaced with build_degradation_transform()'s
+    analog-feed-biased pipeline instead of Ultralytics' generic defaults.
 
-    self.contains_spatial is forced to False regardless of what
-    Ultralytics' own spatial-transform heuristic would say (it classifies
-    CoarseDropout, OpticalDistortion, and Lambda as "spatial" transforms,
-    since Albumentations CAN make them bbox-aware given bbox_params).
-    This pipeline's own A.Compose(pieces) call deliberately has no
-    bbox_params set, so it MUST be called image-only
-    (contains_spatial=False) or the call would break -- this is
-    intentional, not an oversight, but it does mean CoarseDropout/
-    OpticalDistortion/Lambda run here without any bbox awareness at all,
-    relying entirely on small hole size / small distortion magnitude to
-    avoid label corruption rather than Albumentations' own
-    visibility-based box filtering or geometric box remapping. See the
-    CoarseDropout and OpticalDistortion bullets in the module docstring
-    for the more rigorous (not implemented) alternative.
+    self.contains_spatial is forced False -- this pipeline's A.Compose
+    has no bbox_params, so it must be called image-only, even though
+    Ultralytics would otherwise classify CoarseDropout/OpticalDistortion/
+    Lambda as spatial transforms. Those three run here without bbox
+    awareness, relying on small hole size / small distortion magnitude
+    instead of Albumentations' own box remapping to avoid corrupting
+    labels.
 
-    NOTE: this patches an internal (non-public-API) class. If an
-    Ultralytics upgrade changes Albumentations' __init__ signature or
-    where it's instantiated, this patch may silently stop applying --
-    worth a quick visual sanity check (dump a few augmented training
-    images) after any Ultralytics version bump. Safe with --workers 0
-    (this project's default) since it's applied once in the main process
-    before model.train() spins up any dataloader workers.
+    Patches an internal (non-public) class -- if a future Ultralytics
+    upgrade changes Albumentations' __init__ signature or call site,
+    this may silently stop applying; sanity-check with a few dumped
+    augmented images after any Ultralytics version bump. Safe with
+    --workers 0 (this project's default) since it's applied once in the
+    main process before any dataloader worker spins up.
 
-    patched_init() forwards *args/**kwargs to orig_init() rather than
-    hardcoding a fixed parameter list -- see "PATCH SIGNATURE
-    ROBUSTNESS" in the module docstring for why (Ultralytics 8.4.116
-    added a `transforms=` kwarg to the real __init__ that an
-    earlier, hardcoded `def patched_init(self, p=1.0)` couldn't accept,
-    causing a hard TypeError before training could start).
+    patched_init() forwards *args/**kwargs rather than a hardcoded
+    signature, since an Ultralytics update once added a `transforms=`
+    kwarg a hardcoded `def patched_init(self, p=1.0)` couldn't accept.
     """
     transform = build_degradation_transform()
     if transform is None:
@@ -666,23 +874,14 @@ def install_degradation_augment():
     aug_mod.Albumentations.__init__ = patched_init
     print("[degradation aug] Installed analog-feed degradation transform "
           "(motion/gaussian blur, compression artifacts, ISO noise, gamma "
-          "shift, lens barrel distortion) -- closes some of the "
-          "train/deploy domain gap against the real FPV analog feed.")
+          "shift, lens barrel distortion).")
 
 
 def _contains_albumentations(transform_obj, aug_mod, _depth=0, _max_depth=6) -> bool:
-    """
-    Best-effort recursive search through Ultralytics' Compose tree for an
-    Albumentations instance. Walks transform_obj's own .transforms list
-    and any nested .pre_transform -- these are the two attribute names
-    Ultralytics' Compose/BaseMixTransform classes use to nest
-    sub-pipelines as of the version this was written against. This is
-    non-public internal structure (same caveat as the monkeypatch
-    itself), so this degrades to returning False past _max_depth or on
-    an unexpected shape rather than raising -- see
-    make_augmentation_scope_check_callback() for how the "unknown" case
-    is surfaced honestly instead of being reported as a false pass.
-    """
+    """Best-effort recursive search through Ultralytics' Compose tree
+    for an Albumentations instance, via .transforms / .pre_transform
+    (non-public internal structure) -- degrades to False past
+    _max_depth or on an unexpected shape rather than raising."""
     if _depth > _max_depth or transform_obj is None:
         return False
     if isinstance(transform_obj, aug_mod.Albumentations):
@@ -699,22 +898,11 @@ def _contains_albumentations(transform_obj, aug_mod, _depth=0, _max_depth=6) -> 
 
 
 def make_augmentation_scope_check_callback():
-    """
-    on_train_start callback: empirically confirms the degradation
-    augmentation patch reaches the TRAIN dataloader and does NOT reach
-    the validation dataloader -- i.e. val metrics stay a clean,
-    undegraded measure of real performance, and only train batches get
-    the analog-feed simulation. This is a real check performed every
-    run, not just a design assumption documented in a comment: it walks
-    each loader's actual transform tree looking for an Albumentations
-    instance.
-
-    Best-effort by design (see _contains_albumentations docstring) -- if
-    a loader's transform tree can't be walked (e.g. a future Ultralytics
-    version changed its internal shape), this prints 'unknown' rather
-    than a false pass, so a broken check never silently hides a real
-    problem behind output that looks reassuring.
-    """
+    """on_train_start callback: empirically confirms the degradation
+    patch reaches the TRAIN loader and NOT the val loader, by walking
+    each loader's actual transform tree (not just documenting the
+    assumption). Prints 'unknown' rather than a false pass if a tree
+    can't be walked, so a broken check never hides a real problem."""
     def callback(trainer):
         import ultralytics.data.augment as aug_mod
 
@@ -726,8 +914,7 @@ def make_augmentation_scope_check_callback():
             transforms = getattr(loader.dataset, "transforms", None)
             if transforms is None:
                 print(f"[augmentation scope check] {label}: dataset has no "
-                      f".transforms attribute -- unknown (Ultralytics "
-                      f"internals may have changed shape).")
+                      f".transforms attribute -- unknown.")
                 return None
             found = _contains_albumentations(transforms, aug_mod)
             print(f"[augmentation scope check] {label}: degradation "
@@ -748,22 +935,16 @@ def make_augmentation_scope_check_callback():
         if val_found is True:
             print("\n[WARNING] Degradation augmentation appears to be "
                   "reaching the VALIDATION set. Val metrics from this run "
-                  "would no longer be a clean measure of real performance "
-                  "-- stop and investigate before trusting them.")
+                  "would no longer be clean -- investigate before trusting them.")
         elif train_found is False:
             print("\n[WARNING] Degradation augmentation does NOT appear to "
-                  "be reaching the TRAIN set either -- the monkeypatch may "
-                  "not be taking effect this run. Confirm "
-                  "install_degradation_augment() ran before model.train() "
-                  "was called and that albumentations imported "
-                  "successfully (see the '[degradation aug]' log lines "
-                  "above, earlier in this run).")
+                  "reach the TRAIN set either -- the monkeypatch may not be "
+                  "taking effect. Confirm install_degradation_augment() ran "
+                  "before model.train() and albumentations imported OK.")
         elif train_found is None or val_found is None:
             print("\n[note] Scope check was inconclusive for at least one "
-                  "loader (see 'unknown' above) -- Ultralytics internals "
-                  "may not match what this check expects. Training "
-                  "proceeds normally either way; this check is a bonus "
-                  "confirmation, not a gate.")
+                  "loader -- Ultralytics internals may not match what this "
+                  "check expects. Training proceeds normally either way.")
         else:
             print("\n[OK] Degradation augmentation confirmed train-only "
                   "for this run.")
@@ -773,27 +954,90 @@ def make_augmentation_scope_check_callback():
 
 
 def _device_arg_type(value: str):
-    """
-    BUG FIX: --device's default is the int 0, but argparse gives you a
-    bare STRING when the flag is actually typed on the command line (no
-    type= was previously set). torch.cuda.get_device_properties()/
-    torch.device() accept an int (0), 'cpu', or a full 'cuda:0'-style
-    string -- but NOT a bare numeric string like '0'
-    (torch.device('0') raises "Invalid device string"). So the default
-    (never touches this function) worked fine, but anyone who explicitly
-    passed --device 0 on the CLI -- the single most common thing to
-    type -- would crash the startup probe/watchdog with an unrelated-
-    looking torch device-parsing error. 'cpu' and already-qualified
-    strings ('cuda:0', '0,1') are passed through unchanged; anything
-    that parses as a bare int is converted so it matches the untouched
-    default's type.
-    """
+    """--device's default is the int 0, but argparse hands back a bare
+    STRING when the flag is typed on the CLI. torch.device() accepts an
+    int, 'cpu', or 'cuda:0'-style strings, but NOT a bare numeric string
+    like '0' -- so an explicit --device 0 crashed with an unrelated-
+    looking torch device-parsing error until this converts it. 'cpu' and
+    already-qualified strings pass through unchanged."""
     if value.lower() == "cpu":
         return value
     try:
         return int(value)
     except ValueError:
         return value  # e.g. "cuda:0", "0,1" -- already unambiguous to torch
+
+
+def _cache_arg_type(value):
+    """[FIX -- review item #4] --cache had no type=, so `--cache False`
+    on the CLI arrived as the literal string "False", which is truthy
+    -- Ultralytics would still cache to disk despite the docstring's
+    "set to False if disk space is tight" instructions. Same class of
+    bug _device_arg_type() already fixes for --device. Parses
+    true/false case-insensitively to real bools; passes 'ram'/'disk'
+    (or anything else) through unchanged."""
+    if isinstance(value, bool):
+        return value
+    lowered = str(value).strip().lower()
+    if lowered == "false":
+        return False
+    if lowered == "true":
+        return True
+    return value  # "ram" / "disk" -- passed through as-is
+
+
+def _explicitly_provided_resume_overrides(argv=None):
+    """[FIX -- review item] Returns ONLY the resume-overridable flags
+    (imgsz/batch/device/close_mosaic/save_period/workers/cache/patience
+    -- confirmed via the installed ultralytics package's
+    BaseTrainer.check_resume() allowlist) that the user actually TYPED
+    on the CLI this invocation, as a separate throwaway parse with
+    every default set to argparse.SUPPRESS.
+
+    The bug this fixes: parse_args()'s real defaults (imgsz=960,
+    batch=1, device=0, workers=0, cache='disk', save_period=5,
+    patience=30, close_mosaic=10) exist on `args` whether or not the
+    user typed the flag. check_resume()'s override loop is
+    `if k in overrides: setattr(...)` -- it has no way to tell "user
+    typed --batch 1" from "the field defaults to 1" once both look
+    identical in the dict handed to model.train(). Building
+    resume_overrides straight from `args` (the old approach) therefore
+    passed all 8 keys on EVERY --resume invocation, silently
+    overwriting the checkpoint's own saved imgsz/batch/device/.../
+    patience with this script's normal-run defaults even when the user
+    typed bare `--resume` -- e.g. a checkpoint saved at batch=2 would
+    silently resume at batch=1 instead of continuing at 2. Confirmed by
+    reading ultralytics/engine/trainer.py's check_resume(): `overrides`
+    there is exactly the kwargs dict this script hands to
+    model.train(), so "key present" and "user typed it" were being
+    treated as the same thing when they aren't.
+
+    A second SUPPRESS-default parse of the same 8 flags is the fix --
+    only a flag actually present in sys.argv ends up in the returned
+    dict, so `python train.py --resume` (no other flags) now yields an
+    EMPTY resume_overrides, and every one of these 8 settings genuinely
+    resumes from the checkpoint's own args.yaml, exactly as the
+    --resume help text has always claimed. `--resume --batch 2` still
+    overrides just batch, as before. Kept as a separate parser (rather
+    than changing parse_args()'s own defaults to SUPPRESS) so nothing
+    else in this script -- the non-resume train path, the disk-cache-
+    install check, etc., all of which need a real usable default
+    whether or not the user typed the flag -- has to change."""
+    sentinel = argparse.ArgumentParser(add_help=False)
+    sentinel.add_argument("--imgsz", type=int, default=argparse.SUPPRESS)
+    sentinel.add_argument("--batch", type=int, default=argparse.SUPPRESS)
+    sentinel.add_argument("--device", type=_device_arg_type,
+                            default=argparse.SUPPRESS)
+    sentinel.add_argument("--close-mosaic", type=int,
+                            default=argparse.SUPPRESS)
+    sentinel.add_argument("--save-period", type=int,
+                            default=argparse.SUPPRESS)
+    sentinel.add_argument("--workers", type=int, default=argparse.SUPPRESS)
+    sentinel.add_argument("--cache", type=_cache_arg_type,
+                            default=argparse.SUPPRESS)
+    sentinel.add_argument("--patience", type=int, default=argparse.SUPPRESS)
+    known, _unused = sentinel.parse_known_args(argv)
+    return vars(known)
 
 
 def parse_args():
@@ -804,183 +1048,179 @@ def parse_args():
                          "yolo26n if a size doesn't fit.")
     p.add_argument("--data", default=None,
                     help="Dataset yaml. Defaults to the auto-generated "
-                         "datasets/unified.yaml (see prepare_datasets.py) "
-                         "-- unified taxonomy spanning VisDrone+UAVDT+SARD "
-                         "plus anything under datasets/external/. Pass "
-                         "'VisDrone.yaml' explicitly to reproduce the "
-                         "original 10-class baseline instead.")
+                         "datasets/unified.yaml -- unified taxonomy "
+                         "spanning VisDrone+UAVDT+SARD plus datasets/"
+                         "external/. Pass 'VisDrone.yaml' to reproduce "
+                         "the original 10-class baseline instead.")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--imgsz", type=int, default=960,
-                    help="960 is the RECOMMENDED default for this project "
-                         "-- this project's own baseline history shows "
-                         "640px plateaus with small/rare classes missed "
-                         "outright, while the same model at 960px fixed "
-                         "that ceiling and every class improved (see the "
-                         "IMAGE SIZE note in the module docstring). Note "
-                         "imgsz does NOT need to match any source "
-                         "dataset's native resolution -- Ultralytics "
-                         "letterboxes every image (VisDrone/UAVDT/SARD "
-                         "alike) to this single square size regardless. "
-                         "960px HAS shown WDDM spillover in the past on "
-                         "this card (see WDDM note) but mosaic_guard.py's "
-                         "instance cap has since confirmed real VRAM "
-                         "headroom (~2GB/6GB) at this size -- fall back "
-                         "to 640 only if the startup probe/watchdog still "
-                         "trip for you.")
+                    help="960 is RECOMMENDED -- 640px plateaus on small/"
+                         "rare classes, 960px fixed that (see BASELINE "
+                         "HISTORY). Doesn't need to match any source's "
+                         "native resolution -- Ultralytics letterboxes "
+                         "everything to one square size. mosaic_guard.py's "
+                         "instance cap confirms real headroom (~2GB/6GB) "
+                         "at 960px; fall back to 640 only if the startup "
+                         "probe/watchdog trip.")
     p.add_argument("--batch", type=int, default=1,
-                    help="Explicit batch size. batch=1 has zero batching "
-                         "efficiency and is a major speed tax by itself. "
-                         "UPDATE: with mosaic_guard.py's instance cap "
-                         "installed, a real run is now staying around "
-                         "~2GB/6GB VRAM -- there is likely significant "
-                         "headroom to raise this. Test via a short "
-                         "--epochs 3-5 run before committing to a full "
-                         "run: watch nvidia-smi / the printed VRAM probe "
-                         "messages, and increase --batch until either "
-                         "gets close to the 6GB ceiling. Pass -1 for "
-                         "AutoBatch -- was unreliable at 960px in earlier "
-                         "testing (pre-mosaic_guard), may be worth "
-                         "retrying now given the lower actual usage. NOTE: "
-                         "AutoBatch's own pre-training profiling pass "
-                         "(the 'GPU_mem (GB)' table it prints, batch "
-                         "sizes 1/2/4/8...) deliberately probes past the "
-                         "card's physical VRAM to find the ceiling -- a "
-                         "printed 'AutoBatch: Using batch-size N' line "
-                         "means that already resolved cleanly on its own; "
-                         "it is not a sign anything is wrong.")
+                    help="Explicit batch size. batch=1 is a major speed "
+                         "tax; with mosaic_guard.py installed, real runs "
+                         "stay ~2GB/6GB VRAM, so there's likely headroom "
+                         "to raise this -- test with a short --epochs 3-5 "
+                         "run and watch nvidia-smi. Pass -1 for AutoBatch "
+                         "(unreliable at 960px pre-mosaic_guard, may be "
+                         "worth retrying now). AutoBatch's own profiling "
+                         "pass deliberately probes past the physical "
+                         "ceiling to find it -- a printed 'AutoBatch: "
+                         "Using batch-size N' line means that already "
+                         "resolved cleanly.")
     p.add_argument("--device", default=0, type=_device_arg_type,
                     help="GPU index. 0 = first (only, on a laptop) GPU. "
-                         "Use 'cpu' only to sanity-check the script runs, "
-                         "never for a real training run.")
+                         "'cpu' only for a sanity check, never real training.")
     p.add_argument("--workers", type=int, default=0,
-                    help="Dataloader worker processes. Default 0 (main "
-                         "process only) -- spawning workers on Windows "
-                         "reloads the full CUDA DLL stack per process, "
-                         "which has caused paging-file exhaustion crashes "
-                         "on this setup. Raise to 2-4 only after fixing "
-                         "Windows' paging file size if dataloading "
-                         "becomes the bottleneck.")
-    p.add_argument("--cache", default="disk",
-                    help="'disk' caches decoded images to local disk "
-                         "between epochs. Set to False if disk space is "
-                         "tight.")
+                    help="Dataloader worker processes. Default 0 -- "
+                         "spawning workers on Windows reloads the full "
+                         "CUDA DLL stack per process, which has caused "
+                         "paging-file exhaustion here. Raise to 2-4 only "
+                         "after resizing Windows' paging file.")
+    p.add_argument("--cache", default="disk", type=_cache_arg_type,
+                    help="'disk' caches decoded images between epochs. "
+                         "The .npy cache files are automatically "
+                         "redirected onto a mounted drive with room to "
+                         "spare (see install_disk_cache_redirect() / "
+                         "--cache-drive) rather than always landing on "
+                         "the dataset's own drive. Pass 'False' to "
+                         "disable if disk space is tight everywhere.")
+    p.add_argument("--cache-drive", default=None,
+                    help="Explicit drive letter/root (e.g. 'D:\\') for "
+                         "the --cache disk redirect, instead of "
+                         "auto-picking whichever mounted drive has the "
+                         "most free space. Auto-picking is a capacity "
+                         "heuristic, not a speed one -- use this once "
+                         "you know which mounted drive is actually "
+                         "fastest (e.g. keep it off the drive that also "
+                         "holds the dataset, or prefer an SSD over a "
+                         "roomier HDD). Falls back to auto-selection "
+                         "with a printed note if this drive isn't "
+                         "mounted.")
     p.add_argument("--resume", action="store_true",
-                    help="Continue training from the most recently modified "
+                    help="Continue from the most recently modified "
                          "runs/detect/*/weights/last.pt -- full optimizer "
-                         "state preserved, NOT a from-scratch restart. "
-                         "--model/--data/--name/--epochs are ignored when "
-                         "this is set. NOTE: if class_map.py's taxonomy "
-                         "changed since that checkpoint was trained "
-                         "(different nc), resuming will fail loudly -- "
-                         "that's correct behavior; start a fresh run "
-                         "instead.")
+                         "state preserved. --data/--name/--epochs and "
+                         "every augmentation/oversampling/LR setting are "
+                         "restored from that run's own saved args.yaml "
+                         "and silently ignore whatever's passed alongside "
+                         "--resume on the CLI. --imgsz/--batch/--device/"
+                         "--workers/--cache/--save-period/--patience/"
+                         "--close-mosaic ARE the exception -- Ultralytics "
+                         "does honor those specific ones on resume (see "
+                         "_explicitly_provided_resume_overrides() in "
+                         "main()), so e.g. `--resume --batch 1` genuinely "
+                         "lowers the batch size for the rest of that run, "
+                         "and bare `--resume` with none of them typed "
+                         "genuinely leaves all 8 at the checkpoint's own "
+                         "saved values. Fails loudly if the taxonomy "
+                         "(nc/class order) doesn't match the checkpoint -- "
+                         "start fresh instead.")
     p.add_argument("--save-period", type=int, default=5,
-                    help="Also write numbered checkpoint snapshots "
-                         "(epoch5.pt, epoch10.pt, ...) every N epochs. "
-                         "Set to -1 to disable and save disk space.")
+                    help="Also write numbered checkpoints (epoch5.pt, "
+                         "...) every N epochs. -1 to disable.")
+    p.add_argument("--strict-resume-taxonomy", action="store_true",
+                    help="Make --resume's taxonomy check "
+                         "(_verify_resume_taxonomy()) fatal if it can't "
+                         "be verified (missing args.yaml, missing data "
+                         "yaml, unreadable names list) instead of "
+                         "printing a warning and proceeding. Off by "
+                         "default for backward compatibility with older "
+                         "runs; recommended for the final/research run, "
+                         "since an unverifiable check defeats the point "
+                         "of guarding against a silent class reorder.")
     p.add_argument("--max-epoch-minutes", type=float, default=None,
-                    help="Optional failsafe: if any single epoch takes "
-                         "longer than this many minutes, the ongoing "
-                         "watchdog aborts this model size in favor of a "
-                         "smaller one.")
+                    help="Failsafe: abort this model size (ongoing "
+                         "watchdog) if any epoch exceeds this many "
+                         "minutes. On its own (no VRAM signal alongside "
+                         "it) this does NOT trigger --model auto's "
+                         "fallback to a smaller size -- see "
+                         "VRAMBudgetExceeded's docstring for why.")
+    p.add_argument("--vram-safety-margin", type=float, default=0.90,
+                    help="Fraction of physical VRAM (peak allocated OR "
+                         "peak reserved) the startup probe/ongoing "
+                         "watchdog treat as the ceiling before raising "
+                         "VRAMBudgetExceeded. 0.90 leaves real headroom "
+                         "for WDDM safety on this 6GB/Windows setup; "
+                         "raise toward 0.93-0.95 to be more permissive "
+                         "once a model size's real margin is known, or "
+                         "lower toward 0.85 to be more conservative, "
+                         "without editing source.")
     p.add_argument("--copy-paste", type=float, default=0.3,
-                    help="Copy-paste augmentation probability (0.0-1.0). "
-                         "NOTE: verified against Ultralytics' actual "
-                         "implementation -- CopyPaste requires "
-                         "segmentation polygons, which none of this "
-                         "project's datasets have (bbox-only YOLO "
-                         "labels). This flag is currently a no-op on this "
-                         "pipeline; left on by default only because it's "
-                         "harmless. Don't rely on it for sparse-class "
-                         "protection -- see mixup/oversampling instead.")
+                    help="Copy-paste augmentation probability. Currently "
+                         "a NO-OP on this pipeline -- CopyPaste needs "
+                         "segmentation polygons this bbox-only data "
+                         "doesn't have. Left on because it's harmless; "
+                         "use mixup/oversampling for sparse-class "
+                         "protection instead.")
     p.add_argument("--mixup", type=float, default=0.1,
-                    help="Mixup augmentation probability (0.0-1.0). "
-                         "Generally helps generalization on small/"
-                         "imbalanced datasets. Set to 0.0 to disable.")
+                    help="Mixup augmentation probability. 0.0 to disable.")
     p.add_argument("--max-mosaic-instances", type=int, default=800,
-                    help="PROACTIVE fix for the VRAM staircase (see "
-                         "root-cause note above): caps the instance "
-                         "count Mosaic partner selection will aim to "
-                         "stay under when compositing images. See "
-                         "mosaic_guard.py. Set to a very large number "
-                         "(e.g. 999999) to effectively disable.")
+                    help="Caps the instance count Mosaic partner "
+                         "selection aims to stay under -- see "
+                         "mosaic_guard.py. Set very large (e.g. 999999) "
+                         "to effectively disable.")
     p.add_argument("--mosaic-max-tries", type=int, default=40,
-                    help="How many candidate partner images the instance "
-                         "cap will sample/reject before giving up and "
-                         "falling back to the least-dense candidates.")
+                    help="How many candidate partners the instance cap "
+                         "samples/rejects before falling back to the "
+                         "least-dense candidates.")
     p.add_argument("--mosaic", type=float, default=1.0,
-                    help="Mosaic augmentation probability (0.0-1.0). "
-                         "Lower this (e.g. 0.5-0.7) ONLY if the startup "
-                         "probe or ongoing watchdog keep tripping.")
+                    help="Mosaic augmentation probability. Lower this "
+                         "(0.5-0.7) only if the VRAM probes keep tripping.")
     p.add_argument("--close-mosaic", type=int, default=10,
-                    help="Disable mosaic for the last N epochs -- lets the "
-                         "model converge on clean (non-composited) images, "
-                         "which matters specifically for small-object "
-                         "recall (tiny person detections at altitude). "
-                         "Ultralytics default is 10; raise if small "
-                         "objects still look weak in final-epoch val "
-                         "samples.")
+                    help="Disable mosaic for the last N epochs so the "
+                         "model converges on clean images -- matters for "
+                         "small-object recall. Raise if small objects "
+                         "still look weak in final-epoch samples.")
     p.add_argument("--multi-scale", action="store_true",
-                    help="Vary input size +/-50%% per batch during "
-                         "training. Costs more VRAM headroom (another "
-                         "reason to prefer --imgsz 640 over 960 if you "
-                         "enable this), but improves robustness to the "
-                         "object-scale variation between low and high "
-                         "altitude passes.")
+                    help="Vary input size +/-50%% per batch. Costs more "
+                         "VRAM headroom (prefer --imgsz 640 if enabling "
+                         "this) but improves robustness to altitude-scale "
+                         "variation.")
     p.add_argument("--no-degradation-aug", dest="degradation_aug",
                     action="store_false", default=True,
                     help="Disable the analog-feed degradation "
-                         "augmentation pipeline (blur/compression/noise/"
-                         "gamma/lens distortion). On by default -- see "
-                         "module docstring. Requires albumentations; "
-                         "auto-skips with a warning if it isn't "
-                         "installed.")
+                         "augmentation pipeline. On by default -- "
+                         "requires albumentations, auto-skips with a "
+                         "warning if missing.")
     p.add_argument("--oversample-classes", default="motorcycle,other_vehicle",
                     help="Comma-separated UNIFIED_CLASSES names to "
-                         "oversample in the train split (see "
-                         "prepare_datasets.py's _oversample_sparse_"
-                         "classes()). Set to '' to disable. Check the "
-                         "'Per-class instance counts' block prepare_"
-                         "datasets.py prints every run before trusting "
-                         "this default -- 'person' (this project's stated "
-                         "priority) is not in it.")
+                         "oversample in train. '' to disable. Check "
+                         "prepare_datasets.py's 'Per-class instance "
+                         "counts' block before trusting this default -- "
+                         "'person' isn't in it.")
     p.add_argument("--oversample-multiplier", type=int, default=3,
                     help="How many times each oversampled-class image "
-                         "path is duplicated in the train list. 3 = seen "
-                         "3x as often per epoch as it naturally would be.")
+                         "path is duplicated in the train list per epoch.")
     p.add_argument("--patience", type=int, default=30,
                     help="Early stopping: stop if val mAP hasn't improved "
-                         "in this many epochs. best.pt is always kept "
-                         "from the best-val epoch regardless. Raised from "
-                         "Ultralytics' 15-epoch-ish norm to 30 given the "
-                         "added degradation augmentation -- a heavier "
-                         "augmentation pipeline makes val loss noisier "
-                         "epoch-to-epoch, so stopping at 15 risked cutting "
-                         "off before real improvement showed through the "
-                         "added noise. Matches this project's stated "
-                         "priority (precision/robustness over fast "
-                         "iteration, since real-time deployment isn't a "
-                         "constraint) -- lower it back toward 15 if you're "
-                         "doing a quick comparison run instead.")
+                         "in this many epochs. best.pt always comes from "
+                         "the best-val epoch regardless. Raised from "
+                         "Ultralytics' ~15-epoch norm since the "
+                         "degradation augmentation makes val loss noisier "
+                         "epoch-to-epoch. Lower toward 15 for a quick "
+                         "comparison run.")
     p.add_argument("--cos-lr", dest="cos_lr", action="store_true",
                     default=True,
                     help="Cosine LR decay instead of linear (default on).")
     p.add_argument("--no-cos-lr", dest="cos_lr", action="store_false",
-                    help="Disable cosine LR decay, use Ultralytics' "
-                         "linear default instead.")
+                    help="Use Ultralytics' linear LR decay instead.")
     p.add_argument("--label-smoothing", type=float, default=0.0,
                     help="Label smoothing. Reported deprecated/no-op on "
                          "the installed Ultralytics version -- kept for "
                          "forward-compat only.")
     p.add_argument("--name", default=None,
                     help="Run subfolder name under runs/detect/. Defaults "
-                         "to '<model>_<imgsz>' for a fresh run. When "
-                         "combined with --resume, targets that specific "
-                         "run's last.pt instead of guessing by most-"
-                         "recently-modified file across all runs -- "
-                         "e.g. --resume --name yolo26s_960-4. Strongly "
-                         "recommended over bare --resume if more than "
-                         "one run folder exists under runs/detect/.")
+                         "to '<model>_<imgsz>'. With --resume, targets "
+                         "that run's last.pt directly instead of guessing "
+                         "by mtime -- recommended if more than one run "
+                         "folder exists.")
     p.add_argument("--export-only", action="store_true",
                     help="Skip training, just export an existing "
                          "runs/detect/<name>/weights/best.pt.")
@@ -990,11 +1230,19 @@ def parse_args():
                          "runs/detect/*/weights/best.pt found.")
     p.add_argument("--skip-per-source-eval", action="store_true",
                     help="Skip the post-training per-source validation "
-                         "pass (VisDrone/UAVDT/SARD evaluated separately) "
-                         "AND the blended per-class mAP report. On by "
-                         "default since it's a handful of extra quick "
-                         "val() passes -- disable only if you're "
-                         "iterating fast and don't need it every run.")
+                         "pass and the blended per-class mAP report.")
+    p.add_argument("--strict-per-source-eval", action="store_true",
+                    help="Make a per-source evaluation failure inside "
+                         "evaluate_per_source() fatal (raises after all "
+                         "sources have been attempted) instead of only "
+                         "printing a prominent warning and letting "
+                         "training/export continue. Off by default -- "
+                         "same backward-compatible/opt-in-strictness "
+                         "pattern as --strict-resume-taxonomy. Recommend "
+                         "turning this on for the actual Master's/final "
+                         "run, since a partial per-source report "
+                         "(e.g. 2/3 sources) can otherwise slip through "
+                         "unnoticed.")
     return p.parse_args()
 
 
@@ -1004,29 +1252,19 @@ def default_run_name(model: str, imgsz: int) -> str:
 
 
 def _is_resumable_checkpoint(path: Path) -> bool:
-    """
-    Checks whether a .pt checkpoint actually has resumable training
-    state (epoch counter + optimizer state), BEFORE handing it to
-    Ultralytics' model.train(resume=True).
+    """Checks whether a .pt checkpoint actually has resumable state
+    (epoch counter + optimizer state) before handing it to Ultralytics'
+    model.train(resume=True).
 
-    Why this exists: a checkpoint from a run that completed normally
-    (reached its target epoch count, wasn't interrupted) has its
-    optimizer stripped automatically -- see the "Optimizer stripped
-    from ...last.pt" line Ultralytics prints at the end of every
-    successful run. That checkpoint is no longer resumable, no matter
-    what --epochs is set to in that run's saved args.yaml. Ultralytics
-    itself detects this and prints a warning ("not a resumable training
-    checkpoint ... Starting new training instead") -- but the "new
-    training" it starts uses ITS OWN internal defaults (coco8.yaml,
-    80 classes, batch=16, workers=8, etc.), NOT this project's real
-    data/imgsz/batch/degradation-aug setup, because train.py's resume
-    branch calls model.train(resume=True) with no other kwargs to fall
-    back on. Confirmed on this project: that silent fallback trained
-    several real epochs against the wrong 4-image toy dataset before
-    anyone noticed. Checking resumability ourselves first, and refusing
-    loudly with the correct next step, is much safer than letting that
-    silent fallback happen again.
-    """
+    A checkpoint from a run that completed normally has its optimizer
+    stripped, so it's no longer resumable regardless of --epochs in its
+    saved args.yaml. Ultralytics itself detects this and falls back to
+    "new training" using ITS OWN internal defaults (coco8.yaml, 80
+    classes, batch=16, workers=8...), not this project's real setup --
+    confirmed this silently trained several real epochs against the
+    wrong 4-image toy dataset before anyone noticed. Checking
+    resumability ourselves first, and refusing loudly with the correct
+    next step, avoids that repeat."""
     import torch
 
     try:
@@ -1041,27 +1279,216 @@ def _is_resumable_checkpoint(path: Path) -> bool:
     return has_epoch and has_optimizer
 
 
+def _resolve_saved_data_path(data_path_str: str | None, run_dir: Path) -> Path | None:
+    """[FIX -- review item] A saved args.yaml 'data' path is whatever
+    string Ultralytics happened to receive on that run's original
+    command line -- which is very often relative (e.g.
+    `--data datasets/unified.yaml`), and relative to whatever working
+    directory THAT invocation was launched from. Both
+    _verify_resume_taxonomy() and _recover_resume_data_path() used to
+    resolve it only against the current process's cwd
+    (`Path(data_path).exists()`), which fails if this --resume/export
+    invocation happens to run from a different directory even though
+    the dataset yaml never moved -- exactly the "resume from a
+    different directory" case both functions' docstrings already flag
+    as a known gap.
+
+    Tries, in order: the path as given (absolute, or relative to the
+    CURRENT working directory -- unchanged from before, so nothing that
+    worked before stops working), then relative to SCRIPT_DIR (where
+    this script -- and therefore, in every normal invocation of this
+    project, the dataset yaml -- actually lives), then relative to
+    run_dir (runs/detect/<name>/, in case a data yaml was ever placed
+    alongside a specific run). Returns the first candidate that
+    actually exists on disk, or None if none do -- callers keep their
+    existing non-fatal "couldn't verify/recover" handling either way."""
+    if not data_path_str:
+        return None
+    as_given = Path(data_path_str)
+    candidates = [as_given]
+    if not as_given.is_absolute():
+        candidates.append(SCRIPT_DIR / as_given)
+        candidates.append(run_dir / as_given)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _verify_resume_taxonomy(last_pt: Path, model: YOLO,
+                              strict: bool = False) -> None:
+    """[FIX -- review item] _is_resumable_checkpoint() only checks
+    whether a checkpoint HAS resumable state, not whether the taxonomy
+    it was trained against still matches what's currently on disk. The
+    module docstring has long promised resume "fails loudly if the
+    taxonomy (nc) changed", but the only thing that actually enforced
+    that was an incidental PyTorch tensor-shape-mismatch crash on state
+    dict load when nc itself changed -- a same-nc class REORDER (e.g.
+    unified.yaml regenerated with 'motorcycle' and 'other_vehicle'
+    swapped) would load without error and silently mean every
+    prediction is mislabeled, since the detection head's tensor shape
+    doesn't encode class order.
+
+    Compares the checkpoint's own baked-in class list (model.names,
+    read directly from the loaded .pt -- authoritative regardless of
+    which data yaml was used originally) against whatever is CURRENTLY
+    on disk at the data yaml path that same run's own args.yaml
+    records it was trained against. This catches prepare_datasets.py
+    having been re-run with a different taxonomy since this
+    checkpoint's last epoch.
+
+    Deliberately non-fatal by default on any read/parse problem
+    (missing args.yaml on an older run, unexpected yaml shape, etc.) --
+    prints a note and lets Ultralytics' own resume proceed rather than
+    blocking on this check's own fragility. Only raises when a real,
+    readable mismatch is found -- UNLESS strict=True.
+
+    [FIX -- review item] strict (--strict-resume-taxonomy) turns every
+    "couldn't verify" branch below into a hard SystemExit instead of a
+    warning. Off by default (preserves the original permissive
+    behavior for older/experimental runs where args.yaml or the data
+    yaml may legitimately be gone), but worth turning on for a final
+    run specifically because the failure mode this whole function
+    guards against -- a same-nc class reorder silently mislabeling
+    every prediction -- is exactly the kind of thing you don't want to
+    be trusting an unverified assumption about.
+
+    [FIX -- bug found during review] data_path is now initialized to
+    None before the try: block. Previously it was only assigned inside
+    the try (after the first `open(args_yaml)` succeeded), so an
+    exception raised BEFORE that assignment -- e.g. args_yaml existing
+    per .exists() but failing to open, or a YAML parse error on
+    args_yaml itself -- hit the except block's own
+    f"...{args_yaml} or {data_path}..." message and raised an unrelated
+    NameError there instead of printing the intended non-fatal warning,
+    crashing main() with a confusing traceback instead of the
+    deliberately-graceful "skipping this check" path the docstring
+    promises.
+
+    [FIX -- review item] The saved 'data' path is now resolved via
+    _resolve_saved_data_path() instead of a bare
+    `Path(data_path).exists()` -- see that function's docstring for why
+    a relative path saved from a different original working directory
+    used to fail this check (and skip taxonomy verification entirely)
+    even when the dataset yaml was never actually moved."""
+    run_dir = last_pt.parent.parent
+    args_yaml = run_dir / "args.yaml"
+    data_path = None
+
+    def _fail_or_warn(message: str) -> None:
+        if strict:
+            raise SystemExit(
+                f"\n{message} --strict-resume-taxonomy is set -- "
+                f"refusing to resume without a verified taxonomy match.")
+        print(f"{message} Skipping taxonomy verification (pass "
+              f"--strict-resume-taxonomy to make this fatal instead).")
+
+    if not args_yaml.exists():
+        _fail_or_warn(f"[resume] No {args_yaml} found.")
+        return
+
+    try:
+        with open(args_yaml) as f:
+            saved_args = yaml.safe_load(f) or {}
+        raw_data_path = saved_args.get("data")
+        resolved_data_path = _resolve_saved_data_path(raw_data_path, run_dir)
+        if resolved_data_path is None:
+            _fail_or_warn(
+                f"[resume] This run's original data yaml ({raw_data_path}) "
+                f"couldn't be found as given, under {SCRIPT_DIR}, or under "
+                f"{run_dir}.")
+            return
+        data_path = resolved_data_path
+
+        with open(data_path) as f:
+            current_data = yaml.safe_load(f) or {}
+        current_names = current_data.get("names")
+        if isinstance(current_names, dict):
+            current_names = [current_names[k] for k in sorted(current_names)]
+        elif current_names is None:
+            _fail_or_warn(f"[resume] {data_path} has no 'names' key.")
+            return
+    except Exception as e:
+        _fail_or_warn(
+            f"[resume] Couldn't read/parse {args_yaml} or {data_path} "
+            f"to verify taxonomy ({e}).")
+        return
+
+    ckpt_names = [model.names[k] for k in sorted(model.names)]
+    if current_names != ckpt_names:
+        raise SystemExit(
+            f"\n[resume] Taxonomy mismatch -- {last_pt} was trained "
+            f"with classes {ckpt_names}, but {data_path} currently "
+            f"defines {current_names}. This checkpoint's detection head "
+            f"is baked in for the OLD class list; if nc is unchanged "
+            f"but the order differs, resuming would NOT crash -- it "
+            f"would silently mislabel every prediction instead. "
+            f"Re-generate {data_path} back to the taxonomy this "
+            f"checkpoint expects, or start a fresh (non-resume) run to "
+            f"retrain against the current one.")
+
+    print(f"[resume] Taxonomy verified -- {data_path} still matches "
+          f"this checkpoint's {len(ckpt_names)} classes in the same "
+          f"order.")
+
+
+def _recover_resume_data_path(run_dir: Path) -> str | None:
+    """[FIX -- review item] main()'s `data_path` starts as None and,
+    before this fix, was only ever assigned in the fresh-run branch --
+    a --resume run left it None straight through to the end-of-run
+    report, silently SKIPPING report_per_class_map() (the per-class
+    mAP breakdown) even though evaluate_per_source() still ran fine.
+    So a resumed run's console output quietly had one fewer report
+    than a fresh run's, with only a one-line note explaining why.
+
+    Recovers the dataset yaml path from this run's own saved
+    args.yaml -- the same file _verify_resume_taxonomy() already reads
+    before training starts. 'data' isn't in check_resume()'s override
+    allowlist (see _explicitly_provided_resume_overrides()'s
+    docstring), so it's unaffected by anything resumed and safe to
+    read fresh after training completes. Deliberately non-fatal, same
+    as _verify_resume_taxonomy() -- a missing/unreadable args.yaml or
+    data yaml just means the per-class report is skipped, same as
+    before this fix, not that the run itself failed.
+
+    [FIX -- review item] Now resolves the saved path via
+    _resolve_saved_data_path() (same helper _verify_resume_taxonomy()
+    uses) instead of a bare `Path(data_path).exists()` against the
+    current working directory -- see that function's docstring for why
+    a relative path saved from a different original working directory
+    used to silently skip this report even when the dataset yaml was
+    never actually moved."""
+    args_yaml = run_dir / "args.yaml"
+    if not args_yaml.exists():
+        print(f"\n[resume] No {args_yaml} found -- can't recover the "
+              f"dataset yaml for the post-training per-class report; "
+              f"skipping that report.")
+        return None
+    try:
+        with open(args_yaml) as f:
+            saved_args = yaml.safe_load(f) or {}
+        raw_data_path = saved_args.get("data")
+    except Exception as e:
+        print(f"\n[resume] Couldn't read {args_yaml} to recover the "
+              f"dataset yaml ({e}) -- skipping the per-class report.")
+        return None
+    resolved = _resolve_saved_data_path(raw_data_path, run_dir)
+    if resolved is None:
+        print(f"\n[resume] {args_yaml}'s 'data' path ({raw_data_path}) "
+              f"couldn't be found as given, under {SCRIPT_DIR}, or under "
+              f"{run_dir} -- skipping the per-class report.")
+        return None
+    return str(resolved)
+
+
 def find_latest_last_pt(name: str | None = None) -> Path:
-    """
-    Locates the last.pt to resume from.
-
-    If `name` is given (pass --name when resuming, matching the run
-    folder under runs/detect/), resumes THAT specific run only --
-    error loudly if it doesn't have a last.pt, rather than silently
-    falling back to something else.
-
-    If `name` is not given, falls back to the previous behavior: picks
-    the most-recently-modified last.pt across ALL runs/detect/*/ --
-    but now prints every candidate it found (path + mtime) before
-    choosing, so a stray/unrelated run folder (e.g. "runs/detect/train/"
-    left over from an ad-hoc `yolo train` invocation outside this
-    project's own scripts, which defaults to that generic name) can't
-    silently win just because its last.pt happens to be newer. Confirmed
-    this can happen: an unrelated coco8.yaml/80-class run in a folder
-    literally named "train" was picked over a real yolo26s_960-4 run
-    here, because nothing surfaced the ambiguity before committing to
-    an answer. Pass --name explicitly to avoid relying on mtime at all.
-    """
+    """Locates the last.pt to resume from. With `name`, resumes that
+    specific run only (errors loudly if missing). Without it, picks the
+    most-recently-modified last.pt across all runs/detect/*/, but
+    prints every candidate first -- confirmed a stray unrelated run
+    folder (e.g. a generic "train/" from an ad-hoc `yolo train`
+    invocation) can otherwise silently win just by being newer. Pass
+    --name explicitly to avoid relying on mtime at all."""
     if name:
         target = RUNS_PROJECT / name / "weights" / "last.pt"
         if not target.exists():
@@ -1079,9 +1506,9 @@ def find_latest_last_pt(name: str | None = None) -> Path:
 
     if len(candidates) > 1:
         print(f"\n[resume] Multiple runs found under {RUNS_PROJECT} -- "
-              f"no --name given, so picking by most recent file "
-              f"modification time. If this isn't the run you meant, "
-              f"rerun with --resume --name <run_folder_name> instead:")
+              f"no --name given, picking by most recent mtime. If this "
+              f"isn't the run you meant, rerun with --resume --name "
+              f"<run_folder_name>:")
         for c in candidates:
             marker = " <- selected" if c == candidates[-1] else ""
             print(f"    {c}  (modified {c.stat().st_mtime}){marker}")
@@ -1090,24 +1517,41 @@ def find_latest_last_pt(name: str | None = None) -> Path:
 
 
 def find_latest_best_pt() -> Path:
+    """[FIX -- review item] Used by --export-only when --weights isn't
+    given. Previously picked the most-recently-modified best.pt with no
+    visibility into what else was available -- a stray debug/test run
+    folder finishing after the real one silently wins, exporting the
+    wrong model for the C++ deployment pipeline with no crash and no
+    warning. Now mirrors find_latest_last_pt()'s existing candidate
+    list so a wrong pick is at least visible; --export-only has no
+    --name equivalent to target a specific run the way --resume does,
+    so pass --weights explicitly for production exports instead of
+    relying on this."""
     candidates = sorted(RUNS_PROJECT.glob("*/weights/best.pt"),
                          key=lambda p: p.stat().st_mtime)
     if not candidates:
         raise FileNotFoundError(
             f"No {RUNS_PROJECT}/*/weights/best.pt found. Run training "
             f"first, or pass --weights explicitly.")
+
+    if len(candidates) > 1:
+        print(f"\n[export] Multiple runs found under {RUNS_PROJECT} -- "
+              f"no --weights given, picking by most recent mtime. If "
+              f"this isn't the run you meant, rerun with --export-only "
+              f"--weights <path to that run's weights/best.pt>:")
+        for c in candidates:
+            marker = " <- selected" if c == candidates[-1] else ""
+            print(f"    {c}  (modified {c.stat().st_mtime}){marker}")
+
     return candidates[-1]
 
 
 def export_for_cpp(weights_path: Path):
-    """
-    Exports with end2end=False (the one-to-many head) so the ONNX output
-    shape stays (1, nc+4, N) -- what DetectionLink::runInference() already
-    parses via manual class-argmax + cv::dnn::NMSBoxes.
-    """
-    print(f"\nExporting {weights_path} to ONNX (one-to-many head, "
-          f"NMS still required on the C++ side -- matches current "
-          f"runInference())...")
+    """Exports with end2end=False (one-to-many head) so ONNX output
+    shape stays (1, nc+4, N) -- what DetectionLink::runInference()
+    parses via manual class-argmax + cv::dnn::NMSBoxes."""
+    print(f"\nExporting {weights_path} to ONNX (one-to-many head, NMS "
+          f"still required on the C++ side)...")
     model = YOLO(str(weights_path))
     onnx_path = model.export(format="onnx", opset=17, simplify=True,
                               end2end=False, nms=False)
@@ -1129,17 +1573,10 @@ def is_oom_error(exc: Exception) -> bool:
 
 
 def check_overfitting(run_dir: Path, lookback: int = 10) -> None:
-    """
-    Reads results.csv from a completed run and flags the textbook
-    overfitting signature: val loss rising over the last `lookback`
-    epochs while train loss keeps falling. Heuristic, not a verdict.
-
-    NOTE: this only looks at aggregate box loss across ALL classes -- it
-    cannot tell you if one class (e.g. person) is diverging while another
-    (e.g. vehicles) keeps improving; an aggregate trend can look
-    perfectly healthy while hiding exactly that. See report_per_class_map()
-    for the per-class check.
-    """
+    """Reads results.csv and flags the textbook overfitting signature:
+    val loss rising over the last `lookback` epochs while train loss
+    keeps falling. Heuristic, aggregate-only -- see report_per_class_map()
+    for the per-class check this can hide."""
     csv_path = run_dir / "results.csv"
     if not csv_path.exists():
         print(f"\n[overfitting check] No results.csv found at {csv_path}, "
@@ -1189,48 +1626,20 @@ def check_overfitting(run_dir: Path, lookback: int = 10) -> None:
 
 def report_per_class_map(model: YOLO, data_path: str, batch: int,
                            workers: int = 0) -> None:
-    """
-    Runs model.val() on the full (blended) val set from data_path and
-    prints mAP50-95 PER CLASS -- not just the single averaged number
-    Ultralytics prints by default.
+    """Runs model.val() on the full blended val set and prints mAP50-95
+    PER CLASS -- the direct check for "one class detected well, another
+    degraded" that a single averaged number hides (e.g. person, the SAR
+    priority class, trailing vehicle classes). evaluate_per_source()
+    breaks down by DATASET; this breaks down by CLASS on the combined
+    val set.
 
-    This is the direct, ready-made check for "one class detected well,
-    another degraded": a healthy overall mAP can hide e.g. vehicle
-    classes scoring well while person -- the actual SAR priority class
-    -- sits far behind. evaluate_per_source() (below) breaks results
-    down by DATASET; this breaks results down by CLASS on the combined
-    val set, which is the number that actually answers this project's
-    core accuracy question. Check this after every real run, not just
-    the aggregate mAP Ultralytics prints during training.
-
-    FIX (OOM on 6GB card): model.val() defaults to Ultralytics' own
-    validation batch size when none is given -- much larger than the
-    --batch 1 this project actually needs on this card. batch is now
-    passed through explicitly, and the CUDA cache is cleared right
-    before the call so memory left reserved by training (or by a prior
-    val() call, e.g. evaluate_per_source() running just before this)
-    can't stack on top of it.
-
-    FIX (real crash, CONFIRMED from an actual run log -- "paging file
-    too small" OSError loading cublas64_13.dll, right after training
-    finished and its own automatic post-train validation had already
-    succeeded cleanly): unlike model.train() -- which this project
-    always calls with workers=args.workers (0 by default, specifically
-    because Windows reloads the ENTIRE CUDA DLL stack per spawned
-    worker process, see --workers's --help text) -- model.val() was
-    being called here with no workers= argument at all, so it fell back
-    to Ultralytics' own (nonzero) validation default. On Windows that
-    spawns a real subprocess via multiprocessing.spawn, which
-    re-imports this whole script from scratch (import torch -> reload
-    the full CUDA DLL stack a second time, while the parent process
-    still has its own copy resident) -- exactly the failure mode
-    --workers=0 exists to avoid for training, just not previously
-    applied to eval too. workers now defaults to 0 to match, and is
-    threaded through from args.workers by the caller in main() so a
-    deliberately-raised --workers value (once the paging file is
-    resized, per that flag's own help text) applies consistently to
-    both training and eval instead of only half of the pipeline.
-    """
+    batch/workers are passed through explicitly (not left at
+    Ultralytics' own larger defaults) and the CUDA cache is cleared
+    first -- both fixes for real crashes hit on this 6GB card/Windows
+    setup: an unset batch size OOM'd, and Windows spawning nonzero
+    dataloader workers here (unlike every model.train() call, which
+    always passes workers=0) reloaded the full CUDA DLL stack in a
+    subprocess and exhausted the paging file."""
     import gc
     import torch
     gc.collect()
@@ -1250,67 +1659,52 @@ def report_per_class_map(model: YOLO, data_path: str, batch: int,
     print("If 'person' trails the vehicle classes here, that's your "
           "signal to increase person's share of training exposure "
           "(--oversample-classes) or add more SAR-relevant person data "
-          "-- not a sign the model or pipeline is broken.")
+          "-- not a sign the pipeline is broken.")
 
 
 def evaluate_per_source(model: YOLO, run_dir: Path, batch: int,
-                          workers: int = 0) -> None:
-    """
-    Runs a SEPARATE model.val() pass against each source dataset's own
-    val set (VisDrone/UAVDT/SARD individually), reading
-    datasets/per_source_val.json (written by prepare_datasets.py). This
-    is the only way to tell whether combining these three datasets
-    actually helped -- the single blended unified.yaml val number can
-    hide one source regressing while another improves. Silently skipped
-    if the manifest doesn't exist (e.g. --data was set manually to
-    bypass prepare_datasets.py).
+                          workers: int = 0, strict: bool = False) -> None:
+    """Runs a separate model.val() against each source's own val set
+    (VisDrone/UAVDT/SARD individually, from datasets/per_source_val.json)
+    -- the only way to tell whether combining these datasets helped,
+    since the blended val number can hide one source regressing while
+    another improves. Skipped if the manifest doesn't exist.
 
-    Now also prints a per-class breakdown for each source. Historically
-    (pre generate_pseudo_labels.py), a source's per-class numbers were
-    only meaningful for classes that source natively annotated -- UAVDT
-    had no person labels, SARD had no vehicle labels -- with the other
-    rows reading as 0/undefined and safe to ignore.
+    A 0.000 (or near-zero) per-class row is NOT proof that class is
+    structurally absent from that source anymore: generate_pseudo_
+    labels.py --apply cross-labels a source's originally-missing
+    classes (UAVDT: person, SARD: vehicles) once an image clears
+    review, so it may just mean little of that source has been merged
+    for that class yet. Cross-check datasets/pending_review_images.json
+    and pseudo_labels_summary.json before concluding otherwise -- and
+    note that per-source mAP itself is measured on only the currently
+    review-cleared portion of that source, which can be a small
+    fraction of its total images; treat these numbers as "performance
+    on the reviewed subset so far", not "performance on the full
+    source dataset".
 
-    UPDATE -- this is no longer unconditionally true. generate_pseudo_
-    labels.py cross-references the other three detection models against
-    exactly the classes a source didn't originally label, and --apply
-    merges those pseudo-labels into the real dataset for any image
-    that's been FULLY reviewed (see that script's V8/V9 notes on
-    pending_review_images.json -- still-pending images are excluded from
-    every train/val/test list entirely, not partially merged). So a
-    source's own val set drawn here CAN now genuinely contain ground
-    truth for a class it didn't originally annotate: a UAVDT val image
-    may have a real person box, a SARD val image may have a real vehicle
-    box. A row reading 0.000 (or very low) is therefore no longer proof
-    that class is structurally absent from that source -- it may simply
-    mean few/none of that source's images carrying that class have
-    cleared review and been merged yet. Cross-check against
-    datasets/pending_review_images.json and pseudo_labels_summary.json's
-    per-class auto/queued/discarded counts before drawing a conclusion
-    from a near-zero row here.
+    batch/workers are passed through explicitly and the CUDA cache is
+    cleared BEFORE each source's val() call -- same two Windows/6GB
+    failure modes as report_per_class_map()'s docstring (leftover
+    reserved memory from a prior val() call plus an unset workers=
+    default spawning a paging-file-exhausting subprocess), confirmed
+    from an actual crash on the UAVDT pass specifically.
 
-    FIX (real crash, CONFIRMED from an actual run log -- "paging file
-    too small" OSError loading cublas64_13.dll, striking on the FIRST
-    source (VisDrone) right after training finished and its own
-    automatic post-train validation had already succeeded cleanly):
-    model.val() here was being called with no workers= argument, unlike
-    every model.train() call in this project, which always passes
-    workers=args.workers (0 by default) specifically because Windows
-    reloads the entire CUDA DLL stack per spawned dataloader worker
-    process (see --workers's --help text). Without an explicit
-    workers=0 here, model.val() fell back to Ultralytics' own nonzero
-    validation default, which spawns a real subprocess via
-    multiprocessing.spawn on Windows -- that subprocess re-imports this
-    whole script from scratch (import torch -> reload the full CUDA DLL
-    stack a SECOND time, while the parent process still has its own
-    copy resident), and that second load is what actually exhausted the
-    paging file. This is a different resource than the GPU-VRAM OOM the
-    gc.collect()/empty_cache() calls below guard against -- those two
-    fixes address separate failure modes that happened to surface in
-    the same function, not the same bug twice. workers now defaults to
-    0 to match training, and is threaded through from args.workers by
-    the caller in main().
-    """
+    [FIX -- review item, the one remaining real bug from the last
+    review] Previously ANY exception from a source's model.val() call
+    was caught, printed as "[skipped: ...]", and training/export
+    continued as if nothing had happened -- a genuine failure (CUDA
+    OOM, a corrupted val image, a bad yaml) looked identical in the
+    console output to an intentionally-empty/not-yet-reviewed source,
+    and the final "Training complete." banner gave no indication the
+    reported experiment might only cover e.g. 2/3 sources. Failures are
+    now collected into failed_sources and, after every source has been
+    attempted (so one bad source never prevents the others from being
+    tried), the run either raises (strict=True, i.e.
+    --strict-per-source-eval) or prints an impossible-to-miss warning
+    block naming exactly which source(s) failed and why (default,
+    preserves the old "don't block export" behavior but no longer
+    silently)."""
     if not PER_SOURCE_MANIFEST_PATH.exists():
         print(f"\n[per-source eval] No {PER_SOURCE_MANIFEST_PATH} found "
               f"(prepare_datasets.py wasn't run this session?) -- skipping.")
@@ -1332,18 +1726,9 @@ def evaluate_per_source(model: YOLO, run_dir: Path, batch: int,
     tmp_dir = run_dir / "per_source_eval"
     tmp_dir.mkdir(exist_ok=True)
 
+    failed_sources = []  # [(name, error_str), ...]
+
     for name, val_dirs in per_source.items():
-        # FIX (OOM on 6GB card, confirmed root cause of the UAVDT
-        # crash): clear the caching allocator BEFORE each source's
-        # val() call. Without this, memory reserved by the previous
-        # source's val() (VisDrone ran fine here) -- or by training
-        # itself -- can still be held when the next call starts, even
-        # though it's logically done being used. By the time UAVDT's
-        # turn came up the card had "free: 0, total: 6441926656" left;
-        # an allocation failure that severe can crash the CUDA context
-        # hard enough that the `except Exception` below never gets a
-        # clean shot at it, which is why it died silently instead of
-        # printing "[skipped: ...]".
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1352,18 +1737,12 @@ def evaluate_per_source(model: YOLO, run_dir: Path, batch: int,
         with open(tmp_yaml, "w") as f:
             yaml.safe_dump({
                 "path": None,
-                "train": val_dirs,  # unused by val(), Ultralytics requires the key
+                "train": val_dirs,  # unused by val(), key still required
                 "val": val_dirs,
                 "nc": len(UNIFIED_CLASSES),
                 "names": UNIFIED_CLASSES,
             }, f, sort_keys=False)
         try:
-            # FIX: batch=batch -- without this, model.val() fell back to
-            # Ultralytics' own (much larger) default validation batch
-            # size instead of the --batch 1 this project actually needs.
-            # FIX: workers=workers -- see the module-level fix note in
-            # this function's docstring; this is what stops Windows from
-            # spawning a paging-file-exhausting subprocess here.
             metrics = model.val(data=str(tmp_yaml), split="val",
                                  batch=batch, workers=workers, verbose=False)
             print(f"  {name:10s}  mAP50={metrics.box.map50:.3f}  "
@@ -1375,30 +1754,68 @@ def evaluate_per_source(model: YOLO, run_dir: Path, batch: int,
                     print(f"      {cls_name:15s} mAP50-95={per_class[cls_idx]:.3f}")
         except Exception as e:
             print(f"  {name:10s}  [skipped: {e}]")
+            failed_sources.append((name, str(e)))
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
     print(f"{'=' * 70}")
-    print("Note: each source's ORIGINAL native classes are limited (UAVDT "
-          "had no person labels, SARD had no vehicle labels) -- but "
-          "generate_pseudo_labels.py --apply merges cross-source pseudo-"
-          "labels into any image that has been FULLY reviewed, so a "
-          "source can now genuinely carry boxes for a class it didn't "
-          "originally annotate. A 0.000 (or near-zero) row above may mean "
-          "'not enough of this source has been reviewed/merged for this "
-          "class yet', not 'this source can never have this class' -- "
-          "check datasets/pending_review_images.json and pseudo_labels_"
-          "summary.json's per-class counts before assuming the latter.")
+    print("Note: a 0.000 (or near-zero) row above may mean 'not enough of "
+          "this source has been reviewed/merged for this class yet', not "
+          "'this source can never have this class' -- check "
+          "pending_review_images.json / pseudo_labels_summary.json first.")
+
+    if failed_sources:
+        names_and_errors = "; ".join(f"{n}: {e}" for n, e in failed_sources)
+        if strict:
+            raise RuntimeError(
+                f"Per-source evaluation failed for: {names_and_errors}. "
+                f"The reported experiment would otherwise be incomplete "
+                f"(missing {len(failed_sources)}/{len(per_source)} "
+                f"source(s)) -- refusing to continue with "
+                f"--strict-per-source-eval set.")
+        print(f"\n{'!' * 70}\n"
+              f"WARNING: PER-SOURCE EVALUATION INCOMPLETE "
+              f"({len(failed_sources)}/{len(per_source)} source(s) failed)\n"
+              f"{'!' * 70}")
+        for n, e in failed_sources:
+            print(f"  {n} evaluation FAILED: {e}")
+        print(f"{'!' * 70}\n"
+              f"Training/export will still proceed, but any per-source "
+              f"report from this run is INCOMPLETE -- do not treat a "
+              f"missing source's numbers as '0' or 'not applicable'. "
+              f"Pass --strict-per-source-eval to make this fatal instead.\n"
+              f"{'!' * 70}")
 
 
 def train_with_model_fallback(args, data_path: str):
-    """
-    Tries each candidate in MODEL_SIZE_CANDIDATES (or just args.model if
-    it's an explicit choice, not 'auto') until one survives both the
-    startup probe AND the ongoing watchdog without tripping
-    VRAMBudgetExceeded, and without a real CUDA OOM either.
-    """
+    """Tries each candidate in MODEL_SIZE_CANDIDATES (or just args.model
+    if not 'auto') until one survives both the startup probe and the
+    ongoing watchdog without tripping VRAMBudgetExceeded or a real OOM.
+
+    [FIX -- review item] A VRAMBudgetExceeded with reason="epoch_time"
+    (the ongoing watchdog's --max-epoch-minutes ceiling tripping with
+    no memory signal alongside it) is handled separately below and does
+    NOT trigger a fallback to a smaller model -- see VRAMBudgetExceeded's
+    docstring for why an epoch running long, on its own, isn't evidence
+    a model doesn't fit.
+
+    [FIX -- review item] When args.model == "auto" and the user also
+    passed an explicit --name, every candidate used to be trained under
+    THE SAME requested run name -- e.g. `--model auto --name
+    final_run`. If yolo26m tripped the VRAM guard after Ultralytics had
+    already created runs/detect/final_run/, the next candidate
+    (yolo26s) got handed that identical name again, and Ultralytics
+    itself silently disambiguates by appending a suffix
+    (runs/detect/final_run2/), so the run that actually trained could
+    end up living somewhere other than the requested/reported name --
+    confusing for --resume/--export-only's own by-name lookups later.
+    Each auto-search candidate's run directory now gets the model's own
+    stem appended (e.g. final_run_yolo26m, final_run_yolo26s) so
+    there's never a name collision between candidates in the first
+    place. When --name isn't given, default_run_name() already bakes
+    the stem in (e.g. yolo26m_960), so it was -- and remains --
+    naturally unique per candidate without any change needed there."""
     import gc
     import torch
 
@@ -1423,12 +1840,19 @@ def train_with_model_fallback(args, data_path: str):
     )
     if args.label_smoothing:
         print("[note] --label-smoothing is set, but your installed "
-              "Ultralytics reported this deprecated -- it may have no "
-              "effect. Passing it through anyway.")
+              "Ultralytics reported this deprecated -- passing it "
+              "through anyway.")
         train_kwargs["label_smoothing"] = args.label_smoothing
 
     for i, model_name in enumerate(candidates):
-        this_run_name = (args.name or default_run_name(model_name, args.imgsz))
+        if args.model == "auto" and args.name:
+            # An explicit --name would otherwise collide across
+            # candidates -- see this function's [FIX] docstring note.
+            this_run_name = f"{args.name}_{Path(model_name).stem}"
+        else:
+            # No --name given: default_run_name() already includes the
+            # model stem, so it's unique per candidate without change.
+            this_run_name = args.name or default_run_name(model_name, args.imgsz)
         print(f"\n{'=' * 70}\nAttempting: {model_name} @ {args.imgsz}px, "
               f"batch={args.batch}\n{'=' * 70}")
         model = None
@@ -1436,11 +1860,13 @@ def train_with_model_fallback(args, data_path: str):
             model = YOLO(model_name)
             model.add_callback(
                 "on_train_batch_end",
-                make_startup_probe_callback(args.device))
+                make_startup_probe_callback(
+                    args.device, safety_margin=args.vram_safety_margin))
             model.add_callback(
                 "on_train_epoch_end",
                 make_ongoing_watchdog_callback(
-                    args.device, max_epoch_minutes=args.max_epoch_minutes))
+                    args.device, max_epoch_minutes=args.max_epoch_minutes,
+                    safety_margin=args.vram_safety_margin))
             if args.degradation_aug:
                 model.add_callback(
                     "on_train_start",
@@ -1453,24 +1879,35 @@ def train_with_model_fallback(args, data_path: str):
             )
             return model, this_run_name, model_name
         except (RuntimeError, VRAMBudgetExceeded) as e:
+            if isinstance(e, VRAMBudgetExceeded) and e.reason == "epoch_time":
+                # Epoch-time budget alone isn't evidence this model
+                # size doesn't fit -- could be disk I/O contention, a
+                # competing process, a slow first epoch, etc. Don't
+                # silently downgrade model size for this (that masks
+                # the real cause behind a "fix" that likely wouldn't
+                # help) -- fail loudly instead so it gets investigated.
+                if model is not None:
+                    del model
+                gc.collect()
+                torch.cuda.empty_cache()
+                print(f"\n[epoch-time budget] {model_name} exceeded "
+                      f"--max-epoch-minutes ({e}) with no VRAM signal "
+                      f"alongside it -- NOT falling back to a smaller "
+                      f"model, since a slow epoch alone doesn't mean "
+                      f"{model_name} doesn't fit. Investigate the actual "
+                      f"cause (disk I/O, background processes, --cache "
+                      f"settings), or raise --max-epoch-minutes if this "
+                      f"epoch was just legitimately slow.")
+                raise
             is_vram_issue = isinstance(e, VRAMBudgetExceeded) or is_oom_error(e)
             if not is_vram_issue:
                 raise
-            # BUG FIX: empty_cache() used to run here while `model` (this
-            # candidate's weights, optimizer state, EMA shadow copy, and
-            # dataloader) was STILL referenced by the local variable --
+            # Drop the reference and gc.collect() BEFORE empty_cache() --
             # empty_cache() only releases blocks the allocator considers
-            # idle, and none of this candidate's memory was idle yet,
-            # it was just about to become unreachable on the next loop
-            # iteration's reassignment. That meant the next (smaller)
-            # candidate was loading while the failed one's memory was
-            # still fully resident -- exactly the kind of accumulation
-            # this fallback path exists to avoid. Explicitly drop the
-            # reference and run a real gc.collect() first so PyTorch's
-            # allocator has something to actually give back before the
-            # next candidate asks for VRAM. `model = None` above (before
-            # the try) guards the case where YOLO(model_name) itself is
-            # what raised, so there's nothing yet to delete.
+            # idle, and this candidate's memory wasn't idle yet while
+            # `model` still referenced it. Without this, the next
+            # (smaller) candidate loaded while the failed one's memory
+            # was still fully resident.
             if model is not None:
                 del model
             gc.collect()
@@ -1491,12 +1928,9 @@ def main():
     args = parse_args()
 
     if args.export_only:
-        # MINOR FIX: this check used to run AFTER installing the
-        # training-only monkeypatches below, so a pure --export-only
-        # invocation (which never calls model.train() at all) still
-        # patched Ultralytics' Mosaic/Albumentations internals and
-        # printed their banners for no reason. Export doesn't touch
-        # either, so there's nothing to gain from installing them here.
+        # Runs before installing the training-only monkeypatches below --
+        # export never touches Mosaic/Albumentations/disk-cache
+        # placement, so there's nothing to gain from patching them here.
         weights = Path(args.weights) if args.weights else find_latest_best_pt()
         export_for_cpp(weights)
         return
@@ -1504,10 +1938,13 @@ def main():
     install_instance_cap(max_instances=args.max_mosaic_instances,
                           max_tries=args.mosaic_max_tries)
 
+    if str(args.cache).lower() == "disk":
+        install_disk_cache_redirect(preferred_drive=args.cache_drive)
+
     if args.degradation_aug:
         install_degradation_augment()
 
-    data_path = None  # only set on a fresh (non-resume) run -- see guard below
+    data_path = None  # only set on a fresh (non-resume) run
 
     if args.resume:
         last_pt = find_latest_last_pt(args.name)
@@ -1515,71 +1952,110 @@ def main():
         if not _is_resumable_checkpoint(last_pt):
             raise SystemExit(
                 f"\n[resume] {last_pt} has no epoch/optimizer state left "
-                f"to resume -- this means that run already completed "
-                f"normally (Ultralytics strips optimizer state from "
-                f"last.pt/best.pt once a run finishes, regardless of what "
-                f"--epochs is set to in its args.yaml). True resume is "
-                f"only possible for a run that was INTERRUPTED before "
-                f"reaching its target epoch count.\n\n"
-                f"To train more epochs starting from these weights "
-                f"instead, run a fresh (non-resume) training pass using "
-                f"this checkpoint as the starting model -- e.g.:\n\n"
+                f"to resume -- that run already completed normally "
+                f"(Ultralytics strips optimizer state from last.pt/best.pt "
+                f"once a run finishes, regardless of --epochs in its "
+                f"args.yaml). True resume only works for a run "
+                f"INTERRUPTED before its target epoch count.\n\n"
+                f"To train more epochs from these weights instead, run a "
+                f"fresh (non-resume) pass using this checkpoint as the "
+                f"starting model:\n\n"
                 f"    python train.py --model \"{last_pt}\" --epochs 5\n\n"
-                f"This is a warm start, not a true continuation: the LR "
-                f"schedule and optimizer momentum restart from scratch "
-                f"rather than picking up exactly where training left "
-                f"off, but the learned weights carry over. Adjust "
-                f"--epochs/--imgsz/--batch/etc. as you would for any "
-                f"normal run.")
+                f"This is a warm start, not a true continuation -- LR "
+                f"schedule/optimizer momentum restart from scratch, but "
+                f"the learned weights carry over. Adjust --epochs/--imgsz/"
+                f"--batch as you would for any normal run.")
 
         print(f"\nResuming training from {last_pt}...")
         model = YOLO(str(last_pt))
 
-        # BUG FIX: this branch used to call model.train(resume=True)
-        # with no callbacks attached at all -- train_with_model_fallback()
-        # (the fresh-run path, below) adds the startup probe, the
-        # ongoing watchdog, and the augmentation-scope check, but this
-        # resume path skipped all three. That meant every resumed run
-        # had NO WDDM safety net whatsoever -- exactly the failure mode
-        # this file's whole WDDM section exists to catch, and resumed
-        # runs are not less likely to hit it (they pick up mid-training,
-        # right where the staircase/mosaic-density issue was already
-        # underway). install_degradation_augment()/install_instance_cap()
-        # in main() are global monkeypatches so they already applied
-        # here regardless -- it was specifically the per-Trainer
-        # add_callback() calls that were missing.
+        # [FIX -- review item] Only checked resumability (epoch/optimizer
+        # present) before, not whether the taxonomy this checkpoint was
+        # trained against still matches what's currently on disk -- see
+        # _verify_resume_taxonomy()'s docstring for the same-nc/reordered-
+        # classes case that a raw PyTorch shape-mismatch crash wouldn't
+        # have caught.
+        _verify_resume_taxonomy(last_pt, model,
+                                 strict=args.strict_resume_taxonomy)
+
+        # train_with_model_fallback() (fresh-run path) adds the startup
+        # probe, ongoing watchdog, and augmentation-scope check -- this
+        # resume path needs the same per-Trainer callbacks explicitly,
+        # since they don't carry over from the global monkeypatches alone.
         model.add_callback(
             "on_train_batch_end",
-            make_startup_probe_callback(args.device))
+            make_startup_probe_callback(
+                args.device, safety_margin=args.vram_safety_margin))
         model.add_callback(
             "on_train_epoch_end",
             make_ongoing_watchdog_callback(
-                args.device, max_epoch_minutes=args.max_epoch_minutes))
+                args.device, max_epoch_minutes=args.max_epoch_minutes,
+                safety_margin=args.vram_safety_margin))
         if args.degradation_aug:
             model.add_callback(
                 "on_train_start",
                 make_augmentation_scope_check_callback())
 
+        # [FIX -- review item] Verified against the installed
+        # ultralytics package's BaseTrainer.check_resume(): it DOES
+        # honor a specific allowlist of args re-passed to model.train()
+        # alongside resume=True -- imgsz/batch/device/close_mosaic/
+        # save_period/workers/cache/patience among them -- restoring
+        # everything else (data/name/epochs/mosaic prob/mixup/cos_lr/
+        # oversampling/...) from the checkpoint's own saved args.yaml
+        # regardless of what's passed here.
+        #
+        # [FIX -- review item] Building this dict from `args` directly
+        # (the previous version) put all 8 keys in unconditionally,
+        # since argparse's own defaults for imgsz/batch/device/.../
+        # patience are indistinguishable from a value the user actually
+        # typed once they're sitting on `args`. check_resume() only
+        # checks "is this key present in the dict I was handed", not
+        # "did the user type this" -- so bare `--resume` was silently
+        # overwriting the checkpoint's saved imgsz/batch/device/.../
+        # patience with this script's normal-run defaults every time.
+        # _explicitly_provided_resume_overrides() does a second,
+        # SUPPRESS-defaulted parse of just these 8 flags so only ones
+        # actually typed this invocation end up here -- see its
+        # docstring for the full trace through ultralytics' source.
+        resume_overrides = _explicitly_provided_resume_overrides()
+        if resume_overrides:
+            print(f"[resume] CLI overrides for this resume: "
+                  f"{resume_overrides}")
+        else:
+            print("[resume] No --imgsz/--batch/--device/--close-mosaic/"
+                  "--save-period/--workers/--cache/--patience typed this "
+                  "invocation -- all 8 resume from this checkpoint's own "
+                  "saved args.yaml unchanged.")
+
         try:
-            model.train(resume=True)
+            model.train(resume=True, **resume_overrides)
         except VRAMBudgetExceeded as e:
-            # Unlike the fresh-run path, there's no smaller model size to
-            # fall back to here -- the checkpoint's architecture is
-            # fixed. Fail loudly with a concrete next step instead of
-            # silently falling back to Ultralytics' own defaults (see
-            # _is_resumable_checkpoint's docstring for why a silent
-            # fallback is specifically dangerous on this project).
+            # Unlike a fresh run, there's no smaller MODEL to fall back
+            # to here -- the checkpoint's architecture is fixed. But
+            # --batch/--imgsz/--workers/--cache genuinely ARE honored on
+            # resume (see resume_overrides above), so lowering those is
+            # a real option here, not just "start over".
             raise SystemExit(
                 f"\n[VRAM] Resumed run at {last_pt} hit the VRAM budget "
                 f"check ({e}). Resuming can't fall back to a smaller "
-                f"model size -- the checkpoint's architecture is fixed. "
-                f"Free up VRAM, or start a fresh (non-resume) run with a "
-                f"smaller --imgsz/--batch or --model, using this "
-                f"checkpoint as a warm start (see the resumability error "
-                f"message above for that pattern).")
+                f"MODEL size, but --batch/--imgsz/--workers/--cache ARE "
+                f"honored on resume -- try, e.g.:\n\n"
+                f"    python train.py --resume --name "
+                f"{last_pt.parent.parent.name} --batch 1 --imgsz 640\n\n"
+                f"If that's already at the floor, free up VRAM, or start "
+                f"a fresh (non-resume) run with a smaller --model, using "
+                f"this checkpoint as a warm start (see the resumability "
+                f"error message above).")
 
         run_name = last_pt.parent.parent.name
         used_model_name = None
+        # [FIX -- review item] recovers the dataset yaml so the
+        # end-of-run report block below (data_path is not None ->
+        # report_per_class_map()) runs for a resumed run exactly like
+        # it does for a fresh one, instead of always hitting the
+        # "[per-class report] Skipped" branch.
+        data_path = _recover_resume_data_path(last_pt.parent.parent)
     else:
         oversample_classes = [
             c.strip() for c in args.oversample_classes.split(",") if c.strip()
@@ -1597,21 +2073,24 @@ def main():
     if used_model_name is not None and used_model_name != args.model:
         print(f"[note] Requested --model {args.model}, but training "
               f"actually completed on {used_model_name} -- see the "
-              f"'[VRAM]' fallback messages above for why. If this wasn't "
-              f"intentional (e.g. you specifically wanted yolo26m), check "
-              f"whether --imgsz 640 (more VRAM headroom) lets the larger "
-              f"model fit instead of silently accepting the fallback.")
+              f"'[VRAM]' fallback messages above for why. If unintended, "
+              f"check whether --imgsz 640 (more VRAM headroom) lets the "
+              f"larger model fit instead.")
 
-    # BUG FIX: this is the piece the earlier "reload fresh for eval" fix
-    # was missing. `model` (with its full .trainer -- optimizer state,
-    # EMA shadow copy, dataloader buffers, often larger than the model
-    # weights themselves) was never released here -- it stayed
-    # referenced by this variable for the REST of main(), straight
-    # through eval and export. So `eval_model = YOLO(str(best_pt))`
-    # below wasn't actually giving eval a clean VRAM footprint; it was
-    # adding a second model's memory on top of the first one, which was
-    # still fully resident the whole time. Only `best_pt`'s path is
-    # needed from here on, so free everything else now.
+    # [FIX -- review item] evaluate_per_source()/report_per_class_map()
+    # below used to be passed args.batch directly. That's fine for an
+    # explicit --batch, but --batch -1 (AutoBatch) is only meaningful to
+    # model.train() -- Ultralytics resolves it to a concrete int
+    # (trainer.batch_size) during training, and passing the raw -1
+    # through to model.val() here is undefined/unsupported. Captured
+    # here (before `model` is freed below) so eval always uses the real
+    # batch size training actually ran at, AutoBatch or not.
+    eval_batch = getattr(model.trainer, "batch_size", None) or args.batch
+
+    # `model` (trainer, optimizer state, EMA shadow, dataloader buffers)
+    # stayed referenced through eval/export otherwise -- free it now so
+    # eval_model below actually gets a clean VRAM footprint instead of
+    # stacking on top of this.
     import gc
     import torch
     del model
@@ -1623,22 +2102,20 @@ def main():
 
     if not args.skip_per_source_eval:
         eval_model = YOLO(str(best_pt))
-        evaluate_per_source(eval_model, run_dir, args.batch,
-                             workers=args.workers)
+        evaluate_per_source(eval_model, run_dir, eval_batch,
+                             workers=args.workers,
+                             strict=args.strict_per_source_eval)
         if data_path is not None:
-            report_per_class_map(eval_model, data_path, args.batch,
+            report_per_class_map(eval_model, data_path, eval_batch,
                                   workers=args.workers)
         else:
             print("\n[per-class report] Skipped -- no data_path available "
-                  "for a --resume run in this process. Run "
-                  "`python train.py --export-only` style follow-up, or "
-                  "call report_per_class_map(model, 'datasets/unified.yaml', "
-                  "args.batch) manually if you want it after a resumed run.")
+                  "for a --resume run in this process. Run `python "
+                  "train.py --export-only` style follow-up, or call "
+                  "report_per_class_map(model, 'datasets/unified.yaml', "
+                  "a concrete --batch value) manually if needed after a "
+                  "resumed run.")
 
-        # Same reasoning as above: eval_model isn't needed once eval is
-        # done, and export_for_cpp() loads its own fresh model from
-        # best_pt -- free eval_model first so export doesn't have to
-        # compete with it.
         del eval_model
         gc.collect()
         if torch.cuda.is_available():

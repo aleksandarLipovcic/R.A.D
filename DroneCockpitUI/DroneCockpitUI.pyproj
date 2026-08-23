@@ -59,6 +59,8 @@
     <Compile Include="NNTraining\check_label_gaps.py" />
     <Compile Include="NNTraining\generate_pseudo_labels.py" />
     <Compile Include="NNTraining\finetune_and_resolve_queue.py" />
+    <Compile Include="NNTraining\dedupe_real_labels.py" />
+    <Compile Include="NNTraining\review_batch_assigner.py" />
     <Compile Include="NNTraining\resolve_cross_class_conflicts.py" />
     <Compile Include="NNTraining\review_labels.py" />
     <Compile Include="NNTraining\verify_pipeline_assumptions.py" />

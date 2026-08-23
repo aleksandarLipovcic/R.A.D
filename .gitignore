@@ -39,3 +39,4 @@ runs/
 # VRAM diagnostics / profiling artifacts
 *vram_snapshot.pickle
 *vram_trace.csv
+/DroneCockpitUI/NNTraining/handoff

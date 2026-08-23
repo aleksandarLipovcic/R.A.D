@@ -2,50 +2,86 @@
 mosaic_guard.py -- caps the worst-case instance count of Ultralytics'
 Mosaic augmentation for Project R.A.D.
 
-Why this exists: VisDrone has some frames with 1000+ annotated instances
-(dense crowds/traffic). Ultralytics' mosaic augmentation composites up
-to 4 (or 9) source images into one training sample *before* batching --
-if a composite happens to pull together several dense frames, that
-single slot needs dramatically more memory than a typical batch (loss/
-target-assignment cost scales with instance count, not image size),
-regardless of --batch/--imgsz. Confirmed against the per-batch training
-log: batch 44 (378 -> 3632 instances) and batch 61 (-> 4864 instances)
-lined up exactly with the GPU_mem jumps that eventually pushed past this
+Why: VisDrone has frames with 1000+ annotated instances. Mosaic
+composites up to 4/9 source images into one training sample *before*
+batching -- if a composite pulls together several dense frames, that
+one slot needs way more memory than a typical batch (loss/target-
+assignment cost scales with instance count, not image size). Confirmed
+against training logs: batch 44 (378->3632 instances) and batch 61
+(->4864) lined up exactly with the GPU_mem jumps that pushed past this
 card's 6GB.
 
-What this does: subclasses Mosaic and overrides get_params() -- the step
-where mosaic partner images are picked -- to steer selection away from
-combinations that would exceed --max-mosaic-instances, instead of
-picking partners uniformly at random. It does NOT shrink the mosaic
-grid (4/9); Mosaic's canvas-building code (apply_image) hardcodes
-geometry for a fixed grid size, so changing that per-call risks breaking
-it. Instead it changes WHICH images fill that grid: candidates are
-sampled the normal way, but any candidate that would push the running
-instance total over budget is skipped and another tried, up to a retry
-limit -- so a mosaic still happens (keeping the accuracy benefit), it's
-just steered away from stacking several dense frames together. If the
-retry budget is exhausted (e.g. most nearby images happen to be dense),
-selection falls back to a two-phase strategy: first it still tries to
-respect the budget using everything it's already seen, and only if
-*that* still can't fill the remaining slots does it accept over-budget
-candidates (lightest-first) as a genuine last resort -- so the cap is
-violated only when it is truly unavoidable, not by default.
+What this does: subclasses Mosaic and overrides get_params() (where
+partner images are picked) to steer selection away from combinations
+that would exceed --max-mosaic-instances, instead of picking uniformly
+at random. Does NOT shrink the mosaic grid (apply_image()'s geometry
+code hardcodes grid size). Candidates are sampled normally; any that
+would push the running total over budget are skipped and another is
+tried, up to a retry limit. If the retry budget runs out, falls back
+in two phases: (1) still budget-aware -- sweep everything already seen
+and take what fits, (2) genuine last resort -- accept over-budget
+candidates (lightest first) so selection never stalls.
 
-This is a PROACTIVE fix -- it makes the pathological batches far less
-likely in the first place. train.py's startup probe and ongoing VRAM
-watchdog stay in place as the REACTIVE safety net, since a single source
-image can occasionally be dense enough on its own to need real headroom
-even with zero mosaic partners -- no selection policy can fix that,
-only imgsz/batch/model-size can.
+This is PROACTIVE -- train.py's startup probe + VRAM watchdog remain
+the REACTIVE safety net, since a single source image can occasionally
+be dense enough alone to need real headroom even with zero partners.
 
-Deliberately reads only dataset.labels[i]["cls"] (label metadata
-Ultralytics already loads into memory from its dataset cache) to peek
-instance counts -- NEVER calls get_image_and_label() speculatively for a
-candidate we might discard, since that decodes the actual image from
-disk and would defeat the point of a *cheap* guard. If that lookup ever
-fails, the guard fails conservative (treats the candidate as maximally
-dense) rather than permissive -- a bookkeeping failure should never make
-this *less* restrictive.
+Only reads dataset.labels[i]["cls"] (already-loaded label metadata) to
+peek instance counts -- never decodes a candidate image from disk just
+to maybe discard it. If that lookup fails, treats the candidate as
+maximally dense (fail conservative, never permissive).
+
+Call order this relies on (verified against ultralytics/data/augment.py):
+BaseMixTransform.__call__() -> self.get_params(labels) -> Mosaic.get_params()
+-> super().get_params(labels) [BaseMixTransform.get_params] -> self.get_indexes().
+So InstanceCappedMosaic.get_params() stashing self._own_count *before*
+calling super().get_params(labels) is guaranteed to run before
+get_indexes() reads it, every call -- get_indexes() is never reached any
+other way in this pipeline.
+
+  [FIX -- review item] get_indexes()'s final catch-all fallback (used
+  only when Phase 1 and Phase 2 together still can't fill `needed`
+  slots from everything sampled so far -- e.g. a small dataset or
+  heavy index-space duplication from prepare_datasets.py's oversampling
+  collapsing many indices onto few unique physical files) used to
+  sample with zero dedup check, unlike every other path in this
+  method. That silently violated this class's own stated guarantee
+  (see _dedupe_key()'s docstring: "a mosaic never wastes a partner
+  slot on the same image twice") in exactly the scenario most likely
+  to reach this fallback. Reproduced directly: with only 2 unique
+  physical files behind a 6-index dataset and max_tries=5, the old
+  code returned the same physical image twice for a 3-slot mosaic.
+  The fallback now respects the same dedupe_key check as Phase 1/2,
+  bounded by fallback_cap tries, and only accepts a genuine duplicate
+  as an absolute last resort (with a one-time printed explanation) if
+  the dataset truly doesn't have enough unique images to fill the
+  mosaic -- which was always the implicit assumption, just never
+  enforced on this path.
+
+  [FIX -- review item] self.trip_count was incremented every time the
+  retry budget ran out (comment: "for logging") but nothing anywhere
+  -- this module or train.py -- ever printed, read, or otherwise
+  surfaced it, so there was no way to tell from a training run how
+  often the instance-cap guard had to fall back to Phase 1/2. It now
+  prints a message the first few times it trips and periodically
+  (log-scale) after that, so frequent trips are visible without
+  spamming the log on a run where they're rare (the expected case).
+
+  [POLISH -- review follow-up] get_indexes()'s main sampling loop kept
+  `seen` as a plain list, so redrawing the same already-seen-but-not-
+  yet-accepted candidate index (common once the budget gets tight)
+  re-ran the instance-count lookup and appended a second entry. Not a
+  correctness bug -- Phase 1/2 skip anything already in selected_keys
+  -- just wasted label lookups. `seen` is now keyed by dedupe_key so
+  each physical image's count is looked up at most once per call.
+
+  [POLISH -- review follow-up] the duplicate-fallback warning in
+  _fill_remaining_unique() only ever printed on the 1st/2nd/5th
+  occurrence (_TRIP_REPORT_MULTIPLES), unlike trip_count's full
+  log-scale schedule -- so a duplicate-fallback problem that turned
+  frequent on a small dataset would go quiet after the 5th time.
+  Both counters now go through the same _should_report() log-scale
+  check.
 """
 
 from typing import Any
@@ -54,20 +90,45 @@ import random
 
 from ultralytics.data.augment import Mosaic
 
-# Class-level defaults, set once by install_instance_cap() before any
-# dataset is built. Kept as class attributes (rather than always passing
-# explicit kwargs) because Ultralytics' v8_transforms() instantiates
-# Mosaic with a fixed positional/keyword signature we don't control --
-# see install_instance_cap()'s docstring for why a straight subclass
-# swap, not a wrapped factory function, is what gets patched in.
 _DEFAULT_MAX_INSTANCES = 800
 _DEFAULT_MAX_TRIES = 40
+
+# [FIX] trip_count log-scale reporting points -- print on the 1st,
+# 2nd, 5th, 10th, 20th, 50th, ... trip, so a rare event is visible
+# immediately but a frequent one doesn't spam every single mosaic call.
+_TRIP_REPORT_MULTIPLES = (1, 2, 5)
+
+
+def _should_report(n: int) -> bool:
+    """Shared log-scale reporting schedule: fires on the 1st, 2nd, 5th,
+    10th, 20th, 50th, 100th, ... occurrence. Used for both trip_count
+    and the duplicate-fallback counter so a rare event is visible
+    immediately and a frequent one doesn't spam the log.
+
+    [FIX -- review item] The previous formula (`n % (10 ** (len(str(n))
+    - 1)) == 0`) doesn't actually implement a 1-2-5 schedule -- it
+    fires on EVERY multiple of 10 within a decade (10, 20, 30, ..., 90)
+    and every multiple of 100 within a century (100, 200, ..., 900),
+    not just 10/20/50/100/200/500. That's the opposite of what both
+    call sites (trip_count, _duplicate_fallback_count) need this for:
+    on a run where either counter climbs into the tens or hundreds --
+    plausible on a small/heavily-oversampled dataset, exactly the case
+    this guard exists for -- the old formula prints roughly 10x more
+    often than intended, reintroducing the log-spam problem this
+    function was written to avoid. Fixed to check membership against
+    the actual {1,2,5} x 10^k sequence instead."""
+    if n in _TRIP_REPORT_MULTIPLES:
+        return True
+    if n < 10:
+        return False
+    magnitude = 10 ** (len(str(n)) - 1)
+    return n in (magnitude, 2 * magnitude, 5 * magnitude)
 
 
 class InstanceCappedMosaic(Mosaic):
     """Mosaic that steers partner-image selection away from combinations
     that would exceed a total instance-count budget. See module
-    docstring for the full rationale."""
+    docstring for the rationale."""
 
     max_instances_default = _DEFAULT_MAX_INSTANCES
     max_tries_default = _DEFAULT_MAX_TRIES
@@ -81,46 +142,26 @@ class InstanceCappedMosaic(Mosaic):
                                else cls.max_instances_default)
         self.max_tries = (max_tries if max_tries is not None
                            else cls.max_tries_default)
-        self.trip_count = 0  # how often the retry budget ran out; for logging
+        self.trip_count = 0  # how often the retry budget ran out; now logged, see _report_trip()
+        self._duplicate_fallback_count = 0  # how often a true duplicate had to be accepted
 
-        # Oversampling (see prepare_datasets.py's
-        # _oversample_sparse_classes()) writes duplicate absolute image
-        # paths into oversample_train.txt as additional train: entries,
-        # which means the SAME physical image can end up at multiple
-        # distinct dataset indices. Deduping only by index (as an
-        # earlier version of this file did) would let one mosaic draw
-        # that same image twice under two different indices -- not a
-        # budget/memory-safety problem (instance counts are still
-        # summed correctly either way), but it wastes a partner slot on
-        # redundant content instead of the variety mosaic is meant to
-        # add, and oversampling makes that more likely than pure chance
-        # would. im_files is a standard BaseDataset attribute for YOLO
-        # detection datasets; fall back to index-only dedup (pre-
-        # existing behavior) if it's ever missing rather than assuming.
+        # Oversampling (prepare_datasets._oversample_sparse_classes())
+        # writes duplicate absolute image paths as extra train: entries,
+        # so the same physical image can sit at multiple dataset indices.
+        # Dedupe by physical path (via im_files) rather than index alone,
+        # so a mosaic never wastes a partner slot on the same image
+        # twice under two different indices.
         self._im_files = getattr(dataset, "im_files", None)
         if self._im_files is None:
             print("[mosaic_guard] note: dataset has no im_files attribute -- "
-                  "falling back to index-only duplicate detection (won't "
-                  "catch the same physical image at two different indices, "
-                  "e.g. from oversampling).")
+                  "falling back to index-only duplicate detection.")
 
     def _dedupe_key(self, idx: int):
-        """Identity used to detect 'already selected for this mosaic'.
-        Prefers the physical image path (so two dataset indices that
-        reference the same image, e.g. via oversample_train.txt-style
-        duplicate entries, are correctly treated as one candidate);
-        falls back to the raw index if im_files isn't available.
-
-        Runs the path through os.path.normcase before comparing -- on
-        Windows (this project's target platform), the same physical
-        file can otherwise compare as "different" purely from '/' vs
-        '\\' separators or drive-letter casing between however
-        Ultralytics built dataset.im_files and however a given path was
-        originally written (e.g. prepare_datasets.py's
-        str(Path.resolve()) output for oversample_train.txt). Without
-        this, the dedup silently stops catching real duplicates on
-        exactly the platform this matters most for, instead of failing
-        loudly. normcase is a no-op on POSIX."""
+        """Identity for 'already selected this mosaic'. Prefers the
+        physical path (normcased -- on Windows the same file can compare
+        'different' purely from separator/case differences between
+        however im_files was built vs. how a path was written elsewhere,
+        e.g. oversample_train.txt); falls back to raw index."""
         if self._im_files is not None:
             try:
                 return os.path.normcase(str(self._im_files[idx]))
@@ -129,35 +170,24 @@ class InstanceCappedMosaic(Mosaic):
         return idx
 
     def _sample_candidate_index(self) -> int:
-        # Mirrors the base class's locality behavior: when buffer_enabled
-        # (see Mosaic.__init__), prefer recently-loaded indices so we
-        # don't regress disk-cache locality just for the sake of the cap.
+        # Mirrors base-class locality: prefer recently-loaded indices
+        # when buffering, so we don't regress disk-cache locality.
         if self.buffer_enabled and len(self.dataset.buffer) > 0:
             return random.choice(list(self.dataset.buffer))
         dataset_len = len(self.dataset)
         if dataset_len <= 0:
-            # Shouldn't happen in normal operation, but this is a
-            # defensive memory guard -- fail with a clear message
-            # instead of a cryptic `ValueError: empty range for
-            # randrange()` out of random.randint().
             raise RuntimeError(
                 "InstanceCappedMosaic: dataset is empty; cannot select "
-                "mosaic partners."
-            )
+                "mosaic partners.")
         return random.randint(0, dataset_len - 1)
 
     def _instance_count(self, index: int) -> int:
         try:
             return len(self.dataset.labels[index]["cls"])
         except (KeyError, TypeError, IndexError, AttributeError) as exc:
-            # Conservative fallback: if we can't verify how dense a
-            # candidate is, treat it as maximally dense rather than
-            # empty. Treating a lookup failure as 0 instances would make
-            # the guard *less* restrictive exactly when its bookkeeping
-            # is unreliable -- the wrong direction for a memory-safety
-            # mechanism. Only catch the failure modes we actually expect
-            # (malformed/missing label entries); anything else is a real
-            # bug and should still surface normally.
+            # Fail conservative: treat an unreadable candidate as
+            # maximally dense, not empty -- a lookup failure should
+            # never make this guard less restrictive.
             print(f"[mosaic_guard] warning: instance-count lookup failed "
                   f"for dataset index {index} ({exc!r}); treating as "
                   f"max_instances ({self.max_instances}).")
@@ -168,52 +198,44 @@ class InstanceCappedMosaic(Mosaic):
         cls = labels.get("cls")
         return len(cls) if cls is not None else 0
 
+    def _report_trip(self) -> None:
+        """[FIX] trip_count was tracked but never surfaced anywhere.
+        Prints on a log-scale schedule (1st, 2nd, 5th, 10th, 20th, ...
+        trip) so occasional trips are visible without spamming a long
+        training run if they become frequent -- frequency itself is a
+        useful signal that --max-mosaic-instances or --max-tries may
+        need adjusting."""
+        if _should_report(self.trip_count):
+            print(f"[mosaic_guard] note: retry budget exhausted for a "
+                  f"mosaic partner selection ({self.trip_count} time(s) so "
+                  f"far this run) -- fell back to a budget-aware sweep of "
+                  f"already-seen candidates. Non-fatal; if this climbs "
+                  f"steadily, consider raising --mosaic-max-tries or "
+                  f"lowering --max-mosaic-instances.")
+
     def get_params(self, labels: dict[str, Any]) -> dict[str, Any]:
-        """
-        Mosaic.get_params() does two things: pick partner indexes (via
-        get_indexes(), which does NOT receive `labels`) and then, using
-        those, compute the pixel-placement geometry for the composite.
-        Overriding get_params() outright -- as an earlier draft of this
-        guard did -- silently threw away that geometry step. Instead:
-        stash the current image's own instance count where get_indexes()
-        (overridden below) can read it, then fully delegate to Mosaic's
-        real get_params() so layout computation stays intact.
-        """
+        """Mosaic.get_params() picks partner indexes (via get_indexes(),
+        which doesn't see `labels`) then computes placement geometry.
+        Stash this image's own instance count for get_indexes() to read,
+        then delegate to the real get_params() so layout stays intact."""
         self._own_count = self._own_instance_count(labels)
         return super().get_params(labels)
 
     def get_indexes(self):
-        """
-        Replaces Mosaic's uniform-random partner selection. Samples
-        candidates the normal way, skipping any index already selected,
-        and skips any that would push the running instance total over
-        budget, trying another up to self.max_tries -- so a mosaic
-        still happens (keeping the accuracy benefit), it's just steered
-        away from stacking several dense frames together.
-
-        If the retry budget runs out, falls back in two phases:
-          1. Still budget-aware -- sweep everything already seen
-             (lightest first) and take anything that still fits the
-             remaining budget.
-          2. Only if that still isn't enough, accept over-budget
-             candidates (lightest first) as a genuine last resort, so
-             selection never stalls or raises. This means the cap is
-             only violated when literally no seen candidate combination
-             fits it, not as the default fallback behavior.
-        """
+        """Replaces Mosaic's uniform-random partner selection with a
+        budget-aware sample: skip candidates that would push the running
+        instance total over budget, retry up to max_tries. If the retry
+        budget runs out, fall back in two phases -- (1) still
+        budget-aware, sweep everything already seen for what fits, then
+        (2) accept over-budget candidates (lightest first) as a last
+        resort so selection never stalls."""
         needed = self.n - 1
         budget = self.max_instances - getattr(self, "_own_count", 0)
 
         if budget <= 0:
-            # The base image alone is already at/over the cap -- no
-            # partner choice fixes that, but we can still minimize
-            # further damage instead of accepting the first random
-            # candidate: sample a pool of *unique* candidates (by
-            # physical image, not just index -- see _dedupe_key) and
-            # take the least-dense `needed` of them, same policy as the
-            # retry-exhausted fallback below. Bounded by max_tries so a
-            # tiny dataset (fewer unique candidates than the pool
-            # target) can't loop indefinitely.
+            # Base image alone is already at/over cap -- minimize
+            # further damage: sample a pool of unique candidates and
+            # take the least-dense `needed` of them.
             pool: dict[Any, tuple[int, int]] = {}
             pool_target = max(needed, self.max_tries // 2)
             attempts = 0
@@ -225,14 +247,18 @@ class InstanceCappedMosaic(Mosaic):
                 attempts += 1
             ordered = sorted(pool.values(), key=lambda t: t[1])
             selected = [idx for idx, _ in ordered[:needed]]
-            while len(selected) < needed:  # pathologically tiny dataset
-                selected.append(self._sample_candidate_index())
+            selected_keys = {self._dedupe_key(idx) for idx in selected}
+            self._fill_remaining_unique(selected, selected_keys, needed)
             return selected
 
         selected: list[int] = []
         selected_keys: set = set()
         running = 0
-        seen: list[tuple[int, int]] = []
+        # [POLISH] keyed by dedupe_key (not a plain list) so redrawing
+        # the same not-yet-accepted candidate doesn't re-run
+        # _instance_count() or add a redundant entry for Phase 1/2 to
+        # sort through.
+        seen: dict[Any, tuple[int, int]] = {}
         tries = 0
 
         while len(selected) < needed and tries < self.max_tries:
@@ -240,11 +266,10 @@ class InstanceCappedMosaic(Mosaic):
             idx = self._sample_candidate_index()
             key = self._dedupe_key(idx)
             if key in selected_keys:
-                # Already chosen this image (by index or physical path)
-                # for this mosaic -- skip without spending a lookup.
                 continue
-            count = self._instance_count(idx)
-            seen.append((idx, count))
+            if key not in seen:
+                seen[key] = (idx, self._instance_count(idx))
+            idx, count = seen[key]
             if running + count <= budget:
                 selected.append(idx)
                 selected_keys.add(key)
@@ -252,15 +277,12 @@ class InstanceCappedMosaic(Mosaic):
 
         if len(selected) < needed:
             self.trip_count += 1
+            self._report_trip()
 
-            # Phase 1: still respect the budget. Sweep everything we've
-            # seen so far (lightest first) and take anything that still
-            # fits the remaining budget -- this is what the old fallback
-            # skipped, and is what let it silently exceed max_instances.
-            for idx, count in sorted(seen, key=lambda t: t[1]):
+            # Phase 1: still budget-aware -- sweep what we've seen.
+            for key, (idx, count) in sorted(seen.items(), key=lambda kv: kv[1][1]):
                 if len(selected) >= needed:
                     break
-                key = self._dedupe_key(idx)
                 if key in selected_keys:
                     continue
                 if running + count <= budget:
@@ -268,61 +290,83 @@ class InstanceCappedMosaic(Mosaic):
                     selected_keys.add(key)
                     running += count
 
-            # Phase 2: genuine last resort. Only now, if nothing seen
-            # fits the remaining budget, accept over-budget candidates
-            # (lightest first) so selection never stalls.
+            # Phase 2: last resort -- accept over-budget, lightest first.
             if len(selected) < needed:
-                for idx, count in sorted(seen, key=lambda t: t[1]):
+                for key, (idx, count) in sorted(seen.items(), key=lambda kv: kv[1][1]):
                     if len(selected) >= needed:
                         break
-                    key = self._dedupe_key(idx)
                     if key in selected_keys:
                         continue
                     selected.append(idx)
                     selected_keys.add(key)
                     running += count
 
-            while len(selected) < needed:  # pathologically tiny dataset
-                selected.append(self._sample_candidate_index())
+            # [FIX] used to be a bare `while len(selected) < needed:
+            # selected.append(self._sample_candidate_index())` with NO
+            # dedupe check -- the only place in this method that could
+            # silently return the same physical image twice, breaking
+            # the class's own stated guarantee. Now goes through the
+            # same unique-candidate search as everywhere else, and only
+            # accepts a genuine duplicate if the dataset truly can't
+            # supply enough unique images (logged when that happens).
+            self._fill_remaining_unique(selected, selected_keys, needed)
 
         return selected
+
+    def _fill_remaining_unique(self, selected: list, selected_keys: set,
+                                 needed: int) -> None:
+        """Tops `selected` up to `needed` entries, preferring a physical
+        image not already in `selected_keys`. Bounded by a generous try
+        budget so a pathologically tiny dataset can't hang training;
+        if that budget is exhausted, accepts duplicates as a true last
+        resort and logs it (log-scale) so the degradation is visible
+        rather than silent."""
+        fallback_cap = max(self.max_tries * 4, needed * 20, 20)
+        attempts = 0
+        accepted_duplicate = False
+        while len(selected) < needed:
+            idx = self._sample_candidate_index()
+            key = self._dedupe_key(idx)
+            attempts += 1
+            if key in selected_keys and attempts < fallback_cap:
+                continue
+            if key in selected_keys:
+                accepted_duplicate = True
+            selected.append(idx)
+            selected_keys.add(key)
+        if accepted_duplicate:
+            self._duplicate_fallback_count += 1
+            # [POLISH] shares the same log-scale schedule as
+            # _report_trip() instead of only firing on 1st/2nd/5th, so
+            # a duplicate-fallback problem that becomes frequent stays
+            # visible instead of going quiet after the 5th occurrence.
+            if _should_report(self._duplicate_fallback_count):
+                print(f"[mosaic_guard] warning: dataset didn't have enough "
+                      f"unique images to fill a mosaic without repeating one "
+                      f"({self._duplicate_fallback_count} time(s) this run) "
+                      f"-- only a concern if this is frequent, which would "
+                      f"point to a very small dataset or --max-tries set "
+                      f"too low relative to dataset size.")
 
 
 def install_instance_cap(max_instances: int = _DEFAULT_MAX_INSTANCES,
                           max_tries: int = _DEFAULT_MAX_TRIES) -> None:
-    """
-    Monkeypatches ultralytics.data.augment.Mosaic -> InstanceCappedMosaic.
-
-    Must be called before any dataset/trainer is built. This works
-    because v8_transforms() (ultralytics/data/augment.py) constructs
-    Mosaic via a bare module-global name, resolved at CALL time (i.e.
-    each time a dataset's build_transforms() runs) rather than at
-    v8_transforms' definition time -- so patching the module attribute
-    once, early, is sufficient. A plain subclass swap (rather than a
-    wrapped factory function) is used specifically so isinstance checks
-    elsewhere in Ultralytics (e.g. CopyPaste's internal handling) keep
-    working unmodified.
-    """
+    """Monkeypatches ultralytics.data.augment.Mosaic -> InstanceCappedMosaic.
+    Must run before any dataset/trainer is built -- v8_transforms()
+    resolves the `Mosaic` name at call time, so patching the module
+    attribute once, early, is enough. A subclass swap (not a wrapped
+    factory) keeps isinstance checks elsewhere in Ultralytics working."""
     import ultralytics.data.augment as augment_module
 
     InstanceCappedMosaic.max_instances_default = max_instances
     InstanceCappedMosaic.max_tries_default = max_tries
     augment_module.Mosaic = InstanceCappedMosaic
 
-    # Sanity-check that the patch actually took effect. This is mostly
-    # about catching future-you refactoring this into something that no
-    # longer assigns the module attribute correctly (e.g. patching a
-    # re-imported/aliased module object) rather than anything that can
-    # fail today -- cheap insurance against a silent no-op patch.
     if augment_module.Mosaic is not InstanceCappedMosaic:
         raise RuntimeError(
             "[mosaic_guard] Failed to install InstanceCappedMosaic -- "
             "ultralytics.data.augment.Mosaic was not replaced. Check for "
-            "an Ultralytics version change or an import-order issue."
-        )
+            "an Ultralytics version change or an import-order issue.")
 
     print(f"[mosaic_guard] Instance-capped mosaic installed "
-          f"(max_instances={max_instances}, max_tries={max_tries}) -- "
-          f"mosaic partner selection will now actively avoid stacking "
-          f"multiple dense VisDrone frames together instead of leaving "
-          f"it to chance.")
+          f"(max_instances={max_instances}, max_tries={max_tries}).")
