@@ -17,7 +17,11 @@ Usage:
         --hide-classes other_vehicle
 
 WHAT THIS PRODUCES for a video source:
-  - The usual Ultralytics annotated video, saved under --out.
+  - An annotated .mp4 video under --out, written directly by this
+    script frame-by-frame with cv2.VideoWriter (NOT via Ultralytics'
+    internal save=True path -- that was silently failing to produce a
+    usable video file in testing, so this script no longer depends on
+    it and instead builds the video itself and verifies the result).
   - detections.csv under --out: one row per frame, with a count per
     class and that frame's mean detection confidence per class. This is
     the thing to actually open and scroll/plot afterward -- eyeballing
@@ -60,12 +64,24 @@ import csv
 from collections import defaultdict
 from pathlib import Path
 
+import cv2
 from ultralytics import YOLO
 
 # Nothing hidden by default -- see the NOTE in the module docstring for
 # why the old shed/parking_lot default no longer applies to the current
 # unified taxonomy. Pass --hide-classes explicitly per test run instead.
 DEFAULT_HIDDEN = []
+
+# Codec fallback chain for cv2.VideoWriter. mp4v is the common working
+# choice on most OpenCV builds; if it fails to open (returns a writer
+# where isOpened() is False -- which happens silently on some Windows
+# OpenCV builds missing the codec), fall back to XVID/.avi, which uses
+# a much more universally-available codec.
+VIDEO_CODEC_FALLBACKS = [
+    ("mp4v", ".mp4"),
+    ("XVID", ".avi"),
+    ("MJPG", ".avi"),
+]
 
 
 def parse_args():
@@ -100,6 +116,30 @@ def parse_args():
     return p.parse_args()
 
 
+def open_video_writer(out_dir: Path, source_stem: str, fps: float, width: int, height: int):
+    """Try each codec in VIDEO_CODEC_FALLBACKS until one actually opens.
+    Returns (writer, output_path). Raises RuntimeError if none work --
+    loudly, instead of silently producing a 0-byte or missing file."""
+    for fourcc_str, ext in VIDEO_CODEC_FALLBACKS:
+        out_path = out_dir / f"{source_stem}_annotated{ext}"
+        fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
+        writer = cv2.VideoWriter(str(out_path), fourcc, fps, (width, height))
+        if writer.isOpened():
+            print(f"Video writer opened with codec={fourcc_str} -> {out_path}")
+            return writer, out_path
+        else:
+            print(f"  codec={fourcc_str} failed to open a writer, trying next fallback...")
+            writer.release()
+    raise RuntimeError(
+        "Could not open a cv2.VideoWriter with any of the fallback codecs "
+        f"{VIDEO_CODEC_FALLBACKS}. This points to your OpenCV build lacking "
+        "working video codec support -- check 'pip list | findstr opencv' for "
+        "opencv-python vs opencv-python-headless both being installed "
+        "(they conflict), and consider "
+        "'pip install opencv-python --upgrade --force-reinstall'."
+    )
+
+
 def main():
     args = parse_args()
     model = YOLO(args.weights)
@@ -109,15 +149,31 @@ def main():
     if args.hide_classes:
         print(f"Hiding classes: {args.hide_classes}")
 
+    # Probe the source ourselves for fps/resolution so the video writer
+    # can be set up before we start consuming the results generator.
+    # This also tells us up front whether the source is a real video
+    # (vs. a folder/single image), so we only attempt video writing
+    # when it makes sense.
+    is_video_source = False
+    fps, width, height = 30.0, None, None
+    probe_cap = cv2.VideoCapture(args.source)
+    if probe_cap.isOpened():
+        frame_count = probe_cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        if frame_count and frame_count > 1:
+            is_video_source = True
+            fps = probe_cap.get(cv2.CAP_PROP_FPS) or 30.0
+            width = int(probe_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(probe_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    probe_cap.release()
+
     results = model.predict(
         source=args.source,
         imgsz=args.imgsz,
         conf=args.conf,
         classes=keep_ids or None,
-        save=True,
-        project=str(Path(args.out).parent),
-        name=Path(args.out).name,
-        exist_ok=True,
+        save=False,  # we write the annotated video ourselves below --
+                     # letting Ultralytics also try was redundant and
+                     # its internal writer was the thing silently failing
         stream=True,  # process frame-by-frame instead of loading a full
                        # video's results into memory at once -- matters
                        # once "video" means a real multi-minute clip
@@ -127,6 +183,7 @@ def main():
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "detections.csv"
+    source_stem = Path(args.source).stem
 
     class_names_sorted = [all_names[i] for i in sorted(all_names.keys())]
 
@@ -136,6 +193,9 @@ def main():
     conf_sum = defaultdict(float)
     n_frames = 0
     n_zero_detection_frames = 0
+
+    video_writer = None
+    video_out_path = None
 
     print(f"\n{'=' * 60}")
     if not args.quiet:
@@ -183,6 +243,36 @@ def main():
             ]
             writer.writerow(row)
 
+            # Write the annotated frame to video, only for real video
+            # sources. r.plot() draws boxes/labels on a copy of the
+            # original-resolution frame -- exactly what save=True would
+            # have produced internally, we're just doing it ourselves.
+            if is_video_source:
+                annotated = r.plot()
+                if video_writer is None:
+                    h, w = annotated.shape[:2]
+                    video_writer, video_out_path = open_video_writer(
+                        out_dir, source_stem, fps, w, h
+                    )
+                video_writer.write(annotated)
+
+    if video_writer is not None:
+        video_writer.release()
+        # Hard verification instead of trusting the writer silently --
+        # a 0-byte or missing file here means something went wrong even
+        # though isOpened() reported True.
+        if video_out_path.exists() and video_out_path.stat().st_size > 0:
+            size_mb = video_out_path.stat().st_size / (1024 * 1024)
+            print(f"\nVideo written and verified: {video_out_path} ({size_mb:.1f} MB)")
+        else:
+            print(f"\nWARNING: {video_out_path} is missing or 0 bytes after "
+                  f"release() -- the codec reported success but no data was "
+                  f"actually written. Try a different fallback codec or "
+                  f"check disk space.")
+    elif not is_video_source:
+        print("\nSource was not detected as a multi-frame video "
+              "(folder/single image?) -- no video written, only detections.csv.")
+
     print(f"\n{'=' * 60}")
     print(f"Aggregate summary across {n_frames} frames")
     print(f"{'=' * 60}")
@@ -206,7 +296,7 @@ def main():
               "is missing real detections, or --conf is set too high for "
               "this footage's actual confidence distribution.")
 
-    print(f"\nAnnotated video saved under: {args.out}")
+    print(f"\nOutput directory: {out_dir}")
     print(f"Per-frame detection log: {csv_path}")
     print("Look specifically for: false positives on background clutter, "
           "missed obvious cars/people, and whether box tightness looks "
