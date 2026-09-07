@@ -184,7 +184,17 @@ VIDEO_PROBE_RETRY_MS = 3000   # how often to retry connect_auto() if no device f
 # present; otherwise classes show up as "class_N" in the detection list.
 #
 # EDIT THIS to match your local model location.
-DETECTION_MODEL_PATH = os.path.join(script_dir, "models", "yolov8n.onnx")
+DETECTION_MODEL_PATH = os.path.join(script_dir, "models", "yolo26m_main.onnx")
+
+# Square side the model expects, letterboxed -- MUST match whatever
+# imgsz export_model.py used (EXPORT_IMGSZ there). yolo26m_main was
+# exported at 960 with a static (non-dynamic) input shape, so feeding it
+# anything else isn't just less accurate, it's a hard shape mismatch:
+# DetectionLink::runInference()'s net.forward() call throws a
+# cv::Exception that is NOT caught anywhere on that worker thread, which
+# terminates the whole process, not just detection. Keep this in sync
+# with set_input_size() below and with EXPORT_IMGSZ in export_model.py.
+DETECTION_INPUT_SIZE = 960
 
 # Directory annotated detection screenshots are written to (created on
 # first use). Leave as "" to disable screenshot saving -- detections are
@@ -1288,6 +1298,32 @@ class DroneCockpitApp:
         self.detection_link.set_video_link_source(self.video_link)
         self.detection_link.set_telemetry_provider(self._get_detection_telemetry)
         self.detection_link.set_model_path(DETECTION_MODEL_PATH)
+
+        # set_input_size() is only present in DroneBackend once
+        # Bindings.cpp has been recompiled after the binding was added --
+        # editing Bindings.cpp/Detectionlink.cpp source does NOT change
+        # the already-built DroneBackend.pyd Python actually imports.
+        # `import DroneBackend` failing here would take the *entire*
+        # cockpit down over a detection-only config mismatch, so warn
+        # loudly and keep going instead -- DetectionLink just falls back
+        # to its compiled-in default inputSize_ (640), which only matters
+        # if that also doesn't match your .onnx export (see
+        # DETECTION_INPUT_SIZE / Detectionlink.h's setInputSize() docs).
+        if hasattr(self.detection_link, "set_input_size"):
+            self.detection_link.set_input_size(DETECTION_INPUT_SIZE)
+        else:
+            print(
+                "[DetectionLink] WARNING: this build of DroneBackend has no "
+                "set_input_size() -- it was compiled before that binding "
+                "was added to Bindings.cpp. Rebuild the DroneBackend "
+                "extension (.pyd) from the current source and replace the "
+                "one this app is importing. Continuing with whatever "
+                f"default input size is compiled in (see inputSize_ in "
+                f"Detectionlink.h) -- detection will misbehave if that "
+                f"doesn't match the {DETECTION_INPUT_SIZE}x{DETECTION_INPUT_SIZE} "
+                "the current model was exported at."
+            )
+
         self.detection_link.set_screenshot_dir(DETECTION_SCREENSHOT_DIR)
         self.detection_link.set_detection_interval_ms(DETECTION_INTERVAL_MS)
 
@@ -1462,6 +1498,137 @@ class DroneCockpitApp:
                   "at a real ONNX model and that a frame source is wired "
                   "up. Detection stays disabled; the rest of the cockpit "
                   "runs normally.")
+
+    def _show_help_window(self) -> None:
+        """
+        Full "How to use this cockpit" reference, opened by clicking the
+        ℹ toolbar button. Previously that button had no command attached
+        at all -- it only carried a hover _Tooltip, so clicking it did
+        nothing and the only guidance available was the couple of lines
+        about dragging/z-order shown on mouse-over. This gives it a real
+        click action plus much more complete content (panels, toolbar,
+        instruments), while leaving the hover tooltip as a quick-glance
+        summary.
+
+        Reuses the same "build widgets first, then size/center" approach
+        as LayoutManagerDialog/_open_detection_window so the window can't
+        end up clipped or off-screen.
+        """
+        win = getattr(self, "_help_window", None)
+        if win is not None and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            win.focus_force()
+            return
+
+        win = tk.Toplevel(self.root, bg="#0f1428")
+        self._help_window = win
+        win.title("Cockpit Help")
+        win.transient(self.root)
+
+        header = tk.Frame(win, bg="#0f1428")
+        header.pack(fill="x", padx=16, pady=(14, 6))
+        tk.Label(
+            header, text="ℹ  Drone Cockpit — Help & Controls",
+            fg="#66d9ff", bg="#0f1428", font=("Consolas", 13, "bold"),
+        ).pack(side="left")
+
+        body = tk.Frame(win, bg="#0f1428")
+        body.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+
+        text = tk.Text(
+            body, wrap="word", bg="#0a0e1c", fg="#c0d0f0",
+            font=("Consolas", 10), relief="flat", padx=14, pady=12,
+            highlightthickness=1, highlightbackground="#26365a",
+            cursor="arrow",
+        )
+        scroll = tk.Scrollbar(body, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        text.pack(side="left", fill="both", expand=True)
+
+        text.tag_configure("h1", foreground="#66d9ff",
+                            font=("Consolas", 11, "bold"),
+                            spacing3=4, spacing1=10)
+        text.tag_configure("body", foreground="#c0d0f0",
+                            font=("Consolas", 10), spacing3=2)
+        text.tag_configure("bullet", foreground="#a0b8d8",
+                            font=("Consolas", 10), lmargin1=14, lmargin2=28,
+                            spacing3=1)
+
+        def h1(t):
+            text.insert("end", t + "\n", "h1")
+
+        def body_line(t):
+            text.insert("end", t + "\n", "body")
+
+        def bullet(t):
+            text.insert("end", "•  " + t + "\n", "bullet")
+
+        h1("Panel layout")
+        bullet("Drag a panel's title bar to move it anywhere in the workspace.")
+        bullet("Click any panel to bring it to the front of the stack.")
+        bullet("Right-click a title bar for snap-to-edge and z-order options.")
+        bullet("Drag a panel's edge/corner to resize it (when unlocked).")
+
+        h1("Toolbar")
+        bullet("Layouts ▾ — switch, preview, save, rename or delete saved "
+               "panel-layout profiles.")
+        bullet("Layout: <name> — shows which saved profile is currently active.")
+        bullet("Panels ▾ — show or hide individual instrument panels without "
+               "affecting your saved layout.")
+        bullet("Detections — opens the object-detection & map window in its "
+               "own separate window, so it never overlaps the live FPV feed.")
+        bullet("↺ Revert to Saved — discards unsaved on-screen changes and "
+               "reloads the active profile's last-saved layout.")
+        bullet("🏭 Factory Default — snaps all panels back to the built-in "
+               "default positions (in memory only; does not touch any saved "
+               "profile).")
+        bullet("🔓 / 🔒 Save & Lock Layout — saves the current layout and "
+               "locks panels so they can't be dragged or resized. Click "
+               "again to unlock.")
+
+        h1("Instrument panels")
+        bullet("FC Status / Arming — flight-controller connection state, arm "
+               "status, and pre-arm checklist.")
+        bullet("IMU / Attitude — MPU-6500 roll/pitch/yaw rates and gyro/mag "
+               "calibration controls, plus link round-trip time.")
+        bullet("Magnetometer — QMC5883L compass heading with lock status "
+               "and a CAL MAG calibration routine.")
+        bullet("ADI — Attitude Indicator — artificial horizon showing bank, "
+               "pitch and heading.")
+        bullet("ALT / VSI — barometric altitude and vertical-speed strip, "
+               "with QNH reference.")
+        bullet("GPS / Map — satellite count, DOP, and a live map with "
+               "position, altitude and bearing readouts.")
+        bullet("FPV — Live Video — native low-latency camera feed from the "
+               "aircraft, decoupled from the telemetry loop for minimum lag.")
+
+        h1("Detections & Map window")
+        bullet("Runs as its own top-level window so heavy map/detection "
+               "redraws never compete with or overlap the FPV video.")
+        bullet("Closing it does not stop detection — records keep "
+               "accumulating in the background and resume streaming in as "
+               "soon as you reopen it.")
+
+        text.configure(state="disabled")
+
+        close_btn = tk.Button(
+            win, text="Close", command=win.destroy,
+            bg="#162040", fg="#a0b8d8", activebackground="#1e3060",
+            activeforeground="#ffffff", relief="flat", padx=16, pady=6,
+            cursor="hand2", bd=0,
+            highlightthickness=1, highlightbackground="#26365a",
+        )
+        close_btn.pack(pady=(0, 14))
+
+        win.update_idletasks()
+        win_w, win_h = 620, 620
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win_w) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win_h) // 2
+        win.geometry(f"{win_w}x{win_h}+{max(0, x)}+{max(0, y)}")
+        win.lift()
+        win.focus_force()
 
     def _open_detection_window(self) -> None:
         """
@@ -1937,10 +2104,10 @@ class DroneCockpitApp:
         self._detections_btn.pack(side="left", padx=(0, 6))
 
         info_btn = self._mk_icon_btn(
-            toolbar, "ℹ", None,
-            "Drag a panel's title bar to move it.\n"
-            "Click any panel to bring it to front.\n"
-            "Right-click a title bar for snap-to and z-order options.",
+            toolbar, "ℹ", self._show_help_window,
+            "Help — click for the full guide to panels, the toolbar, and "
+            "the instruments (drag title bars to move panels, click to "
+            "bring to front, right-click for snap-to and z-order).",
         )
         info_btn.pack(side="left")
 

@@ -645,6 +645,17 @@ PYBIND11_MODULE(DroneBackend, m) {
             "Wall-clock ms (epoch) when the source frame was grabbed.")
         .def_readonly("class_name", &DetectionRecord::className)
         .def_readonly("confidence", &DetectionRecord::confidence)
+        .def_readonly("track_id", &DetectionRecord::trackId,
+            "Identity assigned by DetectionLink's IoU-based tracker, NOT "
+            "a fresh id per pass -- every record sharing the same "
+            "track_id is (as far as position-based tracking can tell) "
+            "the same physical object at a different moment. A given "
+            "track only gets a new record when it's first seen, once it "
+            "has moved far enough on the map, or periodically if it's "
+            "been static a while (see set_track_move_threshold_m / "
+            "set_track_refresh_interval_ms). NOT appearance-based re-ID: "
+            "an object that leaves frame and comes back gets a new "
+            "track_id.")
         .def_readonly("bbox_x", &DetectionRecord::bboxX)
         .def_readonly("bbox_y", &DetectionRecord::bboxY)
         .def_readonly("bbox_w", &DetectionRecord::bboxW)
@@ -654,6 +665,18 @@ PYBIND11_MODULE(DroneBackend, m) {
         .def_readonly("georeferenced", &DetectionRecord::georeferenced,
             "False if telemetry wasn't valid for this pass -- lat/lon are "
             "meaningless when this is False.")
+        .def_readonly("range_method", &DetectionRecord::rangeMethod,
+            "'ground_plane' or 'object_size' -- which ranging method "
+            "produced latitude/longitude/distance_m/bearing_deg. Empty "
+            "string when georeferenced is False.")
+        .def_readonly("distance_m", &DetectionRecord::distanceM,
+            "Estimated distance from the drone to the object, metres. "
+            "0 when georeferenced is False.")
+        .def_readonly("bearing_deg", &DetectionRecord::bearingDeg,
+            "Compass bearing from the drone to the object at detection "
+            "time, 0-360. 0 (== due north) when georeferenced is False -- "
+            "always check georeferenced first, don't treat 0 as a real "
+            "reading.")
         .def_readonly("screenshot_path", &DetectionRecord::screenshotPath,
             "Empty string if screenshot saving is disabled or failed.")
         .def_readonly("telemetry", &DetectionRecord::telemetry,
@@ -695,8 +718,9 @@ PYBIND11_MODULE(DroneBackend, m) {
         .def("set_model_path", &DetectionLink::setModelPath,
             py::arg("path"),
             "Path to an ONNX object-detection model (Ultralytics "
-            "YOLOv8/v11 export layout). A sibling '<stem>.names' file is "
-            "loaded automatically if present.")
+            "end-to-end/NMS-baked export layout, e.g. YOLO26 -- output "
+            "shape [1, maxDetections, 6]). A sibling '<stem>.names' file "
+            "is loaded automatically if present.")
         .def("set_screenshot_dir", &DetectionLink::setScreenshotDir,
             py::arg("dir"),
             "Directory detection screenshots are written to (created if "
@@ -712,6 +736,72 @@ PYBIND11_MODULE(DroneBackend, m) {
         .def("set_confidence_threshold", &DetectionLink::setConfidenceThreshold,
             py::arg("threshold"),
             "Raw model confidence below which a detection is discarded.")
+        .def("set_input_size", &DetectionLink::setInputSize,
+            py::arg("size"),
+            "Square side (pixels) the ONNX model expects, letterboxed. "
+            "MUST match the imgsz the .onnx was exported at (see "
+            "export_model.py) or every box -- and therefore every "
+            "georeferenced position -- comes out scaled wrong with no "
+            "error or crash to flag it. Does not need to match training "
+            "imgsz, only the export.")
+        .def("set_use_cuda", &DetectionLink::setUseCuda,
+            py::arg("enabled"),
+            "Opt into CUDA inference. Only takes effect if this OpenCV "
+            "build actually has CUDA/cuDNN support compiled in (the "
+            "stock pip wheel does not) -- start() proves the CUDA path "
+            "with a dummy forward pass and silently falls back to CPU "
+            "if it fails. Check is_using_cuda() after start() to see "
+            "which one you actually got.")
+        .def("is_using_cuda", &DetectionLink::isUsingCuda,
+            "True only if set_use_cuda(True) was called AND start() "
+            "proved the CUDA backend actually works on this machine/build.")
+        .def("set_known_object_width", &DetectionLink::setKnownObjectWidth,
+            py::arg("class_name"), py::arg("width_m"),
+            "Real-world width in metres for one class, measured face-on "
+            "(e.g. a person's shoulder width, a car's width -- not "
+            "length). Enables object-size-based ranging for that class; "
+            "class_name must match a name from the model's .names file "
+            "exactly. Safe to call at runtime, including while running.")
+        .def("clear_known_object_widths", &DetectionLink::clearKnownObjectWidths,
+            "Removes every configured class width -- object-size ranging "
+            "then falls back to unavailable for all classes until "
+            "set_known_object_width() is called again.")
+        .def("set_min_ground_ray_component", &DetectionLink::setMinGroundRayComponent,
+            py::arg("v"),
+            "Ray-downward-component threshold (0-1, default 0.12) below "
+            "which ground-plane ranging is skipped in favor of "
+            "object-size ranging (when available for that class) -- see "
+            "the header comment on rangeByGroundPlane() for why a "
+            "near-horizontal ray makes ground-plane intersection "
+            "unreliable regardless of how accurate the altitude reading is.")
+        .def("set_track_iou_threshold", &DetectionLink::setTrackIouThreshold,
+            py::arg("iou"),
+            "Minimum IoU (0-1, default 0.3) between a raw box and a "
+            "track's last matched box, same class, to count as the same "
+            "object across passes. Lower catches faster-moving objects "
+            "at the cost of more false merges between nearby same-class "
+            "objects; raise it if two objects passing near each other "
+            "get incorrectly tracked as one.")
+        .def("set_track_max_missed_passes", &DetectionLink::setTrackMaxMissedPasses,
+            py::arg("passes"),
+            "How many consecutive passes a track may go unmatched "
+            "(occlusion, a missed detection) before it's dropped. "
+            "Default 6 (~1.5s at the default 250ms interval). Once "
+            "dropped, the object reappearing starts a brand new "
+            "track_id -- this tracker is position/IoU-based, not "
+            "appearance re-ID.")
+        .def("set_track_move_threshold_m", &DetectionLink::setTrackMoveThresholdM,
+            py::arg("meters"),
+            "Minimum ground movement, in meters, between a track's last "
+            "recorded position and its current one before a new "
+            "DetectionRecord is written for it. Default 3.0. Only "
+            "compared when both positions are georeferenced.")
+        .def("set_track_refresh_interval_ms", &DetectionLink::setTrackRefreshIntervalMs,
+            py::arg("ms"),
+            "Even a perfectly static, continuously-tracked object gets a "
+            "fresh DetectionRecord (and screenshot) at least this often "
+            "so it doesn't go stale in 'what's new' views. Default 10000 "
+            "(10s).")
         .def("start", &DetectionLink::start,
             "Loads the model and starts the worker thread. Returns False "
             "(and does not start the thread) if the model failed to load "
@@ -730,7 +820,22 @@ PYBIND11_MODULE(DroneBackend, m) {
             "Only records with id > since_id, so a poller can pull "
             "incrementally instead of re-fetching the whole list every "
             "tick. Pass 0 to get everything.")
-        .def("clear_records", &DetectionLink::clearRecords);
+        .def("clear_records", &DetectionLink::clearRecords)
+        .def("get_latest_annotated_frame_jpeg",
+            [](const DetectionLink& self) -> py::bytes {
+                auto jpeg = self.getLatestAnnotatedFrameJpeg();
+                if (jpeg.empty())
+                    return py::bytes();
+                return py::bytes(reinterpret_cast<const char*>(jpeg.data()), jpeg.size());
+            },
+            "JPEG bytes of the most recent frame this link processed, "
+            "with that pass's detection boxes drawn on it. Empty bytes "
+            "if no pass has completed yet. A deliberate, narrow exception "
+            "to 'pixel data never crosses into Python' -- meant to feed "
+            "an OPTIONAL, low-rate (poll at ~1-3Hz, not per-tick) 'live "
+            "detections' preview pane, never the pilot's primary FPV "
+            "path (that stays on VideoLink.attach_to_window() exactly "
+            "as before). Costs one JPEG encode per call.");
 
     // =========================================================================
     // Free functions
