@@ -25,6 +25,7 @@
 #include <cmath>
 #include <filesystem>
 #include <algorithm>
+#include <iostream>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -195,40 +196,201 @@ bool DetectionLink::start() {
     }
 
     running_.store(true);
-    worker_ = std::thread(&DetectionLink::detectionLoop, this);
+    previewWorker_ = std::thread(&DetectionLink::previewLoop, this);
+    inferenceWorker_ = std::thread(&DetectionLink::inferenceLoop, this);
     return true;
 }
 
 void DetectionLink::stop() {
     running_.store(false);
-    if (worker_.joinable())
-        worker_.join();
+    if (previewWorker_.joinable())
+        previewWorker_.join();
+    if (inferenceWorker_.joinable())
+        inferenceWorker_.join();
 }
 
-void DetectionLink::detectionLoop() {
-#ifdef _WIN32
-    // Deliberately the mirror image of VideoLink's capture thread, which
-    // raises itself to ABOVE_NORMAL. Detection is supplementary -- it
-    // must never win a scheduling contest against the thread painting
-    // the pilot's live feed.
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-#endif
+void DetectionLink::previewLoop() {
+    // TEMPORARY diagnostic -- delete once you've confirmed the rebuilt
+    // .pyd is what's actually loaded. If you don't see this exact line
+    // in your console/stdout when the detection engine starts, the app
+    // is still running an OLDER build of this file (stale .pyd from a
+    // previous build directory, a locked file that silently failed to
+    // overwrite, a different copy earlier on the Python path, etc.) --
+    // that would fully explain unchanged behavior after a "rebuild" that
+    // didn't actually replace what's running. Check DroneBackend.__file__
+    // from Python at startup too, to see exactly which .pyd got imported.
+    std::cout << "[DetectionLink] preview thread active (kPreviewTickMs=40); "
+        "inference thread runs independently (detectionIntervalMs="
+        << detectionIntervalMs_.load() << ")" << std::endl;
+
+    // Deliberately genuinely lightweight (frame grab + draw + JPEG-free
+    // clone/rectangle/putText, no model, no georeferencing, no mutex
+    // contention beyond boxesMutex_/frameMutex_ which inferenceLoop only
+    // holds briefly) so this thread can actually sustain kPreviewTickMs
+    // regardless of what inferenceLoop is doing. Left at default/NORMAL
+    // priority -- it's not the heavy CPU consumer, inferenceLoop is (see
+    // that function's own THREAD_PRIORITY_BELOW_NORMAL).
+    constexpr int kPreviewTickMs = 40;   // ~25fps ceiling for the live preview pane
+
+    // Draws `boxes` onto a clone of `frame` and publishes it as the live
+    // preview.
+    auto publishPreviewFrame = [this](const cv::Mat& frame, const std::vector<RawDetection>& boxes) {
+        cv::Mat annotated = frame.clone();
+        for (const auto& raw : boxes) {
+            cv::rectangle(annotated, cv::Rect(raw.x, raw.y, raw.w, raw.h), cv::Scalar(0, 220, 255), 2);
+            std::string label = classNameFor(raw.classIndex) + " " +
+                std::to_string(static_cast<int>(raw.confidence * 100)) + "%";
+            cv::putText(annotated, label, cv::Point(raw.x, std::max(0, raw.y - 6)),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 220, 255), 1);
+        }
+        std::lock_guard<std::mutex> lock(frameMutex_);
+        lastAnnotatedFrame_ = annotated;
+        };
+
+    // Sleeps off whatever time is left in this tick's kPreviewTickMs
+    // budget. If the tick itself (frame grab + draw) already overran the
+    // budget, loops straight back around instead of sleeping negative
+    // time.
+    auto throttleToTick = [](std::chrono::steady_clock::time_point tickStart, int tickBudgetMs) {
+        double tickMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+            std::chrono::steady_clock::now() - tickStart).count();
+        int sleepMs = tickBudgetMs - static_cast<int>(tickMs);
+        if (sleepMs > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
+        };
+
+    // ── TEMPORARY perf-diagnostic counters ────────────────────────────
+    // Printed once every kDebugPrintEveryTicks ticks (~1s at the 40ms
+    // target). boxes_age_ms is the important new number here: how stale
+    // the overlay is relative to wall-clock "now" -- this should track
+    // roughly detectionIntervalMs_ (plus one inference-pass duration) if
+    // everything is healthy, and should NOT keep climbing unbounded; if
+    // it does, inferenceLoop has fallen permanently behind. Delete this
+    // whole block once the bottleneck is found and fixed.
+    constexpr int kDebugPrintEveryTicks = 25;
+    int dbgTickCounter = 0;
+    double dbgGrabMsAccum = 0.0, dbgPublishMsAccum = 0.0, dbgTotalMsAccum = 0.0;
+    int dbgEmptyFrameTicksInWindow = 0;
 
     while (running_.load()) {
-        auto passStart = std::chrono::steady_clock::now();
+        auto tickStart = std::chrono::steady_clock::now();
 
+        auto dbgGrabStart = std::chrono::steady_clock::now();
         cv::Mat frame = frameSource_ ? frameSource_() : cv::Mat();
+        double dbgGrabMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+            std::chrono::steady_clock::now() - dbgGrabStart).count();
+        dbgGrabMsAccum += dbgGrabMs;
+
         if (frame.empty()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(detectionIntervalMs_.load()));
+            dbgEmptyFrameTicksInWindow++;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
 
-        TelemetrySnapshot telemetry = telemetryProvider_ ? telemetryProvider_() : TelemetrySnapshot{};
+        std::vector<RawDetection> boxes;
+        {
+            std::lock_guard<std::mutex> lock(boxesMutex_);
+            boxes = latestBoxes_;   // whatever inferenceLoop most recently finished, if anything
+        }
 
-        auto rawAll = runInference(frame);
+        auto dbgPublishStart = std::chrono::steady_clock::now();
+        publishPreviewFrame(frame, boxes);
+        double dbgPublishMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+            std::chrono::steady_clock::now() - dbgPublishStart).count();
+        dbgPublishMsAccum += dbgPublishMs;
+        dbgTotalMsAccum += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+            std::chrono::steady_clock::now() - tickStart).count();
+
+        if (++dbgTickCounter >= kDebugPrintEveryTicks) {
+            int64_t nowWallMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            int64_t lastInfMs = lastInferenceCompletedAtMs_.load();
+            std::cout << "[DetectionLink][perf][preview] "
+                << "avg_grab=" << (dbgGrabMsAccum / dbgTickCounter) << "ms "
+                << "avg_publish=" << (dbgPublishMsAccum / dbgTickCounter) << "ms "
+                << "avg_tick=" << (dbgTotalMsAccum / dbgTickCounter) << "ms "
+                << "(target=" << kPreviewTickMs << "ms, ~"
+                << (1000.0 / std::max(0.001, dbgTotalMsAccum / dbgTickCounter)) << "fps) "
+                << "boxes_age_ms=" << (lastInfMs > 0 ? (nowWallMs - lastInfMs) : -1)
+                << " empty_frames=" << dbgEmptyFrameTicksInWindow
+                << std::endl;
+            dbgTickCounter = 0; dbgGrabMsAccum = dbgPublishMsAccum = dbgTotalMsAccum = 0.0;
+            dbgEmptyFrameTicksInWindow = 0;
+        }
+
+        throttleToTick(tickStart, kPreviewTickMs);
+    }
+}
+
+void DetectionLink::inferenceLoop() {
+#ifdef _WIN32
+    // Deliberately the mirror image of VideoLink's capture thread, which
+    // raises itself to ABOVE_NORMAL. This is the thread doing the actual
+    // model forward pass -- the heavy CPU consumer -- so it, not
+    // previewLoop, is the one that must never win a scheduling contest
+    // against the thread painting the pilot's live feed.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+
+    // Runs independently of previewLoop entirely: grabs its own frame,
+    // runs the model + tracker + record-writing at detectionIntervalMs_
+    // cadence (or however long a pass actually takes, if that's longer
+    // than the interval -- see the back-to-back-passes note on
+    // kDefaultDetectionIntervalMs), and hands off only the resulting
+    // boxes to previewLoop via boxesMutex_/latestBoxes_. Critically,
+    // previewLoop can NEVER be blocked by this loop no matter how slow a
+    // given pass is -- a multi-second forward() call (e.g. an
+    // unoptimized Debug build, or CPU-only inference at a large
+    // inputSize) now only means the overlay goes stale for that long, it
+    // does NOT freeze the live pane itself the way the old single-thread
+    // version did.
+    auto lastInferenceAt = std::chrono::steady_clock::now() -
+        std::chrono::milliseconds(detectionIntervalMs_.load());
+
+    // ── TEMPORARY perf-diagnostic counters ────────────────────────────
+    // Printed once every kDebugPrintEveryPasses passes -- a small number
+    // (not time-based) since a single pass can legitimately take
+    // anywhere from milliseconds (CUDA, small inputSize, Release build)
+    // to multiple seconds (CPU, large inputSize, Debug build), and we
+    // still want feedback at a reasonable cadence either way. Delete
+    // this whole block once the bottleneck is found and fixed.
+    constexpr int kDebugPrintEveryPasses = 5;
+    int dbgPassCounter = 0;
+    double dbgInferMsAccum = 0.0, dbgPassMsAccum = 0.0;
+    int dbgRecordsAccum = 0;
+
+    while (running_.load()) {
+        auto now = std::chrono::steady_clock::now();
+        int64_t msSinceInference = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - lastInferenceAt).count();
+        int intervalMs = detectionIntervalMs_.load();
+        if (msSinceInference < intervalMs) {
+            // Not due yet -- sleep a short, bounded amount rather than
+            // busy-spinning, but don't oversleep past when we're due.
+            int remaining = static_cast<int>(intervalMs - msSinceInference);
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::min(remaining, 20)));
+            continue;
+        }
+
+        auto passStart = std::chrono::steady_clock::now();
+        lastInferenceAt = passStart;
+
+        cv::Mat frame = frameSource_ ? frameSource_() : cv::Mat();
+        if (frame.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
 
         int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
+
+        TelemetrySnapshot telemetry = telemetryProvider_ ? telemetryProvider_() : TelemetrySnapshot{};
+
+        auto dbgInferStart = std::chrono::steady_clock::now();
+        auto rawAll = runInference(frame);
+        double dbgInferMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+            std::chrono::steady_clock::now() - dbgInferStart).count();
+        dbgInferMsAccum += dbgInferMs;
 
         // Filter by confidence BEFORE handing detections to the tracker --
         // a sub-threshold row shouldn't be allowed to start, extend, or
@@ -260,23 +422,10 @@ void DetectionLink::detectionLoop() {
         // rationale and its position-only re-ID limitations.
         auto assignments = updateTracks(rawDetections, geoCandidates, nowMs);
 
-        cv::Mat passAnnotated;   // built lazily, only if at least one detection survives the threshold
-
+        int recordsThisPass = 0;
         for (size_t i = 0; i < rawDetections.size(); ++i) {
             const auto& raw = rawDetections[i];
             const auto& assignment = assignments[i];
-
-            // Always draw every currently-tracked box on the live preview
-            // frame, whether or not it earns a new DetectionRecord this
-            // pass -- the live view is meant to show what the model sees
-            // right now, independent of the dedup/re-ID bookkeeping below.
-            if (passAnnotated.empty())
-                passAnnotated = frame.clone();
-            cv::rectangle(passAnnotated, cv::Rect(raw.x, raw.y, raw.w, raw.h), cv::Scalar(0, 220, 255), 2);
-            std::string label = classNameFor(raw.classIndex) + " " +
-                std::to_string(static_cast<int>(raw.confidence * 100)) + "%";
-            cv::putText(passAnnotated, label, cv::Point(raw.x, std::max(0, raw.y - 6)),
-                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 220, 255), 1);
 
             if (!assignment.shouldRecord)
                 continue;   // same object as an already-recorded sighting, nothing new to log yet
@@ -324,26 +473,35 @@ void DetectionLink::detectionLoop() {
                 records_.push_back(rec);
             }
             detectionCount_.fetch_add(1);
+            recordsThisPass++;
         }
+        dbgRecordsAccum += recordsThisPass;
 
-        if (!passAnnotated.empty()) {
-            std::lock_guard<std::mutex> lock(frameMutex_);
-            lastAnnotatedFrame_ = passAnnotated;
+        // Hand off this pass's boxes to previewLoop -- the ONLY point of
+        // contact between the two threads besides the (already-existing)
+        // frameMutex_/recordsMutex_.
+        {
+            std::lock_guard<std::mutex> lock(boxesMutex_);
+            latestBoxes_ = rawDetections;
         }
+        lastInferenceCompletedAtMs_.store(nowMs);
 
         double durationMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
             std::chrono::steady_clock::now() - passStart).count();
         lastPassDurationMs_.store(durationMs);
         lastPassTimestampMs_.store(nowMs);
+        dbgPassMsAccum += durationMs;
 
-        int intervalMs = detectionIntervalMs_.load();
-        int remainingMs = intervalMs - static_cast<int>(durationMs);
-        if (remainingMs > 0)
-            std::this_thread::sleep_for(std::chrono::milliseconds(remainingMs));
-        // If inference itself took longer than the configured interval,
-        // loop straight back around rather than sleeping negative time --
-        // this is the signal to raise detectionIntervalMs_ or move to a
-        // smaller/faster model, not something to silently absorb.
+        if (++dbgPassCounter >= kDebugPrintEveryPasses) {
+            std::cout << "[DetectionLink][perf][inference] "
+                << "avg_inference=" << (dbgInferMsAccum / dbgPassCounter) << "ms "
+                << "avg_pass_total=" << (dbgPassMsAccum / dbgPassCounter) << "ms "
+                << "(interval_target=" << intervalMs << "ms) "
+                << "records=" << dbgRecordsAccum
+                << (isUsingCuda() ? " backend=CUDA" : " backend=CPU")
+                << std::endl;
+            dbgPassCounter = 0; dbgInferMsAccum = dbgPassMsAccum = 0.0; dbgRecordsAccum = 0;
+        }
     }
 }
 
@@ -359,7 +517,7 @@ std::vector<DetectionLink::RawDetection> DetectionLink::runInference(const cv::M
     const int inputSize = inputSize_.load();
     int origW = frame.cols, origH = frame.rows;
 
-    // detectionLoop() already skips frame.empty() (cols==0 || rows==0 ||
+    // inferenceLoop() already skips frame.empty() (cols==0 || rows==0 ||
     // no data) before calling here, but that's not quite the same thing
     // as "safe to divide by" -- guard explicitly anyway, since a 0 on
     // either side turns scale into +-inf, scaledW/H into NaN, and
@@ -401,7 +559,7 @@ std::vector<DetectionLink::RawDetection> DetectionLink::runInference(const cv::M
     // historically only forward() was guarded, which still let a
     // resize/blobFromImage exception (e.g. from the channel-format hiccup
     // above, before this normalization existed) escape uncaught out of
-    // this function, up through detectionLoop() on its own worker
+    // this function, up through inferenceLoop() on its own worker
     // thread, and straight to std::terminate()/abort() -- killing the
     // *entire* cockpit process over what should only ever cost a single
     // skipped detection pass.
@@ -695,6 +853,25 @@ void DetectionLink::clearKnownObjectWidths() {
 }
 
 std::vector<uchar> DetectionLink::getLatestAnnotatedFrameJpeg() const {
+    // ── TEMPORARY perf diagnostic ──────────────────────────────────────
+    // This function is called from Python (DetectionMapWidget's Tk-thread
+    // poll, ~25Hz) via pybind11, and runs SYNCHRONOUSLY on whichever
+    // thread calls it. If the pybind11 wrapper for this function does not
+    // release the GIL (py::gil_scoped_release) for the duration of the
+    // call, every millisecond spent inside this function -- lock, copy,
+    // AND imencode -- blocks the entire Python interpreter: the Tk
+    // mainloop, DetectionWorker's poll thread, everything. That would
+    // show up exactly as "the whole feed" bogging down, even though the
+    // native FPV window itself is painted independently by VideoLink.
+    // Check the Bindings.cpp entry for get_latest_annotated_frame_jpeg
+    // and add py::call_guard<py::gil_scoped_release>() (or an explicit
+    // py::gil_scoped_release inside the wrapper) if it's missing -- that
+    // alone can be the difference between this stalling everything else
+    // and running truly in parallel with it.
+    static std::atomic<int> dbgCallCounter{ 0 };
+    constexpr int kDebugPrintEveryCalls = 25;
+    auto dbgStart = std::chrono::steady_clock::now();
+
     std::vector<uchar> jpeg;
     cv::Mat frame;
     {
@@ -703,7 +880,43 @@ std::vector<uchar> DetectionLink::getLatestAnnotatedFrameJpeg() const {
             return jpeg;
         frame = lastAnnotatedFrame_;   // cv::Mat copy is a cheap header copy; data is shared
     }
-    cv::imencode(".jpg", frame, jpeg);
+    double dbgCopyMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+        std::chrono::steady_clock::now() - dbgStart).count();
+
+    // Encode cost scales with pixel count, and DetectionMapWidget
+    // immediately thumbnails whatever comes back down to 640x360 anyway
+    // (see _poll_live_frame) -- so encoding at the full source-camera
+    // resolution 25x/sec is pure waste: more imencode time here, more
+    // bytes copied across the pybind11 boundary, more JPEG-decode time on
+    // the Python side, for detail that gets thrown away one line later.
+    // Downscaling here (to the same target size, aspect-preserved) should
+    // cut this function's cost by roughly (original_pixels/target_pixels)
+    // -- often several times over for a >960px-wide source frame.
+    auto dbgResizeStart = std::chrono::steady_clock::now();
+    cv::Mat toEncode = frame;
+    constexpr int kPreviewMaxWidth = 640;
+    if (frame.cols > kPreviewMaxWidth) {
+        double scale = static_cast<double>(kPreviewMaxWidth) / frame.cols;
+        cv::resize(frame, toEncode, cv::Size(), scale, scale, cv::INTER_AREA);
+    }
+    double dbgResizeMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+        std::chrono::steady_clock::now() - dbgResizeStart).count();
+
+    auto dbgEncodeStart = std::chrono::steady_clock::now();
+    cv::imencode(".jpg", toEncode, jpeg);
+    double dbgEncodeMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+        std::chrono::steady_clock::now() - dbgEncodeStart).count();
+
+    int n = dbgCallCounter.fetch_add(1) + 1;
+    if (n % kDebugPrintEveryCalls == 0) {
+        double totalMs = dbgCopyMs + dbgResizeMs + dbgEncodeMs;
+        std::cout << "[DetectionLink][perf] getLatestAnnotatedFrameJpeg: "
+            << "src=" << frame.cols << "x" << frame.rows
+            << " encoded=" << toEncode.cols << "x" << toEncode.rows
+            << " lock+copy=" << dbgCopyMs << "ms resize=" << dbgResizeMs
+            << "ms imencode=" << dbgEncodeMs << "ms total=" << totalMs
+            << "ms jpeg_bytes=" << jpeg.size() << std::endl;
+    }
     return jpeg;
 }
 

@@ -119,44 +119,73 @@ from DetectionMapWidget  import DetectionMapWidget
 
 # ── Path configuration ────────────────────────────────────────────────────────
 script_dir   = os.path.dirname(os.path.abspath(__file__))
-backend_path = os.path.abspath(os.path.join(script_dir, '..', 'x64', 'Debug'))
+backend_path = os.path.abspath(os.path.join(script_dir, '..', 'x64', 'Release'))
 sys.path.append(backend_path)
 
 # DroneBackend.pyd is a native pybind11 extension module. On Python 3.8+,
 # the DLL loader used to import extension modules does NOT search PATH for
 # the module's own transitive dependencies -- it only searches directories
 # explicitly registered via os.add_dll_directory() (plus the folder the
-# .pyd itself lives in). DroneBackend.pyd depends on opencv_world4120d.dll,
-# so OpenCV's bin folder has to be registered here too, or import fails
-# with a generic "DLL load failed" error that doesn't name the missing
-# dependency.
+# .pyd itself lives in). This Release build of DroneBackend.pyd depends on
+# opencv_world4130.dll (CUDA-enabled OpenCV 4.13.0, not the old debug
+# opencv_world4120d.dll), so OpenCV's bin folder has to be registered here
+# too, or import fails with a generic "DLL load failed" error that doesn't
+# name the missing dependency. It also needs the CUDA and cuDNN runtime
+# folders discoverable, for the same reason.
 #
-# EDIT THIS to match your local OpenCV install location if it differs.
-OPENCV_BIN_DIR = r"C:\opencv\build\x64\vc16\bin"
+# EDIT THIS to match your local OpenCV 4.13.0 (CUDA) install location.
+OPENCV_BIN_DIR = r"C:\openCVBuild\build\bin\Release"
+CUDA_BIN_DIR   = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64"
+CUDNN_BIN_DIR  = r"C:\Program Files\NVIDIA\CUDNN\v9.24\bin\13.3\x64"
 
 
 def _register_dll_directories() -> None:
     """Register every folder DroneBackend.pyd needs its dependencies
     resolved from. Safe to call on any platform/Python version -- no-ops
     if os.add_dll_directory doesn't exist (non-Windows / old Python) or if
-    a given folder doesn't exist on this machine."""
+    a given folder doesn't exist on this machine.
+
+    NOTE: os.add_dll_directory() alone is not enough for cuDNN 9.x.
+    cudnn64_9.dll is a thin frontend that loads its own engine backends
+    (cudnn_ops64_9.dll, cudnn_cnn64_9.dll, cudnn_graph64_9.dll, ...) at
+    runtime via a classic, flag-less LoadLibrary call, which only
+    searches PATH -- it never sees directories registered through
+    add_dll_directory. Skipping the PATH prepend below produces exactly
+    "Invalid handle. Cannot load symbol cudnnGetVersion": cudnn64_9.dll
+    itself loads fine, but it can't pull in its own sibling DLLs."""
     if not hasattr(os, "add_dll_directory"):
         return
 
-    for candidate in (backend_path, OPENCV_BIN_DIR):
+    valid_dirs = []
+    for candidate in (backend_path, OPENCV_BIN_DIR, CUDA_BIN_DIR, CUDNN_BIN_DIR):
         if not os.path.isdir(candidate):
             print(f"[DroneBackend] DLL directory notice: "
                   f"'{candidate}' does not exist, skipping")
             continue
         try:
             os.add_dll_directory(candidate)
+            valid_dirs.append(candidate)
         except Exception as e:
             print(f"[DroneBackend] DLL directory notice: {e}")
+
+    # Belt-and-suspenders: also prepend to PATH for cuDNN's internal
+    # flag-less LoadLibrary calls (see note above). Must happen before
+    # `import DroneBackend` below.
+    if valid_dirs:
+        os.environ["PATH"] = os.pathsep.join(valid_dirs) + os.pathsep + os.environ["PATH"]
 
 
 _register_dll_directories()
 
 import DroneBackend
+
+# TEMPORARY diagnostic -- delete once you've confirmed which DroneBackend
+# .pyd is actually loaded. If the live detection feed still doesn't speed
+# up after a rebuild, check this path first: a stale copy earlier on
+# sys.path (site-packages, an old build/ or dist/ folder, a leftover
+# .pyd next to a different script) will get imported silently instead of
+# your freshly built one, with no error at all.
+print(f"[diagnostic] DroneBackend loaded from: {DroneBackend.__file__}")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 #
@@ -211,6 +240,18 @@ DETECTION_INTERVAL_MS = 250
 # getters off the Tk thread, and how often the detection map window is
 # pumped with any newly-arrived records.
 DETECTION_POLL_HZ = 4
+
+# Opt into DetectionLink's CUDA backend (see DetectionLink::setUseCuda()).
+# This ONLY works if the OpenCV this DroneBackend.pyd was built against
+# has CUDA/cuDNN support compiled in -- the stock opencv-python /
+# vcpkg opencv4 port does NOT; you need a source (or vcpkg with the
+# cuda+dnn-cuda features) build against the CUDA toolkit + cuDNN version
+# installed on this machine. If that build doesn't exist, start() falls
+# back to CPU silently -- check the printed "[DetectionLink] CUDA ..."
+# line right after start() (below) to see which one you actually got.
+# Worth doing on an RTX 3060: at 960x960/YOLO26m, CUDA should take
+# inference from hundreds-of-ms-to-seconds on CPU down to low tens of ms.
+DETECTION_USE_CUDA = True
 
 BG_WORKSPACE   = "#1a1a2e"
 PANEL_BG       = "#0f0f1a"
@@ -1327,6 +1368,18 @@ class DroneCockpitApp:
         self.detection_link.set_screenshot_dir(DETECTION_SCREENSHOT_DIR)
         self.detection_link.set_detection_interval_ms(DETECTION_INTERVAL_MS)
 
+        # Same defensive hasattr pattern as set_input_size() above --
+        # set_use_cuda()/is_using_cuda() are also newer bindings that a
+        # stale .pyd might not have yet.
+        if hasattr(self.detection_link, "set_use_cuda"):
+            self.detection_link.set_use_cuda(DETECTION_USE_CUDA)
+        elif DETECTION_USE_CUDA:
+            print(
+                "[DetectionLink] WARNING: this build of DroneBackend has no "
+                "set_use_cuda() -- rebuild DroneBackend from current source "
+                "to get it. Continuing on CPU."
+            )
+
         # DetectionWorker only ever does cheap, mutex-protected reads off
         # DetectionLink (status counters + incremental record pulls) --
         # never frames, never inference, never disk I/O -- so it's safe to
@@ -1486,6 +1539,23 @@ class DroneCockpitApp:
         if self.detection_link.start():
             self._detection_engine_running = True
             self._detection_engine_detail = ""
+            # Confirms which backend actually got engaged -- setUseCuda()
+            # silently falls back to CPU if this build/machine's OpenCV
+            # lacks CUDA DNN support, so this print is the only place that
+            # tells you which one you actually got.
+            if hasattr(self.detection_link, "is_using_cuda"):
+                backend = "CUDA" if self.detection_link.is_using_cuda() else "CPU"
+                print(f"[DetectionLink] inference backend: {backend}")
+                if DETECTION_USE_CUDA and backend == "CPU":
+                    print(
+                        "[DetectionLink] NOTE: DETECTION_USE_CUDA=True but "
+                        "the engine fell back to CPU -- this DroneBackend.pyd "
+                        "was likely built against an OpenCV without CUDA/"
+                        "cuDNN support. A stock opencv-python/vcpkg opencv4 "
+                        "build does not have this; you need a source (or "
+                        "vcpkg with cuda+dnn-cuda features) build against "
+                        "your installed CUDA toolkit + matching cuDNN."
+                    )
             return
 
         self._detection_engine_running = False
@@ -1659,6 +1729,13 @@ class DroneCockpitApp:
         self._detection_map_window.set_engine_status(
             self._detection_engine_running, self._detection_engine_detail)
 
+        # Without this, DetectionMapWidget._link stays None and the live
+        # annotated-feed pane (and its poll loop) never starts -- see
+        # DetectionMapWidget.set_detection_link()'s own docstring. This was
+        # the one call missing between DetectionLink starting up above and
+        # the window actually being able to show anything live.
+        self._detection_map_window.set_detection_link(self.detection_link)
+
         # Center over the main window and force it to the front. A bare
         # Toplevel with no explicit position can land off in a corner or
         # behind the main window depending on the window manager, which
@@ -1698,6 +1775,50 @@ class DroneCockpitApp:
         else:
             self._close_detection_window()
 
+    def _get_telemetry_status_summary(self) -> tuple:
+        """
+        Returns (valid, detail) describing, in plain language, whether the
+        NEXT detection pass will be able to georeference anything. Mirrors
+        exactly the same gps.position_usable check _get_detection_telemetry()
+        gates DetectionLink's snapshot on, so this can never disagree with
+        the real reason pins are or aren't appearing on the map -- it
+        exists purely so DetectionMapWidget can show that reason instead of
+        an operator having to cross-reference the FC status panel themselves.
+        """
+        hub = getattr(self, "hub", None)
+        if hub is None or not hub.is_connected():
+            return False, "no telemetry link"
+        try:
+            state = hub.get_latest_state()
+        except Exception:
+            return False, "telemetry read failed"
+        gps = state.gps
+        if bool(gps.position_usable):
+            return True, f"GPS usable ({gps.num_sat} sats, HDOP {gps.hdop / 100.0:.1f})"
+        return False, (
+            f"GPS not usable yet ({gps.num_sat} sats, HDOP {gps.hdop / 100.0:.1f} -- "
+            "need fix>=2D, >=4 sats, HDOP<5.0)"
+        )
+
+    def _get_current_drone_fix(self) -> tuple:
+        """
+        Returns (latitude, longitude, valid) for the map's drone marker.
+        Deliberately independent of DetectionLink/DetectionWorker entirely
+        -- the map should be able to show where the drone is regardless of
+        whether anything has ever been detected, so this reads straight
+        from the same hub state _get_detection_telemetry() does rather
+        than going through a detection record.
+        """
+        hub = getattr(self, "hub", None)
+        if hub is None or not hub.is_connected():
+            return 0.0, 0.0, False
+        try:
+            state = hub.get_latest_state()
+        except Exception:
+            return 0.0, 0.0, False
+        gps = state.gps
+        return gps.latitude, gps.longitude, bool(gps.position_usable)
+
     def _pump_detection_records(self) -> None:
         """
         Drains DetectionWorker's incremental new-records buffer into the
@@ -1718,6 +1839,12 @@ class DroneCockpitApp:
         records = self._detection_worker.get_new_records()
         if records:
             win.add_records(records)
+
+        telemetry_valid, telemetry_detail = self._get_telemetry_status_summary()
+        win.set_telemetry_status(telemetry_valid, telemetry_detail)
+
+        drone_lat, drone_lon, drone_valid = self._get_current_drone_fix()
+        win.set_drone_telemetry(drone_lat, drone_lon, drone_valid)
 
         self._detection_pump_job = self.root.after(
             int(1000 / DETECTION_POLL_HZ), self._pump_detection_records)

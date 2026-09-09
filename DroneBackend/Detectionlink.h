@@ -55,7 +55,7 @@ struct DetectionRecord {
     std::string className;
     float confidence = 0.0f;
 
-    // Identity assigned by the tracker in detectionLoop(), NOT a fresh
+    // Identity assigned by the tracker in inferenceLoop(), NOT a fresh
     // value per pass. Every DetectionRecord sharing the same trackId is
     // (as far as position/IoU-based tracking can tell) the SAME physical
     // object observed at a different moment -- see the "Object tracking
@@ -288,7 +288,8 @@ public:
     std::vector<uchar> getLatestAnnotatedFrameJpeg() const;
 
 private:
-    void detectionLoop();
+    void previewLoop();
+    void inferenceLoop();
 
     struct RawDetection {
         int classIndex = -1;
@@ -359,7 +360,7 @@ private:
         const TelemetrySnapshot& telemetry) const;
 
     // ── Tracking state (see setTrackIouThreshold() etc. above) ────────
-    // Owned and touched ONLY by the worker thread inside detectionLoop()
+    // Owned and touched ONLY by inferenceLoop() -- previewLoop() never
     // -- unlike records_/lastAnnotatedFrame_, this is never read from
     // Python or any other thread, so it needs no mutex of its own.
     struct Track {
@@ -420,11 +421,38 @@ private:
     mutable std::mutex classWidthsMutex_;
     std::unordered_map<std::string, double> knownObjectWidthsM_;
 
-    std::thread worker_;
+    // ── Two independent worker threads ────────────────────────────────
+    // previewWorker_ runs previewLoop(): grabs a frame and republishes it
+    // (with whatever boxes inferenceWorker_ most recently finished)
+    // strictly on kPreviewTickMs cadence. It NEVER calls runInference()
+    // and so can never be blocked by it, no matter how slow a given
+    // model/build/hardware combination makes a single forward() pass --
+    // this is what actually gives the live preview pane the video
+    // feed's own responsiveness, structurally, rather than "as long as
+    // inference stays fast enough" (which the old single-thread version
+    // silently depended on and which broke badly on an unoptimized Debug
+    // build: a several-SECOND runInference() call blocked frame grab +
+    // republish for that whole duration, since both lived on one thread).
+    // inferenceWorker_ runs inferenceLoop(): grabs its own frame
+    // independently, runs the model + tracker + record-writing at
+    // detectionIntervalMs_ cadence (or however long a pass actually
+    // takes, if that's longer), and publishes only the resulting boxes
+    // (via boxesMutex_/latestBoxes_) for previewLoop to pick up. The two
+    // threads never block on each other beyond the brief box-list mutex.
+    std::thread previewWorker_;
+    std::thread inferenceWorker_;
     std::atomic<bool> running_{ false };
     std::atomic<uint64_t> detectionCount_{ 0 };
     std::atomic<double> lastPassDurationMs_{ 0.0 };
     std::atomic<int64_t> lastPassTimestampMs_{ 0 };
+    std::atomic<int64_t> lastInferenceCompletedAtMs_{ 0 };   // wall-clock ms; 0 = no pass completed yet
+
+    // Boxes from the most recently COMPLETED inference pass -- written
+    // only by inferenceLoop(), read only by previewLoop(), both under
+    // this mutex. This is the sole hand-off point between the two
+    // threads' otherwise-independent work.
+    mutable std::mutex boxesMutex_;
+    std::vector<RawDetection> latestBoxes_;
 
     mutable std::mutex recordsMutex_;
     std::vector<DetectionRecord> records_;

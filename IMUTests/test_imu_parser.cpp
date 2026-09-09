@@ -22,7 +22,16 @@
 //   ctest --test-dir build -R imu --output-on-failure
 //   -- or --
 //   ./imu_tests.exe
+//
+// PCH note: under MSVC /Yu, "#include "pch.h"" MUST be the first line the
+// compiler sees (comments/whitespace excepted). Everything before it is
+// discarded, not just skipped for the PCH build -- which is why this file
+// previously threw "DroneLink: base class undefined" even though
+// DroneLink.h was included: it was included *before* pch.h, so the
+// compiler never actually processed it.
 // =============================================================================
+
+#include "pch.h"
 
 #include <gtest/gtest.h>
 #include <vector>
@@ -31,7 +40,6 @@
 
 #include "DroneLink.h"
 #include "IMUSensor.h"
-#include "pch.h"
 
 // =============================================================================
 // Helpers
@@ -68,9 +76,9 @@ static std::vector<uint8_t> makeIMUFrame(
     buf[4] = cmd;
 
     auto put16 = [&](int offset, int16_t v) {
-        buf[offset]     = static_cast<uint8_t>(v & 0xFF);
+        buf[offset] = static_cast<uint8_t>(v & 0xFF);
         buf[offset + 1] = static_cast<uint8_t>((v >> 8) & 0xFF);
-    };
+        };
 
     put16(5, ax);
     put16(7, ay);
@@ -290,16 +298,16 @@ TEST(IMUSensorScale, UT_SCALE_001_AccelOneg_ZAxis) {
 
 TEST(IMUSensorScale, UT_SCALE_001_AccelOneg_AllAxes) {
     MockDroneLink mock;
-    mock.injectedState.ax =  2048;   // +1.0 g
+    mock.injectedState.ax = 2048;   // +1.0 g
     mock.injectedState.ay = -2048;   // -1.0 g
-    mock.injectedState.az =  1024;   //  0.5 g
+    mock.injectedState.az = 1024;   //  0.5 g
 
     IMUSensor imu(&mock);
     auto scaled = imu.getScaledData();
 
-    EXPECT_NEAR(scaled.accX,  1.0f, 0.001f);
+    EXPECT_NEAR(scaled.accX, 1.0f, 0.001f);
     EXPECT_NEAR(scaled.accY, -1.0f, 0.001f);
-    EXPECT_NEAR(scaled.accZ,  0.5f, 0.001f);
+    EXPECT_NEAR(scaled.accZ, 0.5f, 0.001f);
 }
 
 TEST(IMUSensorScale, UT_SCALE_001_AccelZeroInput) {
@@ -376,15 +384,15 @@ TEST(IMUSensorScale, UT_SCALE_003_NegativeGyro_YAxis) {
 TEST(IMUSensorScale, UT_SCALE_003_NegativeGyro_AllAxes) {
     MockDroneLink mock;
     mock.injectedState.gx = -16400;
-    mock.injectedState.gy =   -820;   // -50.0 °/s
-    mock.injectedState.gz =    820;   // +50.0 °/s
+    mock.injectedState.gy = -820;   // -50.0 °/s
+    mock.injectedState.gz = 820;   // +50.0 °/s
 
     IMUSensor imu(&mock);
     auto scaled = imu.getScaledData();
 
     EXPECT_NEAR(scaled.gyroX, -1000.0f, 0.1f);
-    EXPECT_NEAR(scaled.gyroY,   -50.0f, 0.1f);
-    EXPECT_NEAR(scaled.gyroZ,    50.0f, 0.1f);
+    EXPECT_NEAR(scaled.gyroY, -50.0f, 0.1f);
+    EXPECT_NEAR(scaled.gyroZ, 50.0f, 0.1f);
 }
 
 TEST(IMUSensorScale, UT_SCALE_003_MaxGyroNegative) {
@@ -405,21 +413,21 @@ TEST(IMUSensorScale, UT_SCALE_003_MaxGyroNegative) {
 
 TEST(IMUSensorRaw, RawDataPassthrough) {
     MockDroneLink mock;
-    mock.injectedState.ax =  100;
+    mock.injectedState.ax = 100;
     mock.injectedState.ay = -200;
-    mock.injectedState.az =  300;
+    mock.injectedState.az = 300;
     mock.injectedState.gx = -400;
-    mock.injectedState.gy =  500;
+    mock.injectedState.gy = 500;
     mock.injectedState.gz = -600;
 
     IMUSensor imu(&mock);
     auto raw = imu.getRawData();
 
-    EXPECT_EQ(raw.accX,  100);
+    EXPECT_EQ(raw.accX, 100);
     EXPECT_EQ(raw.accY, -200);
-    EXPECT_EQ(raw.accZ,  300);
+    EXPECT_EQ(raw.accZ, 300);
     EXPECT_EQ(raw.gyroX, -400);
-    EXPECT_EQ(raw.gyroY,  500);
+    EXPECT_EQ(raw.gyroY, 500);
     EXPECT_EQ(raw.gyroZ, -600);
 }
 

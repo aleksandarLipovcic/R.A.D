@@ -46,7 +46,7 @@
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
-    <ConfigurationType>Application</ConfigurationType>
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>v145</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
@@ -108,12 +108,12 @@
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>C:\opencv\build\include;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\Include;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\pybind11\include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\openCVBuild\build\install\include;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\Include;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\pybind11\include</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>C:\opencv\build\x64\vc16\lib;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\libs</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>C:\openCVBuild\build\install\x64\vc18\lib;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\libs</AdditionalLibraryDirectories>
       <AdditionalDependencies>C:\opencv\build\x64\vc16\lib\opencv_world4120d.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
@@ -126,11 +126,13 @@
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>C:\openCVBuild\build\install\include;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\Include;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\pybind11\include</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>C:\opencv\build\x64\vc16\lib\opencv_world4120.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>C:\openCVBuild\build\install\x64\vc18\lib\opencv_world4130.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>C:\openCVBuild\build\install\x64\vc18\lib;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\libs</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
