@@ -247,11 +247,95 @@ DETECTION_POLL_HZ = 4
 # vcpkg opencv4 port does NOT; you need a source (or vcpkg with the
 # cuda+dnn-cuda features) build against the CUDA toolkit + cuDNN version
 # installed on this machine. If that build doesn't exist, start() falls
-# back to CPU silently -- check the printed "[DetectionLink] CUDA ..."
-# line right after start() (below) to see which one you actually got.
-# Worth doing on an RTX 3060: at 960x960/YOLO26m, CUDA should take
-# inference from hundreds-of-ms-to-seconds on CPU down to low tens of ms.
+# back to CPU silently -- check the printed "[DetectionLink] inference
+# backend: ..." line right after start() (below) to see which one you
+# actually got. Confirmed working on this rig's RTX 3060 6GB (laptop) --
+# inference currently runs at DNN_TARGET_CUDA (FP32); avg_inference sits
+# around 70-85ms at 960x960/YOLO26m on this card, which is on the slow
+# side for FP32 CUDA via cv::dnn -- see the perf notes in Detectionlink.cpp
+# (DNN_TARGET_CUDA_FP16 / a TensorRT export are the next lever if this
+# interval ever needs to come down).
 DETECTION_USE_CUDA = True
+
+# Horizontal FOV of the actual camera in degrees, used for every
+# pixel-offset -> ray-angle calculation in georeferencing (see
+# DetectionLink::setHorizontalFovDeg() / computeWorldRay() in
+# Detectionlink.cpp). This MUST match the physical camera, not a guess --
+# Detectionlink.h's compiled-in default (90 deg) was never actually
+# correct for this rig and was silently never overridden until now.
+# Sourced from the E5-FPV night-vision module's own datasheet: "FOV: 100
+# deg". Update this if the camera is ever swapped for a different
+# model/lens -- check the new module's datasheet, don't assume 90 or
+# reuse this value.
+DETECTION_CAMERA_FOV_DEG = 100.0
+
+# Known face-on real-world widths (meters) for object-size ranging (see
+# DetectionLink::setKnownObjectWidth() / rangeByObjectSize() in
+# Detectionlink.cpp) -- this is the ranging method that still works when
+# ground-plane ranging can't (shallow ray -- see the georeferencing note
+# in the DetectionLink setup code below for why that's the common case
+# on this rigidly forward-facing, non-gimbaled camera). Without entries
+# here, DetectionLink had NO fallback and many/most detections in level
+# flight likely never got georeferenced at all.
+#
+# Keys MUST exactly match the class names in your model's sibling
+# ".names" file (same stem as DETECTION_MODEL_PATH, one class name per
+# line) -- open that file and confirm before trusting these. A key that
+# doesn't match any real class name fails silently (that class just
+# never gets object-size ranging), not with an error.
+DETECTION_KNOWN_OBJECT_WIDTHS_M = {
+    "person": 0.5,     # average shoulder width, face-on
+    "vehicle": 1.8,     # average car width, face-on -- rename/split this
+                        # key (e.g. "car"/"truck") if your .names file
+                        # doesn't use a single combined "vehicle" class
+}
+
+# ── Camera mount angle (manual, NOT the SimpleBGC gimbal) ───────────────
+# The SimpleBGC gimbal hardware is physically installed but not
+# electrically wired (missing step-down modules) -- there is no live
+# pan/tilt readback yet. In the meantime the camera is mounted at a
+# FIXED angle chosen by hand before each flight (anywhere from 0 deg
+# forward-level, through 90 deg straight down, to 180 deg backward-level,
+# or negative for facing upward -- a single tilt hinge, no pan -- though
+# the controls below expose a pan value too, ready for the day the
+# gimbal's second axis is wired in).
+#
+# These two constants are now only the STARTUP defaults for the
+# "📐 Camera Angle" toolbar control (see __init__'s
+# self._camera_tilt_deg/self._camera_pan_deg) -- once the app is running,
+# set the actual angle live from that toolbar button instead of editing
+# these and restarting. They still matter as the value the app opens
+# with, so keep them roughly matched to how you usually mount the camera.
+#
+# Wire snapshot.gimbal_pan_deg/gimbal_tilt_deg to a real SimpleBGC
+# readback in _get_camera_mount_angle() once the gimbal is actually
+# powered ("auto" mode already exists as a placeholder for exactly that);
+# until then, georeferenced pins will drift off if the toolbar's Manual
+# value doesn't match how the camera is actually physically angled right
+# now.
+#
+# Tilting toward 90 (straight down) during search sweeps is the single
+# biggest improvement available to ground-plane ranging accuracy -- see
+# the DetectionLink setup code below and rangeByGroundPlane()'s doc
+# comment in Detectionlink.cpp for why a steep ray matters so much more
+# than which ranging method is technically "preferred".
+CAMERA_MOUNT_PAN_DEG = 0.0     # startup default only -- see toolbar control
+CAMERA_MOUNT_TILT_DEG = 0.0    # 0=forward-level, 90=down, 180=backward-level, negative=up
+
+# ── Bearings-only triangulation tuning ───────────────────────────────
+# See DetectionLink::setTriangulationMinBaselineM() /
+# setTriangulationMinBearingSpreadDeg() in Detectionlink.h for the full
+# rationale -- both exist to reject a triangulated fix computed from
+# observations with too little real parallax between them (e.g. the
+# drone flew straight at the object with no lateral offset), which would
+# otherwise be numerically "valid" but dominated by GPS/heading noise.
+# The header's own compiled-in defaults (5.0m / 5.0deg) are reasonable
+# starting points and don't strictly need overriding here -- these are
+# only broken out as named constants so they're easy to find and tune
+# from Python without a rebuild once you've flown a few missions and
+# have a feel for how noisy/clean your GPS+heading are in practice.
+DETECTION_TRIANGULATION_MIN_BASELINE_M = 5.0
+DETECTION_TRIANGULATION_MIN_BEARING_SPREAD_DEG = 5.0
 
 BG_WORKSPACE   = "#1a1a2e"
 PANEL_BG       = "#0f0f1a"
@@ -1255,6 +1339,29 @@ class DroneCockpitApp:
         self.root.configure(bg="#0d0d1a")
         self.root.resizable(True, True)
 
+        # ── Camera mount angle (manual toolbar control) ──────────────────────
+        # Source of truth for CAMERA_MOUNT_TILT_DEG/CAMERA_MOUNT_PAN_DEG now
+        # that they're live-editable from the "📐 Camera Angle" toolbar
+        # button instead of only being module constants you'd hand-edit and
+        # restart for. Deliberately plain floats behind a lock, NOT a Tk
+        # StringVar/DoubleVar: _get_detection_telemetry() (which reads this
+        # via _get_camera_mount_angle()) runs on DetectionLink's own C++
+        # worker thread, not the Tk thread -- touching a Tk variable from
+        # there is not safe. The dialog's Tk widgets update this lock-
+        # protected state from their callbacks (Tk thread); this getter
+        # reads it back (whichever thread calls it).
+        self._camera_angle_lock = threading.Lock()
+        # "manual" or "auto". Genuinely should default to "auto" once the
+        # SimpleBGC gimbal is electrically wired and its IMU-based attitude
+        # readback exists -- there is no such readback yet (see
+        # _get_camera_mount_angle()'s TODO below), so "auto" would silently
+        # do nothing useful right now. Defaulting to "manual" is the
+        # correct choice for THIS moment, not the long-term intent -- flip
+        # this back to "auto" once real feedback is wired in.
+        self._camera_angle_mode = "manual"
+        self._camera_tilt_deg = CAMERA_MOUNT_TILT_DEG
+        self._camera_pan_deg = CAMERA_MOUNT_PAN_DEG
+
         self.hub = DroneBackend.DroneLink()
         self._update_job = None
 
@@ -1367,6 +1474,95 @@ class DroneCockpitApp:
 
         self.detection_link.set_screenshot_dir(DETECTION_SCREENSHOT_DIR)
         self.detection_link.set_detection_interval_ms(DETECTION_INTERVAL_MS)
+
+        # ── Georeferencing config -- was silently missing before ────────
+        # Without these two calls, DetectionLink ran on its compiled-in
+        # header defaults: horizontalFovDeg_=90 (Detectionlink.h) and NO
+        # known object widths at all. On this rig specifically that meant
+        # (a) every ray-angle/bearing calculation was wrong by however far
+        # 90 deg differs from the camera's real FOV, and (b) object-size
+        # ranging (rangeByObjectSize() in Detectionlink.cpp) was never
+        # available, leaving ONLY ground-plane ranging -- which itself
+        # needs a ray steeper than ~7 deg below horizontal
+        # (minGroundRayComponent_, see setMinGroundRayComponent() in the
+        # header) to be trusted. The camera's SimpleBGC gimbal isn't
+        # electrically wired yet (see CAMERA_MOUNT_PAN_DEG/
+        # CAMERA_MOUNT_TILT_DEG and _get_detection_telemetry() above), so
+        # unless you've physically angled the camera down for this
+        # flight, that 7-degree bar is rarely cleared in level forward
+        # flight -- most detections likely never got a lat/lon at all.
+        # Both gaps are closed here.
+        if hasattr(self.detection_link, "set_horizontal_fov_deg"):
+            # E5-FPV night-vision module datasheet: FOV: 100 deg. Update
+            # this constant (see DETECTION_CAMERA_FOV_DEG above) if the
+            # camera is ever swapped for a different model/lens.
+            self.detection_link.set_horizontal_fov_deg(DETECTION_CAMERA_FOV_DEG)
+        else:
+            print(
+                "[DetectionLink] WARNING: this build of DroneBackend has no "
+                "set_horizontal_fov_deg() -- rebuild DroneBackend from "
+                "current source to get it. Continuing on the compiled-in "
+                "default of 90 deg, which does NOT match this camera's "
+                f"real {DETECTION_CAMERA_FOV_DEG} deg FOV -- every "
+                "georeferenced bearing will be off until this is rebuilt."
+            )
+
+        if hasattr(self.detection_link, "set_known_object_width"):
+            # Enables rangeByObjectSize() as a fallback whenever
+            # ground-plane ranging can't be trusted (shallow ray -- the
+            # common case whenever the camera is mounted forward-level
+            # rather than angled down -- see CAMERA_MOUNT_TILT_DEG
+            # above). Values are face-on width in meters -- see
+            # setKnownObjectWidth()'s doc comment in Detectionlink.h for
+            # why width (not length/height) is what the bbox actually
+            # measures at most viewing angles.
+            #
+            # IMPORTANT: these class-name strings MUST exactly match the
+            # names in your model's sibling .names file (one class name
+            # per line, same stem as DETECTION_MODEL_PATH) -- a mismatch
+            # doesn't error, it just silently never matches, and that
+            # class quietly falls back to ground-plane-only again. Open
+            # the .names file next to yolo26m_main.onnx and confirm the
+            # exact strings before relying on this; adjust the dict below
+            # to match if your classes are named differently (e.g. "car"/
+            # "truck" instead of a single "vehicle" class).
+            for class_name, width_m in DETECTION_KNOWN_OBJECT_WIDTHS_M.items():
+                self.detection_link.set_known_object_width(class_name, width_m)
+        else:
+            print(
+                "[DetectionLink] WARNING: this build of DroneBackend has no "
+                "set_known_object_width() -- rebuild DroneBackend from "
+                "current source to get it. Object-size ranging will stay "
+                "unavailable; only ground-plane ranging will ever produce "
+                "a lat/lon, and only when the ray is steep enough."
+            )
+
+        # Bearings-only triangulation (rangeByTriangulation() in
+        # Detectionlink.cpp) -- a third ranging method that needs neither
+        # a steep ray nor an assumed object size, using instead a
+        # tracked object's accumulated bearing history plus however far
+        # the drone has moved between sightings. These two thresholds
+        # guard against trusting a fix built from too little real
+        # parallax (see setTriangulationMinBaselineM/
+        # setTriangulationMinBearingSpreadDeg in Detectionlink.h) --
+        # overriding them here is optional, the compiled-in defaults
+        # (5.0m / 5.0deg) match these constants already, but they're
+        # exposed as named constants above so they're easy to tune
+        # without a rebuild once you've flown a few missions.
+        if hasattr(self.detection_link, "set_triangulation_min_baseline_m"):
+            self.detection_link.set_triangulation_min_baseline_m(
+                DETECTION_TRIANGULATION_MIN_BASELINE_M)
+        if hasattr(self.detection_link, "set_triangulation_min_bearing_spread_deg"):
+            self.detection_link.set_triangulation_min_bearing_spread_deg(
+                DETECTION_TRIANGULATION_MIN_BEARING_SPREAD_DEG)
+        if not hasattr(self.detection_link, "set_triangulation_min_baseline_m"):
+            print(
+                "[DetectionLink] WARNING: this build of DroneBackend has no "
+                "triangulation bindings -- rebuild DroneBackend from "
+                "current source to get bearings-only triangulated ranging "
+                "(range_method=='triangulated'). Ground-plane/object-size "
+                "ranging still work as before without it."
+            )
 
         # Same defensive hasattr pattern as set_input_size() above --
         # set_use_cuda()/is_using_cuda() are also newer bindings that a
@@ -1484,6 +1680,185 @@ class DroneCockpitApp:
     # Object detection (DetectionLink / DetectionWorker / DetectionMapWidget)
     # =========================================================================
 
+    def _get_camera_mount_angle(self) -> tuple:
+        """
+        Thread-safe. Called from _get_detection_telemetry() (DetectionLink's
+        C++ worker thread) AND from the Tk-thread dialog's live status
+        label -- lock-protected plain state, no Tk widgets touched here.
+        Returns (tilt_deg, pan_deg).
+
+        TODO once the SimpleBGC gimbal is electrically wired: in "auto"
+        mode, read its real IMU-based pan/tilt readback here instead of
+        falling back to the manual values. There is no such readback yet,
+        so "auto" is currently indistinguishable from "manual" except for
+        the one-time warning shown when switching into it (see
+        _set_camera_angle_mode()) -- it's wired up this way now so turning
+        on real auto-tracking later is a one-line change in this function,
+        not a UI rework.
+        """
+        with self._camera_angle_lock:
+            return self._camera_tilt_deg, self._camera_pan_deg
+
+    def _set_camera_mount_angle(self, tilt_deg: float = None, pan_deg: float = None) -> None:
+        """Thread-safe setter, called from the Tk-thread dialog only."""
+        with self._camera_angle_lock:
+            if tilt_deg is not None:
+                self._camera_tilt_deg = tilt_deg
+            if pan_deg is not None:
+                self._camera_pan_deg = pan_deg
+
+    def _set_camera_angle_mode(self, mode: str) -> None:
+        """Thread-safe mode switch, called from the Tk-thread dialog only."""
+        if mode == "auto":
+            messagebox.showinfo(
+                "Camera Angle — Auto",
+                "Auto mode has no real gimbal feedback to read yet -- the "
+                "SimpleBGC gimbal isn't electrically wired (missing "
+                "step-down modules). Auto will keep using the last Manual "
+                "tilt/pan values until real stepper-position readback is "
+                "wired into DroneLink. Switch back to Manual any time to "
+                "set them directly.",
+            )
+        with self._camera_angle_lock:
+            self._camera_angle_mode = mode
+        self._refresh_camera_angle_label()
+
+    def _refresh_camera_angle_label(self) -> None:
+        """Updates the small toolbar status label -- Tk thread only. Safe
+        to call any time the mode/tilt/pan changes, including from
+        _show_camera_angle_dialog()'s live slider callbacks."""
+        tilt_deg, pan_deg = self._get_camera_mount_angle()
+        mode = self._camera_angle_mode
+        if mode == "auto":
+            text = "📐 Auto (unwired)"
+        else:
+            text = f"📐 Manual: {tilt_deg:+.0f}° tilt, {pan_deg:+.0f}° pan"
+        lbl = getattr(self, "_camera_angle_lbl", None)
+        if lbl is not None:
+            lbl.config(text=text)
+
+    def _show_camera_angle_dialog(self) -> None:
+        """
+        Toolbar-triggered popup for setting how the FPV camera is
+        physically mounted -- see the "Camera mount angle" constants'
+        comment near the top of this file for the full rationale. Sliders
+        apply live (no separate Apply/OK step) so you can nudge tilt and
+        immediately see the toolbar label update to confirm what's being
+        fed into georeferencing.
+        """
+        win = tk.Toplevel(self.root)
+        win.title("Camera Angle")
+        win.configure(bg="#0f1428")
+        win.resizable(False, False)
+        win.transient(self.root)
+
+        pad = dict(padx=14, pady=(10, 0))
+
+        tk.Label(
+            win, text="Camera mount angle", fg="#00d4ff", bg="#0f1428",
+            font=("Consolas", 11, "bold"),
+        ).pack(anchor="w", **pad)
+        tk.Label(
+            win,
+            text="Used for detection georeferencing (DetectionLink).\n"
+                 "Auto has no real gimbal feedback yet -- see the info "
+                 "shown when you switch to it.",
+            fg="#8098c0", bg="#0f1428", font=("Consolas", 8),
+            justify="left",
+        ).pack(anchor="w", padx=14, pady=(2, 8))
+
+        # ── Mode toggle ──────────────────────────────────────────────
+        mode_row = tk.Frame(win, bg="#0f1428")
+        mode_row.pack(fill="x", padx=14, pady=(0, 10))
+
+        mode_var = tk.StringVar(value=self._camera_angle_mode)
+        interactive_widgets = []   # populated below as tilt/pan scale + presets are built
+
+        def set_manual_widgets_enabled(enabled: bool):
+            state = "normal" if enabled else "disabled"
+            for w in interactive_widgets:
+                w.configure(state=state)
+
+        def apply_mode():
+            self._set_camera_angle_mode(mode_var.get())
+            set_manual_widgets_enabled(mode_var.get() == "manual")
+
+        tk.Radiobutton(
+            mode_row, text="🕹 Manual", variable=mode_var, value="manual",
+            command=apply_mode, fg="#c0d0f0", bg="#0f1428",
+            selectcolor="#1e3060", activebackground="#0f1428",
+            activeforeground="#ffffff", font=("Consolas", 10),
+        ).pack(side="left", padx=(0, 16))
+        tk.Radiobutton(
+            mode_row, text="⟳ Auto", variable=mode_var, value="auto",
+            command=apply_mode, fg="#c0d0f0", bg="#0f1428",
+            selectcolor="#1e3060", activebackground="#0f1428",
+            activeforeground="#ffffff", font=("Consolas", 10),
+        ).pack(side="left")
+
+        # ── Manual controls ──────────────────────────────────────────
+        manual_frame = tk.Frame(win, bg="#0f1428")
+        manual_frame.pack(fill="x", padx=14, pady=(0, 6))
+
+        def on_tilt(v):
+            self._set_camera_mount_angle(tilt_deg=float(v))
+            self._refresh_camera_angle_label()
+
+        def on_pan(v):
+            self._set_camera_mount_angle(pan_deg=float(v))
+            self._refresh_camera_angle_label()
+
+        tk.Label(
+            manual_frame, text="Tilt (0=forward, 90=down, 180=back, -=up)",
+            fg="#a0b8d8", bg="#0f1428", font=("Consolas", 8),
+        ).pack(anchor="w")
+        tilt_scale = tk.Scale(
+            manual_frame, from_=-180, to=180, orient="horizontal",
+            resolution=1, length=280, command=on_tilt,
+            bg="#0f1428", fg="#c0d0f0", troughcolor="#1c2c54",
+            highlightthickness=0, activebackground="#00d4ff",
+            font=("Consolas", 8),
+        )
+        tilt_scale.set(self._camera_tilt_deg)
+        tilt_scale.pack(fill="x", pady=(0, 6))
+        interactive_widgets.append(tilt_scale)
+
+        preset_row = tk.Frame(manual_frame, bg="#0f1428")
+        preset_row.pack(fill="x", pady=(0, 10))
+        for label, val in (("Up", -90), ("Forward", 0), ("Down", 90), ("Backward", 180)):
+            preset_btn = tk.Button(
+                preset_row, text=label, command=lambda v=val: tilt_scale.set(v),
+                relief="flat", bg="#162040", fg="#a0b8d8",
+                activebackground="#1e3060", activeforeground="#ffffff",
+                font=("Consolas", 8), padx=6, pady=2, cursor="hand2",
+            )
+            preset_btn.pack(side="left", padx=(0, 6))
+            interactive_widgets.append(preset_btn)
+
+        tk.Label(
+            manual_frame, text="Pan (0=centered)",
+            fg="#a0b8d8", bg="#0f1428", font=("Consolas", 8),
+        ).pack(anchor="w")
+        pan_scale = tk.Scale(
+            manual_frame, from_=-180, to=180, orient="horizontal",
+            resolution=1, length=280, command=on_pan,
+            bg="#0f1428", fg="#c0d0f0", troughcolor="#1c2c54",
+            highlightthickness=0, activebackground="#00d4ff",
+            font=("Consolas", 8),
+        )
+        pan_scale.set(self._camera_pan_deg)
+        pan_scale.pack(fill="x", pady=(0, 10))
+        interactive_widgets.append(pan_scale)
+
+        set_manual_widgets_enabled(self._camera_angle_mode == "manual")
+
+        tk.Button(
+            win, text="Close", command=win.destroy,
+            relief="flat", bg="#162040", fg="#a0b8d8",
+            activebackground="#1e3060", activeforeground="#ffffff",
+            font=("Consolas", 9), padx=10, pady=4, cursor="hand2",
+        ).pack(pady=(0, 12))
+
     def _get_detection_telemetry(self) -> "DroneBackend.TelemetrySnapshot":
         """
         Trampoline passed to DetectionLink.set_telemetry_provider(). Called
@@ -1495,13 +1870,16 @@ class DroneCockpitApp:
         mutex-protected snapshot (see Bindings.cpp), so it's safe to call
         straight from here.
 
-        NOTE: gimbal_pan_deg / gimbal_tilt_deg are left at 0 (forward/level)
-        below -- the SimpleBGC gimbal has no telemetry readback wired into
-        DroneLink yet, so georeference() currently assumes a level,
-        forward-facing camera. Wire the real pan/tilt angles in here once
-        that readback exists; until then, georeferenced pins will drift off
-        whenever the gimbal is actually panned or tilted away from that
-        assumption.
+        NOTE: gimbal_pan_deg / gimbal_tilt_deg come from
+        _get_camera_mount_angle() below, NOT from live gimbal telemetry --
+        the SimpleBGC gimbal hardware is physically installed but not
+        electrically wired yet (missing step-down modules), so there's no
+        readback to use. That getter's "manual" mode is a live,
+        toolbar-editable stand-in (see the "📐 Camera Angle" button) for
+        however the camera is actually physically angled right now --
+        keep it in sync with reality, there's no sensor to do that for
+        you yet. Its "auto" mode is a placeholder for real SimpleBGC
+        readback once the gimbal is powered.
         """
         snapshot = DroneBackend.TelemetrySnapshot()
 
@@ -1522,8 +1900,9 @@ class DroneCockpitApp:
         snapshot.heading_deg = float(state.yaw)
         snapshot.roll_deg = state.roll / 10.0
         snapshot.pitch_deg = state.pitch / 10.0
-        snapshot.gimbal_pan_deg = 0.0
-        snapshot.gimbal_tilt_deg = 0.0
+        tilt_deg, pan_deg = self._get_camera_mount_angle()
+        snapshot.gimbal_tilt_deg = tilt_deg
+        snapshot.gimbal_pan_deg = pan_deg
         return snapshot
 
     def _retry_detection_engine(self, log_on_failure: bool = False) -> None:
@@ -2229,6 +2608,26 @@ class DroneCockpitApp:
             label="Detections",
         )
         self._detections_btn.pack(side="left", padx=(0, 6))
+
+        self._camera_angle_btn = self._mk_icon_btn(
+            toolbar, "📐", self._show_camera_angle_dialog,
+            "Camera Angle — set how the FPV camera is physically mounted "
+            "(Manual), or hand off to real gimbal feedback once the "
+            "SimpleBGC gimbal is wired (Auto). Used for detection "
+            "georeferencing.",
+            label="Camera Angle",
+        )
+        self._camera_angle_btn.pack(side="left", padx=(0, 8))
+
+        self._camera_angle_lbl = tk.Label(
+            toolbar, text="",
+            fg="#66aadd", bg="#13203a",
+            font=("Consolas", 9, "bold"),
+            padx=8, pady=3,
+            highlightthickness=1, highlightbackground="#2a4a76",
+        )
+        self._camera_angle_lbl.pack(side="left", padx=(0, 16))
+        self._refresh_camera_angle_label()
 
         info_btn = self._mk_icon_btn(
             toolbar, "ℹ", self._show_help_window,

@@ -21,23 +21,25 @@ swaps this pane to that detection's saved screenshot instead (see
 _on_select / _return_to_live), and the live poll keeps running in the
 background the whole time so going back to it is instant.
 
-The map panel is still not a real satellite/tile basemap -- plugging in
-actual imagery is future work (the "terrain matching / satellite
-basemap" piece discussed separately) and needs an internet connection
-or a pre-downloaded tile cache this app doesn't assume. What it DOES do
-now is a proper local metric projection: every georeferenced detection
-is converted to meters-north/meters-east from a fixed origin (the first
-georeferenced sighting of the flight) using an equirectangular
-tangent-plane approximation -- same flat-earth assumption class
-DetectionLink itself uses for its ranging, fine at the sub-few-km scale
-this is for. Unlike the old version (which independently rescaled
-lat-span and lon-span to fill the canvas every time a pin arrived, so
-"close together" or "far apart" on screen didn't mean anything in real
-meters and the whole picture could silently reflow/rescale on every new
-detection), this uses ONE shared scale for both axes, a visible scale
-bar, and a north-up compass mark, so relative distance and direction on
-screen are actually meaningful now -- an approximate pinpoint on a
-real, if still tile-less, map, per the original ask. The detection list
+The map panel is now backed by real XYZ tiles (see MapTiles.py), with
+two switchable providers -- "Satellite" (Esri World Imagery) and
+"Topographic" (OpenTopoMap, a contour-line style closest to a free
+military-map look) -- selected via the radio buttons above the canvas.
+Tiles are cached to disk per-provider the first time an area is viewed
+(see MapTiles.TileCache): if a tile is already cached it's read
+straight off disk and drawn immediately; if it isn't, a background
+download is kicked off (never blocking the Tk thread) and that cell is
+left as a flat placeholder color until the tile lands and a redraw
+picks it up (see _poll_tile_downloads). No network at all is required
+once an area's tiles are cached from a prior flight. Every detection
+and the drone's own position are plotted directly in standard Web
+Mercator pixel space at whatever zoom the current view auto-fits to
+(see _fit_zoom/_mercator_pixel) -- the same coordinate system the
+tiles themselves are drawn in, so pins line up with the imagery exactly
+rather than needing a separate projection reconciled against it. A
+scale bar and north-up compass mark are still drawn on top (see
+_draw_scale_bar), since even with real imagery a quick "how far is
+that" glance shouldn't require the detection list. The detection list
 remains the primary, trustworthy source of exact values (lat/lon,
 distance, bearing) for any single sighting.
 
@@ -49,9 +51,12 @@ one moving pin with a breadcrumb trail, not three unrelated dots.
 """
 
 import math
+import queue
 import time
 import tkinter as tk
 from tkinter import ttk
+
+import MapTiles
 
 try:
     from PIL import Image, ImageTk
@@ -59,7 +64,22 @@ try:
 except ImportError:
     _PIL_AVAILABLE = False
 
-_EARTH_RADIUS_M = 6378137.0
+
+def _mercator_pixel(lat, lon, zoom):
+    """
+    Standard Web Mercator lon/lat -> global pixel coordinates at a given
+    zoom level (tile_size=256, same convention every XYZ tile server
+    uses). This is the ONE coordinate system both the tile mosaic
+    (_draw_tile_mosaic) and the pin/drone markers (_redraw_map's
+    to_canvas) are placed in, so nothing can drift out of alignment with
+    the imagery underneath it.
+    """
+    lat = max(min(lat, 85.05112878), -85.05112878)  # Mercator is undefined at the poles
+    lat_rad = math.radians(lat)
+    n = 2.0 ** zoom
+    x = (lon + 180.0) / 360.0 * n * MapTiles.TILE_SIZE
+    y = (1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0 * n * MapTiles.TILE_SIZE
+    return x, y
 
 
 class DetectionMapWidget(tk.Toplevel):
@@ -76,34 +96,32 @@ class DetectionMapWidget(tk.Toplevel):
         self._records = []          # all DetectionRecord objects seen so far
         self._selected_photo = None  # keep a reference so Tk doesn't GC it
 
-        # ── Map projection state ─────────────────────────────────────
-        # origin is fixed the first time a georeferenced record arrives
-        # and never moves again for the life of this window -- keeping
-        # it fixed (rather than recentering on new bounds every pin, like
-        # the old version did) is what makes the map stop silently
-        # reflowing/rescaling every time a new detection comes in.
-        self._map_origin = None   # (lat, lon) or None until first georeferenced record
+        # ── Map state ─────────────────────────────────────────────────
+        self._map_origin = None   # (lat, lon) of the first-ever georeferenced fix, or None -- only used as
+                                   # the "has anything arrived yet" gate for the "Waiting for GPS fix" message
         self._drone_telemetry = None   # (lat, lon) or None -- see set_drone_telemetry()
-        # track_id -> list of (east_m, north_m) in arrival order, so a
-        # single object's repeated sightings draw as one pin + trail
-        # instead of a pile of unrelated dots (see module docstring).
+        # track_id -> list of (lat, lon) in arrival order, so a single
+        # object's repeated sightings draw as one pin + trail instead of
+        # a pile of unrelated dots (see module docstring).
         self._track_positions = {}
+        self._map_zoom = None      # zoom the map was last drawn at (for reference/debugging)
+        self._map_center = None    # (lat, lon) the map was last centered on
+
+        # ── Tile provider / cache state ──────────────────────────────
+        self._tile_cache = MapTiles.TileCache()
+        self._map_provider = "satellite"
+        # Decoded-tile cache, keyed (provider, zoom, x, y) -> PIL.Image.
+        # Unbounded for now (cleared wholesale on provider switch) --
+        # fine for a single flight's worth of panning/zooming; if this
+        # ever shows up as a memory problem on long sessions, cap it with
+        # an LRU instead of clearing it all at once.
+        self._tile_image_cache = {}
+        self._mosaic_photo = None  # keep a ref so Tk doesn't GC the composited basemap image
+        self._tile_poll_job = None
+        self._resize_job = None
 
         self._build_layout()
-
-    def _project_local_m(self, lat, lon):
-        """
-        Equirectangular tangent-plane projection relative to
-        self._map_origin: returns (east_m, north_m). Same flat-earth
-        assumption DetectionLink itself uses for ranging -- fine at the
-        sub-few-km scale a single flight covers, not meant for anything
-        further.
-        """
-        origin_lat, origin_lon = self._map_origin
-        lat_rad = math.radians((lat + origin_lat) / 2.0)
-        north_m = math.radians(lat - origin_lat) * _EARTH_RADIUS_M
-        east_m = math.radians(lon - origin_lon) * _EARTH_RADIUS_M * math.cos(lat_rad)
-        return east_m, north_m
+        self._poll_tile_downloads()
 
     # =====================================================================
     # Layout
@@ -169,13 +187,34 @@ class DetectionMapWidget(tk.Toplevel):
         self._tree.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self._tree.bind("<<TreeviewSelect>>", self._on_select)
 
-        # ── Right: pin map (placeholder) + screenshot preview ────────
+        # ── Right: pin map + screenshot preview ───────────────────────
         right = tk.Frame(paned, bg="#1a1a1a")
         paned.add(right, weight=2)
 
-        self._map_canvas = tk.Canvas(right, bg="#0d1f14", height=260, highlightthickness=0)
-        self._map_canvas.pack(fill="x", padx=8, pady=(8, 4))
-        tk.Label(right, text="North-up, true-to-scale local plot (see scale bar) -- not satellite imagery yet",
+        map_header = tk.Frame(right, bg="#1a1a1a")
+        map_header.pack(fill="x", padx=8, pady=(8, 0))
+        tk.Label(map_header, text="Map", fg="#ffffff", bg="#1a1a1a",
+                 font=("Segoe UI", 11, "bold")).pack(side="left")
+
+        # Satellite / topographic toggle. Each provider's tiles are
+        # cached to disk independently (see MapTiles.TileCache) --
+        # switching back and forth never re-downloads anything that was
+        # already fetched under either one.
+        self._map_provider_var = tk.StringVar(value=self._map_provider)
+        for key, cfg in MapTiles.PROVIDERS.items():
+            tk.Radiobutton(
+                map_header, text=cfg["label"], value=key, variable=self._map_provider_var,
+                command=self._on_map_provider_change, fg="#cccccc", bg="#1a1a1a",
+                selectcolor="#333333", activebackground="#1a1a1a", activeforeground="#ffffff",
+                indicatoron=False, padx=10, relief="flat", borderwidth=1,
+            ).pack(side="right", padx=(4, 0))
+
+        self._map_canvas = tk.Canvas(right, bg="#111a14", height=260, highlightthickness=0)
+        self._map_canvas.pack(fill="x", padx=8, pady=(4, 2))
+        self._map_canvas.bind("<Configure>", self._on_map_canvas_resize)
+
+        self._map_attribution_var = tk.StringVar(value="")
+        tk.Label(right, textvariable=self._map_attribution_var,
                  fg="#888888", bg="#1a1a1a", font=("Segoe UI", 8)).pack(anchor="w", padx=8)
 
         # ── Live annotated feed (primary view for this pane) ──────────
@@ -272,10 +311,10 @@ class DetectionMapWidget(tk.Toplevel):
             self._redraw_map()
             return
         if self._map_origin is None:
-            # Same "fixed for the rest of the flight" origin add_records()
-            # already uses for the first georeferenced detection -- now
-            # either source can be the one that establishes it, whichever
-            # happens first.
+            # Same "first fix to arrive wins" gate add_records() already
+            # uses for the first georeferenced detection -- now either
+            # source can be the one that clears the "Waiting for GPS fix"
+            # placeholder, whichever happens first.
             self._map_origin = (latitude, longitude)
         self._drone_telemetry = (latitude, longitude)
         self._redraw_map()
@@ -320,7 +359,8 @@ class DetectionMapWidget(tk.Toplevel):
         Feed newly-arrived DetectionRecords in (typically the list
         returned by DetectionWorker.get_new_records() each tick). Cheap:
         a handful of Treeview inserts and canvas ovals, no image
-        decoding happens here.
+        decoding happens here (tile decoding, when needed, happens
+        lazily inside _draw_tile_mosaic on redraw, not here).
         """
         if not records:
             return
@@ -339,12 +379,8 @@ class DetectionMapWidget(tk.Toplevel):
 
             if rec.georeferenced:
                 if self._map_origin is None:
-                    # Fixed for the rest of the flight -- see
-                    # _project_local_m()'s docstring for why a fixed
-                    # origin (vs. recentering every pin) matters.
                     self._map_origin = (rec.latitude, rec.longitude)
-                pos = self._project_local_m(rec.latitude, rec.longitude)
-                self._track_positions.setdefault(track_id, []).append(pos)
+                self._track_positions.setdefault(track_id, []).append((rec.latitude, rec.longitude))
 
             self._redraw_map()
 
@@ -354,23 +390,138 @@ class DetectionMapWidget(tk.Toplevel):
             self._tree.see(children[-1])
 
     # =====================================================================
-    # Internals
+    # Internals — map / tiles
     # =====================================================================
+
+    def _on_map_provider_change(self) -> None:
+        self._map_provider = self._map_provider_var.get()
+        # Different provider = different tile bytes at the same z/x/y --
+        # drop the decoded-image cache so we don't accidentally paint the
+        # old provider's tiles under the new provider's label/attribution.
+        # The on-disk cache itself is untouched (each provider has its own
+        # subdirectory), so nothing already downloaded is lost.
+        self._tile_image_cache.clear()
+        self._redraw_map()
+
+    def _on_map_canvas_resize(self, _event) -> None:
+        # Debounced: dragging the window edge fires many <Configure>
+        # events in a row, and a full tile-mosaic rebuild on every one of
+        # them would be wasted work (and visibly janky). Wait for resizing
+        # to pause for 120ms before actually redrawing.
+        if self._resize_job is not None:
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(120, self._redraw_map)
+
+    def _poll_tile_downloads(self) -> None:
+        """
+        Background tile downloads (see MapTiles.TileCache) hand finished
+        tiles back via a thread-safe queue rather than calling into Tk
+        directly from a worker thread -- same reasoning as the live-feed
+        poll elsewhere in this file: only the Tk thread should ever touch
+        Tk state. This drains that queue on a timer and triggers exactly
+        one redraw if anything new landed, rather than one redraw per tile.
+        """
+        any_ready = False
+        while True:
+            try:
+                self._tile_cache.ready_queue.get_nowait()
+            except queue.Empty:
+                break
+            any_ready = True
+        if any_ready:
+            self._redraw_map()
+        self._tile_poll_job = self.after(300, self._poll_tile_downloads)
+
+    def _fit_zoom(self, min_lat, max_lat, min_lon, max_lon, canvas_w, canvas_h, pad) -> int:
+        """
+        Highest zoom level (most detail) at which the given lat/lon
+        bounding box still fits inside the canvas, capped at the current
+        provider's max supported zoom. Standard "fit bounds" search: walk
+        zoom down from max until the box's Mercator-pixel footprint fits.
+        """
+        max_zoom = MapTiles.PROVIDERS[self._map_provider]["max_zoom"]
+        avail_w = max(canvas_w - 2 * pad, 40)
+        avail_h = max(canvas_h - 2 * pad, 40)
+        for zoom in range(max_zoom, 0, -1):
+            x0, y0 = _mercator_pixel(max_lat, min_lon, zoom)  # NW corner
+            x1, y1 = _mercator_pixel(min_lat, max_lon, zoom)  # SE corner
+            if (x1 - x0) <= avail_w and (y1 - y0) <= avail_h:
+                return zoom
+        return 1
+
+    def _draw_tile_mosaic(self, zoom, center_lat, center_lon, w, h) -> None:
+        """
+        Composites just enough tiles to cover the canvas into one PIL
+        image and draws it as the map background. Tiles already on disk
+        (see MapTiles.TileCache.get_cached) are pasted in immediately;
+        missing ones are left as the flat placeholder color and a
+        background download is queued for them -- _poll_tile_downloads
+        picks those up and triggers a follow-up redraw once they land.
+        """
+        cpx, cpy = _mercator_pixel(center_lat, center_lon, zoom)
+        top_left_x = cpx - w / 2.0
+        top_left_y = cpy - h / 2.0
+
+        if not _PIL_AVAILABLE:
+            self._map_canvas.create_rectangle(0, 0, w, h, fill="#111a14", outline="")
+            self._map_canvas.create_text(
+                12, h - 14, anchor="w", fill="#888888",
+                text="Pillow not installed -- showing flat background instead of map tiles",
+                font=("Segoe UI", 8))
+            return
+
+        n_tiles = 2 ** zoom
+        tile_x_min = int(math.floor(top_left_x / MapTiles.TILE_SIZE))
+        tile_x_max = int(math.floor((top_left_x + w) / MapTiles.TILE_SIZE))
+        tile_y_min = int(math.floor(top_left_y / MapTiles.TILE_SIZE))
+        tile_y_max = int(math.floor((top_left_y + h) / MapTiles.TILE_SIZE))
+
+        mosaic = Image.new("RGB", (max(int(w), 1), max(int(h), 1)), "#111a14")
+        for ty in range(tile_y_min, tile_y_max + 1):
+            if ty < 0 or ty >= n_tiles:
+                continue  # off the top/bottom of the world -- nothing to paste
+            for tx in range(tile_x_min, tile_x_max + 1):
+                wrapped_tx = tx % n_tiles  # longitude wraps at +/-180; latitude (ty) never does
+                cache_key = (self._map_provider, zoom, wrapped_tx, ty)
+                tile_img = self._tile_image_cache.get(cache_key)
+                if tile_img is None:
+                    tile_path = self._tile_cache.get_cached(self._map_provider, zoom, wrapped_tx, ty)
+                    if tile_path is not None:
+                        try:
+                            tile_img = Image.open(tile_path).convert("RGB")
+                            self._tile_image_cache[cache_key] = tile_img
+                        except (OSError, ValueError):
+                            tile_img = None
+                if tile_img is not None:
+                    paste_x = int(tx * MapTiles.TILE_SIZE - top_left_x)
+                    paste_y = int(ty * MapTiles.TILE_SIZE - top_left_y)
+                    mosaic.paste(tile_img, (paste_x, paste_y))
+                # else: not cached yet (download now queued, see get_cached)
+                # or the tile failed to load -- leave this cell as the flat
+                # placeholder color; _poll_tile_downloads will trigger a
+                # redraw once/if it arrives.
+
+        self._mosaic_photo = ImageTk.PhotoImage(mosaic)
+        self._map_canvas.create_image(0, 0, anchor="nw", image=self._mosaic_photo)
 
     def _redraw_map(self) -> None:
         """
-        Full repaint of the map canvas from self._track_positions AND
-        self._drone_telemetry (see _project_local_m/add_records/
-        set_drone_telemetry). Cheap enough to call on every new record,
-        every drone telemetry tick, and every selection change -- this is
-        a handful of points per flight, not per-frame data.
+        Full repaint of the map canvas: basemap tiles (_draw_tile_mosaic)
+        plus track pins/trails and the drone marker on top, all in the
+        same Web Mercator pixel space (_mercator_pixel) so nothing can
+        drift out of alignment with the imagery. Cheap enough to call on
+        every new record, every drone telemetry tick, every selection
+        change, and every tile that finishes downloading -- a flight is a
+        handful of points and, at any one time, a handful of tiles, not
+        per-frame data.
         """
         self._map_canvas.delete("all")
 
         if self._map_origin is None:
             # Neither a detection nor a drone GPS fix has ever arrived --
-            # there is no reference point yet to draw anything relative
-            # to. This is the only case with genuinely nothing to show.
+            # there is no coordinate yet to center a map on. This is the
+            # only case with genuinely nothing to show.
+            self._map_canvas.create_rectangle(0, 0, 400, 260, fill="#111a14", outline="")
             self._map_canvas.create_text(
                 12, 14, anchor="nw", fill="#888888",
                 text="Waiting for GPS fix...", font=("Segoe UI", 9))
@@ -380,39 +531,34 @@ class DetectionMapWidget(tk.Toplevel):
         h = self._map_canvas.winfo_height() or 260
         pad = 34
 
-        # Points that must stay in view: every track pin/trail point,
-        # PLUS the drone's own current position if we have one --
-        # previously only detections drove the extent, so a drone that
-        # had flown well away from its one detection (or that had zero
-        # detections at all) could end up off-canvas or not drawn.
+        # Points the view must fit: every track pin/trail point, plus the
+        # drone's own current position if we have one -- a drone that has
+        # flown well away from its one detection (or that has zero
+        # detections at all) still needs to stay on screen.
         all_points = [p for positions in self._track_positions.values() for p in positions]
         if self._drone_telemetry is not None:
-            all_points.append(self._project_local_m(*self._drone_telemetry))
-
+            all_points.append(self._drone_telemetry)
         if not all_points:
-            # We have an origin (a fix arrived at some point) but nothing
-            # -- not even the drone right now -- to plot yet.
-            self._map_canvas.create_text(
-                12, 14, anchor="nw", fill="#888888",
-                text="No georeferenced detections yet", font=("Segoe UI", 9))
-            return
+            all_points = [self._map_origin]  # nothing plottable yet, but still center the basemap somewhere real
 
-        eastings = [p[0] for p in all_points]
-        northings = [p[1] for p in all_points]
-        # A single shared scale for BOTH axes (unlike the old lat-range /
-        # lon-range-independent scaling) so distance and direction on
-        # screen actually correspond to real meters. Floor the extent at
-        # 5m so a single early detection doesn't zoom in to a meaningless
-        # degree before there's anything to compare it against.
-        extent_m = max(max(eastings) - min(eastings), max(northings) - min(northings), 5.0)
-        usable_px = max(min(w, h) - 2 * pad, 40)
-        scale_px_per_m = usable_px / extent_m
+        lats = [p[0] for p in all_points]
+        lons = [p[1] for p in all_points]
+        min_lat, max_lat = min(lats), max(lats)
+        min_lon, max_lon = min(lons), max(lons)
+        center_lat = (min_lat + max_lat) / 2.0
+        center_lon = (min_lon + max_lon) / 2.0
 
-        cx, cy = w / 2.0, h / 2.0
+        zoom = self._fit_zoom(min_lat, max_lat, min_lon, max_lon, w, h, pad)
+        self._map_zoom = zoom
+        self._map_center = (center_lat, center_lon)
 
-        def to_canvas(east_m, north_m):
-            # North-up: canvas y decreases as north increases.
-            return cx + east_m * scale_px_per_m, cy - north_m * scale_px_per_m
+        self._draw_tile_mosaic(zoom, center_lat, center_lon, w, h)
+
+        center_px, center_py = _mercator_pixel(center_lat, center_lon, zoom)
+
+        def to_canvas(lat, lon):
+            px, py = _mercator_pixel(lat, lon, zoom)
+            return w / 2.0 + (px - center_px), h / 2.0 + (py - center_py)
 
         # Which track (if any) the pilot currently has selected in the
         # list, so its pin/trail can be highlighted on the map too.
@@ -424,12 +570,9 @@ class DetectionMapWidget(tk.Toplevel):
                 selected_track_id = getattr(focused_rec, "track_id", 0)
 
         if not self._track_positions:
-            # We have an origin and/or a drone fix (otherwise we'd have
-            # returned above), just nothing detected/georeferenced yet --
-            # still draw the drone marker, scale bar and compass below,
-            # just with this small note instead of any track pins.
+            self._map_canvas.create_rectangle(8, 8, 210, 26, fill="#000000", stipple="gray50", outline="")
             self._map_canvas.create_text(
-                12, 14, anchor="nw", fill="#888888",
+                14, 17, anchor="w", fill="#dddddd",
                 text="No georeferenced detections yet", font=("Segoe UI", 9))
 
         for track_id, positions in self._track_positions.items():
@@ -437,28 +580,30 @@ class DetectionMapWidget(tk.Toplevel):
 
             if len(positions) > 1:
                 coords = []
-                for east_m, north_m in positions:
-                    x, y = to_canvas(east_m, north_m)
+                for lat, lon in positions:
+                    x, y = to_canvas(lat, lon)
                     coords.extend([x, y])
                 self._map_canvas.create_line(
-                    *coords, fill="#2fb8c9" if is_selected else "#665f33", width=1)
+                    *coords, fill="#2fb8c9" if is_selected else "#e0d060", width=2)
 
             last_idx = len(positions) - 1
-            for idx, (east_m, north_m) in enumerate(positions):
-                x, y = to_canvas(east_m, north_m)
+            for idx, (lat, lon) in enumerate(positions):
+                x, y = to_canvas(lat, lon)
                 if idx == last_idx:
                     # Most recent sighting of this track -- the "current"
-                    # pin, drawn bright and larger.
+                    # pin, drawn bright and larger, with a dark outline so
+                    # it stays visible against both light and dark imagery.
                     color = "#00e0ff" if is_selected else "#ffaa00"
-                    radius = 5
+                    radius = 6
                 else:
                     # Older sighting of the SAME object -- a faded
                     # breadcrumb, not a separate detection to read on
                     # its own.
-                    color = "#777744"
-                    radius = 2
+                    color = "#998833"
+                    radius = 3
                 self._map_canvas.create_oval(
-                    x - radius, y - radius, x + radius, y + radius, fill=color, outline="")
+                    x - radius, y - radius, x + radius, y + radius,
+                    fill=color, outline="#000000", width=1)
 
         # Drone marker: driven by set_drone_telemetry() (continuous, from
         # the app's own poll loop) rather than digging through
@@ -467,19 +612,24 @@ class DetectionMapWidget(tk.Toplevel):
         # ones, never showed the drone at all even though its position is
         # always known independent of anything being spotted.
         if self._drone_telemetry is not None:
-            de, dn = self._project_local_m(*self._drone_telemetry)
-            dx, dy = to_canvas(de, dn)
+            dx, dy = to_canvas(*self._drone_telemetry)
             self._map_canvas.create_polygon(
-                dx, dy - 7, dx - 6, dy + 5, dx + 6, dy + 5, fill="#00ff88", outline="")
+                dx, dy - 8, dx - 7, dy + 6, dx + 7, dy + 6,
+                fill="#00ff88", outline="#003318", width=1)
             self._map_canvas.create_text(
-                dx, dy + 15, text="drone", fill="#00ff88", font=("Segoe UI", 7))
+                dx, dy + 17, text="drone", fill="#00ff88", font=("Segoe UI", 7, "bold"))
 
-        # North-up compass mark -- fixed, since the map itself is always
-        # drawn north-up (see to_canvas() above).
+        # North-up compass mark -- fixed, since the map is always drawn
+        # north-up (standard Web Mercator orientation, same as the tiles).
         self._map_canvas.create_text(
-            w - 22, 16, text="N ↑", fill="#aaaaaa", font=("Segoe UI", 9, "bold"))
+            w - 24, 16, text="N ↑", fill="#ffffff", font=("Segoe UI", 9, "bold"))
 
+        meters_per_pixel = 156543.03392804097 * math.cos(math.radians(center_lat)) / (2 ** zoom)
+        scale_px_per_m = (1.0 / meters_per_pixel) if meters_per_pixel > 0 else 1.0
         self._draw_scale_bar(scale_px_per_m, h, pad)
+
+        cfg = MapTiles.PROVIDERS[self._map_provider]
+        self._map_attribution_var.set(f"{cfg['label']} — {cfg['attribution']}  ·  zoom {zoom}")
 
     def _draw_scale_bar(self, scale_px_per_m: float, canvas_h: int, pad: int) -> None:
         if scale_px_per_m <= 0:
@@ -499,12 +649,16 @@ class DetectionMapWidget(tk.Toplevel):
 
         x0 = pad * 0.6
         y0 = canvas_h - 16
-        self._map_canvas.create_line(x0, y0, x0 + bar_px, y0, fill="#cccccc", width=2)
-        self._map_canvas.create_line(x0, y0 - 4, x0, y0 + 4, fill="#cccccc")
-        self._map_canvas.create_line(x0 + bar_px, y0 - 4, x0 + bar_px, y0 + 4, fill="#cccccc")
+        self._map_canvas.create_line(x0, y0, x0 + bar_px, y0, fill="#ffffff", width=2)
+        self._map_canvas.create_line(x0, y0 - 4, x0, y0 + 4, fill="#ffffff")
+        self._map_canvas.create_line(x0 + bar_px, y0 - 4, x0 + bar_px, y0 + 4, fill="#ffffff")
         label = f"{nice_m:.0f} m" if nice_m >= 1 else f"{nice_m:.1f} m"
         self._map_canvas.create_text(x0 + bar_px / 2.0, y0 - 10, text=label,
-                                      fill="#cccccc", font=("Segoe UI", 8))
+                                      fill="#ffffff", font=("Segoe UI", 8))
+
+    # =====================================================================
+    # Internals — detection list / preview
+    # =====================================================================
 
     def _on_select(self, _event) -> None:
         selection = self._tree.selection()

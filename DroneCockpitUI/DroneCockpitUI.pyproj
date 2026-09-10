@@ -55,6 +55,8 @@
     </Compile>
     <Compile Include="FPVWidget.py" />
     <Compile Include="export_model.py" />
+    <Compile Include="MapTiles.py" />
+    <Compile Include="prefetch_tiles.py" />
     <Compile Include="NNTraining\class_map.py" />
     <Compile Include="NNTraining\cross_reference_gaps.py" />
     <Compile Include="NNTraining\check_label_gaps.py" />

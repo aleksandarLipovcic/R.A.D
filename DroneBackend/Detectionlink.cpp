@@ -31,6 +31,32 @@
 #include <windows.h>
 #endif
 
+// ── Verbose diagnostic logging ──────────────────────────────────────
+// Same convention as VIDEOLINK_VERBOSE_LOGGING in VideoLink.cpp: every
+// [DetectionLink][perf]/[DetectionLink] DEBUG line below (preview-thread
+// startup notice, per-tick preview/inference timing, the one-time raw
+// model-space row dump, and the JPEG-encode timing in
+// getLatestAnnotatedFrameJpeg()) is compiled out by default now that
+// CUDA is confirmed working and these aren't needed for normal runs.
+// Set DETECTIONLINK_VERBOSE_LOGGING to 1 (or define it via a build-system
+// flag) to bring all of them back exactly as they were, e.g. when
+// diagnosing a new model export, a new capture device, or a perf
+// regression. This does NOT affect the one-time cv::Exception warning
+// in runInference() below (search "a detection pass failed") -- that's
+// a genuine error surfaced to stderr regardless of this flag, not a
+// diagnostic print, since silencing it would hide real failures.
+#ifndef DETECTIONLINK_VERBOSE_LOGGING
+#define DETECTIONLINK_VERBOSE_LOGGING 0
+#endif
+
+#if DETECTIONLINK_VERBOSE_LOGGING
+#define DL_LOG(...) do { std::cout __VA_ARGS__ << std::endl; } while (0)
+#define DL_LOG_ERR(...) do { fprintf(stderr, __VA_ARGS__); } while (0)
+#else
+#define DL_LOG(...) do { } while (0)
+#define DL_LOG_ERR(...) do { } while (0)
+#endif
+
 namespace {
     // Detection does not need anywhere near 30fps -- it exists to give
     // the pilot supplementary situational awareness, not to drive the
@@ -42,6 +68,16 @@ namespace {
     // back-to-back passes with no idle time, which is fine but worth
     // knowing.
     constexpr int kDefaultDetectionIntervalMs = 250;
+
+    // Cap on how many past BearingObservations a single Track carries
+    // (see Track::bearingHistory in the header). Triangulation only ever
+    // needs a handful of well-spread observations -- keeping every
+    // sighting for a track's whole lifetime would grow unbounded for a
+    // long-dwelling object and cost more per-pass compute (every kept
+    // observation is one more line in the least-squares solve) for no
+    // accuracy benefit past a point. Oldest is dropped first once this
+    // is exceeded.
+    constexpr size_t kMaxBearingHistoryPerTrack = 12;
 
     constexpr double kEarthRadiusM = 6378137.0;
 
@@ -210,18 +246,14 @@ void DetectionLink::stop() {
 }
 
 void DetectionLink::previewLoop() {
-    // TEMPORARY diagnostic -- delete once you've confirmed the rebuilt
-    // .pyd is what's actually loaded. If you don't see this exact line
-    // in your console/stdout when the detection engine starts, the app
-    // is still running an OLDER build of this file (stale .pyd from a
-    // previous build directory, a locked file that silently failed to
-    // overwrite, a different copy earlier on the Python path, etc.) --
-    // that would fully explain unchanged behavior after a "rebuild" that
-    // didn't actually replace what's running. Check DroneBackend.__file__
-    // from Python at startup too, to see exactly which .pyd got imported.
-    std::cout << "[DetectionLink] preview thread active (kPreviewTickMs=40); "
+    // Was a TEMPORARY "which .pyd actually loaded" diagnostic during the
+    // CUDA bring-up; kept but now gated behind DETECTIONLINK_VERBOSE_LOGGING
+    // rather than deleted, since it's still the fastest way to catch a
+    // stale/locked .pyd not actually being replaced by a rebuild. Re-enable
+    // the macro above if a "rebuild" ever appears to have no effect.
+    DL_LOG(<< "[DetectionLink] preview thread active (kPreviewTickMs=40); "
         "inference thread runs independently (detectionIntervalMs="
-        << detectionIntervalMs_.load() << ")" << std::endl;
+        << detectionIntervalMs_.load() << ")");
 
     // Deliberately genuinely lightweight (frame grab + draw + JPEG-free
     // clone/rectangle/putText, no model, no georeferencing, no mutex
@@ -302,18 +334,21 @@ void DetectionLink::previewLoop() {
             std::chrono::steady_clock::now() - tickStart).count();
 
         if (++dbgTickCounter >= kDebugPrintEveryTicks) {
+            // Gated behind DETECTIONLINK_VERBOSE_LOGGING -- see macro def
+            // near the top of this file. Still tracked/reset every window
+            // regardless (the accumulators cost nothing meaningful), only
+            // the print itself is compiled out.
             int64_t nowWallMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
             int64_t lastInfMs = lastInferenceCompletedAtMs_.load();
-            std::cout << "[DetectionLink][perf][preview] "
+            DL_LOG(<< "[DetectionLink][perf][preview] "
                 << "avg_grab=" << (dbgGrabMsAccum / dbgTickCounter) << "ms "
                 << "avg_publish=" << (dbgPublishMsAccum / dbgTickCounter) << "ms "
                 << "avg_tick=" << (dbgTotalMsAccum / dbgTickCounter) << "ms "
                 << "(target=" << kPreviewTickMs << "ms, ~"
                 << (1000.0 / std::max(0.001, dbgTotalMsAccum / dbgTickCounter)) << "fps) "
                 << "boxes_age_ms=" << (lastInfMs > 0 ? (nowWallMs - lastInfMs) : -1)
-                << " empty_frames=" << dbgEmptyFrameTicksInWindow
-                << std::endl;
+                << " empty_frames=" << dbgEmptyFrameTicksInWindow);
             dbgTickCounter = 0; dbgGrabMsAccum = dbgPublishMsAccum = dbgTotalMsAccum = 0.0;
             dbgEmptyFrameTicksInWindow = 0;
         }
@@ -402,6 +437,18 @@ void DetectionLink::inferenceLoop() {
             if (raw.confidence >= confidenceThreshold_.load())
                 rawDetections.push_back(raw);
 
+        // Peek-match this pass's boxes against tracks_ from previous
+        // passes BEFORE computing geo candidates -- purely so a matched
+        // track's accumulated bearingHistory can be handed to
+        // rangeByTriangulation() below. matchRawToTracks() is pure/
+        // read-only (see its header comment), so this is safe to call
+        // again inside updateTracks() afterward with the exact same
+        // result; we pass this result straight through instead of
+        // letting updateTracks() recompute it, so there's only one
+        // source of truth for "which track did this raw detection match"
+        // this pass.
+        std::vector<int> matchedTrackIdx = matchRawToTracks(rawDetections);
+
         // Georeference every surviving raw detection ONCE, up front --
         // both so updateTracks() below can compare a continuing track's
         // fresh position against its last-recorded one (the actual
@@ -410,17 +457,24 @@ void DetectionLink::inferenceLoop() {
         // same ray/ranging math a second time.
         std::vector<GeoCandidate> geoCandidates;
         geoCandidates.reserve(rawDetections.size());
-        for (const auto& raw : rawDetections)
-            geoCandidates.push_back(computeGeoCandidate(raw, frame.cols, frame.rows, telemetry));
+        for (size_t ri = 0; ri < rawDetections.size(); ++ri) {
+            const std::vector<BearingObservation>* history = nullptr;
+            if (matchedTrackIdx[ri] >= 0)
+                history = &tracks_[static_cast<size_t>(matchedTrackIdx[ri])].bearingHistory;
+            geoCandidates.push_back(
+                computeGeoCandidate(rawDetections[ri], frame.cols, frame.rows, telemetry, history));
+        }
 
-        // Match this pass's boxes against tracks_ from previous passes.
+        // Commit this pass's matches/new-tracks/aging, using the SAME
+        // matchedTrackIdx computed above -- see updateTracks()'s header
+        // comment for why it takes this instead of recomputing its own.
         // assignments[i] corresponds to rawDetections[i]: which track it
         // belongs to (existing or brand new), and whether that track's
         // state (new track, moved enough, or refresh interval elapsed)
         // warrants writing a DetectionRecord this pass -- see
         // setTrackIouThreshold() etc. in the header for the full
         // rationale and its position-only re-ID limitations.
-        auto assignments = updateTracks(rawDetections, geoCandidates, nowMs);
+        auto assignments = updateTracks(rawDetections, geoCandidates, matchedTrackIdx, telemetry, nowMs);
 
         int recordsThisPass = 0;
         for (size_t i = 0; i < rawDetections.size(); ++i) {
@@ -493,13 +547,17 @@ void DetectionLink::inferenceLoop() {
         dbgPassMsAccum += durationMs;
 
         if (++dbgPassCounter >= kDebugPrintEveryPasses) {
-            std::cout << "[DetectionLink][perf][inference] "
+            // Gated behind DETECTIONLINK_VERBOSE_LOGGING -- see macro def
+            // near the top of this file. This was the line used to
+            // confirm backend=CUDA during bring-up; re-enable if you ever
+            // need to re-verify which backend is actually engaged, or to
+            // profile inference time after a model/export change.
+            DL_LOG(<< "[DetectionLink][perf][inference] "
                 << "avg_inference=" << (dbgInferMsAccum / dbgPassCounter) << "ms "
                 << "avg_pass_total=" << (dbgPassMsAccum / dbgPassCounter) << "ms "
                 << "(interval_target=" << intervalMs << "ms) "
                 << "records=" << dbgRecordsAccum
-                << (isUsingCuda() ? " backend=CUDA" : " backend=CPU")
-                << std::endl;
+                << (isUsingCuda() ? " backend=CUDA" : " backend=CPU"));
             dbgPassCounter = 0; dbgInferMsAccum = dbgPassMsAccum = 0.0; dbgRecordsAccum = 0;
         }
     }
@@ -621,11 +679,15 @@ std::vector<DetectionLink::RawDetection> DetectionLink::runInference(const cv::M
     // raw values on a test frame).
     cv::Mat out = output.reshape(1, output.size[1]);   // -> [maxDetections, 6]
 
-    // One-time diagnostic: print the first handful of real (non-padding)
-    // rows' raw model-space values before any of the corner/pixel-space
-    // assumptions below are applied to them. If boxes are coming out
-    // wrong/invisible, this tells you which assumption is actually wrong
-    // instead of guessing:
+    // One-time diagnostic (now gated behind DETECTIONLINK_VERBOSE_LOGGING --
+    // see macro def near the top of this file): prints the first handful
+    // of real (non-padding) rows' raw model-space values before any of
+    // the corner/pixel-space assumptions below are applied to them. Was
+    // used to confirm the [x1,y1,x2,y2,conf,cls] layout and pixel-space
+    // (not normalized) coordinates against this export -- that's now
+    // confirmed for yolo26m_main.onnx, so it's off by default. If a
+    // future re-export ever produces wrong/invisible boxes again,
+    // re-enable the macro and check:
     //   - x1/y1/x2/y2 all sitting in roughly 0.0-1.0 -> the export is
     //     normalized, not pixel-space; every ox1/oy1/ox2/oy2 below needs
     //     an extra "* inputSize" before the letterbox-undo math.
@@ -648,15 +710,17 @@ std::vector<DetectionLink::RawDetection> DetectionLink::runInference(const cv::M
         if (conf < 0.001f)   // padding rows; the real threshold is applied by the caller
             continue;
 
+#if DETECTIONLINK_VERBOSE_LOGGING
         if (debugRowsLogged.load() < 8) {
             int n = debugRowsLogged.fetch_add(1);
-            fprintf(stderr,
+            DL_LOG_ERR(
                 "[DetectionLink] DEBUG row %d: model-space x1=%.2f y1=%.2f "
                 "x2=%.2f y2=%.2f conf=%.3f cls=%d (inputSize=%d) -- see "
                 "runInference()'s comment above this loop for how to read "
                 "these.\n",
                 n, x1, y1, x2, y2, conf, classIndex, inputSize);
         }
+#endif
 
         // Undo letterbox: from inputSize-space back to original frame.
         float ox1 = (x1 - padX) / static_cast<float>(scale);
@@ -677,29 +741,56 @@ std::vector<DetectionLink::RawDetection> DetectionLink::runInference(const cv::M
 }
 
 DetectionLink::GeoCandidate DetectionLink::computeGeoCandidate(const RawDetection& raw,
-    int frameW, int frameH, const TelemetrySnapshot& telemetry) const {
+    int frameW, int frameH, const TelemetrySnapshot& telemetry,
+    const std::vector<BearingObservation>* history) const {
     GeoCandidate geo;
 
-    // Ground-plane and object-size ranging always agree on *direction*
-    // (same world ray) and only differ on *how far* -- see
-    // rangeByGroundPlane/rangeByObjectSize for why each one degrades in
-    // different situations.
+    // Ground-plane, triangulated, and object-size ranging always agree
+    // on *direction* (same world ray) and only differ on *how far* --
+    // see rangeByGroundPlane/rangeByTriangulation/rangeByObjectSize for
+    // why each one degrades in different situations.
     double ux = 0.0, uy = 0.0, uz = 0.0;
     if (!computeWorldRay(raw, frameW, frameH, telemetry, ux, uy, uz))
         return geo;
 
+    // Recorded regardless of whether any ranging method below succeeds
+    // -- this is what lets updateTracks() log a bearing observation for
+    // triangulation on every pass a track is seen, not only the passes
+    // that happened to get georeferenced some other way.
+    geo.rayValid = true;
+    geo.rayUnitNorth = ux;
+    geo.rayUnitEast = uy;
+
     RangeEstimate ground = rangeByGroundPlane(telemetry, ux, uy, uz);
+    RangeEstimate triangulated;
+    if (history && !history->empty())
+        triangulated = rangeByTriangulation(*history, ux, uy, telemetry);
     RangeEstimate bySize = rangeByObjectSize(raw, frameW, telemetry, ux, uy, uz);
 
-    // Prefer ground-plane when the ray is steep enough for it to be
-    // trustworthy (see setMinGroundRayComponent()); it needs no
-    // assumption about the object's real-world size. Otherwise prefer
-    // object-size if this class has a known width configured. If only
-    // one of the two produced a result, use whichever that is -- some
-    // georeference is better than none as long as we're honest about
-    // which method (and therefore which failure mode) produced it.
+    // Preference order, each one degrading in a different, complementary
+    // situation:
+    //   1. ground-plane, when the ray is steep enough to trust (see
+    //      setMinGroundRayComponent()) -- no assumed object size, no
+    //      dependence on track history length.
+    //   2. triangulated, when this track has enough accumulated parallax
+    //      (see setTriangulationMinBaselineM/setTriangulationMinBearingSpreadDeg)
+    //      -- also no assumed object size, and this is exactly the case
+    //      ground-plane can't handle: a shallow/forward-facing ray. This
+    //      is what lets a distance estimate keep refining pass-to-pass
+    //      as the drone moves, without needing the object's real-world
+    //      size at all.
+    //   3. object-size, when this class has a known width configured --
+    //      the fallback for a shallow ray with NOT enough parallax yet
+    //      (track just started, or the drone is flying straight at the
+    //      object with no lateral offset -- triangulation's own
+    //      degenerate case).
+    // If more than one produced a result, prefer in that order; if only
+    // one did, use whichever that is -- some georeference is better than
+    // none as long as we're honest (via geo.method) about which one
+    // produced it.
     const RangeEstimate* chosen = nullptr;
     if (ground.valid) chosen = &ground;
+    else if (triangulated.valid) chosen = &triangulated;
     else if (bySize.valid) chosen = &bySize;
 
     if (chosen) {
@@ -772,6 +863,19 @@ namespace {
         if (outBearingDeg < 0.0)
             outBearingDeg += 360.0;
     }
+
+    // Inverse of offsetLatLon() above -- same flat-earth approximation,
+    // consistent by construction so a round trip through both functions
+    // is exact. Used by rangeByTriangulation() to bring a track's PAST
+    // bearing observations (each stamped with the drone's lat/lon at the
+    // time) into the CURRENT pass's local north/east frame, so all of a
+    // track's observations can be compared/solved in one common frame.
+    void latLonToLocalMeters(double originLat, double originLon, double lat, double lon,
+        double& outNorthM, double& outEastM) {
+        double originLatRad = degToRad(originLat);
+        outNorthM = degToRad(lat - originLat) * kEarthRadiusM;
+        outEastM = degToRad(lon - originLon) * kEarthRadiusM * std::cos(originLatRad);
+    }
 }
 
 DetectionLink::RangeEstimate DetectionLink::rangeByGroundPlane(const TelemetrySnapshot& telemetry,
@@ -796,6 +900,93 @@ DetectionLink::RangeEstimate DetectionLink::rangeByGroundPlane(const TelemetrySn
     offsetLatLon(telemetry.latitude, telemetry.longitude, northM, eastM, est.lat, est.lon, est.bearingDeg);
     est.distanceM = t;
     est.method = "ground_plane";
+    est.valid = true;
+    return est;
+}
+
+DetectionLink::RangeEstimate DetectionLink::rangeByTriangulation(
+    const std::vector<BearingObservation>& history,
+    double curUnitNorth, double curUnitEast, const TelemetrySnapshot& telemetry) const {
+    RangeEstimate est;
+
+    // Every observation (history + this pass's own) reduced to: an
+    // observer position in meters, local to THIS pass's drone position,
+    // plus a horizontal-only unit bearing direction from there. Ray
+    // observations whose horizontal component is too small to normalize
+    // (camera pointed almost straight down/up for that sighting) are
+    // skipped -- they carry no usable bearing.
+    struct Obs { double oN, oE, dN, dE; };
+    std::vector<Obs> obs;
+    obs.reserve(history.size() + 1);
+
+    auto addObs = [&](double lat, double lon, double uN, double uE) {
+        double horizMag = std::sqrt(uN * uN + uE * uE);
+        if (horizMag < 1e-6)
+            return;
+        double oN = 0.0, oE = 0.0;
+        latLonToLocalMeters(telemetry.latitude, telemetry.longitude, lat, lon, oN, oE);
+        obs.push_back({ oN, oE, uN / horizMag, uE / horizMag });
+        };
+
+    for (const auto& h : history)
+        addObs(h.droneLat, h.droneLon, h.unitNorth, h.unitEast);
+    addObs(telemetry.latitude, telemetry.longitude, curUnitNorth, curUnitEast);   // oN=oE=0 for this one
+
+    if (obs.size() < 2)
+        return est;   // nothing to intersect yet -- first sighting of this track
+
+    // Degeneracy check: require real parallax, not just elapsed
+    // distance. A drone can rack up meters of movement while flying
+    // essentially straight at (or at a constant bearing past) the
+    // object -- large baseline, ~zero angular spread, and a
+    // numerically "valid" solve that's actually amplifying GPS/heading
+    // noise into a huge range error. Check every pair, not just
+    // first-vs-last, since a track's history can wander non-monotonically
+    // (e.g. an orbit, or a missed-then-reacquired pass).
+    double maxBaselineM = 0.0, maxSpreadDeg = 0.0;
+    for (size_t i = 0; i < obs.size(); ++i) {
+        for (size_t j = i + 1; j < obs.size(); ++j) {
+            double dN = obs[i].oN - obs[j].oN, dE = obs[i].oE - obs[j].oE;
+            maxBaselineM = std::max(maxBaselineM, std::sqrt(dN * dN + dE * dE));
+            double dot = obs[i].dN * obs[j].dN + obs[i].dE * obs[j].dE;
+            dot = std::max(-1.0, std::min(1.0, dot));
+            maxSpreadDeg = std::max(maxSpreadDeg, radToDeg(std::acos(dot)));
+        }
+    }
+    if (maxBaselineM < triangulationMinBaselineM_.load() ||
+        maxSpreadDeg < triangulationMinBearingSpreadDeg_.load())
+        return est;   // not enough parallax yet -- rangeByObjectSize() is the fallback for this case
+
+    // Least-squares intersection of all observation lines
+    // (P = O_i + t * D_i): minimize the sum of squared perpendicular
+    // distances from the solved point to every line. Each observation
+    // contributes the 2x2 projector onto the perpendicular of its own
+    // direction, (I - D_i * D_i^T); summing those gives a single 2x2
+    // normal-equations system, solved directly (no iteration needed at
+    // this dimensionality).
+    double A00 = 0.0, A01 = 0.0, A11 = 0.0, b0 = 0.0, b1 = 0.0;
+    for (const auto& o : obs) {
+        double p00 = 1.0 - o.dN * o.dN;
+        double p01 = -o.dN * o.dE;
+        double p11 = 1.0 - o.dE * o.dE;
+        A00 += p00; A01 += p01; A11 += p11;
+        b0 += p00 * o.oN + p01 * o.oE;
+        b1 += p01 * o.oN + p11 * o.oE;
+    }
+    double det = A00 * A11 - A01 * A01;
+    if (std::abs(det) < 1e-6)
+        return est;   // degenerate despite the spread check above -- be conservative
+
+    double targetN = (A11 * b0 - A01 * b1) / det;
+    double targetE = (A00 * b1 - A01 * b0) / det;
+
+    double distanceM = std::sqrt(targetN * targetN + targetE * targetE);
+    if (!(distanceM > 0.5) || distanceM > 5000.0)
+        return est;   // reject a nonsensical/blown-up solve rather than pass it through as real
+
+    offsetLatLon(telemetry.latitude, telemetry.longitude, targetN, targetE, est.lat, est.lon, est.bearingDeg);
+    est.distanceM = distanceM;
+    est.method = "triangulated";
     est.valid = true;
     return est;
 }
@@ -909,13 +1100,17 @@ std::vector<uchar> DetectionLink::getLatestAnnotatedFrameJpeg() const {
 
     int n = dbgCallCounter.fetch_add(1) + 1;
     if (n % kDebugPrintEveryCalls == 0) {
+        // Gated behind DETECTIONLINK_VERBOSE_LOGGING -- see macro def
+        // near the top of this file. Re-enable if the live-detections
+        // preview pane ever feels slow and you need to see where the
+        // time in this call is actually going.
         double totalMs = dbgCopyMs + dbgResizeMs + dbgEncodeMs;
-        std::cout << "[DetectionLink][perf] getLatestAnnotatedFrameJpeg: "
+        DL_LOG(<< "[DetectionLink][perf] getLatestAnnotatedFrameJpeg: "
             << "src=" << frame.cols << "x" << frame.rows
             << " encoded=" << toEncode.cols << "x" << toEncode.rows
             << " lock+copy=" << dbgCopyMs << "ms resize=" << dbgResizeMs
             << "ms imencode=" << dbgEncodeMs << "ms total=" << totalMs
-            << "ms jpeg_bytes=" << jpeg.size() << std::endl;
+            << "ms jpeg_bytes=" << jpeg.size());
     }
     return jpeg;
 }
@@ -982,30 +1177,30 @@ double DetectionLink::trackIou(const RawDetection& raw, const Track& track) {
     return unionArea > 0.0 ? interArea / unionArea : 0.0;
 }
 
-std::vector<DetectionLink::TrackAssignment> DetectionLink::updateTracks(
-    const std::vector<RawDetection>& rawDetections,
-    const std::vector<GeoCandidate>& geoCandidates, int64_t nowMs) {
-
-    std::vector<TrackAssignment> assignments(rawDetections.size());
-    std::vector<bool> rawMatched(rawDetections.size(), false);
-    const size_t originalTrackCount = tracks_.size();   // tracks_ grows below as new tracks are appended
-    std::vector<bool> trackMatched(originalTrackCount, false);
+std::vector<int> DetectionLink::matchRawToTracks(const std::vector<RawDetection>& rawDetections) const {
+    std::vector<int> matched(rawDetections.size(), -1);
+    std::vector<bool> rawTaken(rawDetections.size(), false);
+    std::vector<bool> trackTaken(tracks_.size(), false);
 
     // Greedy IoU matching: consider every (raw detection, track) pair
     // with matching class and IoU above threshold, take the best pair
     // first, remove both from consideration, repeat. Simple O(n*m) --
     // fine at the handful of simultaneous detections this app expects;
     // swap for a proper Hungarian assignment only if that stops being
-    // true.
+    // true. Pure/read-only: does not touch tracks_ at all, so it's safe
+    // to call from inferenceLoop() as a "preview" match before
+    // updateTracks() runs its own (identical, since it's the same
+    // function) real assignment -- see this function's declaration in
+    // the header for why that split exists.
     double iouThreshold = trackIouThreshold_.load();
     while (true) {
         double bestIou = iouThreshold;
         int bestRawIdx = -1, bestTrackIdx = -1;
         for (size_t ri = 0; ri < rawDetections.size(); ++ri) {
-            if (rawMatched[ri])
+            if (rawTaken[ri])
                 continue;
             for (size_t ti = 0; ti < tracks_.size(); ++ti) {
-                if (trackMatched[ti])
+                if (trackTaken[ti])
                     continue;
                 if (tracks_[ti].classIndex != rawDetections[ri].classIndex)
                     continue;
@@ -1020,11 +1215,32 @@ std::vector<DetectionLink::TrackAssignment> DetectionLink::updateTracks(
         if (bestRawIdx < 0)
             break;   // no pair left clears the IoU threshold
 
-        rawMatched[bestRawIdx] = true;
-        trackMatched[bestTrackIdx] = true;
+        rawTaken[bestRawIdx] = true;
+        trackTaken[bestTrackIdx] = true;
+        matched[bestRawIdx] = bestTrackIdx;
+    }
+    return matched;
+}
 
-        Track& track = tracks_[bestTrackIdx];
-        const RawDetection& raw = rawDetections[bestRawIdx];
+std::vector<DetectionLink::TrackAssignment> DetectionLink::updateTracks(
+    const std::vector<RawDetection>& rawDetections,
+    const std::vector<GeoCandidate>& geoCandidates,
+    const std::vector<int>& matchedTrackIdx,
+    const TelemetrySnapshot& telemetry, int64_t nowMs) {
+
+    std::vector<TrackAssignment> assignments(rawDetections.size());
+    const size_t originalTrackCount = tracks_.size();   // tracks_ grows below as new tracks are appended
+    std::vector<bool> trackMatched(originalTrackCount, false);
+
+    for (size_t ri = 0; ri < rawDetections.size(); ++ri) {
+        int ti = matchedTrackIdx[ri];
+        if (ti < 0)
+            continue;   // handled in the "brand-new track" loop below
+
+        trackMatched[static_cast<size_t>(ti)] = true;
+
+        Track& track = tracks_[static_cast<size_t>(ti)];
+        const RawDetection& raw = rawDetections[ri];
         track.lastX = raw.x; track.lastY = raw.y; track.lastW = raw.w; track.lastH = raw.h;
         track.lastSeenMs = nowMs;
         track.missedPasses = 0;
@@ -1037,7 +1253,7 @@ std::vector<DetectionLink::TrackAssignment> DetectionLink::updateTracks(
         // (trackId) stable across passes.
         bool shouldRecord = false;
         int64_t sinceLastRecordMs = nowMs - track.lastRecordMs;
-        const GeoCandidate& geo = geoCandidates[bestRawIdx];
+        const GeoCandidate& geo = geoCandidates[ri];
 
         if (sinceLastRecordMs >= trackRefreshIntervalMs_.load()) {
             shouldRecord = true;
@@ -1062,14 +1278,33 @@ std::vector<DetectionLink::TrackAssignment> DetectionLink::updateTracks(
         // so leave shouldRecord false and rely purely on the refresh
         // interval above to keep this track's entry from going stale.
 
-        assignments[bestRawIdx].trackId = track.trackId;
-        assignments[bestRawIdx].shouldRecord = shouldRecord;
+        // Append this pass's bearing observation regardless of whether
+        // shouldRecord ended up true -- an un-recorded sighting is still
+        // a real ray the drone took, and is exactly the parallax a
+        // FUTURE pass's rangeByTriangulation() needs. Only appended when
+        // computeGeoCandidate() actually got a ray (geo.rayValid) -- see
+        // that function for the one case it can't (telemetry invalid or
+        // a zero-size frame).
+        if (geo.rayValid) {
+            BearingObservation obs;
+            obs.timestampMs = nowMs;
+            obs.droneLat = telemetry.latitude;
+            obs.droneLon = telemetry.longitude;
+            obs.unitNorth = geo.rayUnitNorth;
+            obs.unitEast = geo.rayUnitEast;
+            track.bearingHistory.push_back(obs);
+            if (track.bearingHistory.size() > kMaxBearingHistoryPerTrack)
+                track.bearingHistory.erase(track.bearingHistory.begin());
+        }
+
+        assignments[ri].trackId = track.trackId;
+        assignments[ri].shouldRecord = shouldRecord;
     }
 
     // Unmatched raw detections start brand-new tracks -- always recorded
     // immediately, same as the pre-tracking behavior for a first sighting.
     for (size_t ri = 0; ri < rawDetections.size(); ++ri) {
-        if (rawMatched[ri])
+        if (matchedTrackIdx[ri] >= 0)
             continue;
         Track track;
         track.trackId = nextTrackId_++;
@@ -1078,6 +1313,18 @@ std::vector<DetectionLink::TrackAssignment> DetectionLink::updateTracks(
         track.lastW = rawDetections[ri].w; track.lastH = rawDetections[ri].h;
         track.lastSeenMs = nowMs;
         track.missedPasses = 0;
+
+        const GeoCandidate& geo = geoCandidates[ri];
+        if (geo.rayValid) {
+            BearingObservation obs;
+            obs.timestampMs = nowMs;
+            obs.droneLat = telemetry.latitude;
+            obs.droneLon = telemetry.longitude;
+            obs.unitNorth = geo.rayUnitNorth;
+            obs.unitEast = geo.rayUnitEast;
+            track.bearingHistory.push_back(obs);
+        }
+
         tracks_.push_back(track);
 
         assignments[ri].trackId = track.trackId;

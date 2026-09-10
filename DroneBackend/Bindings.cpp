@@ -770,10 +770,26 @@ PYBIND11_MODULE(DroneBackend, m) {
             py::arg("v"),
             "Ray-downward-component threshold (0-1, default 0.12) below "
             "which ground-plane ranging is skipped in favor of "
-            "object-size ranging (when available for that class) -- see "
+            "triangulated/object-size ranging (when available) -- see "
             "the header comment on rangeByGroundPlane() for why a "
             "near-horizontal ray makes ground-plane intersection "
             "unreliable regardless of how accurate the altitude reading is.")
+        .def("set_triangulation_min_baseline_m", &DetectionLink::setTriangulationMinBaselineM,
+            py::arg("m"),
+            "Minimum straight-line distance (metres, default 5.0) the "
+            "drone must have moved between the most different pair of a "
+            "track's bearing observations before a triangulated fix is "
+            "trusted for it -- see rangeByTriangulation()'s header "
+            "comment for why this and the bearing-spread threshold below "
+            "are both needed to catch a degenerate (no-parallax) case.")
+        .def("set_triangulation_min_bearing_spread_deg", &DetectionLink::setTriangulationMinBearingSpreadDeg,
+            py::arg("deg"),
+            "Minimum angular spread (degrees, default 5.0) between the "
+            "most different pair of bearing directions used for a "
+            "triangulated fix -- catches the case where the drone moved "
+            "plenty of metres but essentially straight at (or past, at "
+            "constant bearing) the object, which gives a large baseline "
+            "but almost no actual parallax to triangulate with.")
         .def("set_track_iou_threshold", &DetectionLink::setTrackIouThreshold,
             py::arg("iou"),
             "Minimum IoU (0-1, default 0.3) between a raw box and a "

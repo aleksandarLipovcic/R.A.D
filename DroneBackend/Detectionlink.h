@@ -189,6 +189,32 @@ public:
     // still used as a last resort rather than dropping the detection.
     void setMinGroundRayComponent(double v) { minGroundRayComponent_.store(v); }
 
+    // ── Bearings-only triangulation (rangeByTriangulation()) ─────────
+    //
+    // Minimum straight-line distance, in meters, the drone must have
+    // moved between the OLDEST and the farthest-apart pair of bearing
+    // observations used for a triangulated fix on a given track, before
+    // that fix is trusted. Below this, the observations are too close
+    // together in space to fix a distant object's range reliably --
+    // small GPS/heading noise turns into a huge range error, the same
+    // failure mode ground-plane has at a shallow ray, just caused by
+    // insufficient parallax instead of a shallow angle. Default 5.0m.
+    // Lower this only if your GPS/heading accuracy is good enough to
+    // trust a shorter baseline; raise it if triangulated fixes still
+    // look noisy on the map.
+    void setTriangulationMinBaselineM(double m) { triangulationMinBaselineM_.store(m); }
+
+    // Minimum angular spread, in degrees, between the most different
+    // pair of bearing directions used for a triangulated fix. This is
+    // the OTHER half of the degeneracy check alongside the baseline
+    // above: a drone can move plenty of meters while flying essentially
+    // straight at (or straight past, at constant bearing) the object,
+    // which gives a large baseline but almost no actual parallax to
+    // triangulate with. Default 5.0 degrees. This is exactly the
+    // situation rangeByObjectSize() stays useful for -- see that
+    // method's own doc comment.
+    void setTriangulationMinBearingSpreadDeg(double deg) { triangulationMinBearingSpreadDeg_.store(deg); }
+
     // ── Object tracking / re-identification (call before or during start()) ──
     //
     // Detection passes run every detectionIntervalMs_ (default 250ms) --
@@ -299,17 +325,47 @@ private:
 
     std::vector<RawDetection> runInference(const cv::Mat& frame);
 
+    // A single pass's bearing to a tracked object, kept around across
+    // passes so a LATER pass -- once the drone has moved -- can
+    // triangulate against it. Deliberately minimal: just enough to
+    // re-derive the observer's local position (via the stored lat/lon)
+    // and the horizontal ray direction at the time; no range/size
+    // assumption baked in here at all, which is the whole point versus
+    // rangeByObjectSize().
+    struct BearingObservation {
+        int64_t timestampMs = 0;
+        double droneLat = 0.0, droneLon = 0.0;
+        double unitNorth = 0.0, unitEast = 0.0;   // horizontal-only, unit length
+    };
+
     // Result of a single ranging attempt -- kept separate from the
-    // simpler georeference() this replaces so ground-plane and
-    // object-size distances can each be computed and compared instead
-    // of the first one found silently winning.
+    // simpler georeference() this replaces so ground-plane,
+    // triangulated, and object-size distances can each be computed and
+    // compared instead of the first one found silently winning.
     struct RangeEstimate {
         bool valid = false;
         double lat = 0.0, lon = 0.0;
         double distanceM = 0.0;
         double bearingDeg = 0.0;
-        std::string method;   // "ground_plane" or "object_size"
+        std::string method;   // "ground_plane", "triangulated", or "object_size"
     };
+
+    // Least-squares intersection of this track's accumulated bearing
+    // history (see BearingObservation above) plus this pass's own ray --
+    // NO assumed real-world object size, NO altitude/attitude
+    // trustworthiness requirement (unlike ground-plane). Needs real
+    // parallax to be trustworthy: degenerates (returns invalid) when the
+    // drone has been flying straight at the object with no lateral
+    // offset between observations, or when there's only one usable
+    // sighting so far -- see setTriangulationMinBaselineM() /
+    // setTriangulationMinBearingSpreadDeg() for the thresholds that
+    // guard against a numerically "valid" but noise-dominated fix in
+    // that near-degenerate case. That's also exactly the situation
+    // rangeByObjectSize() is still useful for, which is why
+    // computeGeoCandidate() tries both rather than one replacing the
+    // other.
+    RangeEstimate rangeByTriangulation(const std::vector<BearingObservation>& history,
+        double curUnitNorth, double curUnitEast, const TelemetrySnapshot& telemetry) const;
 
     // Builds the world-space (NED) unit ray for one detection: composes
     // the pixel offset + horizontal FOV into a camera-space ray, then
@@ -355,9 +411,22 @@ private:
         double distanceM = 0.0;
         double bearingDeg = 0.0;
         std::string method;
+
+        // The horizontal-only component of this detection's world ray
+        // (north/east, unit length -- see computeWorldRay()), filled
+        // whenever the ray itself could be computed, REGARDLESS of
+        // whether ground-plane/triangulation/object-size ranging
+        // actually produced a position. This is what lets updateTracks()
+        // log a bearing observation for triangulation on every pass a
+        // track is seen, not only the passes where it happened to get
+        // georeferenced some other way -- an un-ranged sighting today is
+        // still useful parallax for a triangulated fix once the drone
+        // has moved and there are 2+ sightings of the same track.
+        bool rayValid = false;
+        double rayUnitNorth = 0.0, rayUnitEast = 0.0;
     };
     GeoCandidate computeGeoCandidate(const RawDetection& raw, int frameW, int frameH,
-        const TelemetrySnapshot& telemetry) const;
+        const TelemetrySnapshot& telemetry, const std::vector<BearingObservation>* history) const;
 
     // ── Tracking state (see setTrackIouThreshold() etc. above) ────────
     // Owned and touched ONLY by inferenceLoop() -- previewLoop() never
@@ -372,6 +441,16 @@ private:
         int64_t lastSeenMs = 0;       // last pass this track was matched
         int64_t lastRecordMs = 0;     // last pass a DetectionRecord was written for this track
         int missedPasses = 0;
+
+        // Rolling history of this track's bearing observations (see
+        // BearingObservation above), oldest first, capped at
+        // kMaxBearingHistoryPerTrack (Detectionlink.cpp) -- appended to
+        // on EVERY pass this track is seen (matched or freshly created),
+        // regardless of whether that pass's own ranging succeeded, so a
+        // string of un-ranged forward-flight sightings still accumulates
+        // useful parallax for rangeByTriangulation() once the drone has
+        // moved enough.
+        std::vector<BearingObservation> bearingHistory;
     };
     std::vector<Track> tracks_;
     uint64_t nextTrackId_ = 1;
@@ -379,17 +458,35 @@ private:
     // IoU between a raw detection's box and a track's last matched box.
     static double trackIou(const RawDetection& raw, const Track& track);
 
-    // Matches this pass's raw detections against tracks_ (greedy,
-    // highest-IoU-first, same class required), updates tracks_ in place,
-    // ages out/removes tracks that exceeded trackMaxMissedPasses_, and
-    // returns, for each raw detection (by index into rawDetections,
-    // parallel array), the trackId it was assigned (existing or freshly
-    // created) plus whether a new DetectionRecord should be written for
-    // it this pass. geoCandidates must be the same size as
-    // rawDetections (index-parallel) -- see setTrackMoveThresholdM() /
+    // Pure/read-only greedy IoU+class matching of this pass's raw
+    // detections against tracks_ AS THEY STOOD AT THE END OF THE
+    // PREVIOUS PASS -- no mutation, no new tracks created. Returns, per
+    // rawDetections index, the matched tracks_ index or -1. Factored out
+    // of updateTracks() so inferenceLoop() can look up an existing
+    // track's bearingHistory (to feed rangeByTriangulation() via
+    // computeGeoCandidate()) BEFORE updateTracks() itself runs and
+    // mutates tracks_ -- both call sites use this exact same function,
+    // so the "preview" match inferenceLoop() sees for history lookup is
+    // guaranteed identical to the "real" match updateTracks() commits
+    // (same algorithm, same inputs, called before either mutates
+    // anything).
+    std::vector<int> matchRawToTracks(const std::vector<RawDetection>& rawDetections) const;
+
+    // Matches this pass's raw detections against tracks_ (using the
+    // already-computed matchedTrackIdx from matchRawToTracks() above --
+    // see that function's comment for why this isn't recomputed here),
+    // updates tracks_ in place (position, bearingHistory, missed-pass
+    // aging), ages out/removes tracks that exceeded
+    // trackMaxMissedPasses_, and returns, for each raw detection (by
+    // index into rawDetections, parallel array), the trackId it was
+    // assigned (existing or freshly created) plus whether a new
+    // DetectionRecord should be written for it this pass. geoCandidates
+    // and matchedTrackIdx must both be the same size as rawDetections
+    // (index-parallel) -- see setTrackMoveThresholdM() /
     // setTrackRefreshIntervalMs() for what "should [record]" means for a
     // continuing (already-tracked) detection; a brand new track is
-    // always recorded.
+    // always recorded. telemetry is only used here to stamp each
+    // BearingObservation with the drone's position at this pass.
     struct TrackAssignment {
         uint64_t trackId = 0;
         bool shouldRecord = false;
@@ -397,6 +494,8 @@ private:
     std::vector<TrackAssignment> updateTracks(
         const std::vector<RawDetection>& rawDetections,
         const std::vector<GeoCandidate>& geoCandidates,
+        const std::vector<int>& matchedTrackIdx,
+        const TelemetrySnapshot& telemetry,
         int64_t nowMs);
 
     std::atomic<double> trackIouThreshold_{ 0.3 };
@@ -417,6 +516,8 @@ private:
     std::atomic<bool> useCuda_{ false };
     std::atomic<bool> usingCuda_{ false };
     std::atomic<double> minGroundRayComponent_{ 0.12 };
+    std::atomic<double> triangulationMinBaselineM_{ 5.0 };
+    std::atomic<double> triangulationMinBearingSpreadDeg_{ 5.0 };
 
     mutable std::mutex classWidthsMutex_;
     std::unordered_map<std::string, double> knownObjectWidthsM_;
