@@ -91,11 +91,27 @@ FIXES vs previous version
       that module's docstring) opened via the new "🎯 Detections" toolbar
       button. See DroneCockpitApp._get_detection_telemetry /
       _open_detection_window / _pump_detection_records below.
+  11. Console cleanup now that CUDA bring-up is done: the one-off "which
+      DroneBackend.pyd got imported" diagnostic is gone, and the routine
+      LayoutStore load/save confirmations, viewport-clamp notices, and
+      inference-backend confirmation are gated behind
+      COCKPIT_VERBOSE_LOGGING=1 (off by default) instead of always
+      printing. Genuine warnings/errors are unaffected -- see that flag's
+      comment above _register_dll_directories() for the full rationale.
+  12. Camera mount angle (mode + tilt/pan) now persists across restarts as
+      part of the active layout profile, the same way panel geometry
+      does -- see LayoutStore's on-disk format and
+      DroneCockpitApp._current_snapshot()/_apply_layout() below. Previously
+      it silently reset to CAMERA_MOUNT_TILT_DEG/CAMERA_MOUNT_PAN_DEG
+      (both 0) every launch, which meant georeferencing was quietly wrong
+      until you reopened the "📐 Camera Angle" dialog and re-entered
+      whatever the camera was actually mounted at.
 """
 
 import sys
 import os
 import json
+import math
 import threading
 from pathlib import Path
 from typing import Optional
@@ -179,13 +195,24 @@ _register_dll_directories()
 
 import DroneBackend
 
-# TEMPORARY diagnostic -- delete once you've confirmed which DroneBackend
-# .pyd is actually loaded. If the live detection feed still doesn't speed
-# up after a rebuild, check this path first: a stale copy earlier on
-# sys.path (site-packages, an old build/ or dist/ folder, a leftover
-# .pyd next to a different script) will get imported silently instead of
-# your freshly built one, with no error at all.
-print(f"[diagnostic] DroneBackend loaded from: {DroneBackend.__file__}")
+# ── Verbose diagnostic logging ──────────────────────────────────────────────
+# Same convention as DETECTIONLINK_VERBOSE_LOGGING in Detectionlink.cpp:
+# routine/diagnostic console output (LayoutStore load/save confirmations,
+# viewport-clamp notices, which inference backend got engaged) is off by
+# default now that the CUDA build is confirmed working and this app has
+# moved past bring-up. Set COCKPIT_VERBOSE_LOGGING=1 in the environment to
+# bring all of it back, e.g. while diagnosing a new DroneBackend.pyd build,
+# a fresh CUDA/cuDNN install, or a layout-persistence bug. This does NOT
+# affect genuine warnings/errors (missing bindings, failed DLL registration,
+# a stale .pyd, DetectionLink/VideoLink start failures) -- those stay on
+# regardless, since silencing them would hide real problems.
+COCKPIT_VERBOSE_LOGGING = os.environ.get("COCKPIT_VERBOSE_LOGGING", "0") == "1"
+
+
+def _vlog(msg: str) -> None:
+    if COCKPIT_VERBOSE_LOGGING:
+        print(msg)
+
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 #
@@ -300,19 +327,24 @@ DETECTION_KNOWN_OBJECT_WIDTHS_M = {
 # the controls below expose a pan value too, ready for the day the
 # gimbal's second axis is wired in).
 #
-# These two constants are now only the STARTUP defaults for the
-# "📐 Camera Angle" toolbar control (see __init__'s
-# self._camera_tilt_deg/self._camera_pan_deg) -- once the app is running,
-# set the actual angle live from that toolbar button instead of editing
-# these and restarting. They still matter as the value the app opens
-# with, so keep them roughly matched to how you usually mount the camera.
+# These two constants are now only the FALLBACK defaults -- used to seed
+# the very first layout profile, and to fill in a saved profile that
+# predates this field or has a missing/malformed "camera_angle" entry
+# (see LayoutStore's on-disk format and DroneCockpitApp._apply_layout()).
+# Once the app has run once, the mode/tilt/pan you set from the
+# "📐 Camera Angle" toolbar button is saved into the active layout
+# profile (on dialog close, and again at shutdown as a safety net) and
+# restored from there on every future launch, the same way panel
+# geometry is -- editing these two constants and restarting no longer
+# has any effect once a profile with its own "camera_angle" exists.
 #
 # Wire snapshot.gimbal_pan_deg/gimbal_tilt_deg to a real SimpleBGC
 # readback in _get_camera_mount_angle() once the gimbal is actually
-# powered ("auto" mode already exists as a placeholder for exactly that);
-# until then, georeferenced pins will drift off if the toolbar's Manual
-# value doesn't match how the camera is actually physically angled right
-# now.
+# powered ("auto" mode already exists as a placeholder for exactly that,
+# and its choice persists across restarts the same as Manual's values
+# do); until then, georeferenced pins will drift off if the toolbar's
+# Manual value doesn't match how the camera is actually physically
+# angled right now.
 #
 # Tilting toward 90 (straight down) during search sweeps is the single
 # biggest improvement available to ground-plane ranging accuracy -- see
@@ -902,11 +934,25 @@ class LayoutStore:
                 "panels": {
                     "<panel_name>": {"x":.., "y":.., "w":.., "h":.., "visible":..},
                     ...
+                },
+                "camera_angle": {
+                    "mode": "manual",   # or "auto"
+                    "tilt_deg": 0.0,    # 0=forward, 90=down, 180=back, -=up
+                    "pan_deg": 0.0
                 }
             },
             ...
           }
         }
+
+    "camera_angle" mirrors the "📐 Camera Angle" toolbar dialog's state
+    (see DroneCockpitApp._current_snapshot()/_apply_layout()) -- saved and
+    restored together with panel geometry so the camera mount angle used
+    for detection georeferencing survives a restart the same way the rest
+    of the layout does. A profile saved before this field existed simply
+    has no "camera_angle" key; _apply_layout() falls back to the
+    CAMERA_MOUNT_TILT_DEG/CAMERA_MOUNT_PAN_DEG module constants in that
+    case rather than erroring.
 
     If the new file doesn't exist yet but a legacy single-profile
     cockpit_layout.json does, it is transparently imported as a profile
@@ -934,7 +980,7 @@ class LayoutStore:
             try:
                 with open(self._legacy_path) as fh:
                     legacy = json.load(fh)
-                print(f"[LayoutStore] migrating legacy layout file "
+                _vlog(f"[LayoutStore] migrating legacy layout file "
                       f"→ profile '{_DEFAULT_PROFILE_NAME}'")
                 return {
                     "active_profile": _DEFAULT_PROFILE_NAME,
@@ -949,7 +995,7 @@ class LayoutStore:
         try:
             with open(self._path, "w") as fh:
                 json.dump(self._data, fh, indent=2)
-            print(f"[LayoutStore] saved → {self._path}")
+            _vlog(f"[LayoutStore] saved → {self._path}")
         except Exception as e:
             print(f"[LayoutStore] save failed: {e}")
 
@@ -1340,24 +1386,37 @@ class DroneCockpitApp:
         self.root.resizable(True, True)
 
         # ── Camera mount angle (manual toolbar control) ──────────────────────
-        # Source of truth for CAMERA_MOUNT_TILT_DEG/CAMERA_MOUNT_PAN_DEG now
-        # that they're live-editable from the "📐 Camera Angle" toolbar
-        # button instead of only being module constants you'd hand-edit and
-        # restart for. Deliberately plain floats behind a lock, NOT a Tk
-        # StringVar/DoubleVar: _get_detection_telemetry() (which reads this
-        # via _get_camera_mount_angle()) runs on DetectionLink's own C++
-        # worker thread, not the Tk thread -- touching a Tk variable from
-        # there is not safe. The dialog's Tk widgets update this lock-
-        # protected state from their callbacks (Tk thread); this getter
-        # reads it back (whichever thread calls it).
+        # Source of truth for the current mode/tilt/pan while the app is
+        # running, live-editable from the "📐 Camera Angle" toolbar button.
+        # These three are just the IN-MEMORY startup values -- the real
+        # source of truth on disk is the active layout profile's
+        # "camera_angle" entry (see LayoutStore's on-disk format and
+        # _apply_layout() below), which is what __init__ actually loads
+        # into these fields a few lines down, via _apply_layout(). The
+        # CAMERA_MOUNT_TILT_DEG/CAMERA_MOUNT_PAN_DEG module constants only
+        # matter as a fallback for a profile with no saved camera_angle
+        # yet (e.g. the very first run). Deliberately plain floats behind
+        # a lock, NOT a Tk StringVar/DoubleVar: _get_detection_telemetry()
+        # (which reads this via _get_camera_mount_angle()) runs on
+        # DetectionLink's own C++ worker thread, not the Tk thread --
+        # touching a Tk variable from there is not safe. The dialog's Tk
+        # widgets update this lock-protected state from their callbacks
+        # (Tk thread); this getter reads it back (whichever thread calls
+        # it).
         self._camera_angle_lock = threading.Lock()
-        # "manual" or "auto". Genuinely should default to "auto" once the
-        # SimpleBGC gimbal is electrically wired and its IMU-based attitude
-        # readback exists -- there is no such readback yet (see
-        # _get_camera_mount_angle()'s TODO below), so "auto" would silently
-        # do nothing useful right now. Defaulting to "manual" is the
-        # correct choice for THIS moment, not the long-term intent -- flip
-        # this back to "auto" once real feedback is wired in.
+        # Handle to the single open "Camera Angle" Toplevel, or None when
+        # closed -- see _show_camera_angle_dialog() for why this exists.
+        self._camera_angle_win = None
+        # "manual" or "auto" -- overwritten below by _apply_layout() with
+        # whatever was last saved, if anything was. Genuinely should
+        # default to "auto" once the SimpleBGC gimbal is electrically
+        # wired and its IMU-based attitude readback exists -- there is no
+        # such readback yet (see _get_camera_mount_angle()'s TODO below),
+        # so "auto" would silently do nothing useful right now (it still
+        # falls back to whatever the Manual tilt/pan were last set to).
+        # "manual" is the correct fallback for THIS moment, not the
+        # long-term intent -- flip CAMERA_MOUNT_* mode handling over to
+        # defaulting "auto" once real feedback is wired in.
         self._camera_angle_mode = "manual"
         self._camera_tilt_deg = CAMERA_MOUNT_TILT_DEG
         self._camera_pan_deg = CAMERA_MOUNT_PAN_DEG
@@ -1745,8 +1804,38 @@ class DroneCockpitApp:
         apply live (no separate Apply/OK step) so you can nudge tilt and
         immediately see the toolbar label update to confirm what's being
         fed into georeferencing.
+
+        Singleton dialog: repeated clicks on the toolbar button used to
+        spawn a brand new Toplevel every time (nothing ever tracked
+        whether one was already open), so mashing the button stacked up
+        N duplicate windows, each with its own pair of sliders all
+        writing to the same underlying state. Data was never actually
+        corrupted (every instance shares self._camera_tilt_deg/_pan_deg
+        under the same lock) but it looked broken and was confusing to
+        use. Now we keep a handle to the live window and just raise/focus
+        it on repeat clicks instead of creating another one.
         """
+        existing = getattr(self, "_camera_angle_win", None)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_force()
+            return
+
         win = tk.Toplevel(self.root)
+        self._camera_angle_win = win
+
+        def on_close():
+            self._camera_angle_win = None
+            # Persist mode/tilt/pan into the active layout profile now,
+            # same as any other layout edit -- don't wait for app
+            # shutdown (shutdown() also persists as a safety net, but a
+            # crash or kill between now and then would otherwise lose
+            # whatever was just set here).
+            self._persist_active()
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
         win.title("Camera Angle")
         win.configure(bg="#0f1428")
         win.resizable(False, False)
@@ -1803,10 +1892,12 @@ class DroneCockpitApp:
         def on_tilt(v):
             self._set_camera_mount_angle(tilt_deg=float(v))
             self._refresh_camera_angle_label()
+            redraw_indicator()
 
         def on_pan(v):
             self._set_camera_mount_angle(pan_deg=float(v))
             self._refresh_camera_angle_label()
+            redraw_indicator()
 
         tk.Label(
             manual_frame, text="Tilt (0=forward, 90=down, 180=back, -=up)",
@@ -1850,10 +1941,112 @@ class DroneCockpitApp:
         pan_scale.pack(fill="x", pady=(0, 10))
         interactive_widgets.append(pan_scale)
 
+        # ── 3D-ish orientation indicator ───────────────────────────────
+        # A schematic wireframe camera (box body + lens cone) rotated
+        # live by the tilt/pan sliders above, drawn with a simple
+        # isometric projection -- no extra dependency, just stdlib
+        # `math` and Canvas line/polygon primitives. This is a sanity
+        # check while setting the mount angle, not a real 3D renderer.
+        # A dashed arrow marks the drone's fixed forward-flight
+        # direction so tilt/pan reads as "relative to the nose", which
+        # is what matters when interpreting georeferenced detections.
+        indicator_frame = tk.Frame(win, bg="#0f1428")
+        indicator_frame.pack(fill="x", padx=14, pady=(4, 4))
+
+        _CANVAS_W, _CANVAS_H = 252, 190
+        indicator_canvas = tk.Canvas(
+            indicator_frame, width=_CANVAS_W, height=_CANVAS_H, bg="#0a0e1e",
+            highlightthickness=1, highlightbackground="#1c2c54",
+        )
+        indicator_canvas.pack()
+
+        tk.Label(
+            indicator_frame,
+            text="Dashed = drone nose (forward flight)   Solid cone = camera view",
+            fg="#5a7098", bg="#0f1428", font=("Consolas", 7),
+        ).pack(anchor="w", pady=(3, 0))
+
+        _ISO_COS30 = math.cos(math.radians(30))
+        _ISO_SIN30 = math.sin(math.radians(30))
+        _CX, _CY, _SCALE = _CANVAS_W // 2, _CANVAS_H // 2 + 6, 46
+
+        def _rotate(pt, tilt_deg, pan_deg):
+            """Local camera-frame point (X=right, Y=forward, Z=up) ->
+            world frame. Tilt (pitch about X) is applied first -- the
+            camera nods up/down on its own mount -- then pan (yaw about
+            Z) swings the whole tilted assembly left/right, matching a
+            real pan-tilt head. Sign convention matches the slider
+            labels: tilt 90=down, -90=up; must mirror
+            _get_camera_mount_angle()'s tilt/pan meaning exactly, since
+            this is purely a visual and never feeds georeferencing
+            itself."""
+            x, y, z = pt
+            t = math.radians(tilt_deg)
+            y, z = y * math.cos(t) + z * math.sin(t), -y * math.sin(t) + z * math.cos(t)
+            p = math.radians(pan_deg)
+            x, y = x * math.cos(p) - y * math.sin(p), x * math.sin(p) + y * math.cos(p)
+            return (x, y, z)
+
+        def _project(pt):
+            x, y, z = pt
+            sx = (x - y) * _ISO_COS30
+            sy = (x + y) * _ISO_SIN30 - z
+            return (_CX + sx * _SCALE, _CY - sy * _SCALE)
+
+        # Camera body (box) + lens cone, in the camera's own local frame.
+        hw, hd, hh = 0.42, 0.5, 0.34
+        _BODY = [
+            (-hw, -hd, -hh), (hw, -hd, -hh), (hw, -hd, hh), (-hw, -hd, hh),  # back face
+            (-hw,  hd, -hh), (hw,  hd, -hh), (hw,  hd, hh), (-hw,  hd, hh),  # front face
+        ]
+        _BODY_EDGES = [
+            (0, 1), (1, 2), (2, 3), (3, 0),   # back face
+            (4, 5), (5, 6), (6, 7), (7, 4),   # front face
+            (0, 4), (1, 5), (2, 6), (3, 7),   # connecting edges
+        ]
+        _LENS_TIP = (0, hd + 0.55, 0)
+        _LENS_FRONT_CORNERS = (4, 5, 6, 7)  # front-face corners fan out to the tip
+
+        def redraw_indicator(*_args):
+            tilt_deg, pan_deg = self._get_camera_mount_angle()
+            indicator_canvas.delete("all")
+
+            # Fixed ground reference + dashed "nose" arrow -- neither
+            # rotates; they're the frame the camera orientation is
+            # judged against.
+            ground = [(-1.3, -1.3, -hh - 0.02), (1.3, -1.3, -hh - 0.02),
+                      (1.3, 1.3, -hh - 0.02), (-1.3, 1.3, -hh - 0.02)]
+            gpts = [c for p in ground for c in _project(p)]
+            indicator_canvas.create_polygon(*gpts, outline="#1c2c54", fill="", width=1)
+            nose_from = _project((0, -1.3, -hh - 0.02))
+            nose_to = _project((0, 1.55, -hh - 0.02))
+            indicator_canvas.create_line(
+                *nose_from, *nose_to, fill="#5a7098", width=2,
+                dash=(4, 3), arrow="last",
+            )
+
+            # Rotated camera body.
+            world = [_rotate(p, tilt_deg, pan_deg) for p in _BODY]
+            proj = [_project(p) for p in world]
+            for a, b in _BODY_EDGES:
+                indicator_canvas.create_line(*proj[a], *proj[b], fill="#00d4ff", width=2)
+
+            # Lens cone: front face corners fanning out to a tip point,
+            # so the "pointy end" visually reads as where the lens looks.
+            tip_proj = _project(_rotate(_LENS_TIP, tilt_deg, pan_deg))
+            for idx in _LENS_FRONT_CORNERS:
+                indicator_canvas.create_line(*proj[idx], *tip_proj, fill="#ffb020", width=1)
+            indicator_canvas.create_oval(
+                tip_proj[0] - 3, tip_proj[1] - 3, tip_proj[0] + 3, tip_proj[1] + 3,
+                fill="#ffb020", outline="",
+            )
+
+        redraw_indicator()
+
         set_manual_widgets_enabled(self._camera_angle_mode == "manual")
 
         tk.Button(
-            win, text="Close", command=win.destroy,
+            win, text="Close", command=on_close,
             relief="flat", bg="#162040", fg="#a0b8d8",
             activebackground="#1e3060", activeforeground="#ffffff",
             font=("Consolas", 9), padx=10, pady=4, cursor="hand2",
@@ -1920,11 +2113,13 @@ class DroneCockpitApp:
             self._detection_engine_detail = ""
             # Confirms which backend actually got engaged -- setUseCuda()
             # silently falls back to CPU if this build/machine's OpenCV
-            # lacks CUDA DNN support, so this print is the only place that
-            # tells you which one you actually got.
+            # lacks CUDA DNN support. Routine confirmation is gated behind
+            # COCKPIT_VERBOSE_LOGGING now that CUDA is confirmed working;
+            # the unexpected-fallback case below still always prints,
+            # since that's a real problem worth surfacing.
             if hasattr(self.detection_link, "is_using_cuda"):
                 backend = "CUDA" if self.detection_link.is_using_cuda() else "CPU"
-                print(f"[DetectionLink] inference backend: {backend}")
+                _vlog(f"[DetectionLink] inference backend: {backend}")
                 if DETECTION_USE_CUDA and backend == "CPU":
                     print(
                         "[DetectionLink] NOTE: DETECTION_USE_CUDA=True but "
@@ -2187,6 +2382,21 @@ class DroneCockpitApp:
         whether anything has ever been detected, so this reads straight
         from the same hub state _get_detection_telemetry() does rather
         than going through a detection record.
+
+        NOTE: deliberately does NOT use gps.position_usable here.
+        position_usable additionally requires HDOP<5.0 -- that threshold
+        exists to gate whether a DETECTION gets georeferenced accurately
+        enough to trust its computed lat/lon (see _get_detection_telemetry /
+        _get_telemetry_status_summary), not whether the map has anything to
+        center a basemap on. Reusing it here meant the map (including the
+        already-downloaded/cached tile mosaic -- see
+        DetectionMapWidget._redraw_map's _map_origin gate) stayed on
+        "Waiting for GPS fix..." any time HDOP was above 5.0, even with a
+        solid 3D fix and 4+ sats, which is exactly when the FC status
+        panel's own GPS widget was already showing a lock. A noisy fix is
+        still fine for "roughly where is the drone" -- it just isn't
+        accurate enough to trust a detection's triangulated position
+        against, which is what position_usable is actually for.
         """
         hub = getattr(self, "hub", None)
         if hub is None or not hub.is_connected():
@@ -2196,7 +2406,13 @@ class DroneCockpitApp:
         except Exception:
             return 0.0, 0.0, False
         gps = state.gps
-        return gps.latitude, gps.longitude, bool(gps.position_usable)
+        # Loose "do we have *any* real fix" check, independent of HDOP:
+        # enough satellites for a fix to exist at all, and a coordinate
+        # that isn't the zeroed-out default. If your GPS binding exposes
+        # a fix_type field (2D/3D) that's a cleaner check than num_sat
+        # alone -- swap it in here if so.
+        has_fix = gps.num_sat >= 4 and (gps.latitude != 0.0 or gps.longitude != 0.0)
+        return gps.latitude, gps.longitude, has_fix
 
     def _pump_detection_records(self) -> None:
         """
@@ -2238,10 +2454,19 @@ class DroneCockpitApp:
             "geometry": None,
             "locked": False,
             "panels": {name: dict(geo) for name, geo in _DEFAULT_PANELS.items()},
+            "camera_angle": {
+                "mode": "manual",
+                "tilt_deg": CAMERA_MOUNT_TILT_DEG,
+                "pan_deg": CAMERA_MOUNT_PAN_DEG,
+            },
         }
 
     def _current_snapshot(self) -> dict:
-        """Capture the on-screen state (geometry, lock, all panel rects)."""
+        """Capture the on-screen state (geometry, lock, all panel rects,
+        and the "📐 Camera Angle" mode/tilt/pan) -- saved together as one
+        profile so restoring a layout also restores how the camera was
+        mounted when that layout was last used."""
+        tilt_deg, pan_deg = self._get_camera_mount_angle()
         return {
             "geometry": self.root.geometry(),
             "locked":   self._locked_ref[0],
@@ -2251,6 +2476,11 @@ class DroneCockpitApp:
                     "visible": self._vis_vars[name].get(),
                 }
                 for name, panel in self._panels.items()
+            },
+            "camera_angle": {
+                "mode": self._camera_angle_mode,
+                "tilt_deg": tilt_deg,
+                "pan_deg": pan_deg,
             },
         }
 
@@ -2288,6 +2518,22 @@ class DroneCockpitApp:
         self._locked_ref[0] = locked
         self._update_lock_button(locked)
 
+        # ── Restore camera mount angle (mode + tilt/pan) ──────────────────
+        # Falls back to the module-level startup defaults for any profile
+        # saved before this field existed, or with a missing/malformed
+        # entry, so old layout files keep loading instead of erroring.
+        cam = layout.get("camera_angle") or {}
+        mode = cam.get("mode", "manual")
+        if mode not in ("manual", "auto"):
+            mode = "manual"
+        tilt_deg = cam.get("tilt_deg", CAMERA_MOUNT_TILT_DEG)
+        pan_deg = cam.get("pan_deg", CAMERA_MOUNT_PAN_DEG)
+        with self._camera_angle_lock:
+            self._camera_angle_mode = mode
+            self._camera_tilt_deg = float(tilt_deg)
+            self._camera_pan_deg = float(pan_deg)
+        self._refresh_camera_angle_label()
+
         self.root.after_idle(self._clamp_all_panels)
 
     # =========================================================================
@@ -2318,7 +2564,7 @@ class DroneCockpitApp:
         new_y = max(0, min(y, ws_h - TITLE_H))
 
         if new_x != x or new_y != y:
-            print(f"[Viewport] clamping '{name}' from ({x},{y}) → ({new_x},{new_y})")
+            _vlog(f"[Viewport] clamping '{name}' from ({x},{y}) → ({new_x},{new_y})")
             panel.set_geometry(new_x, new_y, w, h)
 
     # =========================================================================
@@ -2614,7 +2860,8 @@ class DroneCockpitApp:
             "Camera Angle — set how the FPV camera is physically mounted "
             "(Manual), or hand off to real gimbal feedback once the "
             "SimpleBGC gimbal is wired (Auto). Used for detection "
-            "georeferencing.",
+            "georeferencing. Saved with the active layout profile, so it "
+            "persists across restarts.",
             label="Camera Angle",
         )
         self._camera_angle_btn.pack(side="left", padx=(0, 8))

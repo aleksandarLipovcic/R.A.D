@@ -774,70 +774,23 @@ class DetectionMapWidget(tk.Toplevel):
                 self._preview_label.config(image="", text="(live feed paused)",
                                             fg="#888888", bg="#000000")
 
-    # ── TEMPORARY perf diagnostic ────────────────────────────────────────
-    # These accumulate across calls and get flushed to the console every
-    # _DBG_PRINT_EVERY ticks (~1s at the intended 40ms cadence). Three
-    # numbers matter most here:
-    #   avg_wall_interval -- how much real wall-clock time actually
-    #     elapsed between polls. If this is way above the requested 40ms,
-    #     something on the Tk thread (this call included) is stalling the
-    #     mainloop and eating into after()'s own scheduling, not just this
-    #     callback's own work.
-    #   avg_get_call_ms -- time spent inside the single call to
-    #     get_latest_annotated_frame_jpeg(). This crosses the pybind11
-    #     boundary synchronously; if it's large, see the perf comment on
-    #     that function in Detectionlink.cpp (GIL release).
-    #   avg_decode_ms / avg_photoimage_ms -- PIL decode + thumbnail, and
-    #     Tk PhotoImage construction, both on this thread.
-    # Delete this whole block (and the _dbg_* attrs) once the bottleneck
-    # is found and fixed.
-    _DBG_PRINT_EVERY = 25
-
     def _poll_live_frame(self) -> None:
         if not self._live_enabled.get() or self._link is None:
             return
 
-        import time
-        now = time.monotonic()
-        if not hasattr(self, "_dbg_last_poll_at"):
-            self._dbg_last_poll_at = now
-            self._dbg_tick = 0
-            self._dbg_interval_accum = 0.0
-            self._dbg_get_accum = 0.0
-            self._dbg_decode_accum = 0.0
-            self._dbg_photo_accum = 0.0
-            self._dbg_empty_count = 0
-            self._dbg_last_jpeg_len = -1
-        wall_interval_ms = (now - self._dbg_last_poll_at) * 1000.0
-        self._dbg_last_poll_at = now
-        self._dbg_interval_accum += wall_interval_ms
-
-        get_start = time.monotonic()
         try:
             jpeg_bytes = self._link.get_latest_annotated_frame_jpeg()
         except AttributeError:
             # Binding not wired up yet on the C++/pybind11 side -- fail
             # quiet rather than spamming the console every tick.
             jpeg_bytes = None
-        self._dbg_get_accum += (time.monotonic() - get_start) * 1000.0
 
         if jpeg_bytes:
-            same_len_as_last = (len(jpeg_bytes) == self._dbg_last_jpeg_len)
-            self._dbg_last_jpeg_len = len(jpeg_bytes)
-            if same_len_as_last:
-                # Same byte length twice in a row is a decent (not
-                # perfect) proxy for "the backend republished the exact
-                # same annotated frame again" -- worth knowing if the
-                # C++ side is falling behind its own 40ms tick.
-                self._dbg_empty_count += 1
             try:
                 import io
-                decode_start = time.monotonic()
                 img = Image.open(io.BytesIO(bytes(jpeg_bytes)))
                 img.thumbnail((640, 360))
-                self._dbg_decode_accum += (time.monotonic() - decode_start) * 1000.0
 
-                photo_start = time.monotonic()
                 # Always keep the decoded frame around, even while a
                 # saved screenshot is on screen, so "Back to live"
                 # (_return_to_live) has something current to show
@@ -845,26 +798,8 @@ class DetectionMapWidget(tk.Toplevel):
                 self._live_photo = ImageTk.PhotoImage(img)
                 if self._viewing_saved_id is None:
                     self._preview_label.config(image=self._live_photo, text="")
-                self._dbg_photo_accum += (time.monotonic() - photo_start) * 1000.0
             except (OSError, ValueError):
                 pass
-
-        self._dbg_tick += 1
-        if self._dbg_tick >= self._DBG_PRINT_EVERY:
-            n = self._dbg_tick
-            achieved_fps = 1000.0 / (self._dbg_interval_accum / n) if self._dbg_interval_accum else 0.0
-            print(
-                f"[DetectionMapWidget][perf] avg_wall_interval={self._dbg_interval_accum / n:.1f}ms "
-                f"(~{achieved_fps:.1f}fps, target=25fps) "
-                f"avg_get_call={self._dbg_get_accum / n:.1f}ms "
-                f"avg_decode={self._dbg_decode_accum / n:.1f}ms "
-                f"avg_photoimage={self._dbg_photo_accum / n:.1f}ms "
-                f"repeated_frames={self._dbg_empty_count}/{n}"
-            )
-            self._dbg_tick = 0
-            self._dbg_interval_accum = self._dbg_get_accum = 0.0
-            self._dbg_decode_accum = self._dbg_photo_accum = 0.0
-            self._dbg_empty_count = 0
 
         # 40ms (~25fps): matches DetectionLink's own preview-tick cadence
         # (kPreviewTickMs in Detectionlink.cpp), which now redraws and

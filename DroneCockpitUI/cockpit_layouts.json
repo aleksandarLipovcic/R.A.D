@@ -296,12 +296,17 @@
           "visible": false
         },
         "fpv": {
-          "x": 710,
+          "x": 384,
           "y": 2,
           "w": 798,
           "h": 546,
           "visible": true
         }
+      },
+      "camera_angle": {
+        "mode": "manual",
+        "tilt_deg": -30.0,
+        "pan_deg": 0.0
       }
     }
   }

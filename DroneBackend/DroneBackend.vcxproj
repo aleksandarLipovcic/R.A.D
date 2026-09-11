@@ -73,6 +73,19 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <TargetExt>.pyd</TargetExt>
   </PropertyGroup>
+  <!-- Same override as Debug|x64 above, applied to Release|x64: without
+       this, Release|x64 built a plain .dll instead of a .pyd, which
+       pybind11/Python's import machinery does not automatically pick up.
+       That gap is what made every Release rebuild require a manual
+       dll-to-pyd rename/copy step, which was easy to forget (and did get
+       forgotten: a stale DroneBackend.pyd from an earlier manual rename
+       is what caused verbose C++ debug logging to keep showing up in the
+       cockpit console after CUDA bring-up was already done). With this
+       in place, MSBuild emits DroneBackend.pyd directly for Release|x64
+       too, the same way Debug|x64 always has. -->
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <TargetExt>.pyd</TargetExt>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>

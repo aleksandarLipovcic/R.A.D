@@ -20,16 +20,6 @@ import time
 
 
 class DetectionWorker:
-    # TEMPORARY perf diagnostic: print once every _DBG_PRINT_EVERY loop
-    # iterations. This worker runs on its own Python thread, separate
-    # from Tk's -- if avg_link_calls_ms is ever large, this thread is
-    # holding the GIL for a meaningful chunk of its 250ms period (at
-    # poll_hz=4), which competes with whatever DetectionMapWidget's
-    # _poll_live_frame is doing on the Tk thread at the same time. Delete
-    # this whole diagnostic (and the _dbg_* attrs) once the bottleneck is
-    # found and fixed.
-    _DBG_PRINT_EVERY = 20   # ~5s at poll_hz=4
-
     def __init__(self, detection_link, poll_hz: int = 4):
         self._link = detection_link
         self._interval = 1.0 / poll_hz
@@ -44,11 +34,6 @@ class DetectionWorker:
         self._last_seen_id = 0
         self._new_records = []   # records pulled since the last get_new_records() call
 
-        self._dbg_tick = 0
-        self._dbg_link_calls_accum = 0.0
-        self._dbg_loop_accum = 0.0
-        self._dbg_fresh_records_accum = 0
-
     def start(self):
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -61,9 +46,6 @@ class DetectionWorker:
 
     def _loop(self):
         while self._running:
-            loop_start = time.monotonic()
-
-            link_calls_start = time.monotonic()
             count = self._link.get_detection_count()
             duration_ms = self._link.get_last_pass_duration_ms()
             timestamp_ms = self._link.get_last_pass_timestamp_ms()
@@ -73,7 +55,6 @@ class DetectionWorker:
             # structs (a few floats/strings), not frames, so pulling this
             # every poll tick is fine at 4-10Hz.
             fresh = self._link.get_records_since(self._last_seen_id)
-            link_calls_ms = (time.monotonic() - link_calls_start) * 1000.0
 
             with self._lock:
                 self._detection_count = count
@@ -82,23 +63,6 @@ class DetectionWorker:
                 if fresh:
                     self._new_records.extend(fresh)
                     self._last_seen_id = fresh[-1].id
-
-            self._dbg_link_calls_accum += link_calls_ms
-            self._dbg_fresh_records_accum += len(fresh)
-            self._dbg_loop_accum += (time.monotonic() - loop_start) * 1000.0
-            self._dbg_tick += 1
-            if self._dbg_tick >= self._DBG_PRINT_EVERY:
-                n = self._dbg_tick
-                print(
-                    f"[DetectionWorker][perf] avg_link_calls={self._dbg_link_calls_accum / n:.2f}ms "
-                    f"avg_loop_body={self._dbg_loop_accum / n:.2f}ms "
-                    f"last_pass_duration={duration_ms:.1f}ms "
-                    f"new_records={self._dbg_fresh_records_accum}"
-                )
-                self._dbg_tick = 0
-                self._dbg_link_calls_accum = 0.0
-                self._dbg_loop_accum = 0.0
-                self._dbg_fresh_records_accum = 0
 
             time.sleep(self._interval)
 
