@@ -46,6 +46,26 @@ struct TelemetrySnapshot {
     double pitchDeg = 0.0;
     double gimbalPanDeg = 0.0;
     double gimbalTiltDeg = 0.0;
+
+    // --- Added for the software OSD's battery/RSSI/GPS/home-distance
+    // readouts (VideoLink::drawOsdBattery/Rssi/Gps/HomeDistance). Nothing
+    // in DetectionLink itself reads these -- they ride along on the same
+    // snapshot purely because VideoLink reuses this struct rather than
+    // inventing a second telemetry type. All default to values that read
+    // as "no data yet" so an OSD-only snapshot that never sets them
+    // doesn't display something misleading.
+    float batteryVoltage = 0.0f;        // volts
+    uint8_t batteryPercentage = 0;      // 0-100, computed from mAh capacity/drawn
+    uint8_t rssi = 0;                   // 0-255 raw link quality, same scale as DroneState::rssi
+    uint8_t gpsFixType = 0;             // 0 = no fix, 1 = 2D, 2 = 3D
+    uint8_t gpsNumSat = 0;              // satellites used in the solution
+    double homeDistanceM = 0.0;         // distance to home point, metres
+    double groundSpeedMs = 0.0;         // ground speed, metres/second
+
+    // Added for VideoLink's OSD flight timer (drawOsdTimer) -- mirrors
+    // DroneState::armed. Nothing in DetectionLink itself reads this,
+    // same as the battery/RSSI/GPS fields above.
+    bool armed = false;
 };
 
 // One detected + georeferenced object -- this is what becomes a pin.

@@ -1,8 +1,14 @@
 #include "VideoLink.h"
+// Full definition of TelemetrySnapshot (VideoLink.h only forward-declares
+// it) -- adjust this include if TelemetrySnapshot ever moves out of
+// DetectionLink.h; it's defined there today per Bindings.cpp's own
+// include order (VideoLink.h then DetectionLink.h).
+#include "DetectionLink.h"
 #include <chrono>
 #include <iostream>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <mutex>
 
 // Silences OpenCV's own internal MSMF/DSHOW logger (the
@@ -337,11 +343,43 @@ namespace {
     }
 }
 
+namespace {
+    // The full set of OSD element ids the overlay knows how to draw.
+    // setOsdElementEnabled()/setOsdElementAnchor() reject anything not in
+    // this list. Add a new id here + a case in VideoLink::drawOsdOverlay()
+    // together -- keeping them in one place is what makes an unknown id
+    // from the Python side a loud no-op instead of a silently-ignored typo.
+    const char* kOsdElementIds[] = { "altitude", "horizon", "compass",
+        "battery", "rssi", "gps", "timer", "home_distance" };
+}
+
 VideoLink::VideoLink() {
     static bool logLevelSet = false;
     if (!logLevelSet) {
         cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_SILENT);
         logLevelSet = true;
+    }
+    // Seed every known element with a sane default layout up front so
+    // getOsdElementLayout()/the settings panel always has something to
+    // read, even before the pilot has touched anything this session.
+    // Defaults mirror where these three sat in the Betaflight OSD
+    // screenshot: altitude top-left, horizon dead center, compass
+    // bottom-center.
+    {
+        std::lock_guard<std::mutex> lock(osdMutex_);
+        osdLayout_["altitude"] = OsdElementLayout{ true, OsdAnchor::TopLeft, 16, 16, 0.5f, 0.5f };
+        osdLayout_["horizon"] = OsdElementLayout{ true, OsdAnchor::Center, 0, 0, 0.5f, 0.5f };
+        osdLayout_["compass"] = OsdElementLayout{ true, OsdAnchor::BottomCenter, 16, 16, 0.5f, 0.5f };
+        // New elements default to the four corners/edges the three above
+        // don't already occupy, mirroring the spread-out layout of a
+        // typical Betaflight/INAV OSD (each stat gets its own spot,
+        // nothing overlapping) -- the pilot can drag any of these
+        // elsewhere via the settings panel same as the original three.
+        osdLayout_["timer"] = OsdElementLayout{ true, OsdAnchor::TopCenter, 16, 16, 0.5f, 0.5f };
+        osdLayout_["rssi"] = OsdElementLayout{ true, OsdAnchor::TopRight, 16, 16, 0.5f, 0.5f };
+        osdLayout_["gps"] = OsdElementLayout{ true, OsdAnchor::MiddleLeft, 16, 16, 0.5f, 0.5f };
+        osdLayout_["home_distance"] = OsdElementLayout{ true, OsdAnchor::MiddleRight, 16, 16, 0.5f, 0.5f };
+        osdLayout_["battery"] = OsdElementLayout{ true, OsdAnchor::BottomLeft, 16, 16, 0.5f, 0.5f };
     }
     startDeviceNotifications();
 }
@@ -939,6 +977,571 @@ void VideoLink::hideWindow() {
         ShowWindow(hwnd, SW_HIDE);
 }
 
+// =============================================================================
+// Software OSD overlay
+// =============================================================================
+//
+// See the module comment on this block in VideoLink.h for why this exists
+// (replacing the FC's analog OSD, which was optically baked into every
+// frame ahead of the capture card and confusing the aerial-detection
+// model) and why it's safe by construction: everything here draws into
+// the render-window back buffer only, one layer above the plain
+// StretchDIBits blit in paintFrameDirect(), and nowhere near latestFrame_
+// (see captureLoop(), which stores latestFrame_ well before paintFrame()
+// is even called).
+
+namespace {
+    bool isKnownOsdElementId(const std::string& id) {
+        for (const char* known : kOsdElementIds)
+            if (id == known)
+                return true;
+        return false;
+    }
+}
+
+void VideoLink::setOsdElementEnabled(const std::string& id, bool enabled) {
+    if (!isKnownOsdElementId(id)) {
+        VL_LOG(<< "[" << nowStr() << "] [VideoLink] setOsdElementEnabled: unknown id '"
+            << id << "' ignored");
+        return;
+    }
+    std::lock_guard<std::mutex> lock(osdMutex_);
+    osdLayout_[id].enabled = enabled;
+}
+
+void VideoLink::setOsdElementAnchor(const std::string& id, OsdAnchor anchor, int marginX, int marginY) {
+    if (!isKnownOsdElementId(id)) {
+        VL_LOG(<< "[" << nowStr() << "] [VideoLink] setOsdElementAnchor: unknown id '"
+            << id << "' ignored");
+        return;
+    }
+    std::lock_guard<std::mutex> lock(osdMutex_);
+    OsdElementLayout& layout = osdLayout_[id];
+    layout.anchor = anchor;
+    layout.marginX = marginX;
+    layout.marginY = marginY;
+}
+
+void VideoLink::setOsdElementCustomPosition(const std::string& id, float fx, float fy) {
+    if (!isKnownOsdElementId(id)) {
+        VL_LOG(<< "[" << nowStr() << "] [VideoLink] setOsdElementCustomPosition: unknown id '"
+            << id << "' ignored");
+        return;
+    }
+    // Clamp defensively -- a drag that ends outside the video panel
+    // (pilot's mouse slid past the edge before releasing) should clamp to
+    // the edge, not place the element off-screen where it can never be
+    // grabbed again without falling back to a preset anchor.
+    fx = (std::max)(0.0f, (std::min)(1.0f, fx));
+    fy = (std::max)(0.0f, (std::min)(1.0f, fy));
+    std::lock_guard<std::mutex> lock(osdMutex_);
+    OsdElementLayout& layout = osdLayout_[id];
+    layout.anchor = OsdAnchor::Custom;
+    layout.customFx = fx;
+    layout.customFy = fy;
+}
+
+VideoLink::OsdElementLayout VideoLink::getOsdElementLayout(const std::string& id) const {
+    std::lock_guard<std::mutex> lock(osdMutex_);
+    auto it = osdLayout_.find(id);
+    return (it != osdLayout_.end()) ? it->second : OsdElementLayout{};
+}
+
+std::vector<std::string> VideoLink::getOsdElementIds() const {
+    return std::vector<std::string>(std::begin(kOsdElementIds), std::end(kOsdElementIds));
+}
+
+void VideoLink::setTelemetryProvider(std::function<TelemetrySnapshot()> provider) {
+    telemetryProvider_ = std::move(provider);
+}
+
+void VideoLink::resetFlightTimer() {
+    // Called from whatever thread the cockpit button lives on (Tk/UI
+    // thread) -- just raise the flag. The actual mutation of
+    // osdTimerAccumulated_/osdTimerRunning_/osdTimerSegmentStart_ happens
+    // inside drawOsdTimer() on the capture/paint thread, which is the
+    // only thread allowed to touch that state.
+    osdTimerResetRequested_.store(true, std::memory_order_relaxed);
+}
+
+void VideoLink::resolveOsdOrigin(const OsdElementLayout& layout, int destW, int destH,
+    int elemW, int elemH, int& outX, int& outY) const {
+    if (layout.anchor == OsdAnchor::Custom) {
+        outX = static_cast<int>(layout.customFx * destW) - elemW / 2;
+        outY = static_cast<int>(layout.customFy * destH) - elemH / 2;
+    }
+    else {
+        // Horizontal placement.
+        switch (layout.anchor) {
+        case OsdAnchor::TopLeft: case OsdAnchor::MiddleLeft: case OsdAnchor::BottomLeft:
+            outX = layout.marginX;
+            break;
+        case OsdAnchor::TopCenter: case OsdAnchor::Center: case OsdAnchor::BottomCenter:
+            outX = (destW - elemW) / 2;
+            break;
+        default:   // TopRight / MiddleRight / BottomRight
+            outX = destW - elemW - layout.marginX;
+            break;
+        }
+        // Vertical placement.
+        switch (layout.anchor) {
+        case OsdAnchor::TopLeft: case OsdAnchor::TopCenter: case OsdAnchor::TopRight:
+            outY = layout.marginY;
+            break;
+        case OsdAnchor::MiddleLeft: case OsdAnchor::Center: case OsdAnchor::MiddleRight:
+            outY = (destH - elemH) / 2;
+            break;
+        default:   // BottomLeft / BottomCenter / BottomRight
+            outY = destH - elemH - layout.marginY;
+            break;
+        }
+    }
+    // Keep fully on-panel regardless of how the position was derived --
+    // a stale custom position from a previous, larger panel size (video
+    // host resized smaller since it was saved) shouldn't push an element
+    // partly off the visible video.
+    outX = (std::max)(0, (std::min)(outX, (std::max)(0, destW - elemW)));
+    outY = (std::max)(0, (std::min)(outY, (std::max)(0, destH - elemH)));
+}
+
+void VideoLink::layoutOsdReadout(HDC hdc, const wchar_t* text, const OsdElementLayout& layout,
+    int destW, int destH, int& outX, int& outY, int& outW, int& outH) const {
+    RECT calc = { 0, 0, 0, 0 };
+    DrawTextW(hdc, text, -1, &calc, DT_CALCRECT | DT_SINGLELINE);
+    outW = calc.right - calc.left + 12;
+    outH = calc.bottom - calc.top + 8;
+    resolveOsdOrigin(layout, destW, destH, outW, outH, outX, outY);
+}
+
+void VideoLink::drawOsdOverlay(HDC targetHdc, int destW, int destH) {
+    if (!osdOverlayEnabled_.load() || !telemetryProvider_)
+        return;
+
+    TelemetrySnapshot t = telemetryProvider_();
+    if (!t.valid)
+        return;   // GPS/attitude not trustworthy yet -- nothing sane to draw
+
+    // Snapshot the whole layout table once per frame instead of locking
+    // per-element -- three short reads under one lock beats three lock
+    // acquisitions, and guarantees all three elements are drawn against
+    // the same consistent layout even if a setter runs concurrently.
+    std::map<std::string, OsdElementLayout> layout;
+    {
+        std::lock_guard<std::mutex> lock(osdMutex_);
+        layout = osdLayout_;
+    }
+
+    auto it = layout.find("altitude");
+    if (it != layout.end() && it->second.enabled)
+        drawOsdAltitude(targetHdc, it->second, destW, destH, t);
+
+    it = layout.find("horizon");
+    if (it != layout.end() && it->second.enabled)
+        drawOsdHorizon(targetHdc, it->second, destW, destH, t);
+
+    it = layout.find("compass");
+    if (it != layout.end() && it->second.enabled)
+        drawOsdCompass(targetHdc, it->second, destW, destH, t);
+
+    it = layout.find("battery");
+    if (it != layout.end() && it->second.enabled)
+        drawOsdBattery(targetHdc, it->second, destW, destH, t);
+
+    it = layout.find("rssi");
+    if (it != layout.end() && it->second.enabled)
+        drawOsdRssi(targetHdc, it->second, destW, destH, t);
+
+    it = layout.find("gps");
+    if (it != layout.end() && it->second.enabled)
+        drawOsdGps(targetHdc, it->second, destW, destH, t);
+
+    it = layout.find("timer");
+    if (it != layout.end() && it->second.enabled)
+        drawOsdTimer(targetHdc, it->second, destW, destH, t);
+
+    it = layout.find("home_distance");
+    if (it != layout.end() && it->second.enabled)
+        drawOsdHomeDistance(targetHdc, it->second, destW, destH, t);
+}
+
+namespace {
+    // Shared look for every OSD text readout -- Consolas, matches
+    // FPVWidget's status-bar font choice on the Python side so the
+    // software OSD reads as part of the same UI, not a mismatched
+    // add-on. Cached per requested pixel height the same way
+    // paintFrameDirect already caches its NoVideoInput font.
+    HFONT getOsdFont(int pixelHeight) {
+        static HFONT cachedFont = nullptr;
+        static int cachedHeight = 0;
+        if (!cachedFont || cachedHeight != pixelHeight) {
+            if (cachedFont)
+                DeleteObject(cachedFont);
+            cachedFont = CreateFontW(
+                -pixelHeight, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_MODERN, L"Consolas");
+            cachedHeight = pixelHeight;
+        }
+        return cachedFont;
+    }
+
+    // Standard analog-FPV-OSD look: bold WHITE glyphs with a 1px BLACK
+    // outline and no filled backing plate. White reads over both bright
+    // sky and dark terrain (unlike the old green, which all but
+    // disappears over green fields/crops -- exactly the case a
+    // search-and-rescue bird spends most of its time over), and the black
+    // outline is what keeps it legible over bright/washed-out sky without
+    // needing a solid box that eats a chunk of the frame. This is drawn
+    // by painting the same text 8 times in black at a 1px ring of offsets
+    // and then once more in white dead-center, same trick every FC OSD
+    // (Betaflight/INAV) font renderer uses.
+    void drawOutlinedText(HDC hdc, const wchar_t* text, const RECT& rect, UINT format,
+        COLORREF color = RGB(255, 255, 255)) {
+        static const int dx[8] = { -1, 0, 1, -1, 1, -1, 0, 1 };
+        static const int dy[8] = { -1, -1, -1, 0, 0, 1, 1, 1 };
+        SetTextColor(hdc, RGB(0, 0, 0));
+        for (int i = 0; i < 8; ++i) {
+            RECT r = rect;
+            OffsetRect(&r, dx[i], dy[i]);
+            DrawTextW(hdc, text, -1, &r, format);
+        }
+        SetTextColor(hdc, color);
+        RECT r = rect;
+        DrawTextW(hdc, text, -1, &r, format);
+    }
+
+
+    // Same outline trick for line art (horizon ladder, sidebar ticks,
+    // compass tick) -- stroke the geometry once in black at width+2, then
+    // again on top in white at the normal width, so the ladder/ticks stay
+    // visible against bright sky the same way the text does instead of
+    // depending on a single flat color.
+    HPEN makeOsdPen(int width, COLORREF color) { return CreatePen(PS_SOLID, width, color); }
+}
+
+void VideoLink::drawOsdAltitude(HDC hdc, const OsdElementLayout& layout, int destW, int destH,
+    const TelemetrySnapshot& t) {
+    wchar_t buf[32];
+    swprintf_s(buf, L"ALT %.1f m", t.altitudeM);
+
+    int fontPx = (std::max)(14, (std::min)(28, destH / 20));
+    HFONT font = getOsdFont(fontPx);
+    HGDIOBJ oldFont = SelectObject(hdc, font);
+
+    RECT calc = { 0, 0, 0, 0 };
+    DrawTextW(hdc, buf, -1, &calc, DT_CALCRECT | DT_SINGLELINE);
+    int elemW = calc.right - calc.left + 12;
+    int elemH = calc.bottom - calc.top + 8;
+
+    int x, y;
+    resolveOsdOrigin(layout, destW, destH, elemW, elemH, x, y);
+
+    // No backing plate -- plain outlined white text on the raw video,
+    // matching how every standard FC (Betaflight/INAV) OSD renders its
+    // readouts: just glyphs, no boxes eating into the frame.
+    int oldBkMode = SetBkMode(hdc, TRANSPARENT);
+    RECT textRect = { x + 6, y + 4, x + elemW - 6, y + elemH - 4 };
+    drawOutlinedText(hdc, buf, textRect, DT_SINGLELINE | DT_VCENTER);
+
+    SetBkMode(hdc, oldBkMode);
+    SelectObject(hdc, oldFont);
+}
+
+void VideoLink::drawOsdHorizon(HDC hdc, const OsdElementLayout& layout, int destW, int destH,
+    const TelemetrySnapshot& t) {
+    // Ladder size scales with panel height, same clamp shape used
+    // elsewhere in this file so it stays legible on a small panel without
+    // taking over a large one.
+    int elemW = (std::max)(180, (std::min)(360, destW / 3));
+    int elemH = elemW;   // square hit-box; the drawn ladder is narrower
+
+    int originX, originY;
+    resolveOsdOrigin(layout, destW, destH, elemW, elemH, originX, originY);
+    int cx = originX + elemW / 2;
+    int cy = originY + elemH / 2;
+
+    // Pitch ladder offset (pixels per degree) and roll rotation. Positive
+    // pitch = nose up = horizon line moves DOWN on screen (matches every
+    // conventional attitude indicator).
+    const double pxPerDeg = elemH / 60.0;   // +/-30 deg of pitch visible
+    double pitchOffsetPx = t.pitchDeg * pxPerDeg;
+    double rollRad = -t.rollDeg * 3.14159265358979 / 180.0;
+    double cosR = std::cos(rollRad), sinR = std::sin(rollRad);
+
+    auto rotate = [&](double lx, double ly, POINT& out) {
+        // Rotate a point given in "local ladder space" (origin at the
+        // pitch-shifted horizon center) by roll, then translate to screen.
+        double rx = lx * cosR - ly * sinR;
+        double ry = lx * sinR + ly * cosR;
+        out.x = static_cast<LONG>(cx + rx);
+        out.y = static_cast<LONG>(cy + pitchOffsetPx + ry);
+        };
+
+    // Draw every stroke twice: a wider black pass first, then a
+    // narrower white pass on top of it. That gives every line a 1px
+    // black outline (same technique as the text) so the ladder and
+    // sidebars stay visible over bright sky AND over green fields/crops
+    // -- the old solid green all but vanished over vegetation, which is
+    // most of what a search-and-rescue bird flies over.
+    auto strokeGeometry = [&](int width, COLORREF color) {
+        HPEN pen = makeOsdPen(width, color);
+        HGDIOBJ oldPen = SelectObject(hdc, pen);
+
+        // Horizon line itself.
+        POINT hl, hr;
+        rotate(-elemW * 0.35, 0, hl);
+        rotate(elemW * 0.35, 0, hr);
+        MoveToEx(hdc, hl.x, hl.y, nullptr);
+        LineTo(hdc, hr.x, hr.y);
+
+        // Center reference chevron (fixed to the airframe, does NOT
+        // rotate with roll -- this is what pilots actually read against
+        // the moving horizon line).
+        POINT chevron[3] = {
+            { static_cast<LONG>(cx - 10), static_cast<LONG>(cy + 6) },
+            { static_cast<LONG>(cx),      static_cast<LONG>(cy) },
+            { static_cast<LONG>(cx + 10), static_cast<LONG>(cy + 6) },
+        };
+        Polyline(hdc, chevron, 3);
+
+        // Sidebars -- vertical tick columns either side, the exact
+        // element the NN was picking up false positives from in the FC
+        // OSD. Purely cosmetic tick marks, fixed to the airframe like
+        // the chevron.
+        for (int side = -1; side <= 1; side += 2) {
+            int sx = cx + side * static_cast<int>(elemW * 0.42);
+            for (int i = -3; i <= 3; ++i) {
+                int ty = cy + i * (elemH / 10);
+                int tickLen = (i == 0) ? 14 : 8;
+                MoveToEx(hdc, sx - tickLen / 2, ty, nullptr);
+                LineTo(hdc, sx + tickLen / 2, ty);
+            }
+        }
+
+        SelectObject(hdc, oldPen);
+        DeleteObject(pen);
+        };
+    strokeGeometry(4, RGB(0, 0, 0));
+    strokeGeometry(2, RGB(255, 255, 255));
+}
+
+void VideoLink::drawOsdCompass(HDC hdc, const OsdElementLayout& layout, int destW, int destH,
+    const TelemetrySnapshot& t) {
+    int elemW = (std::max)(220, (std::min)(420, destW / 2));
+    int elemH = (std::max)(24, (std::min)(40, destH / 16));
+
+    int x, y;
+    resolveOsdOrigin(layout, destW, destH, elemW, elemH, x, y);
+
+    int fontPx = (std::max)(14, (std::min)(22, elemH - 10));
+    HFONT font = getOsdFont(fontPx);
+    HGDIOBJ oldFont = SelectObject(hdc, font);
+
+    // No backing plate -- outlined white letters directly over the video,
+    // consistent with altitude/horizon above.
+    int oldBkMode = SetBkMode(hdc, TRANSPARENT);
+
+    // Simple scrolling tape: one compass letter every 45 degrees, offset
+    // so the letter nearest current heading sits under the center tick --
+    // same idea as the FC OSD's compass strip, but generated from a fixed
+    // string instead of glyphs baked into the video, so nothing here can
+    // ever be mistaken for a ground object by the detector (it never
+    // reaches DetectionLink's frames at all).
+    static const wchar_t* dirs[8] = { L"N", L"NE", L"E", L"SE", L"S", L"SW", L"W", L"NW" };
+    double pxPerDeg = elemW / 90.0;   // +/-45 deg of heading visible across the tape
+    for (int i = -1; i <= 8; ++i) {
+        double dirHeading = ((i % 8) + 8) % 8 * 45.0;
+        double delta = dirHeading - t.headingDeg;
+        while (delta > 180.0) delta -= 360.0;
+        while (delta < -180.0) delta += 360.0;
+        int tx = x + elemW / 2 + static_cast<int>(delta * pxPerDeg);
+        if (tx < x - 20 || tx > x + elemW + 20)
+            continue;
+        RECT letterRect = { tx - 14, y, tx + 14, y + elemH };
+        drawOutlinedText(hdc, dirs[((i % 8) + 8) % 8], letterRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    // Center tick showing exactly where current heading falls on the
+    // tape -- kept as a distinct amber accent (outlined the same way)
+    // so it still reads as "the pointer", not just another white line.
+    auto strokeTick = [&](int width, COLORREF color) {
+        HPEN tickPen = makeOsdPen(width, color);
+        HGDIOBJ oldPen = SelectObject(hdc, tickPen);
+        MoveToEx(hdc, x + elemW / 2, y, nullptr);
+        LineTo(hdc, x + elemW / 2, y + elemH);
+        SelectObject(hdc, oldPen);
+        DeleteObject(tickPen);
+        };
+    strokeTick(4, RGB(0, 0, 0));
+    strokeTick(2, RGB(255, 200, 0));
+
+    SetBkMode(hdc, oldBkMode);
+    SelectObject(hdc, oldFont);
+}
+
+void VideoLink::drawOsdBattery(HDC hdc, const OsdElementLayout& layout, int destW, int destH,
+    const TelemetrySnapshot& t) {
+    wchar_t buf[32];
+    swprintf_s(buf, L"BATT %.1fV %d%%", t.batteryVoltage, static_cast<int>(t.batteryPercentage));
+
+    int fontPx = (std::max)(14, (std::min)(28, destH / 20));
+    HFONT font = getOsdFont(fontPx);
+    HGDIOBJ oldFont = SelectObject(hdc, font);
+
+    int x, y, elemW, elemH;
+    layoutOsdReadout(hdc, buf, layout, destW, destH, x, y, elemW, elemH);
+
+    // Below ~20% left, flip the whole readout to an amber warning color
+    // (same accent the compass heading tick uses) instead of white -- a
+    // low-battery call is exactly the kind of thing that shouldn't blend
+    // in with every other white readout.
+    COLORREF color = (t.batteryPercentage > 0 && t.batteryPercentage <= 20)
+        ? RGB(255, 80, 40) : RGB(255, 255, 255);
+
+    int oldBkMode = SetBkMode(hdc, TRANSPARENT);
+    RECT textRect = { x + 6, y + 4, x + elemW - 6, y + elemH - 4 };
+    drawOutlinedText(hdc, buf, textRect, DT_SINGLELINE | DT_VCENTER, color);
+    SetBkMode(hdc, oldBkMode);
+    SelectObject(hdc, oldFont);
+}
+
+void VideoLink::drawOsdRssi(HDC hdc, const OsdElementLayout& layout, int destW, int destH,
+    const TelemetrySnapshot& t) {
+    // Shown as a 0-100% figure -- easier for a pilot to read at a glance
+    // than the raw 0-255 link-quality byte the FC actually reports.
+    int pct = static_cast<int>(t.rssi) * 100 / 255;
+    wchar_t buf[24];
+    swprintf_s(buf, L"RSSI %d%%", pct);
+
+    int fontPx = (std::max)(14, (std::min)(28, destH / 20));
+    HFONT font = getOsdFont(fontPx);
+    HGDIOBJ oldFont = SelectObject(hdc, font);
+
+    int x, y, elemW, elemH;
+    layoutOsdReadout(hdc, buf, layout, destW, destH, x, y, elemW, elemH);
+
+    COLORREF color = (pct <= 20) ? RGB(255, 80, 40) : RGB(255, 255, 255);
+
+    int oldBkMode = SetBkMode(hdc, TRANSPARENT);
+    RECT textRect = { x + 6, y + 4, x + elemW - 6, y + elemH - 4 };
+    drawOutlinedText(hdc, buf, textRect, DT_SINGLELINE | DT_VCENTER, color);
+    SetBkMode(hdc, oldBkMode);
+    SelectObject(hdc, oldFont);
+}
+
+void VideoLink::drawOsdGps(HDC hdc, const OsdElementLayout& layout, int destW, int destH,
+    const TelemetrySnapshot& t) {
+    wchar_t buf[24];
+    // fixType >= 2 is GPSReading::positionUsable's own "3D fix" bar --
+    // matches the threshold DroneCockpitUI already uses to decide whether
+    // lat/lon are trustworthy, so the OSD's notion of "locked" agrees
+    // with the rest of the app's.
+    bool locked = t.gpsFixType >= 2;
+    if (locked)
+        swprintf_s(buf, L"GPS %d", static_cast<int>(t.gpsNumSat));
+    else
+        swprintf_s(buf, L"GPS: NO FIX");
+
+    int fontPx = (std::max)(14, (std::min)(28, destH / 20));
+    HFONT font = getOsdFont(fontPx);
+    HGDIOBJ oldFont = SelectObject(hdc, font);
+
+    int x, y, elemW, elemH;
+    layoutOsdReadout(hdc, buf, layout, destW, destH, x, y, elemW, elemH);
+
+    COLORREF color = locked ? RGB(255, 255, 255) : RGB(255, 80, 40);
+
+    int oldBkMode = SetBkMode(hdc, TRANSPARENT);
+    RECT textRect = { x + 6, y + 4, x + elemW - 6, y + elemH - 4 };
+    drawOutlinedText(hdc, buf, textRect, DT_SINGLELINE | DT_VCENTER, color);
+    SetBkMode(hdc, oldBkMode);
+    SelectObject(hdc, oldFont);
+}
+
+void VideoLink::drawOsdTimer(HDC hdc, const OsdElementLayout& layout, int destW, int destH,
+    const TelemetrySnapshot& t) {
+    // Flight timer semantics: starts counting on the drone's first arm,
+    // pauses on disarm, resumes from where it left off on the next arm,
+    // and is only ever zeroed by an explicit reset (resetFlightTimer(),
+    // wired to a cockpit button) -- rearming never restarts it on its
+    // own.
+    //
+    // Consume any pending reset first, before the edge-detection below,
+    // so a reset that lands mid-armed-segment doesn't get immediately
+    // re-accumulated by this same call.
+    if (osdTimerResetRequested_.exchange(false, std::memory_order_relaxed)) {
+        osdTimerAccumulated_ = std::chrono::steady_clock::duration::zero();
+        if (osdTimerRunning_) {
+            // Still armed right through the reset -- keep counting, just
+            // from zero, instead of freezing until the next arm.
+            osdTimerSegmentStart_ = std::chrono::steady_clock::now();
+        }
+    }
+
+    // Edge-detect arm/disarm off the telemetry snapshot. Gated on
+    // t.valid the same way the rest of the OSD effectively is elsewhere
+    // -- an invalid/no-link snapshot defaults armed=false, which would
+    // otherwise look like a disarm on every dropped telemetry frame.
+    // Treat "no link this frame" as "no change" instead.
+    if (t.valid) {
+        if (t.armed && !osdTimerPrevArmed_) {
+            // Rising edge: (re-)arm -- start a fresh segment on top of
+            // whatever's already accumulated.
+            osdTimerSegmentStart_ = std::chrono::steady_clock::now();
+            osdTimerRunning_ = true;
+        }
+        else if (!t.armed && osdTimerPrevArmed_) {
+            // Falling edge: disarm -- fold the just-finished segment into
+            // the running total and stop counting until the next arm.
+            osdTimerAccumulated_ += std::chrono::steady_clock::now() - osdTimerSegmentStart_;
+            osdTimerRunning_ = false;
+        }
+        osdTimerPrevArmed_ = t.armed;
+    }
+
+    auto total = osdTimerAccumulated_;
+    if (osdTimerRunning_)
+        total += std::chrono::steady_clock::now() - osdTimerSegmentStart_;
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(total).count();
+    int mm = static_cast<int>(elapsed / 60);
+    int ss = static_cast<int>(elapsed % 60);
+
+    wchar_t buf[16];
+    swprintf_s(buf, L"%d:%02d", mm, ss);
+
+    int fontPx = (std::max)(14, (std::min)(28, destH / 20));
+    HFONT font = getOsdFont(fontPx);
+    HGDIOBJ oldFont = SelectObject(hdc, font);
+
+    int x, y, elemW, elemH;
+    layoutOsdReadout(hdc, buf, layout, destW, destH, x, y, elemW, elemH);
+
+    int oldBkMode = SetBkMode(hdc, TRANSPARENT);
+    RECT textRect = { x + 6, y + 4, x + elemW - 6, y + elemH - 4 };
+    drawOutlinedText(hdc, buf, textRect, DT_SINGLELINE | DT_VCENTER);
+    SetBkMode(hdc, oldBkMode);
+    SelectObject(hdc, oldFont);
+}
+
+void VideoLink::drawOsdHomeDistance(HDC hdc, const OsdElementLayout& layout, int destW, int destH,
+    const TelemetrySnapshot& t) {
+    wchar_t buf[40];
+    swprintf_s(buf, L"HOME %.0fm  %.1fm/s", t.homeDistanceM, t.groundSpeedMs);
+
+    int fontPx = (std::max)(14, (std::min)(28, destH / 20));
+    HFONT font = getOsdFont(fontPx);
+    HGDIOBJ oldFont = SelectObject(hdc, font);
+
+    int x, y, elemW, elemH;
+    layoutOsdReadout(hdc, buf, layout, destW, destH, x, y, elemW, elemH);
+
+    int oldBkMode = SetBkMode(hdc, TRANSPARENT);
+    RECT textRect = { x + 6, y + 4, x + elemW - 6, y + elemH - 4 };
+    drawOutlinedText(hdc, buf, textRect, DT_SINGLELINE | DT_VCENTER);
+    SetBkMode(hdc, oldBkMode);
+    SelectObject(hdc, oldFont);
+}
+
 void VideoLink::paintFrame(const cv::Mat& frame) {
     // Skip the blit entirely while the panel is hidden -- there's no
     // point spending a StretchDIBits round trip on a window Windows
@@ -1026,6 +1629,12 @@ void VideoLink::paintFrameDirect(HDC targetHdc, int destW, int destH, const cv::
         0, 0, destW, destH,
         0, 0, frame.cols, frame.rows,
         frame.data, &bmi, DIB_RGB_COLORS, SRCCOPY);
+
+    // ── Software OSD overlay ─────────────────────────────────────────
+    // Drawn straight after the video blit, before the NoVideoInput
+    // banner below, so the banner (when present) stays on top of and
+    // fully legible over any OSD element it happens to overlap.
+    drawOsdOverlay(targetHdc, destW, destH);
 
     // ── "No drone video" warning banner ─────────────────────────────
     // The box is sized FROM the actual measured text extent (via

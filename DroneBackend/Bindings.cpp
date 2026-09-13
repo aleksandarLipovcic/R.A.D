@@ -507,6 +507,37 @@ PYBIND11_MODULE(DroneBackend, m) {
         .def_readonly("name", &CaptureDeviceInfo::name);
 
     // =========================================================================
+    // VideoLink OSD overlay types
+    //
+    // Registered ahead of VideoLink itself so its methods (which take/
+    // return these types) have something to resolve against. See
+    // VideoLink.h's "Software OSD overlay" section for the full picture --
+    // this replaces the Betaflight-side OSD, drawn entirely in the render
+    // path and never touching the frames DetectionLink sees.
+    // =========================================================================
+    py::enum_<VideoLink::OsdAnchor>(m, "OsdAnchor")
+        .value("TOP_LEFT", VideoLink::OsdAnchor::TopLeft)
+        .value("TOP_CENTER", VideoLink::OsdAnchor::TopCenter)
+        .value("TOP_RIGHT", VideoLink::OsdAnchor::TopRight)
+        .value("MIDDLE_LEFT", VideoLink::OsdAnchor::MiddleLeft)
+        .value("CENTER", VideoLink::OsdAnchor::Center)
+        .value("MIDDLE_RIGHT", VideoLink::OsdAnchor::MiddleRight)
+        .value("BOTTOM_LEFT", VideoLink::OsdAnchor::BottomLeft)
+        .value("BOTTOM_CENTER", VideoLink::OsdAnchor::BottomCenter)
+        .value("BOTTOM_RIGHT", VideoLink::OsdAnchor::BottomRight)
+        .value("CUSTOM", VideoLink::OsdAnchor::Custom);
+
+    py::class_<VideoLink::OsdElementLayout>(m, "OsdElementLayout")
+        .def_readonly("enabled", &VideoLink::OsdElementLayout::enabled)
+        .def_readonly("anchor", &VideoLink::OsdElementLayout::anchor)
+        .def_readonly("margin_x", &VideoLink::OsdElementLayout::marginX)
+        .def_readonly("margin_y", &VideoLink::OsdElementLayout::marginY)
+        .def_readonly("custom_fx", &VideoLink::OsdElementLayout::customFx,
+            "Only meaningful when anchor == CUSTOM.")
+        .def_readonly("custom_fy", &VideoLink::OsdElementLayout::customFy,
+            "Only meaningful when anchor == CUSTOM.");
+
+    // =========================================================================
     // VideoLink
     //
     // Independent of DroneLink -- the FPV analog capture dongle is a
@@ -596,7 +627,56 @@ PYBIND11_MODULE(DroneBackend, m) {
             "Called when the FPV Tk panel is toggled hidden -- without "
             "this, the native window kept rendering even while its Tk "
             "panel was hidden, since hiding a Tk canvas item has no "
-            "effect on a foreign HWND.");
+            "effect on a foreign HWND.")
+
+        // ── Software OSD overlay ─────────────────────────────────────
+        .def("set_osd_overlay_enabled", &VideoLink::setOsdOverlayEnabled,
+            py::arg("enabled"),
+            "Master on/off for the whole overlay -- does not forget "
+            "individual elements' own enabled flags.")
+        .def("is_osd_overlay_enabled", &VideoLink::isOsdOverlayEnabled)
+        .def("set_osd_locked", &VideoLink::setOsdLocked, py::arg("locked"),
+            "When true, OsdDragOverlay (Python side) must refuse to start "
+            "a drag -- checked there, not enforced here, since dragging "
+            "itself is pure Tk/mouse handling that never calls into "
+            "VideoLink until the drag is released.")
+        .def("is_osd_locked", &VideoLink::isOsdLocked)
+        .def("get_osd_element_ids", &VideoLink::getOsdElementIds,
+            "Every id the overlay knows how to draw, e.g. "
+            "['altitude', 'horizon', 'compass'].")
+        .def("set_osd_element_enabled", &VideoLink::setOsdElementEnabled,
+            py::arg("id"), py::arg("enabled"))
+        .def("set_osd_element_anchor", &VideoLink::setOsdElementAnchor,
+            py::arg("id"), py::arg("anchor"), py::arg("margin_x") = 16, py::arg("margin_y") = 16,
+            "Snap an element to one of the 9 preset positions. Switches "
+            "the element out of CUSTOM (free-placed) mode if it was in it.")
+        .def("set_osd_element_custom_position", &VideoLink::setOsdElementCustomPosition,
+            py::arg("id"), py::arg("fx"), py::arg("fy"),
+            "Free-place an element with its center at fractional panel "
+            "position (fx, fy), each in [0, 1]. Puts the element in "
+            "CUSTOM anchor mode. Called on drag-release by OsdDragOverlay "
+            "when the drag did NOT snap to a preset -- see "
+            "osd_overlay_controls.py.")
+        .def("get_osd_element_layout", &VideoLink::getOsdElementLayout,
+            py::arg("id"),
+            "Current layout for one element, for the settings panel to "
+            "read back on open and for save/load. Persistence itself is "
+            "done in Python, not here.")
+        .def("set_telemetry_provider", &VideoLink::setTelemetryProvider,
+            py::arg("provider"),
+            "Python callable, no args, returning a TelemetrySnapshot -- "
+            "the SAME callable already passed to "
+            "DetectionLink.set_telemetry_provider() should be reused "
+            "here (e.g. DroneCockpitApp._get_detection_telemetry()). "
+            "Called once per painted frame, on the capture thread, "
+            "immediately before OSD compositing.")
+        .def("reset_flight_timer", &VideoLink::resetFlightTimer,
+            "Reset the OSD flight timer back to 0:00. Safe to call from "
+            "any thread (e.g. a Tk button on the UI thread) -- the "
+            "reset is applied on the capture thread on the next painted "
+            "frame. If the drone is still armed when this is called, "
+            "the timer keeps running from zero rather than stopping; "
+            "only a disarm ever pauses it.");
 
     // =========================================================================
     // TelemetrySnapshot
@@ -629,7 +709,25 @@ PYBIND11_MODULE(DroneBackend, m) {
         .def_readwrite("gimbal_pan_deg", &TelemetrySnapshot::gimbalPanDeg,
             "Relative to body forward, positive = pan right.")
         .def_readwrite("gimbal_tilt_deg", &TelemetrySnapshot::gimbalTiltDeg,
-            "0 = forward/level, +90 = straight down.");
+            "0 = forward/level, +90 = straight down.")
+        .def_readwrite("battery_voltage", &TelemetrySnapshot::batteryVoltage,
+            "Volts. For the OSD battery readout -- same source as "
+            "DroneState.battery_voltage.")
+        .def_readwrite("battery_percentage", &TelemetrySnapshot::batteryPercentage,
+            "0-100, same source as DroneState.battery_percentage.")
+        .def_readwrite("rssi", &TelemetrySnapshot::rssi,
+            "0-255 raw link quality, same source as DroneState.rssi.")
+        .def_readwrite("gps_fix_type", &TelemetrySnapshot::gpsFixType,
+            "0 = no fix, 1 = 2D, 2 = 3D -- same source as GPSReading.fix_type.")
+        .def_readwrite("gps_num_sat", &TelemetrySnapshot::gpsNumSat,
+            "Satellites used in the solution, same source as GPSReading.num_sat.")
+        .def_readwrite("home_distance_m", &TelemetrySnapshot::homeDistanceM,
+            "Metres, same source as GPSReading.dist_to_home_m.")
+        .def_readwrite("ground_speed_ms", &TelemetrySnapshot::groundSpeedMs,
+            "Metres/second, derived from GPSReading.ground_speed_cms / 100.0.")
+        .def_readwrite("armed", &TelemetrySnapshot::armed,
+            "Same source as DroneState.armed. Drives the OSD flight "
+            "timer's start/pause edge-detection in VideoLink::drawOsdTimer.");
 
     // =========================================================================
     // DetectionRecord

@@ -56,6 +56,7 @@
     <Compile Include="FPVWidget.py" />
     <Compile Include="export_model.py" />
     <Compile Include="MapTiles.py" />
+    <Compile Include="osd_overlay_controls.py" />
     <Compile Include="prefetch_tiles.py" />
     <Compile Include="NNTraining\class_map.py" />
     <Compile Include="NNTraining\cross_reference_gaps.py" />

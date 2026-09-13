@@ -5,7 +5,18 @@
 #include <atomic>
 #include <string>
 #include <vector>
+#include <map>
+#include <functional>
 #include <cstdint>
+#include <chrono>
+
+// Forward declaration only -- the full definition (lat/lon/altitude_m/
+// heading_deg/roll_deg/pitch_deg/gimbal_*/battery_*/rssi/gps_*/
+// home_distance_m/ground_speed_ms) lives in DetectionLink.h. The OSD
+// overlay reuses this struct verbatim instead of inventing a second
+// "current telemetry" type: it's the same aircraft state, just consumed
+// by a second renderer. See setTelemetryProvider() below.
+struct TelemetrySnapshot;
 
 // Windows native window/DC handles for direct-to-window rendering.
 // Forward-declared instead of including <windows.h> here to keep this
@@ -160,6 +171,94 @@ public:
     void hideWindow();
     bool isWindowVisible() const { return windowVisible_.load(); }
 
+    // ── Software OSD overlay ─────────────────────────────────────────
+    //
+    // Replaces the flight controller's own analog OSD (Betaflight, now
+    // disabled at the FC) so the pilot doesn't lose the readouts: this
+    // draws them into the SAME off-screen back buffer paintFrame() already
+    // composites into (see backBufferDc_), on top of the video but BEFORE
+    // the BitBlt to screen -- so it costs nothing extra vs. the FC-baked
+    // OSD in terms of extra round trips, and it is drawn AFTER the frame
+    // is captured into latestFrame_ (see captureLoop()), so it can never
+    // leak into getLatestFrame()/DetectionLink's input. That separation is
+    // the entire point: the FC's OSD was optically burned into the analog
+    // signal ahead of the capture card, so it was physically impossible to
+    // strip back out downstream and confused the aerial-detection model.
+    // This overlay lives one layer higher, purely in the render path, so
+    // it never touches a single pixel DetectionLink ever sees.
+    //
+    // Each element is independently enabled/positioned by id. The
+    // starting set (see kOsdElementIds in the .cpp) is
+    // "altitude" / "horizon" / "compass", matching the three things the
+    // NN was picking up false positives from in the FC OSD -- add more
+    // ids to kOsdElementIds + a case in drawOsdOverlay() to extend this
+    // (e.g. a "battery" element pulled from a second small provider, since
+    // TelemetrySnapshot itself doesn't carry battery voltage).
+    enum class OsdAnchor {
+        TopLeft, TopCenter, TopRight,
+        MiddleLeft, Center, MiddleRight,
+        BottomLeft, BottomCenter, BottomRight,
+        Custom   // free-placed; see customFx/customFy below
+    };
+
+    struct OsdElementLayout {
+        bool enabled = true;
+        OsdAnchor anchor = OsdAnchor::TopLeft;
+        // Pixel inset from whichever edge(s) the anchor names -- ignored
+        // for Center and for Custom.
+        int marginX = 16;
+        int marginY = 16;
+        // Fraction (0..1) of the panel where this element's own CENTER
+        // sits, only used when anchor == Custom (i.e. the pilot dragged
+        // it somewhere that didn't snap to a preset -- see
+        // OsdDragOverlay.commit() on the Python side).
+        float customFx = 0.5f;
+        float customFy = 0.5f;
+    };
+
+    // Enable/disable and position one OSD element. id must be one of
+    // kOsdElementIds (see .cpp) -- unknown ids are ignored (logged in
+    // verbose mode) rather than silently creating a stray entry, so a
+    // typo'd id from the Python settings panel fails visibly instead of
+    // just never drawing.
+    void setOsdElementEnabled(const std::string& id, bool enabled);
+    void setOsdElementAnchor(const std::string& id, OsdAnchor anchor, int marginX, int marginY);
+    void setOsdElementCustomPosition(const std::string& id, float fx, float fy);
+    // Snapshot of one element's current layout, for the settings panel to
+    // read back on open and for save/load (persistence itself is done in
+    // Python -- see osd_overlay_controls.py -- this just exposes state).
+    OsdElementLayout getOsdElementLayout(const std::string& id) const;
+    std::vector<std::string> getOsdElementIds() const;
+
+    // Master on/off -- flips every element at once without forgetting
+    // their individual enabled flags (e.g. a single OSD panel checkbox
+    // "Show OSD overlay"), and a lock that OsdDragOverlay checks before
+    // allowing a drag to start, so a pilot mid-flight can't nudge an
+    // element by brushing the video panel.
+    void setOsdOverlayEnabled(bool enabled) { osdOverlayEnabled_.store(enabled); }
+    bool isOsdOverlayEnabled() const { return osdOverlayEnabled_.load(); }
+    void setOsdLocked(bool locked) { osdLocked_.store(locked); }
+    bool isOsdLocked() const { return osdLocked_.load(); }
+
+    // Same std::function-provider pattern as DetectionLink::setTelemetryProvider
+    // (see Bindings.cpp) -- a plain Python callable returning a
+    // TelemetrySnapshot, invoked once per painted frame on the capture
+    // thread, immediately before compositing. Wire the SAME callable
+    // that's already passed to DetectionLink.set_telemetry_provider() on
+    // the Python side (DroneCockpitApp._get_detection_telemetry() or
+    // equivalent) -- there's no reason for two separate trampolines
+    // producing the same snapshot.
+    void setTelemetryProvider(std::function<TelemetrySnapshot()> provider);
+
+    // Resets the OSD flight timer (see osdTimerAccumulated_ etc. below)
+    // back to 0:00. Safe to call from any thread -- it just raises
+    // osdTimerResetRequested_, which drawOsdTimer() consumes on the
+    // capture/paint thread that actually owns the timer state. Wire this
+    // to a cockpit "reset timer" button. If the timer is currently
+    // running (drone still armed) when this is called, it keeps running
+    // from zero rather than stopping -- only a disarm ever stops it.
+    void resetFlightTimer();
+
     // Called by the OS device-notification window (see notifyThreadMain
     // in the .cpp) the instant Windows reports a capture-class USB
     // device has been plugged back in. Not intended to be called from
@@ -276,6 +375,85 @@ private:
     // otherwise-blank background) from flipping the warning on and off
     // rapidly.
     static double idleColorFraction(const cv::Mat& frame);
+
+    // ── Software OSD overlay state ───────────────────────────────────
+    //
+    // Written from the Python/Tk thread (settings panel + drag overlay
+    // callbacks), read from the capture thread inside paintFrameDirect --
+    // same cross-thread shape as renderHwnd_/renderHdc_ above, but a
+    // std::map isn't atomic-friendly, so this one small mutex guards the
+    // whole layout table instead. Contention is a non-issue: writes only
+    // happen on user interaction (a checkbox click, a drag release), not
+    // per-frame.
+    mutable std::mutex osdMutex_;
+    std::map<std::string, OsdElementLayout> osdLayout_;
+    std::atomic<bool> osdOverlayEnabled_{ true };
+    std::atomic<bool> osdLocked_{ false };
+    std::function<TelemetrySnapshot()> telemetryProvider_;
+
+    // Resolves one element's layout to a top-left pixel origin for a box
+    // of size (elemW, elemH) inside a destW x destH panel. Shared by
+    // every element's draw* helper below so anchor math lives in exactly
+    // one place.
+    void resolveOsdOrigin(const OsdElementLayout& layout, int destW, int destH,
+        int elemW, int elemH, int& outX, int& outY) const;
+
+    // Shared box-sizing + origin resolution for every simple single-line
+    // OSD readout (battery/RSSI/GPS/timer/home-distance) -- measures
+    // `text` with DT_CALCRECT and resolves its anchor via
+    // resolveOsdOrigin. Out-params (not a returned RECT) to match
+    // resolveOsdOrigin's own style and because this header deliberately
+    // never includes <windows.h> / RECT. Same shape drawOsdAltitude/
+    // Compass already used inline; pulled out once the new elements all
+    // needed the identical few lines.
+    void layoutOsdReadout(HDC hdc, const wchar_t* text, const OsdElementLayout& layout,
+        int destW, int destH, int& outX, int& outY, int& outW, int& outH) const;
+
+    // The actual per-element GDI drawing, run from paintFrameDirect after
+    // the video blit. Takes the telemetry snapshot already fetched once
+    // for this frame (not re-fetched per element) and destW/destH of the
+    // panel being painted into.
+    void drawOsdOverlay(HDC targetHdc, int destW, int destH);
+    void drawOsdAltitude(HDC hdc, const OsdElementLayout& layout, int destW, int destH,
+        const TelemetrySnapshot& t);
+    void drawOsdHorizon(HDC hdc, const OsdElementLayout& layout, int destW, int destH,
+        const TelemetrySnapshot& t);
+    void drawOsdCompass(HDC hdc, const OsdElementLayout& layout, int destW, int destH,
+        const TelemetrySnapshot& t);
+    void drawOsdBattery(HDC hdc, const OsdElementLayout& layout, int destW, int destH,
+        const TelemetrySnapshot& t);
+    void drawOsdRssi(HDC hdc, const OsdElementLayout& layout, int destW, int destH,
+        const TelemetrySnapshot& t);
+    void drawOsdGps(HDC hdc, const OsdElementLayout& layout, int destW, int destH,
+        const TelemetrySnapshot& t);
+    void drawOsdTimer(HDC hdc, const OsdElementLayout& layout, int destW, int destH,
+        const TelemetrySnapshot& t);
+    void drawOsdHomeDistance(HDC hdc, const OsdElementLayout& layout, int destW, int destH,
+        const TelemetrySnapshot& t);
+
+    // Flight timer state. Semantics: starts on the drone's first arm,
+    // pauses (holds) on disarm, resumes from where it left off on the
+    // next arm, and is only ever zeroed by an explicit resetFlightTimer()
+    // call (cockpit button). This is deliberately an
+    // accumulated-total-plus-current-segment model rather than a single
+    // start timestamp, so a disarm/rearm cycle doesn't restart the clock.
+    //
+    // osdTimerAccumulated_/osdTimerRunning_/osdTimerSegmentStart_/
+    // osdTimerPrevArmed_ are touched only from drawOsdTimer(), which only
+    // ever runs on VideoLink's own capture/paint thread, so they need no
+    // lock/atomic despite being read+written across frames -- same
+    // reasoning the old single-timestamp version relied on.
+    std::chrono::steady_clock::duration osdTimerAccumulated_{ 0 }; // total time from all completed armed segments
+    bool osdTimerRunning_ = false;             // true while the current armed segment is counting
+    std::chrono::steady_clock::time_point osdTimerSegmentStart_;  // start of the current armed segment
+    bool osdTimerPrevArmed_ = false;           // t.armed as of the previous drawOsdTimer() call, for edge detection
+
+    // The one piece of timer state that DOES cross threads: set from
+    // resetFlightTimer() (called from the Tk/UI thread on a button
+    // click), consumed and cleared inside drawOsdTimer() on the capture
+    // thread. Everything above stays single-threaded; this flag is the
+    // only hand-off.
+    std::atomic<bool> osdTimerResetRequested_{ false };
 
     void createRenderWindow(HWND parent, int x, int y, int w, int h);
     void paintFrame(const cv::Mat& frame);

@@ -1479,6 +1479,16 @@ class DroneCockpitApp:
         # connect()/connect_auto() succeeds and frames start arriving.
         self.fpv_view.attach(self.video_link)
 
+        # Wire the pilot-facing software OSD's telemetry source. Uses
+        # _get_osd_telemetry() (below), a dedicated trampoline -- NOT
+        # _get_detection_telemetry() -- because the two have different
+        # validity/altitude semantics (see _get_osd_telemetry()'s
+        # docstring). Without this call, VideoLink::drawOsdOverlay()
+        # bails out immediately (no telemetryProvider_ set at all), so the
+        # OSD never draws regardless of what's enabled/saved in the
+        # settings panel.
+        self.video_link.set_telemetry_provider(self._get_osd_telemetry)
+
         # The native FPV render window sits entirely outside Tk's widget
         # tree, so nothing about it is touched by raise_panel()/lower_panel()
         # or show()/hide() on the "fpv" DraggablePanel by default. Push it
@@ -2096,6 +2106,98 @@ class DroneCockpitApp:
         tilt_deg, pan_deg = self._get_camera_mount_angle()
         snapshot.gimbal_tilt_deg = tilt_deg
         snapshot.gimbal_pan_deg = pan_deg
+        return snapshot
+
+    def _get_osd_telemetry(self) -> "DroneBackend.TelemetrySnapshot":
+        """
+        Trampoline passed to VideoLink.set_telemetry_provider() -- the
+        pilot-facing software OSD's data source. Deliberately NOT the same
+        callable as _get_detection_telemetry() above, even though
+        VideoLink.h's own comment suggests reusing one: the two have
+        genuinely different validity/altitude semantics and reusing the
+        detection trampoline silently breaks the OSD.
+
+        Why a separate one is needed:
+          - _get_detection_telemetry() sets `valid = gps.position_usable`,
+            which is correct for DetectionLink (no GPS fix -> lat/lon are
+            garbage -> skip georeferencing) but wrong for the OSD: none of
+            altitude/horizon/compass need a GPS fix at all (they come from
+            the barometer, IMU, and magnetometer respectively). Reusing
+            that flag here means the OSD would stay blank on the bench, or
+            anywhere the FC hasn't gotten a GPS lock yet -- which is
+            exactly what was happening. Here `valid` means "do we have a
+            live FC link", not "do we have a GPS fix".
+          - _get_detection_telemetry() also fills altitude_m from
+            gps.altitude_m (GPS altitude). The OSD should read the
+            barometer instead, same source BaroWidget already uses, so the
+            two on-screen altitude readouts agree and don't depend on GPS
+            at all.
+
+        Called directly from VideoLink's own capture/paint thread, once
+        per painted frame (see drawOsdOverlay() in VideoLink.cpp) -- NOT
+        the Tk thread. hub.get_latest_state() is the same thread-safe,
+        mutex-protected snapshot copy _get_detection_telemetry() uses, so
+        calling it a second time here (once per detection pass, once per
+        painted video frame) is safe -- just a small extra mutex-guarded
+        copy, not a correctness concern.
+        """
+        snapshot = DroneBackend.TelemetrySnapshot()
+
+        hub = getattr(self, "hub", None)
+        if hub is None or not hub.is_connected():
+            return snapshot   # valid=False by default -- OSD stays hidden until link is up
+
+        try:
+            state = hub.get_latest_state()
+        except Exception:
+            return snapshot
+
+        # "Do we have a live FC link at all" -- NOT gated on GPS fix. This
+        # guards against drawing anything when the link is down (a fresh,
+        # never-populated snapshot would otherwise be all-zeros and
+        # misleadingly rendered as "valid" data). Note this is coarser
+        # than ideal: none of drawOsdAltitude/Horizon/Compass in
+        # VideoLink.cpp currently check baro_valid/mag_valid individually
+        # -- they render whatever's in the snapshot unconditionally. So if
+        # the barometer or magnetometer itself isn't calibrated/valid yet
+        # (state.baro_valid / state.mag_valid false) while the FC link is
+        # otherwise up, the OSD will still show a number (e.g. "ALT 0.0 m")
+        # with nothing telling the pilot it's not trustworthy. Flagging
+        # this as a follow-up, not fixing it here -- it needs a small
+        # VideoLink.cpp change (checking per-element validity before each
+        # draw call) if you want it closed.
+        snapshot.valid = True
+        snapshot.altitude_m = float(getattr(state, "baro_altitude_cm", 0)) / 100.0
+        snapshot.heading_deg = float(state.yaw)
+        snapshot.roll_deg = state.roll / 10.0
+        snapshot.pitch_deg = state.pitch / 10.0
+
+        # Battery / RSSI -- straight off DroneState, same fields
+        # TelemetryWorker already surfaces to the rest of the UI.
+        snapshot.battery_voltage = float(state.battery_voltage)
+        snapshot.battery_percentage = int(state.battery_percentage)
+        snapshot.rssi = int(state.rssi)
+
+        # Drives VideoLink's OSD flight timer (start on arm / pause on
+        # disarm / resume on rearm -- see drawOsdTimer in VideoLink.cpp).
+        snapshot.armed = bool(getattr(state, "armed", False))
+
+        # GPS lock/sat count and home distance/speed -- same gps reading
+        # DetectionLink's own trampoline above reads lat/lon from. Unlike
+        # that one, the OSD doesn't gate `valid` on position_usable (see
+        # this method's docstring), so these are read defensively in case
+        # gps itself isn't populated yet.
+        gps = getattr(state, "gps", None)
+        if gps is not None:
+            snapshot.gps_fix_type = int(getattr(gps, "fix_type", 0))
+            snapshot.gps_num_sat = int(getattr(gps, "num_sat", 0))
+            snapshot.home_distance_m = float(getattr(gps, "dist_to_home_m", 0.0))
+            # GPSReading.ground_speed_cms is documented in cm/s despite the
+            # underlying field name (groundSpeedMs) -- divide by 100 for
+            # m/s, same conversion telemetry_worker.py's UI dict leaves to
+            # its own consumers.
+            snapshot.ground_speed_ms = float(getattr(gps, "ground_speed_cms", 0)) / 100.0
+
         return snapshot
 
     def _retry_detection_engine(self, log_on_failure: bool = False) -> None:

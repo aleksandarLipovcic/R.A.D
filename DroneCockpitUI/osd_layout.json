@@ -1,0 +1,70 @@
+{
+  "overlay_enabled": true,
+  "locked": true,
+  "elements": {
+    "altitude": {
+      "enabled": true,
+      "anchor": "TOP_LEFT",
+      "margin_x": 16,
+      "margin_y": 16,
+      "custom_fx": 0.5,
+      "custom_fy": 0.5
+    },
+    "horizon": {
+      "enabled": true,
+      "anchor": "CENTER",
+      "margin_x": 16,
+      "margin_y": 16,
+      "custom_fx": 0.5,
+      "custom_fy": 0.5
+    },
+    "compass": {
+      "enabled": true,
+      "anchor": "BOTTOM_CENTER",
+      "margin_x": 16,
+      "margin_y": 16,
+      "custom_fx": 0.5,
+      "custom_fy": 0.5
+    },
+    "battery": {
+      "enabled": true,
+      "anchor": "BOTTOM_LEFT",
+      "margin_x": 16,
+      "margin_y": 16,
+      "custom_fx": 0.5,
+      "custom_fy": 0.5
+    },
+    "rssi": {
+      "enabled": true,
+      "anchor": "TOP_RIGHT",
+      "margin_x": 16,
+      "margin_y": 16,
+      "custom_fx": 0.5,
+      "custom_fy": 0.5
+    },
+    "gps": {
+      "enabled": true,
+      "anchor": "MIDDLE_LEFT",
+      "margin_x": 16,
+      "margin_y": 16,
+      "custom_fx": 0.5,
+      "custom_fy": 0.5
+    },
+    "timer": {
+      "enabled": true,
+      "anchor": "TOP_CENTER",
+      "margin_x": 16,
+      "margin_y": 16,
+      "custom_fx": 0.5,
+      "custom_fy": 0.5
+    },
+    "home_distance": {
+      "enabled": true,
+      "anchor": "MIDDLE_RIGHT",
+      "margin_x": 16,
+      "margin_y": 16,
+      "custom_fx": 0.5,
+      "custom_fy": 0.5
+    }
+  }
+}

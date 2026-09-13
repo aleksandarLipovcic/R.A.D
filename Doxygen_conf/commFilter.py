@@ -2,12 +2,22 @@ import sys
 import os
 import re
 
+
 def filter_file(filename):
-    # Fix 1: [1] to get the extension from the tuple
+    # Force UTF-8 stdout so non-ASCII characters in comments don't crash
+    # the filter when Doxygen captures this script's output via a pipe.
+    sys.stdout.reconfigure(encoding='utf-8')
+
     ext = os.path.splitext(filename)[1].lower()
 
-    with open(filename, 'r', encoding='utf-8', errors='ignore') as f:
-        lines = f.readlines()
+    try:
+        with open(filename, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+    except OSError as e:
+        # Fail loudly on stderr (so it shows in the Doxygen run log)
+        # but still exit cleanly instead of leaving Doxygen with no output.
+        sys.stderr.write(f"commFilter.py: could not read '{filename}': {e}\n")
+        return
 
     for line in lines:
 
@@ -32,6 +42,9 @@ def filter_file(filename):
 
         sys.stdout.write(line)
 
+
 if __name__ == '__main__':
     if len(sys.argv) > 1:
         filter_file(sys.argv[1])
+    else:
+        sys.stderr.write("commFilter.py: no filename provided\n")

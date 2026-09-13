@@ -48,6 +48,35 @@ newest sighting of a given track is drawn as the bright "current" pin;
 earlier sightings of that same track are drawn as a small fading trail
 so a single object logged 3 times over a minute of movement reads as
 one moving pin with a breadcrumb trail, not three unrelated dots.
+
+VIEW STATE — auto-follow vs. manual look-around
+------------------------------------------------
+By default the map is in "follow" mode (self._follow_drone = True): every
+redraw re-fits the view to whatever's currently on the map (all track
+points + the drone), exactly as before. The pilot can now break out of
+that to look around: dragging the map, using the +/- zoom buttons, or
+the mouse wheel/scroll all switch to manual mode (self._follow_drone =
+False), at which point self._map_zoom / self._map_center are held fixed
+across redraws instead of being recomputed from the data every time.
+"Center on drone" flips follow mode back on, which snaps the view back
+to the auto-fit framing (and keeps it following from then on).
+
+Auto-fit is capped at _AUTO_FIT_MAX_ZOOM regardless of a provider's own
+maximum, which matters more than it sounds: with a single point on the
+map (e.g. just the drone, no georeferenced detections yet), the old
+"walk zoom down from max until the bbox fits" search degenerates to a
+zero-size box that always "fits", so it returned the provider's raw
+max_zoom immediately -- 19 for Esri satellite vs. 17 for OpenTopoMap in
+this app's config, even though both providers were prefetched (see
+prefetch_tiles.py) over the SAME zoom range. That's why satellite could
+come up blank ("no imagery at this zoom") right after a prefetch while
+topographic loaded fine at the same location: the two providers'
+auto-fit zoom silently diverged. Capping the auto-fit ceiling to match
+what prefetch_tiles.py actually downloads keeps both providers landing
+on a zoom level that's actually cached; the manual +/- controls can
+still go deeper than the cap on either provider if the pilot wants to
+push past it (kicking off a live download if online, or showing the
+flat placeholder if not).
 """
 
 import math
@@ -65,6 +94,17 @@ except ImportError:
     _PIL_AVAILABLE = False
 
 
+# Ceiling used only for the auto-fit ("follow drone") zoom search in
+# _fit_zoom -- deliberately independent of any one provider's own
+# max_zoom. Matches prefetch_tiles.py's own --max-zoom default, so a
+# pilot who prefetched with the default range gets a follow-mode view
+# that's actually cached on both providers instead of one of them
+# silently landing above what was downloaded (see module docstring).
+# Manual zoom (the +/- buttons, mouse wheel) is NOT capped by this --
+# it can still go up to a provider's real max_zoom.
+_AUTO_FIT_MAX_ZOOM = 17
+
+
 def _mercator_pixel(lat, lon, zoom):
     """
     Standard Web Mercator lon/lat -> global pixel coordinates at a given
@@ -80,6 +120,22 @@ def _mercator_pixel(lat, lon, zoom):
     x = (lon + 180.0) / 360.0 * n * MapTiles.TILE_SIZE
     y = (1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0 * n * MapTiles.TILE_SIZE
     return x, y
+
+
+def _mercator_lonlat(x, y, zoom):
+    """
+    Inverse of _mercator_pixel: global Web Mercator pixel coordinates at
+    a given zoom -> (lat, lon). Needed for panning (turning a canvas drag
+    delta back into a lat/lon center) and for cursor-centered zoom
+    (finding what lat/lon is under the mouse before changing zoom so the
+    same point can be kept under it afterward).
+    """
+    n = 2.0 ** zoom
+    lon = x / (n * MapTiles.TILE_SIZE) * 360.0 - 180.0
+    y_frac = y / (n * MapTiles.TILE_SIZE)
+    lat_rad = math.atan(math.sinh(math.pi * (1.0 - 2.0 * y_frac)))
+    lat = math.degrees(lat_rad)
+    return lat, lon
 
 
 class DetectionMapWidget(tk.Toplevel):
@@ -104,8 +160,17 @@ class DetectionMapWidget(tk.Toplevel):
         # object's repeated sightings draw as one pin + trail instead of
         # a pile of unrelated dots (see module docstring).
         self._track_positions = {}
-        self._map_zoom = None      # zoom the map was last drawn at (for reference/debugging)
-        self._map_center = None    # (lat, lon) the map was last centered on
+        self._map_zoom = None      # zoom the map is currently drawn at (auto-fit or manual, see _follow_drone)
+        self._map_center = None    # (lat, lon) the map is currently centered on
+
+        # ── Manual look-around state ─────────────────────────────────
+        # True (the default): every redraw re-fits zoom/center to the
+        # data, same as before this feature existed. Panning, the +/-
+        # buttons, or the mouse wheel set this False and freeze
+        # _map_zoom/_map_center until "Center on drone" sets it back.
+        self._follow_drone = True
+        self._drag_start = None            # (canvas_x, canvas_y) at drag start, or None
+        self._drag_start_center_px = None  # _map_center's Mercator pixel coords at drag start
 
         # ── Tile provider / cache state ──────────────────────────────
         self._tile_cache = MapTiles.TileCache()
@@ -209,9 +274,50 @@ class DetectionMapWidget(tk.Toplevel):
                 indicatoron=False, padx=10, relief="flat", borderwidth=1,
             ).pack(side="right", padx=(4, 0))
 
+        # Zoom +/- and "Center on drone" -- packed after the provider
+        # loop above so they land just to its left (see _build_layout
+        # packing order notes: repeated side="right" packs stack inward
+        # from the right edge). Center on drone re-enables follow mode
+        # (see _on_center_on_drone); +/- and drag/scroll disable it
+        # (see _adjust_zoom / _zoom_at_point / _on_map_press).
+        zoom_controls = tk.Frame(map_header, bg="#1a1a1a")
+        zoom_controls.pack(side="right", padx=(4, 10))
+
+        self._center_btn = tk.Button(
+            zoom_controls, text="\u2299 Center on drone", command=self._on_center_on_drone,
+            fg="#cccccc", bg="#2a2a2a", activebackground="#3a3a3a", activeforeground="#ffffff",
+            relief="flat", padx=8, borderwidth=1,
+        )
+        self._center_btn.pack(side="left", padx=(0, 8))
+
+        self._zoom_out_btn = tk.Button(
+            zoom_controls, text="\u2212", command=lambda: self._adjust_zoom(-1),
+            fg="#cccccc", bg="#2a2a2a", activebackground="#3a3a3a", activeforeground="#ffffff",
+            relief="flat", width=2, borderwidth=1,
+        )
+        self._zoom_out_btn.pack(side="left")
+
+        self._zoom_in_btn = tk.Button(
+            zoom_controls, text="+", command=lambda: self._adjust_zoom(1),
+            fg="#cccccc", bg="#2a2a2a", activebackground="#3a3a3a", activeforeground="#ffffff",
+            relief="flat", width=2, borderwidth=1,
+        )
+        self._zoom_in_btn.pack(side="left", padx=(2, 0))
+
         self._map_canvas = tk.Canvas(right, bg="#111a14", height=260, highlightthickness=0)
         self._map_canvas.pack(fill="x", padx=8, pady=(4, 2))
         self._map_canvas.bind("<Configure>", self._on_map_canvas_resize)
+
+        # Look-around controls: drag to pan, wheel/scroll to zoom toward
+        # the cursor. All of these hand off to the same manual-view state
+        # that the +/- buttons use (see _on_map_press/_on_map_drag and
+        # _on_mouse_wheel).
+        self._map_canvas.bind("<ButtonPress-1>", self._on_map_press)
+        self._map_canvas.bind("<B1-Motion>", self._on_map_drag)
+        self._map_canvas.bind("<ButtonRelease-1>", self._on_map_release)
+        self._map_canvas.bind("<MouseWheel>", self._on_mouse_wheel)  # Windows / macOS
+        self._map_canvas.bind("<Button-4>", self._on_mouse_wheel)    # Linux (X11) scroll up
+        self._map_canvas.bind("<Button-5>", self._on_mouse_wheel)    # Linux (X11) scroll down
 
         self._map_attribution_var = tk.StringVar(value="")
         tk.Label(right, textvariable=self._map_attribution_var,
@@ -401,6 +507,13 @@ class DetectionMapWidget(tk.Toplevel):
         # The on-disk cache itself is untouched (each provider has its own
         # subdirectory), so nothing already downloaded is lost.
         self._tile_image_cache.clear()
+        # If the pilot is in manual mode above the new provider's own
+        # max_zoom (e.g. zoomed to 19 on satellite, then switched to a
+        # topo provider that tops out lower), clamp down rather than
+        # asking for tiles that don't exist at any zoom.
+        if self._map_zoom is not None:
+            max_zoom = MapTiles.PROVIDERS[self._map_provider]["max_zoom"]
+            self._map_zoom = min(self._map_zoom, max_zoom)
         self._redraw_map()
 
     def _on_map_canvas_resize(self, _event) -> None:
@@ -411,6 +524,97 @@ class DetectionMapWidget(tk.Toplevel):
         if self._resize_job is not None:
             self.after_cancel(self._resize_job)
         self._resize_job = self.after(120, self._redraw_map)
+
+    def _on_center_on_drone(self) -> None:
+        """
+        Bound to the "Center on drone" button. Re-enables follow mode,
+        which snaps the view back to the same auto-fit framing
+        _redraw_map has always used (drone + every track point) and keeps
+        it following from here on, until the pilot pans/zooms again.
+        """
+        self._follow_drone = True
+        self._redraw_map()
+
+    def _adjust_zoom(self, delta: int) -> None:
+        """Bound to the +/- buttons. Zooms toward the current view center."""
+        if self._map_zoom is None or self._map_center is None:
+            return  # no GPS fix yet -- nothing on screen to zoom
+        w = self._map_canvas.winfo_width() or 400
+        h = self._map_canvas.winfo_height() or 260
+        self._zoom_at_point(w / 2.0, h / 2.0, delta)
+
+    def _zoom_at_point(self, canvas_x: float, canvas_y: float, delta: int) -> None:
+        """
+        Changes zoom by `delta` while keeping whatever lat/lon is under
+        (canvas_x, canvas_y) fixed on screen -- standard "zoom toward
+        cursor" behavior, used by both the mouse wheel and the +/-
+        buttons (which zoom toward the canvas center). Unlike the
+        auto-fit search in _fit_zoom, this is allowed to go all the way
+        up to the provider's real max_zoom, not just _AUTO_FIT_MAX_ZOOM --
+        the pilot asking to zoom in further is a deliberate choice to
+        push past what's cached, not a bbox-fitting accident.
+        """
+        if self._map_zoom is None or self._map_center is None:
+            return
+        max_zoom = MapTiles.PROVIDERS[self._map_provider]["max_zoom"]
+        old_zoom = self._map_zoom
+        new_zoom = max(1, min(max_zoom, old_zoom + delta))
+        if new_zoom == old_zoom:
+            return
+
+        w = self._map_canvas.winfo_width() or 400
+        h = self._map_canvas.winfo_height() or 260
+        center_lat, center_lon = self._map_center
+        cpx, cpy = _mercator_pixel(center_lat, center_lon, old_zoom)
+        cursor_px = cpx + (canvas_x - w / 2.0)
+        cursor_py = cpy + (canvas_y - h / 2.0)
+        cursor_lat, cursor_lon = _mercator_lonlat(cursor_px, cursor_py, old_zoom)
+
+        # Re-place that same lat/lon at the new zoom, then back-solve the
+        # center that keeps it under the same canvas point.
+        new_cursor_px, new_cursor_py = _mercator_pixel(cursor_lat, cursor_lon, new_zoom)
+        new_center_px = new_cursor_px - (canvas_x - w / 2.0)
+        new_center_py = new_cursor_py - (canvas_y - h / 2.0)
+        new_center_lat, new_center_lon = _mercator_lonlat(new_center_px, new_center_py, new_zoom)
+
+        self._map_zoom = new_zoom
+        self._map_center = (new_center_lat, new_center_lon)
+        self._follow_drone = False
+        self._redraw_map()
+
+    def _on_mouse_wheel(self, event) -> None:
+        # Windows/macOS deliver a signed event.delta (positive = zoom in);
+        # X11/Linux instead sends separate Button-4 (up/zoom in) and
+        # Button-5 (down/zoom out) events with no delta attribute.
+        delta = 1 if getattr(event, "num", None) == 4 else -1 if getattr(event, "num", None) == 5 else \
+            (1 if getattr(event, "delta", 0) > 0 else -1)
+        self._zoom_at_point(event.x, event.y, delta)
+
+    def _on_map_press(self, event) -> None:
+        if self._map_zoom is None or self._map_center is None:
+            return  # no GPS fix yet -- nothing to drag
+        self._drag_start = (event.x, event.y)
+        center_lat, center_lon = self._map_center
+        self._drag_start_center_px = _mercator_pixel(center_lat, center_lon, self._map_zoom)
+        self._map_canvas.config(cursor="fleur")
+
+    def _on_map_drag(self, event) -> None:
+        if self._drag_start is None:
+            return
+        dx = event.x - self._drag_start[0]
+        dy = event.y - self._drag_start[1]
+        cpx, cpy = self._drag_start_center_px
+        # Dragging right/down should reveal area to the left/above, i.e.
+        # the center point moves opposite to the drag direction.
+        new_lat, new_lon = _mercator_lonlat(cpx - dx, cpy - dy, self._map_zoom)
+        self._map_center = (new_lat, new_lon)
+        self._follow_drone = False
+        self._redraw_map()
+
+    def _on_map_release(self, _event) -> None:
+        self._drag_start = None
+        self._drag_start_center_px = None
+        self._map_canvas.config(cursor="")
 
     def _poll_tile_downloads(self) -> None:
         """
@@ -439,7 +643,7 @@ class DetectionMapWidget(tk.Toplevel):
         provider's max supported zoom. Standard "fit bounds" search: walk
         zoom down from max until the box's Mercator-pixel footprint fits.
         """
-        max_zoom = MapTiles.PROVIDERS[self._map_provider]["max_zoom"]
+        max_zoom = min(MapTiles.PROVIDERS[self._map_provider]["max_zoom"], _AUTO_FIT_MAX_ZOOM)
         avail_w = max(canvas_w - 2 * pad, 40)
         avail_h = max(canvas_h - 2 * pad, 40)
         for zoom in range(max_zoom, 0, -1):
@@ -531,26 +735,33 @@ class DetectionMapWidget(tk.Toplevel):
         h = self._map_canvas.winfo_height() or 260
         pad = 34
 
-        # Points the view must fit: every track pin/trail point, plus the
-        # drone's own current position if we have one -- a drone that has
-        # flown well away from its one detection (or that has zero
-        # detections at all) still needs to stay on screen.
-        all_points = [p for positions in self._track_positions.values() for p in positions]
-        if self._drone_telemetry is not None:
-            all_points.append(self._drone_telemetry)
-        if not all_points:
-            all_points = [self._map_origin]  # nothing plottable yet, but still center the basemap somewhere real
+        if self._follow_drone:
+            # Points the view must fit: every track pin/trail point, plus
+            # the drone's own current position if we have one -- a drone
+            # that has flown well away from its one detection (or that
+            # has zero detections at all) still needs to stay on screen.
+            all_points = [p for positions in self._track_positions.values() for p in positions]
+            if self._drone_telemetry is not None:
+                all_points.append(self._drone_telemetry)
+            if not all_points:
+                all_points = [self._map_origin]  # nothing plottable yet, but still center the basemap somewhere real
 
-        lats = [p[0] for p in all_points]
-        lons = [p[1] for p in all_points]
-        min_lat, max_lat = min(lats), max(lats)
-        min_lon, max_lon = min(lons), max(lons)
-        center_lat = (min_lat + max_lat) / 2.0
-        center_lon = (min_lon + max_lon) / 2.0
+            lats = [p[0] for p in all_points]
+            lons = [p[1] for p in all_points]
+            min_lat, max_lat = min(lats), max(lats)
+            min_lon, max_lon = min(lons), max(lons)
+            center_lat = (min_lat + max_lat) / 2.0
+            center_lon = (min_lon + max_lon) / 2.0
 
-        zoom = self._fit_zoom(min_lat, max_lat, min_lon, max_lon, w, h, pad)
-        self._map_zoom = zoom
-        self._map_center = (center_lat, center_lon)
+            zoom = self._fit_zoom(min_lat, max_lat, min_lon, max_lon, w, h, pad)
+            self._map_zoom = zoom
+            self._map_center = (center_lat, center_lon)
+        else:
+            # Manual look-around mode (drag / zoom buttons / scroll wheel
+            # already set these) -- hold the view still instead of
+            # re-fitting it to the data on every redraw.
+            zoom = self._map_zoom
+            center_lat, center_lon = self._map_center
 
         self._draw_tile_mosaic(zoom, center_lat, center_lon, w, h)
 
