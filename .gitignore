@@ -36,6 +36,14 @@ DroneCockpitUI/NNTraining/datasets/
 DroneCockpitUI/NNTraining/runs/
 runs/
 
+# Runtime-generated caches and outputs (regenerated on demand, never
+# source). Paths are repo-root-relative, matching the
+# DroneCockpitUI/... entries above -- the repo root is the
+# "Project R.A.D" folder, so these resolve to the same two folders
+# without hardcoding anyone's Desktop path.
+DroneCockpitUI/tile_cache/
+DroneCockpitUI/detections/
+
 # VRAM diagnostics / profiling artifacts
 *vram_snapshot.pickle
 *vram_trace.csv
