@@ -351,6 +351,13 @@ namespace {
     // from the Python side a loud no-op instead of a silently-ignored typo.
     const char* kOsdElementIds[] = { "altitude", "horizon", "compass",
         "battery", "rssi", "gps", "timer", "home_distance" };
+
+    // Vertical breathing room between two elements stacked on the same
+    // anchor (see VideoLink::resolveOsdOrigin). Deliberately small: the
+    // single-line readouts already carry +8px of their own padding from
+    // layoutOsdReadout(), so this is just enough to keep two stacked
+    // rows from looking like one double-height block.
+    constexpr int kOsdStackGapPx = 4;
 }
 
 VideoLink::VideoLink() {
@@ -1065,7 +1072,7 @@ void VideoLink::resetFlightTimer() {
 }
 
 void VideoLink::resolveOsdOrigin(const OsdElementLayout& layout, int destW, int destH,
-    int elemW, int elemH, int& outX, int& outY) const {
+    int elemW, int elemH, int& outX, int& outY, bool stack) {
     if (layout.anchor == OsdAnchor::Custom) {
         outX = static_cast<int>(layout.customFx * destW) - elemW / 2;
         outY = static_cast<int>(layout.customFy * destH) - elemH / 2;
@@ -1096,16 +1103,59 @@ void VideoLink::resolveOsdOrigin(const OsdElementLayout& layout, int destW, int 
             break;
         }
     }
+
+    // ── Anchor stacking ──────────────────────────────────────────────
+    // Everything above resolved this element as if it were the only one
+    // on its anchor -- which is exactly what it was before, and exactly
+    // why two elements sharing an anchor painted on top of each other.
+    // Now: offset by however much of this anchor earlier elements have
+    // already claimed this frame, then claim our own slice for whoever
+    // resolves next.
+    //
+    // Direction is chosen so the stack always grows AWAY from the edge
+    // the anchor names, never through it: top-row anchors grow down,
+    // bottom-row anchors grow up. The middle row grows down, which
+    // leaves the first element exactly where it has always been
+    // (vertically centered) and hangs the rest below it -- the
+    // alternative, re-centering the whole block, would shift elements
+    // the pilot had already placed every time a new one was enabled.
+    //
+    // Custom is skipped entirely: a free-placed element is one the pilot
+    // dragged to a specific spot, so nudging it would fight that drag.
+    // `stack == false` (horizon only) opts out the same way. Note that
+    // opting out means NOT consuming a slot either, so the horizon
+    // sitting on BottomRight doesn't shove the readouts there off-panel.
+    if (stack && layout.anchor != OsdAnchor::Custom) {
+        int& claimed = osdStackUsedPx_[static_cast<int>(layout.anchor)];
+        switch (layout.anchor) {
+        case OsdAnchor::BottomLeft: case OsdAnchor::BottomCenter: case OsdAnchor::BottomRight:
+            outY -= claimed;
+            break;
+        default:   // Top row and middle row both grow downward.
+            outY += claimed;
+            break;
+        }
+        claimed += elemH + kOsdStackGapPx;
+    }
+
     // Keep fully on-panel regardless of how the position was derived --
     // a stale custom position from a previous, larger panel size (video
     // host resized smaller since it was saved) shouldn't push an element
     // partly off the visible video.
+    //
+    // This clamp is also the backstop for a stack that has grown taller
+    // than the panel (many elements crammed onto one anchor on a short
+    // video panel): rather than letting the overflow scroll off-screen
+    // where the pilot can't see it at all, the surplus elements pin to
+    // the far edge. That does reintroduce overlap, but only in a case
+    // that has no non-overlapping answer -- and it stays visible, which
+    // an off-panel element would not be.
     outX = (std::max)(0, (std::min)(outX, (std::max)(0, destW - elemW)));
     outY = (std::max)(0, (std::min)(outY, (std::max)(0, destH - elemH)));
 }
 
 void VideoLink::layoutOsdReadout(HDC hdc, const wchar_t* text, const OsdElementLayout& layout,
-    int destW, int destH, int& outX, int& outY, int& outW, int& outH) const {
+    int destW, int destH, int& outX, int& outY, int& outW, int& outH) {
     RECT calc = { 0, 0, 0, 0 };
     DrawTextW(hdc, text, -1, &calc, DT_CALCRECT | DT_SINGLELINE);
     outW = calc.right - calc.left + 12;
@@ -1131,6 +1181,22 @@ void VideoLink::drawOsdOverlay(HDC targetHdc, int destW, int destH) {
         layout = osdLayout_;
     }
 
+    // Clear last frame's anchor stacking. This is per-frame scratch, not
+    // persistent state: rebuilding it from nothing every frame is what
+    // makes a disabled element give its slot back immediately (the ones
+    // below it slide up on the very next paint) without any explicit
+    // invalidation when a checkbox is toggled.
+    osdStackUsedPx_.fill(0);
+
+    // The dispatch order below IS the stack order -- whichever element
+    // is drawn first on a given anchor sits at that anchor, and later
+    // ones queue off it. It deliberately follows kOsdElementIds rather
+    // than the order the pilot happened to tick the checkboxes, so a
+    // readout that gets toggled off and back on mid-flight returns to
+    // the same slot instead of jumping to the end of the stack. If the
+    // preferred reading order ever changes, reorder these blocks (and
+    // kOsdElementIds with them) -- there is no separate priority table
+    // to keep in sync.
     auto it = layout.find("altitude");
     if (it != layout.end() && it->second.enabled)
         drawOsdAltitude(targetHdc, it->second, destW, destH, t);
@@ -1256,7 +1322,13 @@ void VideoLink::drawOsdHorizon(HDC hdc, const OsdElementLayout& layout, int dest
     int elemH = elemW;   // square hit-box; the drawn ladder is narrower
 
     int originX, originY;
-    resolveOsdOrigin(layout, destW, destH, elemW, elemH, originX, originY);
+    // stack = false: the horizon is a large square backdrop, not a line
+    // of text. Letting it claim a stack slot would push any readout
+    // sharing its anchor several hundred pixels away; letting it take an
+    // offset would drag the ladder off the attitude center the pilot
+    // reads against. It resolves standalone, and the readouts stack over
+    // the top of it. See resolveOsdOrigin's header comment.
+    resolveOsdOrigin(layout, destW, destH, elemW, elemH, originX, originY, false);
     int cx = originX + elemW / 2;
     int cy = originY + elemH / 2;
 

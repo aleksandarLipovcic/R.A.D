@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <array>   // std::array -- osdStackUsedPx_ (per-anchor OSD stacking accumulator)
 #include <functional>
 #include <cstdint>
 #include <chrono>
@@ -395,8 +396,37 @@ private:
     // of size (elemW, elemH) inside a destW x destH panel. Shared by
     // every element's draw* helper below so anchor math lives in exactly
     // one place.
+    //
+    // ANCHOR STACKING. Two elements sharing one of the 9 presets used to
+    // resolve to the identical origin and paint directly on top of each
+    // other -- "altitude" and "battery" both on BottomRight rendered as
+    // an unreadable smear. They now STACK instead: the first element
+    // resolved for a given anchor sits exactly where it always did, and
+    // each subsequent one is pushed clear of the ones before it. Top-row
+    // anchors grow downward, bottom-row anchors grow upward, and the
+    // middle row grows downward (so the first element stays vertically
+    // centered and later ones hang below it).
+    //
+    // This is done here, rather than in each draw* helper, because of a
+    // property that holds today and MUST keep holding: every element
+    // calls resolveOsdOrigin EXACTLY ONCE per frame, in the fixed order
+    // drawOsdOverlay() dispatches them (the kOsdElementIds order). That
+    // makes this function the single point where "how much of this
+    // anchor is already spoken for" can be both read and advanced, and
+    // it is why no draw* helper needed changing to get stacking. The
+    // flip side: a future element that calls this twice for one frame
+    // (e.g. to measure, then to place) would silently consume two stack
+    // slots and leave a gap. Measure with a local RECT instead, the way
+    // layoutOsdReadout() does.
+    //
+    // `stack` opts an element out of that bookkeeping entirely -- it
+    // neither offsets nor consumes a slot. Only "horizon" passes false:
+    // it is a large square ladder+sidebar backdrop rather than a line of
+    // text, so queueing a compass readout below it would push the
+    // compass hundreds of pixels off its anchor. The horizon is meant to
+    // be drawn under the readouts, not in line with them.
     void resolveOsdOrigin(const OsdElementLayout& layout, int destW, int destH,
-        int elemW, int elemH, int& outX, int& outY) const;
+        int elemW, int elemH, int& outX, int& outY, bool stack = true);
 
     // Shared box-sizing + origin resolution for every simple single-line
     // OSD readout (battery/RSSI/GPS/timer/home-distance) -- measures
@@ -406,8 +436,11 @@ private:
     // never includes <windows.h> / RECT. Same shape drawOsdAltitude/
     // Compass already used inline; pulled out once the new elements all
     // needed the identical few lines.
+    //
+    // No longer const: it forwards to resolveOsdOrigin, which now
+    // advances the per-anchor stacking accumulator (see above).
     void layoutOsdReadout(HDC hdc, const wchar_t* text, const OsdElementLayout& layout,
-        int destW, int destH, int& outX, int& outY, int& outW, int& outH) const;
+        int destW, int destH, int& outX, int& outY, int& outW, int& outH);
 
     // The actual per-element GDI drawing, run from paintFrameDirect after
     // the video blit. Takes the telemetry snapshot already fetched once
@@ -454,6 +487,23 @@ private:
     // thread. Everything above stays single-threaded; this flag is the
     // only hand-off.
     std::atomic<bool> osdTimerResetRequested_{ false };
+
+    // Per-anchor stacking accumulator: how many vertical pixels each of
+    // the 9 presets has already handed out THIS frame. Indexed by
+    // static_cast<int>(OsdAnchor); the Custom slot exists only to keep
+    // the indexing trivial and is never read (free-placed elements are
+    // exactly the ones the pilot positioned by hand, so second-guessing
+    // them with an auto-offset would fight the drag they just did).
+    //
+    // Needs no lock or atomic for the same reason the timer state above
+    // doesn't: it is written and read only inside resolveOsdOrigin(),
+    // which runs only from the draw* helpers, which run only from
+    // drawOsdOverlay(), which runs only from paintFrameDirect() on
+    // VideoLink's own capture/paint thread. It is zeroed at the top of
+    // every drawOsdOverlay() call -- it is per-frame scratch, not
+    // persistent layout state, so nothing carries over between frames
+    // and a toggled-off element frees its slot on the very next paint.
+    std::array<int, 10> osdStackUsedPx_{};
 
     void createRenderWindow(HWND parent, int x, int y, int w, int h);
     void paintFrame(const cv::Mat& frame);

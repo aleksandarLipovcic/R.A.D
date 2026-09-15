@@ -180,10 +180,20 @@ class OsdSettingsPanel:
         self._win = tk.Toplevel(parent_widget)
         self._win.title("OSD Overlay")
         self._win.configure(bg="#1a1a1a")
-        self._win.resizable(False, False)
+        # Was resizable(False, False) with every element row stacked
+        # straight into self._win -- fine for the original handful of
+        # elements, but stopped fitting once the list grew (and never fit
+        # on a shorter screen anyway). Now resizable, with the master
+        # toggle row and the Save/Load/Close row pinned in place and the
+        # element list (below) the one section that scrolls.
+        self._win.resizable(True, True)
+        self._win.minsize(300, 220)
+        self._win.geometry("360x420")
         # Keep it on top of the main window but not system-modal -- the
         # pilot may want to glance at the live video while adjusting this.
         self._win.transient(parent_widget.winfo_toplevel())
+        self._win.grid_columnconfigure(0, weight=1)
+        self._win.grid_rowconfigure(2, weight=1)   # the scrollable element list, set below
 
         self._enabled_vars = {}
         self._anchor_btns = {}   # elem_id -> {anchor_name: Button}
@@ -205,8 +215,39 @@ class OsdSettingsPanel:
             row=row, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
         row += 1
 
+        # -----------------------------------------------------------
+        # Scrollable element list. Canvas + inner Frame is the standard
+        # Tk pattern -- ttk has no native scrollable frame. The canvas
+        # sits in the row grid_rowconfigure(2) above made stretchy, so it
+        # grows/shrinks with the window; a Scrollbar covers whatever
+        # doesn't fit. Master toggle row and the button row below stay
+        # outside this frame, so they never scroll out of view.
+        # -----------------------------------------------------------
+        list_container = tk.Frame(self._win, bg="#1a1a1a")
+        list_container.grid(row=row, column=0, columnspan=2, sticky="nsew", padx=(10, 0), pady=2)
+        list_container.grid_rowconfigure(0, weight=1)
+        list_container.grid_columnconfigure(0, weight=1)
+
+        self._canvas = tk.Canvas(list_container, bg="#1a1a1a", highlightthickness=0)
+        self._canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = tk.Scrollbar(list_container, orient="vertical", command=self._canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self._canvas.configure(yscrollcommand=scrollbar.set)
+
+        self._elements_frame = tk.Frame(self._canvas, bg="#1a1a1a")
+        self._elements_window = self._canvas.create_window((0, 0), window=self._elements_frame, anchor="nw")
+        self._elements_frame.bind("<Configure>", self._on_elements_frame_configure)
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
+        # Wheel scroll only while the pointer is actually over the list --
+        # bind_all on <Enter>/unbind_all on <Leave> so this panel doesn't
+        # steal scroll events meant for whatever's behind/around it.
+        self._canvas.bind("<Enter>", lambda e: self._canvas.bind_all("<MouseWheel>", self._on_mousewheel))
+        self._canvas.bind("<Leave>", lambda e: self._canvas.unbind_all("<MouseWheel>"))
+        row += 1
+
+        elem_row = 0
         for elem_id in video_link.get_osd_element_ids():
-            row = self._build_element_row(elem_id, row)
+            elem_row = self._build_element_row(elem_id, elem_row)
 
         row += 1
         btn_frame = tk.Frame(self._win, bg="#1a1a1a")
@@ -218,6 +259,22 @@ class OsdSettingsPanel:
         tk.Button(btn_frame, text="Close", command=self._on_close).pack(side="left", padx=4)
 
         self._win.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # -------------------------------------------------------------------
+    # Scroll region upkeep
+    # -------------------------------------------------------------------
+    def _on_elements_frame_configure(self, _event):
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        # Keep the inner frame exactly as wide as the visible canvas, so
+        # rows never get clipped on one side or leave a dead strip on the
+        # other when the window is resized. Height is left alone -- the
+        # scrollbar is what handles that dimension.
+        self._canvas.itemconfigure(self._elements_window, width=event.width)
+
+    def _on_mousewheel(self, event):
+        self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def show(self):
         self._win.deiconify()
@@ -232,13 +289,13 @@ class OsdSettingsPanel:
 
         var = tk.BooleanVar(value=layout.enabled)
         self._enabled_vars[elem_id] = var
-        tk.Checkbutton(self._win, text=label, variable=var,
+        tk.Checkbutton(self._elements_frame, text=label, variable=var,
                         command=lambda e=elem_id: self._on_enabled_toggle(e),
                         bg="#1a1a1a", fg="#ffffff", selectcolor="#333333",
                         activebackground="#1a1a1a", anchor="w"
                         ).grid(row=row, column=0, sticky="w", padx=10)
 
-        grid_frame = tk.Frame(self._win, bg="#1a1a1a")
+        grid_frame = tk.Frame(self._elements_frame, bg="#1a1a1a")
         grid_frame.grid(row=row, column=1, padx=(0, 10), pady=2)
         self._anchor_btns[elem_id] = {}
         current_anchor = layout.anchor.name

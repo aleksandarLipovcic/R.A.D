@@ -305,7 +305,7 @@
       },
       "camera_angle": {
         "mode": "manual",
-        "tilt_deg": -30.0,
+        "tilt_deg": -23.0,
         "pan_deg": 0.0
       }
     }
