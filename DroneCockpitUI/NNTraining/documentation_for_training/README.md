@@ -34,6 +34,9 @@ compiled via pybind11) and the Python/Tkinter cockpit UI
    links out to one page per file/module under `frontend/` (app shell,
    workers, each instrument widget, detection map, tile cache, OSD
    controls, build tooling).
+8. **[ML_PIPELINE.md](ML_PIPELINE.md)** — index for the standalone YOLO
+   training pipeline that produces the `.onnx` model `DetectionLink`
+   loads; links out to one page per script under `ml-pipeline/`.
 
 ## Module map
 
@@ -71,6 +74,31 @@ One file per module/widget under [`frontend/`](FRONTEND.md) — see
 | `MapTiles.py`, `prefetch_tiles.py` | [frontend/map-tiles.md](frontend/map-tiles.md) |
 | `osd_overlay_controls.py`, `osd_layout.json` | [frontend/osd-overlay-controls.md](frontend/osd-overlay-controls.md) |
 | `Setup_Project.py`, `DroneTest.py` | [frontend/setup-tools.md](frontend/setup-tools.md) |
+
+### ML training pipeline
+
+A separate subproject (no runtime dependency on `DroneBackend.pyd` or
+`DroneCockpitUI.py`) that produces the `.onnx` model + `.names` file
+`DetectionLink.set_model_path()` loads. See
+[ML_PIPELINE.md](ML_PIPELINE.md) for the full pipeline-stage diagram.
+
+| Script | Doc page |
+|---|---|
+| `setup.py` | [ml-pipeline/setup.md](ml-pipeline/setup.md) |
+| `class_map.py` | [ml-pipeline/class-map.md](ml-pipeline/class-map.md) |
+| `prepare_datasets.py` | [ml-pipeline/prepare-datasets.md](ml-pipeline/prepare-datasets.md) |
+| `train.py` | [ml-pipeline/train.md](ml-pipeline/train.md) |
+| `mosaic_guard.py` | [ml-pipeline/mosaic-guard.md](ml-pipeline/mosaic-guard.md) |
+| `predict_test.py` | [ml-pipeline/predict-test.md](ml-pipeline/predict-test.md) |
+| `vram_diagnostic.py` | [ml-pipeline/vram-diagnostic.md](ml-pipeline/vram-diagnostic.md) |
+| `verify_pipeline_assumptions.py` | [ml-pipeline/verify-pipeline-assumptions.md](ml-pipeline/verify-pipeline-assumptions.md) |
+| `check_label_gaps.py` | [ml-pipeline/check-label-gaps.md](ml-pipeline/check-label-gaps.md) |
+| `cross_reference_gaps.py` | [ml-pipeline/cross-reference-gaps.md](ml-pipeline/cross-reference-gaps.md) |
+| `resolve_cross_class_conflicts.py` | [ml-pipeline/resolve-cross-class-conflicts.md](ml-pipeline/resolve-cross-class-conflicts.md) |
+| `generate_pseudo_labels.py` | [ml-pipeline/generate-pseudo-labels.md](ml-pipeline/generate-pseudo-labels.md) |
+| `review_labels.py` | [ml-pipeline/review-labels.md](ml-pipeline/review-labels.md) |
+| `finetune_and_resolve_queue.py` | [ml-pipeline/finetune-and-resolve-queue.md](ml-pipeline/finetune-and-resolve-queue.md) |
+| `dedupe_real_labels.py` | [ml-pipeline/dedupe-real-labels.md](ml-pipeline/dedupe-real-labels.md) |
 
 ## Screenshots
 

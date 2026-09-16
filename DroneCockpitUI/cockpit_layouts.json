@@ -243,7 +243,7 @@
       }
     },
     "test3": {
-      "geometry": "1536x793+-8+0",
+      "geometry": "1536x784+-8+0",
       "locked": true,
       "panels": {
         "imu": {
@@ -305,7 +305,74 @@
       },
       "camera_angle": {
         "mode": "manual",
-        "tilt_deg": -23.0,
+        "tilt_deg": -31.0,
+        "pan_deg": -24.0
+      }
+    },
+    "test 44": {
+      "geometry": "1536x784+-8+0",
+      "locked": true,
+      "panels": {
+        "imu": {
+          "x": 1185,
+          "y": 435,
+          "w": 341,
+          "h": 307,
+          "visible": true
+        },
+        "mag": {
+          "x": 385,
+          "y": 551,
+          "w": 801,
+          "h": 193,
+          "visible": true
+        },
+        "adi": {
+          "x": 1305,
+          "y": 2,
+          "w": 223,
+          "h": 430,
+          "visible": true
+        },
+        "baro": {
+          "x": 1185,
+          "y": 2,
+          "w": 120,
+          "h": 430,
+          "visible": true
+        },
+        "gps": {
+          "x": 0,
+          "y": 264,
+          "w": 382,
+          "h": 481,
+          "visible": true
+        },
+        "fc_status": {
+          "x": 0,
+          "y": 2,
+          "w": 382,
+          "h": 262,
+          "visible": true
+        },
+        "arming": {
+          "x": 88,
+          "y": 205,
+          "w": 440,
+          "h": 300,
+          "visible": false
+        },
+        "fpv": {
+          "x": 427,
+          "y": 264,
+          "w": 798,
+          "h": 546,
+          "visible": true
+        }
+      },
+      "camera_angle": {
+        "mode": "manual",
+        "tilt_deg": -7.0,
         "pan_deg": 0.0
       }
     }
