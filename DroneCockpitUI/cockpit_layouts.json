@@ -244,63 +244,63 @@
     },
     "test3": {
       "geometry": "1536x784+-8+0",
-      "locked": true,
+      "locked": false,
       "panels": {
         "imu": {
-          "x": 1185,
-          "y": 435,
-          "w": 341,
-          "h": 307,
-          "visible": true
+          "x": 495,
+          "y": 132,
+          "w": 435,
+          "h": 391,
+          "visible": false
         },
         "mag": {
-          "x": 385,
-          "y": 551,
+          "x": 354,
+          "y": 115,
           "w": 801,
-          "h": 193,
-          "visible": true
+          "h": 479,
+          "visible": false
         },
         "adi": {
-          "x": 1305,
-          "y": 2,
-          "w": 223,
-          "h": 430,
-          "visible": true
+          "x": 526,
+          "y": 66,
+          "w": 600,
+          "h": 552,
+          "visible": false
         },
         "baro": {
-          "x": 1185,
-          "y": 2,
-          "w": 120,
-          "h": 430,
-          "visible": true
+          "x": 596,
+          "y": 66,
+          "w": 196,
+          "h": 602,
+          "visible": false
         },
         "gps": {
-          "x": 0,
-          "y": 264,
-          "w": 382,
-          "h": 481,
+          "x": 284,
+          "y": 29,
+          "w": 558,
+          "h": 624,
           "visible": true
         },
         "fc_status": {
-          "x": 0,
-          "y": 2,
-          "w": 382,
-          "h": 262,
-          "visible": true
+          "x": 456,
+          "y": 29,
+          "w": 481,
+          "h": 661,
+          "visible": false
         },
         "arming": {
-          "x": 88,
-          "y": 205,
-          "w": 440,
-          "h": 300,
+          "x": 324,
+          "y": 29,
+          "w": 508,
+          "h": 553,
           "visible": false
         },
         "fpv": {
-          "x": 384,
+          "x": 226,
           "y": 2,
-          "w": 798,
-          "h": 546,
-          "visible": true
+          "w": 1082,
+          "h": 726,
+          "visible": false
         }
       },
       "camera_angle": {
