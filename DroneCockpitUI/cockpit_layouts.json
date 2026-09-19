@@ -1,5 +1,5 @@
 {
-  "active_profile": "test3",
+  "active_profile": "test",
   "profiles": {
     "Default": {
       "geometry": "1536x793+-11+31",
@@ -116,6 +116,11 @@
           "h": 577,
           "visible": true
         }
+      },
+      "camera_angle": {
+        "mode": "manual",
+        "tilt_deg": 0.0,
+        "pan_deg": 0.0
       }
     },
     "VideoLoad": {
