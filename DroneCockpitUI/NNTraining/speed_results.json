@@ -1,0 +1,101 @@
+[
+  {
+    "backend": "torch",
+    "device": "cpu",
+    "fp16": false,
+    "cudnn_disabled": false,
+    "imgsz": 960,
+    "frame_size": "1920x1080",
+    "runs": 100,
+    "warmup": 10,
+    "cpu": "AMD64 Family 25 Model 80 Stepping 0, AuthenticAMD",
+    "gpu": null,
+    "fps_from_mean_total": 2.223620489141576,
+    "preprocess_ms": {
+      "mean": 4.142636000760831,
+      "median": 4.04405000153929,
+      "p95": 4.9965000071097165
+    },
+    "inference_ms": {
+      "mean": 441.89547199814115,
+      "median": 426.87369999475777,
+      "p95": 511.06889999937266
+    },
+    "postprocess_ms": {
+      "mean": 0.3619659977266565,
+      "median": 0.3471999953035265,
+      "p95": 0.5060999828856438
+    },
+    "total_ms": {
+      "mean": 449.71702899987577,
+      "median": 434.1732499888167,
+      "p95": 520.9322999871802
+    }
+  },
+  {
+    "backend": "torch",
+    "device": "0",
+    "fp16": false,
+    "cudnn_disabled": true,
+    "imgsz": 960,
+    "frame_size": "1920x1080",
+    "runs": 100,
+    "warmup": 10,
+    "cpu": "AMD64 Family 25 Model 80 Stepping 0, AuthenticAMD",
+    "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",
+    "fps_from_mean_total": 23.139317713375718,
+    "preprocess_ms": {
+      "mean": 4.900416001328267,
+      "median": 4.427649997523986,
+      "p95": 7.0801000110805035
+    },
+    "inference_ms": {
+      "mean": 36.4920370010077,
+      "median": 37.12560000712983,
+      "p95": 41.1694000067655
+    },
+    "postprocess_ms": {
+      "mean": 1.0879830000340007,
+      "median": 1.0505499958526343,
+      "p95": 1.581299991812557
+    },
+    "total_ms": {
+      "mean": 43.2164859995828,
+      "median": 43.39200002141297,
+      "p95": 48.78719997941516
+    }
+  },
+  {
+    "backend": "torch",
+    "device": "0",
+    "fp16": true,
+    "cudnn_disabled": true,
+    "imgsz": 960,
+    "frame_size": "1920x1080",
+    "runs": 100,
+    "warmup": 10,
+    "cpu": "AMD64 Family 25 Model 80 Stepping 0, AuthenticAMD",
+    "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",
+    "fps_from_mean_total": 42.67304281403736,
+    "preprocess_ms": {
+      "mean": 3.9527739994809963,
+      "median": 3.7991999997757375,
+      "p95": 4.70109999878332
+    },
+    "inference_ms": {
+      "mean": 18.2521320017986,
+      "median": 15.958699994371273,
+      "p95": 29.15519999805838
+    },
+    "postprocess_ms": {
+      "mean": 0.6515990011394024,
+      "median": 0.5728499963879585,
+      "p95": 1.1627000058069825
+    },
+    "total_ms": {
+      "mean": 23.433998000982683,
+      "median": 21.02190001460258,
+      "p95": 34.54799999599345
+    }
+  }
+]
