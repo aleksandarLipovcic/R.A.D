@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include <windows.h>
 #include <vector>
 #include <string>
@@ -178,6 +178,72 @@ namespace FlightMode {
 }
 
 // =============================================================================
+// RadioLinkStatus / RadioLinkStats — ELRS telemetry path (CrsfLink)
+//
+// Only filled when DroneState::linkSource == "ELRS". On the USB/MSP path
+// (DroneLink) this block stays at its defaults.
+// =============================================================================
+enum class RadioLinkStatus : uint8_t {
+    NO_RADIO = 0,   // no Pocket found on any COM port (unplugged / wrong USB mode)
+    WAITING = 1,   // Pocket's COM port is open, but no telemetry frames yet
+                    //   → drone off, not bound, or USB-VCP not set to Telem Mirror
+    TELEMETRY_OK = 2,
+    DEGRADED = 3,   // frames arriving, but LQ low or instruments going stale
+    TELEMETRY_LOST = 4,   // had telemetry, frames stopped (drone out of range / RX lost)
+};
+
+struct RadioLinkStats {
+    RadioLinkStatus status = RadioLinkStatus::NO_RADIO;
+    std::string     statusStr = "NO_RADIO";
+    std::string     portName;
+
+    // ── ELRS LINK_STATISTICS (0x14) ──────────────────────────────────────────
+    bool     linkStatsValid = false;
+    int      uplinkRssi1Dbm = 0;     // drone RX antenna 1, dBm (negative)
+    int      uplinkRssi2Dbm = 0;     // drone RX antenna 2 (RP4TD has diversity)
+    uint8_t  uplinkLq = 0;     // % — THE number to watch in flight
+    int8_t   uplinkSnr = 0;
+    uint8_t  activeAntenna = 0;
+    uint8_t  rfModeIndex = 0;
+    uint16_t txPowerMw = 0;
+    int      downlinkRssiDbm = 0;     // what the Pocket hears from the drone
+    uint8_t  downlinkLq = 0;     // % of telemetry packets arriving
+    int8_t   downlinkSnr = 0;
+
+    // ── Freshness: ms since each data group was last updated (-1 = never) ────
+    int64_t msSinceLastFrame = -1;
+    int64_t attitudeAgeMs = -1;
+    int64_t gpsAgeMs = -1;
+    int64_t batteryAgeMs = -1;
+    int64_t flightModeAgeMs = -1;
+    int64_t baroAgeMs = -1;
+    int64_t linkStatsAgeMs = -1;
+
+    // ── Measured update rates (Hz, rolling ~2 s window) ─────────────────────
+    float attitudeHz = 0.0f, gpsHz = 0.0f, batteryHz = 0.0f, flightModeHz = 0.0f;
+    float baroHz = 0.0f, varioHz = 0.0f, linkStatsHz = 0.0f, totalFrameHz = 0.0f;
+
+    // ── Counters ─────────────────────────────────────────────────────────────
+    uint32_t framesTotal = 0;
+    uint32_t crcErrors = 0;
+    uint32_t reconnectCount = 0;   // times the Pocket was re-found after a USB drop
+    uint32_t linkLostCount = 0;   // TELEMETRY_OK/DEGRADED → TELEMETRY_LOST transitions
+
+    // ── Things CRSF only hints at (details need the USB link) ────────────────
+    std::string rawFlightMode;           // e.g. "STAB", "ACRO*", "!ERR*"
+    bool        armingBlocked = false;   // BF reports "!ERR" — reason list is MSP-only
+    bool        gpsWaiting = false;   // BF reports "WAIT" — no GPS fix / home yet
+
+    // ── Home point (computed on the laptop — CRSF has no home distance) ──────
+    bool   homeSet = false;
+    double homeLat = 0.0, homeLon = 0.0;
+    float  homeAltM = 0.0f;
+
+    // "BARO" (FC baro frame), "GPS" (GPS altitude relative to home), "NONE"
+    std::string altitudeSource = "NONE";
+};
+
+// =============================================================================
 // DroneState — written exclusively by the worker thread,
 // read by Python via getLatestState() (mutex-protected snapshot copy).
 // =============================================================================
@@ -279,6 +345,14 @@ struct DroneState {
     double   fcCycleMs = 0.0;    // from MSP_STATUS (101)
     bool     linkHealthy = false;
     uint32_t packetCount = 0;
+
+    // ── Telemetry source ──────────────────────────────────────────────────────
+    // "USB"  — DroneLink, MSP over the USB-C cable (full data set)
+    // "ELRS" — CrsfLink, CRSF telemetry mirrored by the RadioMaster Pocket.
+    //          Raw IMU, raw mag, motors, RC channels, satellite list, HDOP,
+    //          arming-disable flags and CPU load are NOT available on this path.
+    std::string    linkSource = "USB";
+    RadioLinkStats radio;
 };
 
 // =============================================================================

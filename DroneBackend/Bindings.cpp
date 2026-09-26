@@ -8,6 +8,8 @@
 #include "GPSNeoM10.h"
 #include "VideoLink.h"
 #include "DetectionLink.h"
+#include "CrsfLink.h"
+#include "SerialPortScan.h"
 
 namespace py = pybind11;
 using namespace pybind11::literals;
@@ -176,6 +178,71 @@ PYBIND11_MODULE(DroneBackend, m) {
         .export_values();
 
     // =========================================================================
+    // RadioLinkStatus / RadioLinkStats — ELRS telemetry path (CrsfLink)
+    // =========================================================================
+    py::enum_<RadioLinkStatus>(m, "RadioLinkStatus")
+        .value("NO_RADIO", RadioLinkStatus::NO_RADIO)
+        .value("WAITING", RadioLinkStatus::WAITING)
+        .value("TELEMETRY_OK", RadioLinkStatus::TELEMETRY_OK)
+        .value("DEGRADED", RadioLinkStatus::DEGRADED)
+        .value("TELEMETRY_LOST", RadioLinkStatus::TELEMETRY_LOST)
+        .export_values();
+
+    py::class_<RadioLinkStats>(m, "RadioLinkStats")
+        .def_readonly("status", &RadioLinkStats::status)
+        .def_readonly("status_str", &RadioLinkStats::statusStr)
+        .def_readonly("port_name", &RadioLinkStats::portName)
+        .def_readonly("link_stats_valid", &RadioLinkStats::linkStatsValid)
+        .def_readonly("uplink_rssi1_dbm", &RadioLinkStats::uplinkRssi1Dbm)
+        .def_readonly("uplink_rssi2_dbm", &RadioLinkStats::uplinkRssi2Dbm)
+        .def_readonly("uplink_lq", &RadioLinkStats::uplinkLq)
+        .def_readonly("uplink_snr", &RadioLinkStats::uplinkSnr)
+        .def_readonly("active_antenna", &RadioLinkStats::activeAntenna)
+        .def_readonly("rf_mode_index", &RadioLinkStats::rfModeIndex)
+        .def_readonly("tx_power_mw", &RadioLinkStats::txPowerMw)
+        .def_readonly("downlink_rssi_dbm", &RadioLinkStats::downlinkRssiDbm)
+        .def_readonly("downlink_lq", &RadioLinkStats::downlinkLq)
+        .def_readonly("downlink_snr", &RadioLinkStats::downlinkSnr)
+        .def_readonly("ms_since_last_frame", &RadioLinkStats::msSinceLastFrame)
+        .def_readonly("attitude_age_ms", &RadioLinkStats::attitudeAgeMs)
+        .def_readonly("gps_age_ms", &RadioLinkStats::gpsAgeMs)
+        .def_readonly("battery_age_ms", &RadioLinkStats::batteryAgeMs)
+        .def_readonly("flight_mode_age_ms", &RadioLinkStats::flightModeAgeMs)
+        .def_readonly("baro_age_ms", &RadioLinkStats::baroAgeMs)
+        .def_readonly("link_stats_age_ms", &RadioLinkStats::linkStatsAgeMs)
+        .def_readonly("attitude_hz", &RadioLinkStats::attitudeHz)
+        .def_readonly("gps_hz", &RadioLinkStats::gpsHz)
+        .def_readonly("battery_hz", &RadioLinkStats::batteryHz)
+        .def_readonly("flight_mode_hz", &RadioLinkStats::flightModeHz)
+        .def_readonly("baro_hz", &RadioLinkStats::baroHz)
+        .def_readonly("vario_hz", &RadioLinkStats::varioHz)
+        .def_readonly("link_stats_hz", &RadioLinkStats::linkStatsHz)
+        .def_readonly("total_frame_hz", &RadioLinkStats::totalFrameHz)
+        .def_readonly("frames_total", &RadioLinkStats::framesTotal)
+        .def_readonly("crc_errors", &RadioLinkStats::crcErrors)
+        .def_readonly("reconnect_count", &RadioLinkStats::reconnectCount)
+        .def_readonly("link_lost_count", &RadioLinkStats::linkLostCount)
+        .def_readonly("raw_flight_mode", &RadioLinkStats::rawFlightMode)
+        .def_readonly("arming_blocked", &RadioLinkStats::armingBlocked)
+        .def_readonly("gps_waiting", &RadioLinkStats::gpsWaiting)
+        .def_readonly("home_set", &RadioLinkStats::homeSet)
+        .def_readonly("home_lat", &RadioLinkStats::homeLat)
+        .def_readonly("home_lon", &RadioLinkStats::homeLon)
+        .def_readonly("home_alt_m", &RadioLinkStats::homeAltM)
+        .def_readonly("altitude_source", &RadioLinkStats::altitudeSource);
+
+    py::class_<SerialPortInfo>(m, "SerialPortInfo")
+        .def_readonly("port", &SerialPortInfo::port)
+        .def_readonly("friendly_name", &SerialPortInfo::friendlyName)
+        .def_readonly("bus_description", &SerialPortInfo::busDescription,
+            "USB product string, e.g. 'Betaflight STM32F405' or the radio's name.")
+        .def_readonly("vid", &SerialPortInfo::vid)
+        .def_readonly("pid", &SerialPortInfo::pid)
+        .def("__repr__", [](const SerialPortInfo& p) {
+            return "<SerialPortInfo " + p.port + " '" + p.busDescription + "' / '" + p.friendlyName + "'>";
+        });
+
+    // =========================================================================
     // DroneState
     // =========================================================================
     py::class_<DroneState>(m, "DroneState")
@@ -265,6 +332,12 @@ PYBIND11_MODULE(DroneBackend, m) {
         .def_readonly("link_healthy", &DroneState::linkHealthy)
         .def_readonly("packet_count", &DroneState::packetCount)
 
+        // ── Telemetry source / ELRS link ──────────────────────────────────────
+        .def_readonly("link_source", &DroneState::linkSource,
+            "'USB' (DroneLink, MSP) or 'ELRS' (CrsfLink, CRSF via RadioMaster Pocket).")
+        .def_readonly("radio", &DroneState::radio,
+            "RadioLinkStats — only meaningful when link_source == 'ELRS'.")
+
         // =====================================================================
         // to_dict()
         //
@@ -293,7 +366,10 @@ PYBIND11_MODULE(DroneBackend, m) {
             };
 
         int rc_link_quality;
-        if (s.rssi == 0) {
+        if (s.linkSource == "ELRS" && s.radio.linkStatsValid) {
+            rc_link_quality = s.radio.uplinkLq;   // real ELRS LQ, 0 means lost
+        }
+        else if (s.rssi == 0) {
             rc_link_quality = -1;
         }
         else {
@@ -310,7 +386,7 @@ PYBIND11_MODULE(DroneBackend, m) {
         default:                        batt_state_str = "INIT";        break;
         }
 
-        return py::dict(
+        py::dict d(
             // ── IMU ───────────────────────────────────────────────────────
             "ax"_a = s.ax, "ay"_a = s.ay, "az"_a = s.az,
             "gx"_a = s.gx, "gy"_a = s.gy, "gz"_a = s.gz,
@@ -442,6 +518,69 @@ PYBIND11_MODULE(DroneBackend, m) {
             "link_healthy"_a = s.linkHealthy,
             "packet_count"_a = s.packetCount
         );
+
+        // ── Telemetry source + what this source can provide ──────────────
+        // Widgets for data the ELRS path cannot carry should check these
+        // and show "USB only" instead of silently displaying zeros.
+        const bool usb = s.linkSource != "ELRS";
+        const RadioLinkStats& r = s.radio;
+        d["link_source"] = s.linkSource;
+        d["available_raw_imu"] = usb;
+        d["available_raw_mag"] = usb;
+        d["available_motors"] = usb;
+        d["available_rc_channels"] = usb;
+        d["available_sat_list"] = usb;
+        d["available_hdop"] = usb;
+        d["available_arming_flags"] = usb;
+        d["available_cpu_load"] = usb;
+
+        // ── ELRS link (CrsfLink) ──────────────────────────────────────────
+        d["radio_status"] = r.statusStr;
+        d["radio_status_int"] = static_cast<int>(r.status);
+        d["radio_port"] = r.portName;
+        d["elrs_link_stats_valid"] = r.linkStatsValid;
+        d["elrs_uplink_lq"] = static_cast<int>(r.uplinkLq);
+        d["elrs_uplink_rssi1_dbm"] = r.uplinkRssi1Dbm;
+        d["elrs_uplink_rssi2_dbm"] = r.uplinkRssi2Dbm;
+        d["elrs_uplink_snr"] = static_cast<int>(r.uplinkSnr);
+        d["elrs_active_antenna"] = static_cast<int>(r.activeAntenna);
+        d["elrs_rf_mode_index"] = static_cast<int>(r.rfModeIndex);
+        d["elrs_tx_power_mw"] = static_cast<int>(r.txPowerMw);
+        d["elrs_downlink_rssi_dbm"] = r.downlinkRssiDbm;
+        d["elrs_downlink_lq"] = static_cast<int>(r.downlinkLq);
+        d["elrs_downlink_snr"] = static_cast<int>(r.downlinkSnr);
+
+        // Data ages (ms, -1 = never received) — grey out stale instruments
+        d["age_last_frame_ms"] = r.msSinceLastFrame;
+        d["age_attitude_ms"] = r.attitudeAgeMs;
+        d["age_gps_ms"] = r.gpsAgeMs;
+        d["age_battery_ms"] = r.batteryAgeMs;
+        d["age_flight_mode_ms"] = r.flightModeAgeMs;
+        d["age_baro_ms"] = r.baroAgeMs;
+        d["age_link_stats_ms"] = r.linkStatsAgeMs;
+
+        d["rate_attitude_hz"] = r.attitudeHz;
+        d["rate_gps_hz"] = r.gpsHz;
+        d["rate_battery_hz"] = r.batteryHz;
+        d["rate_flight_mode_hz"] = r.flightModeHz;
+        d["rate_baro_hz"] = r.baroHz;
+        d["rate_vario_hz"] = r.varioHz;
+        d["rate_link_stats_hz"] = r.linkStatsHz;
+        d["rate_total_hz"] = r.totalFrameHz;
+
+        d["radio_frames_total"] = r.framesTotal;
+        d["radio_crc_errors"] = r.crcErrors;
+        d["radio_reconnect_count"] = r.reconnectCount;
+        d["radio_link_lost_count"] = r.linkLostCount;
+
+        d["raw_flight_mode"] = r.rawFlightMode;
+        d["arming_blocked"] = r.armingBlocked;
+        d["gps_waiting"] = r.gpsWaiting;
+        d["home_set"] = r.homeSet;
+        d["home_lat"] = r.homeLat;
+        d["home_lon"] = r.homeLon;
+        d["altitude_source"] = r.altitudeSource;
+        return d;
             });
 
     // =========================================================================
@@ -954,6 +1093,69 @@ PYBIND11_MODULE(DroneBackend, m) {
     // =========================================================================
     // Free functions
     // =========================================================================
+    // =========================================================================
+    // CrsfLink — ELRS telemetry via RadioMaster Pocket (USB-VCP Telem Mirror)
+    //
+    // Blocking calls release the GIL so the Tk UI keeps running.
+    // =========================================================================
+    py::class_<CrsfLink>(m, "CrsfLink")
+        .def(py::init<>())
+        .def("start_auto", &CrsfLink::startAuto, py::call_guard<py::gil_scoped_release>(),
+            "Non-blocking. Background thread finds the Pocket, connects, and "
+            "reconnects automatically after unplug/replug. Preferred entry point.")
+        .def("connect_auto", &CrsfLink::connectAuto, py::arg("timeout_ms") = 3000,
+            py::call_guard<py::gil_scoped_release>(),
+            "Blocking scan (up to timeout_ms). On success runs like start_auto(). "
+            "Call from a background thread, like VideoLink.connect_auto().")
+        .def("connect", &CrsfLink::connect, py::arg("port_name"),
+            py::call_guard<py::gil_scoped_release>(),
+            "Open a specific COM port; re-opens that same port after an unplug.")
+        .def("disconnect", &CrsfLink::disconnect, py::call_guard<py::gil_scoped_release>())
+        .def("is_connected", &CrsfLink::isConnected,
+            "True while the Pocket's COM port is open (says nothing about the drone — "
+            "use get_status() for that).")
+        .def("is_running", &CrsfLink::isRunning)
+        .def("get_latest_state", &CrsfLink::getLatestState,
+            "Thread-safe DroneState snapshot with link_source == 'ELRS'.")
+        .def("get_status", &CrsfLink::getStatus)
+        .def("get_port_name", &CrsfLink::getPortName)
+        .def("get_last_scan_report", &CrsfLink::getLastScanReport,
+            "Text log of the last port scan — which ports were tried and why they "
+            "were skipped/selected.")
+        .def("set_excluded_ports", &CrsfLink::setExcludedPorts, py::arg("ports"),
+            "Ports the scanner must never open, e.g. [drone_link_port].")
+        .def("set_port_name_hints", &CrsfLink::setPortNameHints, py::arg("hints"),
+            "Case-insensitive fragments of the Pocket's USB name "
+            "(default: edgetx, opentx, radiomaster, pocket).")
+        .def("set_scan_interval_ms", &CrsfLink::setScanIntervalMs, py::arg("ms"))
+        .def("set_probe_ms", &CrsfLink::setProbeMs, py::arg("ms"))
+        .def("set_assert_dtr", &CrsfLink::setAssertDtr, py::arg("on"))
+        .def("set_lost_timeout_ms", &CrsfLink::setLostTimeoutMs, py::arg("ms"),
+            "No drone telemetry for this long -> TELEMETRY_LOST (default 1500).")
+        .def("set_degraded_lq", &CrsfLink::setDegradedLq, py::arg("lq_percent"),
+            "Uplink LQ below this -> DEGRADED (default 70).")
+        .def("set_instrument_stale_ms", &CrsfLink::setInstrumentStaleMs, py::arg("ms"),
+            "Attitude older than this -> DEGRADED (default 1500).")
+        .def("set_yaw_signed", &CrsfLink::setYawSigned, py::arg("signed"),
+            "Yaw wire encoding; decide with bench test IT-ELRS-004 (default True).")
+        .def("set_cell_count", &CrsfLink::setCellCount, py::arg("cells"),
+            "0 = auto from first voltage. Set 4 for the 4S pack on real missions.")
+        .def("set_cell_voltage_thresholds", &CrsfLink::setCellVoltageThresholds,
+            py::arg("warning_v"), py::arg("critical_v"))
+        .def("set_battery_capacity_mah", &CrsfLink::setBatteryCapacityMah, py::arg("mah"))
+        .def("set_min_sats_for_fix", &CrsfLink::setMinSatsForFix, py::arg("sats"))
+        .def("set_gps_altitude_fallback", &CrsfLink::setGpsAltitudeFallback, py::arg("on"))
+        .def_static("enumerate_ports", &CrsfLink::enumeratePorts);
+
+    m.def("enumerate_serial_ports", &EnumerateSerialPorts,
+        "All COM ports with USB product names (tells the FC and the Pocket apart).");
+    m.def("auto_detect_fc", &AutoDetectFlightController,
+        py::arg("exclude_ports") = std::vector<std::string>{}, py::arg("timeout_ms") = 300,
+        py::call_guard<py::gil_scoped_release>(),
+        "Returns the first port that answers an MSP request, or 'NOT_FOUND'. "
+        "Never picks the radio. Use instead of auto_detect_f405() now that the "
+        "Pocket is a second STM32 serial device on the laptop.");
+
     m.def("auto_detect_f405", &AutoDetectF405,
         "Scan COM1-COM29 and return the first port that opens, or 'NOT_FOUND'.");
 }
