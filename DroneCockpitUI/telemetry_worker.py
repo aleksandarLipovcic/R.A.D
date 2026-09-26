@@ -15,9 +15,29 @@ Rules enforced here
       - self._connected (threading.Event — readable from UI for status)
 
 The main thread reads:
-    worker.get_frame()   → dict | None   (non-blocking)
-    worker.is_connected  → bool (property, reads an Event)
-    worker.last_error    → str | None
+    worker.get_frame()        → dict | None   (non-blocking)
+    worker.is_connected       → bool (property, reads an Event)
+    worker.last_error         → str | None
+    worker.get_link_status()  → dict  (USB + ELRS radio link status, always
+                                       available — even when no frames flow)
+
+Two telemetry sources (ELRS update)
+-----------------------------------
+  • USB  — DroneBackend.DroneLink  (MSP over the USB-C cable, full data set)
+  • ELRS — DroneBackend.CrsfLink   (CRSF telemetry via the RadioMaster Pocket,
+                                    USB-VCP set to "Telem Mirror")
+Every poll picks the best source (see _pick_source()):
+  1. USB  if the cable link is healthy
+  2. ELRS if radio telemetry is OK or DEGRADED
+  3. USB  if the cable is connected but momentarily unhealthy
+  4. none → no frame is produced, is_connected goes False
+The frame dict keeps every existing key, plus "link_source" ("USB"/"ELRS")
+and a few ELRS-only keys. Data that CRSF cannot carry (raw IMU, raw mag,
+motors, RC channels, satellite list, HDOP, arming flags) is zero/empty on
+the ELRS path — the "available_*" keys say which.
+
+get_active_state() is the thread-safe way for the OSD / DetectionLink
+trampolines (called from C++ threads) to get the same state the UI shows.
 """
 
 import time
@@ -30,7 +50,12 @@ from typing import Optional
 POLL_HZ        = 60          # backend poll rate (frames per second)
 _POLL_INTERVAL = 1.0 / POLL_HZ
 _QUEUE_DEPTH   = 3           # max buffered frames; older ones are dropped
-RECONNECT_S    = 2.0         # seconds between reconnect attempts
+RECONNECT_S    = 2.0         # seconds between reconnect attempts (legacy, unused)
+_IDLE_S        = 0.1         # poll interval while no source is live
+_STATUS_HZ     = 10          # link-status refresh rate while frames flow
+
+# CrsfLink status strings that mean "drone telemetry is arriving"
+RADIO_LIVE = ("TELEMETRY_OK", "DEGRADED")
 
 
 class TelemetryWorker:
@@ -52,9 +77,14 @@ class TelemetryWorker:
         worker.stop()
     """
 
-    def __init__(self, hub) -> None:
+    def __init__(self, hub, radio=None) -> None:
         self._hub          = hub
+        self._radio        = radio          # DroneBackend.CrsfLink or None
         self._queue: queue.Queue = queue.Queue(maxsize=_QUEUE_DEPTH)
+
+        # Latest link status for the toolbar indicator — replaced as a whole
+        # dict (atomic reference swap), so the Tk thread can read it lock-free.
+        self._link_status: dict = _empty_link_status(radio is not None)
         self._running      = threading.Event()
         self._connected    = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -121,20 +151,79 @@ class TelemetryWorker:
         with self._state_lock:
             return self._last_raw_yaw, self._last_mag_heading, self._last_mag_valid
 
+    def get_link_status(self) -> dict:
+        """
+        USB + ELRS link status for the toolbar (RadioLinkIndicator and the
+        USB status label). Refreshed by the worker thread even while no
+        telemetry frames are produced, so the pilot always sees why.
+        """
+        return self._link_status
+
+    def get_active_state(self):
+        """
+        Thread-safe. The DroneState of the currently best live source, or
+        None if neither USB nor ELRS has live telemetry. Used by the OSD and
+        DetectionLink trampolines, which run on C++ threads.
+        """
+        try:
+            source, state, _ = self._pick_source()
+        except Exception:
+            return None
+        return state if source is not None else None
+
+    # =========================================================================
+    # Source selection  —  USB (DroneLink) vs ELRS (CrsfLink)
+    # =========================================================================
+
+    def _pick_source(self):
+        """
+        Returns (source, state, radio_state):
+          source      "USB" / "ELRS" / None (no live telemetry)
+          state       DroneState to display (None only if nothing exists)
+          radio_state latest CrsfLink state (or None if no radio object),
+                      always returned so the indicator can show radio status
+                      even while USB is the active source.
+        Both get_latest_state() calls are mutex-protected C++ snapshots.
+        """
+        radio_state = self._radio.get_latest_state() if self._radio is not None else None
+        radio_live = (radio_state is not None and
+                      radio_state.radio.status_str in RADIO_LIVE)
+
+        usb_state = None
+        if self._hub.is_connected():
+            usb_state = self._hub.get_latest_state()
+            if getattr(usb_state, "link_healthy", False):
+                return "USB", usb_state, radio_state
+
+        if radio_live:
+            return "ELRS", radio_state, radio_state
+        if usb_state is not None:
+            return "USB", usb_state, radio_state     # cable in, momentarily unhealthy
+        return None, radio_state, radio_state
+
     # =========================================================================
     # Worker thread
     # =========================================================================
 
     def _run(self) -> None:
+        last_status_t = 0.0
         while self._running.is_set():
-            if not self._hub.is_connected():
-                self._connected.clear()
-                time.sleep(RECONNECT_S)
-                continue
-
             try:
-                state = self._hub.get_latest_state()
-                ui_data = self._build_ui_data(state)
+                source, state, radio_state = self._pick_source()
+
+                now = time.monotonic()
+                if source is None or now - last_status_t >= 1.0 / _STATUS_HZ:
+                    self._link_status = self._build_link_status(source, radio_state)
+                    last_status_t = now
+
+                if source is None:
+                    # Nothing live: no frames, but keep refreshing the status
+                    # quickly so the indicator reacts within ~100 ms.
+                    self._connected.clear()
+                    time.sleep(_IDLE_S)
+                    continue
+
+                ui_data = self._build_ui_data(state, source)
 
                 # Update the shared state snapshot (lock is brief)
                 with self._state_lock:
@@ -166,7 +255,49 @@ class TelemetryWorker:
     # Pure data builder  —  NO Tk, NO widget refs, NO side-effects
     # =========================================================================
 
-    def _build_ui_data(self, state) -> dict:
+    def _build_link_status(self, source, radio_state) -> dict:
+        """Flat status dict for the toolbar — no Tk, no widget refs."""
+        st = _empty_link_status(self._radio is not None)
+        st["active_source"] = source or "NONE"
+
+        usb_up = self._hub.is_connected()
+        st["usb_connected"] = usb_up
+        if usb_up:
+            try:
+                st["usb_healthy"] = bool(self._hub.get_latest_state().link_healthy)
+            except Exception:
+                st["usb_healthy"] = False
+
+        if radio_state is not None:
+            r = radio_state.radio
+            st.update({
+                "radio_status":       r.status_str,
+                "radio_port":         r.port_name,
+                "link_stats_valid":   r.link_stats_valid,
+                "uplink_lq":          int(r.uplink_lq),
+                "uplink_rssi1_dbm":   int(r.uplink_rssi1_dbm),
+                "uplink_rssi2_dbm":   int(r.uplink_rssi2_dbm),
+                "uplink_snr":         int(r.uplink_snr),
+                "downlink_lq":        int(r.downlink_lq),
+                "downlink_rssi_dbm":  int(r.downlink_rssi_dbm),
+                "tx_power_mw":        int(r.tx_power_mw),
+                "age_attitude_ms":    int(r.attitude_age_ms),
+                "age_gps_ms":         int(r.gps_age_ms),
+                "age_battery_ms":     int(r.battery_age_ms),
+                "age_flight_mode_ms": int(r.flight_mode_age_ms),
+                "age_last_frame_ms":  int(r.ms_since_last_frame),
+                "rate_attitude_hz":   float(r.attitude_hz),
+                "rate_gps_hz":        float(r.gps_hz),
+                "rate_battery_hz":    float(r.battery_hz),
+                "rate_total_hz":      float(r.total_frame_hz),
+                "reconnect_count":    int(r.reconnect_count),
+                "link_lost_count":    int(r.link_lost_count),
+                "crc_errors":         int(r.crc_errors),
+                "radio_armed":        bool(radio_state.armed),
+            })
+        return st
+
+    def _build_ui_data(self, state, source: str = "USB") -> dict:
         """
         Transforms a raw DroneBackend state object into the flat ui_data
         dict consumed by all widgets.  This is the only place that touches
@@ -257,6 +388,34 @@ class TelemetryWorker:
 
         _rssi = int(state.rssi)
         rc_link_quality = -1 if _rssi == 0 else int(_rssi * 100 / 255)
+
+        # ── ELRS extras ───────────────────────────────────────────────────────
+        is_elrs = (source == "ELRS")
+        radio = getattr(state, "radio", None) if is_elrs else None
+        if radio is not None and radio.link_stats_valid:
+            rc_link_quality = int(radio.uplink_lq)   # real ELRS LQ %, 0 = lost
+        elrs_data = {
+            "link_source": source,
+            # What this source can deliver. Widgets for USB-only data can
+            # show "USB only" instead of zeros when these are False.
+            "available_raw_imu":      not is_elrs,
+            "available_raw_mag":      not is_elrs,
+            "available_motors":       not is_elrs,
+            "available_rc_channels":  not is_elrs,
+            "available_sat_list":     not is_elrs,
+            "available_hdop":         not is_elrs,
+            "available_arming_flags": not is_elrs,
+            "available_cpu_load":     not is_elrs,
+            # CRSF only says "arming blocked yes/no" (reasons need USB)
+            "arming_blocked": bool(radio.arming_blocked) if radio is not None else False,
+            "gps_waiting":    bool(radio.gps_waiting) if radio is not None else False,
+            "altitude_source": radio.altitude_source if radio is not None else "BARO",
+            # Per-instrument data age in ms (-1 = never). Only meaningful on
+            # ELRS; on USB everything is refreshed every poll → 0.
+            "age_attitude_ms": int(radio.attitude_age_ms) if radio is not None else 0,
+            "age_gps_ms":      int(radio.gps_age_ms) if radio is not None else 0,
+            "age_battery_ms":  int(radio.battery_age_ms) if radio is not None else 0,
+        }
 
         try:
             bat_state_str = state.battery_state.name
@@ -352,4 +511,28 @@ class TelemetryWorker:
 
             # ── GPS ───────────────────────────────────────────────────────────
             **gps_data,
+
+            # ── Source + ELRS extras ──────────────────────────────────────────
+            **elrs_data,
         }
+
+
+def _empty_link_status(radio_present: bool) -> dict:
+    """Defaults for get_link_status() before the worker's first pass."""
+    return {
+        "active_source": "NONE",
+        "usb_connected": False,
+        "usb_healthy": False,
+        "radio_present": radio_present,
+        "radio_status": "NO_RADIO" if radio_present else "DISABLED",
+        "radio_port": "",
+        "link_stats_valid": False,
+        "uplink_lq": 0, "uplink_rssi1_dbm": 0, "uplink_rssi2_dbm": 0, "uplink_snr": 0,
+        "downlink_lq": 0, "downlink_rssi_dbm": 0, "tx_power_mw": 0,
+        "age_attitude_ms": -1, "age_gps_ms": -1, "age_battery_ms": -1,
+        "age_flight_mode_ms": -1, "age_last_frame_ms": -1,
+        "rate_attitude_hz": 0.0, "rate_gps_hz": 0.0, "rate_battery_hz": 0.0,
+        "rate_total_hz": 0.0,
+        "reconnect_count": 0, "link_lost_count": 0, "crc_errors": 0,
+        "radio_armed": False,
+    }

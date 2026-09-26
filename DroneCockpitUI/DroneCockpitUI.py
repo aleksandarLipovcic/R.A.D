@@ -113,6 +113,7 @@ import os
 import json
 import math
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -120,6 +121,7 @@ import tkinter as tk
 from tkinter import simpledialog, messagebox
 
 from telemetry_worker import TelemetryWorker
+from radio_link_indicator import RadioLinkIndicator
 from video_worker      import VideoWorker
 from detection_worker  import DetectionWorker
 
@@ -1424,6 +1426,26 @@ class DroneCockpitApp:
         self.hub = DroneBackend.DroneLink()
         self._update_job = None
 
+        # ── ELRS radio telemetry (RadioMaster Pocket, USB-VCP Telem Mirror) ──
+        # Second, independent telemetry source next to the USB cable. It
+        # auto-detects the Pocket and reconnects on its own after an
+        # unplug; TelemetryWorker picks USB or ELRS per poll. None if this
+        # DroneBackend.pyd predates CrsfLink (the cockpit then runs USB-only).
+        self.radio = DroneBackend.CrsfLink() if hasattr(DroneBackend, "CrsfLink") else None
+        if self.radio is None:
+            print("[CrsfLink] not in this DroneBackend build -- radio telemetry disabled")
+
+        # USB auto-connect runs on a background thread (auto_detect_fc sends
+        # an MSP probe to each port, which takes a few hundred ms per port --
+        # too long for the Tk thread now that the UI must stay live while
+        # flying on the radio link alone). Result is handed back through
+        # this attribute and picked up by _update_loop on the Tk thread.
+        self._usb_probe_running = False
+        self._usb_probe_result = None      # (port, ok) from the last probe
+        self._usb_retry_job = None
+        self._usb_port = None
+        self._usb_unhealthy_since = None   # monotonic time the cable link went bad
+
         # Yaw trim is now owned here on the Tk side; the worker gets a copy
         # via set_yaw_trim() whenever it changes.
         self._yaw_trim = 0.0
@@ -1458,7 +1480,7 @@ class DroneCockpitApp:
 
         # ── Background telemetry worker ────────────────────────────────────
         # Starts after UI is built so widgets exist before first frame arrives.
-        self._worker = TelemetryWorker(self.hub)
+        self._worker = TelemetryWorker(self.hub, radio=self.radio)
         self._worker.set_yaw_trim(self._yaw_trim)
 
         # ── Background video (FPV) worker ────────────────────────────────────
@@ -1670,7 +1692,14 @@ class DroneCockpitApp:
         self._detection_engine_detail = ""
         self._retry_detection_engine(log_on_failure=True)
 
-        self._auto_connect()   # connects hub, then starts worker + pump
+        # Telemetry no longer waits for the USB cable: the worker and the Tk
+        # pump start immediately so instruments come alive from whichever
+        # source (USB or ELRS) is available first.
+        if self.radio is not None:
+            self.radio.start_auto()      # non-blocking, auto-reconnects forever
+        self._worker.start()
+        self._schedule_update()
+        self._auto_connect()             # USB probe on a background thread
 
     # =========================================================================
     # Native FPV window sync — keeps VideoLink's off-Tk render HWND's
@@ -2086,14 +2115,12 @@ class DroneCockpitApp:
         """
         snapshot = DroneBackend.TelemetrySnapshot()
 
-        hub = getattr(self, "hub", None)
-        if hub is None or not hub.is_connected():
+        # Active source (USB cable or ELRS radio) -- the same one the
+        # instruments show. None when neither has live telemetry.
+        worker = getattr(self, "_worker", None)
+        state = worker.get_active_state() if worker is not None else None
+        if state is None:
             return snapshot   # valid=False by default -- DetectionLink skips georeferencing
-
-        try:
-            state = hub.get_latest_state()
-        except Exception:
-            return snapshot
 
         gps = state.gps
         snapshot.valid = bool(gps.position_usable)
@@ -2143,14 +2170,12 @@ class DroneCockpitApp:
         """
         snapshot = DroneBackend.TelemetrySnapshot()
 
-        hub = getattr(self, "hub", None)
-        if hub is None or not hub.is_connected():
+        # Active source (USB cable or ELRS radio) -- the same one the
+        # instruments show. None when neither has live telemetry.
+        worker = getattr(self, "_worker", None)
+        state = worker.get_active_state() if worker is not None else None
+        if state is None:
             return snapshot   # valid=False by default -- OSD stays hidden until link is up
-
-        try:
-            state = hub.get_latest_state()
-        except Exception:
-            return snapshot
 
         # "Do we have a live FC link at all" -- NOT gated on GPS fix. This
         # guards against drawing anything when the link is down (a fresh,
@@ -2461,20 +2486,25 @@ class DroneCockpitApp:
         exists purely so DetectionMapWidget can show that reason instead of
         an operator having to cross-reference the FC status panel themselves.
         """
-        hub = getattr(self, "hub", None)
-        if hub is None or not hub.is_connected():
-            return False, "no telemetry link"
+        worker = getattr(self, "_worker", None)
         try:
-            state = hub.get_latest_state()
+            state = worker.get_active_state() if worker is not None else None
         except Exception:
             return False, "telemetry read failed"
+        if state is None:
+            return False, "no telemetry link (USB or radio)"
         gps = state.gps
+        # The ELRS/CRSF path carries no HDOP (reported as 9999); there
+        # position_usable is decided from the satellite count alone.
+        if gps.hdop >= 9999:
+            hdop_txt = "HDOP n/a on radio link"
+            need_txt = "need >=5 sats on radio link"
+        else:
+            hdop_txt = f"HDOP {gps.hdop / 100.0:.1f}"
+            need_txt = "need fix>=2D, >=4 sats, HDOP<5.0"
         if bool(gps.position_usable):
-            return True, f"GPS usable ({gps.num_sat} sats, HDOP {gps.hdop / 100.0:.1f})"
-        return False, (
-            f"GPS not usable yet ({gps.num_sat} sats, HDOP {gps.hdop / 100.0:.1f} -- "
-            "need fix>=2D, >=4 sats, HDOP<5.0)"
-        )
+            return True, f"GPS usable ({gps.num_sat} sats, {hdop_txt})"
+        return False, f"GPS not usable yet ({gps.num_sat} sats, {hdop_txt} -- {need_txt})"
 
     def _get_current_drone_fix(self) -> tuple:
         """
@@ -2500,12 +2530,20 @@ class DroneCockpitApp:
         accurate enough to trust a detection's triangulated position
         against, which is what position_usable is actually for.
         """
-        hub = getattr(self, "hub", None)
-        if hub is None or not hub.is_connected():
-            return 0.0, 0.0, False
+        worker = getattr(self, "_worker", None)
         try:
-            state = hub.get_latest_state()
+            state = worker.get_active_state() if worker is not None else None
+            # Radio link LOST: keep the marker at the LAST KNOWN position
+            # instead of removing it -- for search & rescue, where the drone
+            # was when the link dropped is exactly what the crew needs.
+            radio = getattr(self, "radio", None)
+            if state is None and radio is not None:
+                rs = radio.get_latest_state()
+                if rs.radio.status_str == "TELEMETRY_LOST":
+                    state = rs
         except Exception:
+            return 0.0, 0.0, False
+        if state is None:
             return 0.0, 0.0, False
         gps = state.gps
         # Loose "do we have *any* real fix" check, independent of HDOP:
@@ -2921,6 +2959,18 @@ class DroneCockpitApp:
         )
         self.status_label.pack(side="left", padx=(0, 16))
 
+        # ELRS radio-link traffic light (green / yellow / red, blinks on
+        # link loss). Hover for LQ, RSSI, update rates and reconnect counts.
+        self.radio_indicator = RadioLinkIndicator(toolbar)
+        self.radio_indicator.pack(side="left", padx=(0, 16))
+        # Tooltips go on the indicator's child widgets: a tooltip on the Frame
+        # itself would hide again as soon as the pointer moves onto a child.
+        self._radio_tooltips = []
+        for w_ in self.radio_indicator.hover_widgets():
+            tip = _Tooltip(w_, "Radio link status")
+            self._tooltips[w_] = tip
+            self._radio_tooltips.append(tip)
+
         # Icon-only buttons throughout — mixing wide unicode glyphs with
         # long labels was causing Tkinter to mis-size/clip buttons on some
         # platforms. Every icon button gets a hover tooltip instead.
@@ -3094,38 +3144,112 @@ class DroneCockpitApp:
     # Connection
     # =========================================================================
 
+    # USB (cable) link: probe → connect → watch → drop → probe again.
+    # The telemetry worker and the Tk pump are NOT tied to this any more —
+    # they run from startup and use whichever source (USB / ELRS) is live.
+    USB_DROP_AFTER_S = 5.0   # cable link unhealthy this long → release port, re-probe
+
     def _auto_connect(self) -> None:
-        port = DroneBackend.auto_detect_f405()
-        if port == "NOT_FOUND":
-            self.status_label.config(
-                text="Status: Searching for drone on COM ports...", fg="orange")
-            self.root.after(RECONNECT_MS, self._auto_connect)
+        """Start one background USB probe (no-op if one is already running)."""
+        self._usb_retry_job = None
+        if self._usb_probe_running or self.hub.is_connected():
             return
-        if self.hub.connect(port):
-            self.status_label.config(
-                text=f"Status: Connected — {port}", fg="#00ff88")
-            # Start background worker and Tk pump only after a real connection
-            self._worker.start()
-            self._schedule_update()
-        else:
-            self.status_label.config(
-                text=f"Status: Found {port} but connection failed (port busy?)",
-                fg="red")
-            self.root.after(RECONNECT_MS, self._auto_connect)
+        self._usb_probe_running = True
+        self.status_label.config(text="USB: searching...", fg="orange")
+
+        def _probe():
+            port, ok = "NOT_FOUND", False
+            try:
+                exclude = []
+                if self.radio is not None and self.radio.get_port_name():
+                    exclude.append(self.radio.get_port_name())
+                if hasattr(DroneBackend, "auto_detect_fc"):
+                    # MSP handshake — never mistakes the Pocket for the FC
+                    port = DroneBackend.auto_detect_fc(exclude)
+                else:
+                    port = DroneBackend.auto_detect_f405()
+                if port != "NOT_FOUND":
+                    ok = bool(self.hub.connect(port))
+                    if ok and self.radio is not None:
+                        self.radio.set_excluded_ports([port])
+            except Exception as e:
+                print(f"[DroneLink] USB auto-connect error: {e}")
+            self._usb_probe_result = (port, ok)   # picked up in _update_loop
+            self._usb_probe_running = False
+
+        threading.Thread(target=_probe, name="UsbProbe", daemon=True).start()
+
+    def _schedule_usb_retry(self) -> None:
+        if self._usb_retry_job is None and not self._usb_probe_running:
+            self._usb_retry_job = self.root.after(RECONNECT_MS, self._auto_connect)
 
     def _reconnect(self) -> None:
         """
-        Called when the Tk pump detects the worker has lost the connection.
-        Stops the worker cleanly, disconnects the hub, then retries.
+        The cable link has been dead for USB_DROP_AFTER_S (cable pulled, FC
+        rebooted …). Release the port on a background thread — DroneLink's
+        disconnect() joins its poll thread — then probe again. The telemetry
+        worker keeps running and falls over to ELRS if the radio link is up.
         """
-        self._worker.stop()
-        self.hub.disconnect()
-        self.status_label.config(
-            text="Status: Link lost — reconnecting...", fg="red")
-        # Re-create a fresh worker so its internal state is clean
-        self._worker = TelemetryWorker(self.hub)
-        self._worker.set_yaw_trim(self._yaw_trim)
-        self.root.after(RECONNECT_MS, self._auto_connect)
+        self._usb_port = None
+        self._usb_unhealthy_since = None
+        self.status_label.config(text="USB: link lost — reconnecting...", fg="red")
+
+        def _drop():
+            try:
+                self.hub.disconnect()
+            except Exception as e:
+                print(f"[DroneLink] disconnect error: {e}")
+            if self.radio is not None:
+                self.radio.set_excluded_ports([])
+
+        t = threading.Thread(target=_drop, name="UsbDrop", daemon=True)
+        t.start()
+        self._usb_retry_job = self.root.after(RECONNECT_MS, self._auto_connect)
+
+    def _update_link_status(self) -> None:
+        """Tk thread, every pump tick: USB label + radio traffic light."""
+        link = self._worker.get_link_status()
+
+        # ── Radio indicator ──────────────────────────────────────────────────
+        self.radio_indicator.update_status(link)
+        for tip in self._radio_tooltips:
+            tip.set_text(self.radio_indicator.detail_text or "Radio link status")
+
+        # ── Result of a finished USB probe ───────────────────────────────────
+        if self._usb_probe_result is not None:
+            port, ok = self._usb_probe_result
+            self._usb_probe_result = None
+            if ok:
+                self._usb_port = port
+                self._usb_unhealthy_since = None
+            else:
+                if port != "NOT_FOUND":
+                    print(f"[DroneLink] found {port} but connect failed (port busy?)")
+                self._schedule_usb_retry()
+
+        # ── USB label + drop detection ───────────────────────────────────────
+        src = link.get("active_source", "NONE")
+        if self.hub.is_connected():
+            if link.get("usb_healthy"):
+                self._usb_unhealthy_since = None
+                self.status_label.config(
+                    text=f"USB: connected {self._usb_port or ''}".rstrip(), fg="#00ff88")
+            else:
+                now = time.monotonic()
+                if self._usb_unhealthy_since is None:
+                    self._usb_unhealthy_since = now
+                if now - self._usb_unhealthy_since >= self.USB_DROP_AFTER_S:
+                    self._reconnect()
+                else:
+                    self.status_label.config(text="USB: link degraded", fg="orange")
+        elif self._usb_probe_running:
+            self.status_label.config(text="USB: searching...", fg="orange")
+        else:
+            # Not an error when flying: the radio carries telemetry then.
+            self.status_label.config(
+                text="USB: not connected" + (" (radio active)" if src == "ELRS" else ""),
+                fg="#8090a8" if src == "ELRS" else "orange")
+            self._schedule_usb_retry()
 
     # =========================================================================
     # Update loop  —  Tk main thread only
@@ -3151,18 +3275,15 @@ class DroneCockpitApp:
             self.fpv_view.update_status(connected, fps, device_name)
         self._frame_counters["fpv"] += 1
 
+        # ── Link status: USB label + ELRS radio indicator ─────────────────────
+        # Runs every tick, even when no telemetry source is live, so the
+        # pilot always sees WHY the instruments aren't moving.
+        self._update_link_status()
+
         # ── Connection health check ───────────────────────────────────────────
-        # The worker monitors the backend independently; we just check its flag.
+        # No live source (neither USB nor ELRS): instruments keep their last
+        # values; the red radio indicator / USB label explain the situation.
         if not self._worker.is_connected:
-            # Only show "degraded" if the hub thinks it's still up but the
-            # worker hasn't received valid data recently.
-            if not self.hub.is_connected():
-                self._reconnect()
-                return
-            # Hub says connected but worker hasn't delivered a frame yet —
-            # this is normal during the first few ms after connect.
-            self.status_label.config(text="Status: Waiting for data...",
-                                     fg="orange")
             self._update_job = self.root.after(UI_REFRESH_MS, self._update_loop)
             return
 
@@ -3172,12 +3293,6 @@ class DroneCockpitApp:
             # Worker is alive but no new frame this tick — reschedule and yield
             self._update_job = self.root.after(UI_REFRESH_MS, self._update_loop)
             return
-
-        # ── Update status label from frame data ───────────────────────────────
-        if ui_data.get("link_healthy", True):
-            self.status_label.config(text="Status: Connected", fg="#00ff88")
-        else:
-            self.status_label.config(text="Status: Link degraded", fg="orange")
 
         # ── Feed widgets with per-widget throttling ───────────────────────────
         #
@@ -3242,6 +3357,8 @@ class DroneCockpitApp:
             self.root.after_cancel(self._detection_pump_job)
         self._worker.stop()
         self.hub.disconnect()
+        if self.radio is not None:
+            self.radio.disconnect()
         self._video_worker.stop()
         self.fpv_view.detach()
         self.video_link.disconnect()
