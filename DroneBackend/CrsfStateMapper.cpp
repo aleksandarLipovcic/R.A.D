@@ -52,15 +52,15 @@ void CrsfStateMapper::mapFlightMode(const std::string& rawIn, DroneState& s) {
     s.radio.armingBlocked = false;
     s.radio.gpsWaiting = false;
 
-    if (raw == "!FS!")      { flags |= FlightMode::FAILSAFE;   name = "FAILSAFE";   emergency = true; }
-    else if (raw == "RTH")  { flags |= FlightMode::GPS_RESCUE; name = "GPS RESCUE"; emergency = true; }
+    if (raw == "!FS!") { flags |= FlightMode::FAILSAFE;   name = "FAILSAFE";   emergency = true; }
+    else if (raw == "RTH") { flags |= FlightMode::GPS_RESCUE; name = "GPS RESCUE"; emergency = true; }
     else if (raw == "STAB") { flags |= FlightMode::ANGLE;      name = "ANGLE"; }
-    else if (raw == "HOR")  { flags |= FlightMode::HORIZON;    name = "HORIZON"; }
+    else if (raw == "HOR") { flags |= FlightMode::HORIZON;    name = "HORIZON"; }
     else if (raw == "ACRO" || raw == "AIR") { name = "ACRO"; }
     else if (raw == "MANU") { name = "PASSTHRU"; }
     else if (raw == "!ERR") { name = "ARMING BLOCKED"; s.radio.armingBlocked = true; }
     else if (raw == "WAIT") { name = "WAIT GPS";       s.radio.gpsWaiting = true; }
-    else                    { name = raw.empty() ? "UNKNOWN" : raw; }
+    else { name = raw.empty() ? "UNKNOWN" : raw; }
 
     (void)emergency;
     if (disarmed) name += " [DISARMED]";
@@ -90,9 +90,9 @@ bool CrsfStateMapper::apply(const Crsf::Frame& f, DroneState& s, int64_t now) {
         Crsf::Attitude a;
         if (!Crsf::decodeAttitude(f, a, cfg_.yawSigned)) return false;
         // DroneState keeps MSP units: roll/pitch in decidegrees, yaw in whole degrees.
-        s.roll  = static_cast<int16_t>(std::lround(a.rollDeg * 10.0f));
+        s.roll = static_cast<int16_t>(std::lround(a.rollDeg * 10.0f));
         s.pitch = static_cast<int16_t>(std::lround(a.pitchDeg * 10.0f));
-        s.yaw   = static_cast<int16_t>(std::lround(a.yawDeg) % 360);
+        s.yaw = static_cast<int16_t>(std::lround(a.yawDeg) % 360);
         s.magHeadingDeg = a.yawDeg;   // fused heading — compass widget stays alive
         s.magValid = true;            // heading valid; raw magX/Y/Z stay 0
         s.sensorStatus |= SensorStatus::ACC | SensorStatus::GYRO;
@@ -104,8 +104,8 @@ bool CrsfStateMapper::apply(const Crsf::Frame& f, DroneState& s, int64_t now) {
         if (!Crsf::decodeBattery(f, b)) return false;
         s.batteryVoltage = b.voltageV;
         s.batteryCurrent = b.currentA;
-        s.batteryMahDrawn = static_cast<uint16_t>(std::min<uint32_t>(b.mahDrawn, 0xFFFF));
-        s.batteryPercentage = std::min<uint8_t>(b.remainingPct, 100);
+        s.batteryMahDrawn = static_cast<uint16_t>((std::min<uint32_t>)(b.mahDrawn, 0xFFFF));
+        s.batteryPercentage = (std::min<uint8_t>)(b.remainingPct, 100);
         updateBatteryDerived(s);
         tBatt_ = now; ++nBatt_;
         return true;
@@ -178,7 +178,7 @@ bool CrsfStateMapper::apply(const Crsf::Frame& f, DroneState& s, int64_t now) {
         r.downlinkSnr = l.downlinkSnr;
         // Reuse the existing 0–255 rssi field so rc_link_quality in to_dict()
         // shows the real ELRS LQ % without any widget change.
-        s.rssi = static_cast<uint8_t>(std::min<int>(l.uplinkLq, 100) * 255 / 100);
+        s.rssi = static_cast<uint8_t>((std::min<int>)(l.uplinkLq, 100) * 255 / 100);
         tLink_ = now; ++nLink_;
         return true;
     }
@@ -209,7 +209,7 @@ void CrsfStateMapper::updateHome(DroneState& s) {
         const double d = distanceM(s.gps.latitude, s.gps.longitude, r.homeLat, r.homeLon);
         double b = bearingDeg(s.gps.latitude, s.gps.longitude, r.homeLat, r.homeLon);
         if (b > 180.0) b -= 360.0;    // MSP_COMP_GPS convention: -180..+180
-        s.gps.distToHomM = static_cast<uint16_t>(std::min(d, 65535.0));
+        s.gps.distToHomM = static_cast<uint16_t>((std::min)(d, 65535.0));
         s.gps.bearingToHome = static_cast<int16_t>(std::lround(b));
         s.gps.compValid = true;
     }
@@ -254,7 +254,7 @@ const char* CrsfStateMapper::statusName(RadioLinkStatus st) {
 }
 
 RadioLinkStatus CrsfStateMapper::evaluateStatus(bool portOpen, const RadioLinkStats& r,
-                                                const StatusThresholds& th) {
+    const StatusThresholds& th) {
     if (!portOpen) return RadioLinkStatus::NO_RADIO;
 
     // "Drone telemetry" = anything the FC itself produces. Link statistics
@@ -269,22 +269,22 @@ RadioLinkStatus CrsfStateMapper::evaluateStatus(bool portOpen, const RadioLinkSt
         return RadioLinkStatus::TELEMETRY_LOST;
 
     const bool lqLow = r.linkStatsValid && fresher(r.linkStatsAgeMs, th.lostTimeoutMs)
-                       && r.uplinkLq < th.degradedLq;
+        && r.uplinkLq < th.degradedLq;
     const bool attStale = !fresher(r.attitudeAgeMs, th.instrumentStaleMs);
     if (lqLow || attStale) return RadioLinkStatus::DEGRADED;
     return RadioLinkStatus::TELEMETRY_OK;
 }
 
 void CrsfStateMapper::refresh(DroneState& s, bool portOpen, int64_t now,
-                              const StatusThresholds& th) {
+    const StatusThresholds& th) {
     RadioLinkStats& r = s.radio;
     r.msSinceLastFrame = age(tFrame_, now);
-    r.attitudeAgeMs    = age(tAtt_, now);
-    r.gpsAgeMs         = age(tGps_, now);
-    r.batteryAgeMs     = age(tBatt_, now);
-    r.flightModeAgeMs  = age(tMode_, now);
-    r.baroAgeMs        = age(tBaro_, now);
-    r.linkStatsAgeMs   = age(tLink_, now);
+    r.attitudeAgeMs = age(tAtt_, now);
+    r.gpsAgeMs = age(tGps_, now);
+    r.batteryAgeMs = age(tBatt_, now);
+    r.flightModeAgeMs = age(tMode_, now);
+    r.baroAgeMs = age(tBaro_, now);
+    r.linkStatsAgeMs = age(tLink_, now);
 
     // Rates over a rolling ~2 s window
     if (rateWindowStart_ < 0) rateWindowStart_ = now;
@@ -304,7 +304,8 @@ void CrsfStateMapper::refresh(DroneState& s, bool portOpen, int64_t now,
             s.baroAltitudeCm = static_cast<int32_t>(std::lround((s.gps.altitudeM - r.homeAltM) * 100.0f));
             s.baroValid = true;
             r.altitudeSource = "GPS";
-        } else if (r.baroAgeMs < 0 && r.altitudeSource != "GPS") {
+        }
+        else if (r.baroAgeMs < 0 && r.altitudeSource != "GPS") {
             r.altitudeSource = "NONE";
         }
         // else: keep the last source; its age is visible in baroAgeMs / gpsAgeMs
@@ -313,7 +314,7 @@ void CrsfStateMapper::refresh(DroneState& s, bool portOpen, int64_t now,
     // Status + transition counters
     const RadioLinkStatus st = evaluateStatus(portOpen, r, th);
     const bool wasFlowing = prevStatus_ == RadioLinkStatus::TELEMETRY_OK ||
-                            prevStatus_ == RadioLinkStatus::DEGRADED;
+        prevStatus_ == RadioLinkStatus::DEGRADED;
     if (wasFlowing && st == RadioLinkStatus::TELEMETRY_LOST) ++r.linkLostCount;
     prevStatus_ = st;
     r.status = st;

@@ -7,7 +7,7 @@
 namespace {
     std::string lower(std::string s) {
         std::transform(s.begin(), s.end(), s.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         return s;
     }
     constexpr int READ_CHUNK = 512;
@@ -33,7 +33,7 @@ CrsfLink::~CrsfLink() { disconnect(); }
 HANDLE CrsfLink::openPort(const std::string& name) {
     const std::string path = "\\\\.\\" + name;
     HANDLE h = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return h;
 
     // USB CDC ignores the baud rate, but set a sane line config anyway.
@@ -96,11 +96,11 @@ bool CrsfLink::scanForRadio(std::string& found, bool& nameMatched) {
     auto isExcluded = [&](const std::string& port) {
         for (const auto& e : excluded) if (lower(e) == lower(port)) return true;
         return false;
-    };
+        };
 
     auto ports = EnumerateSerialPorts();
     std::stable_partition(ports.begin(), ports.end(),
-                          [&](const SerialPortInfo& p) { return PortMatchesHints(p, hints); });
+        [&](const SerialPortInfo& p) { return PortMatchesHints(p, hints); });
 
     std::ostringstream rep;
     rep << "scan: " << ports.size() << " COM port(s)\n";
@@ -109,10 +109,12 @@ bool CrsfLink::scanForRadio(std::string& found, bool& nameMatched) {
     for (const auto& p : ports) {
         const std::string names = lower(p.friendlyName + " " + p.busDescription);
         rep << "  " << p.port << " [" << p.busDescription << " | " << p.friendlyName << "] ";
-        if (isExcluded(p.port))                            { rep << "skip: excluded\n"; continue; }
-        if (names.find("bluetooth") != std::string::npos)  { rep << "skip: bluetooth\n"; continue; }
+        if (isExcluded(p.port)) { rep << "skip: excluded\n"; continue; }
+        if (names.find("bluetooth") != std::string::npos) { rep << "skip: bluetooth\n"; continue; }
         if (names.find("betaflight") != std::string::npos ||
-            names.find("inav") != std::string::npos)       { rep << "skip: flight controller\n"; continue; }
+            names.find("inav") != std::string::npos) {
+            rep << "skip: flight controller\n"; continue;
+        }
 
         HANDLE h = openPort(p.port);
         if (h == INVALID_HANDLE_VALUE) {
@@ -224,7 +226,8 @@ void CrsfLink::workerLoop() {
                 std::string port; bool hinted = false; bool ok = false;
                 if (fixed.empty()) {
                     ok = scanForRadio(port, hinted);
-                } else {
+                }
+                else {
                     h_ = openPort(fixed);
                     ok = h_ != INVALID_HANDLE_VALUE; port = fixed; hinted = true;
                 }
@@ -237,7 +240,8 @@ void CrsfLink::workerLoop() {
                     parser_.reset();
                     { std::lock_guard<std::mutex> lk(stateMutex_); portName_ = port; }
                     portOpen_.store(true);
-                } else {
+                }
+                else {
                     nextScanMs = now + scanIntervalMs_.load();
                 }
             }
@@ -258,7 +262,7 @@ void CrsfLink::workerLoop() {
         DWORD errs = 0; COMSTAT cs = {};
         DWORD rd = 0;
         bool dead = !ClearCommError(h_, &errs, &cs) ||
-                    !ReadFile(h_, buf, sizeof(buf), &rd, nullptr);
+            !ReadFile(h_, buf, sizeof(buf), &rd, nullptr);
 
         const int64_t t = nowMs();
         if (!dead && t - lastPresenceCheckMs_ >= PRESENCE_CHECK_MS) {
@@ -339,17 +343,17 @@ void CrsfLink::setPortNameHints(const std::vector<std::string>& h) {
     std::lock_guard<std::mutex> lk(cfgMutex_); hints_ = h;
 }
 
-void CrsfLink::setLostTimeoutMs(int ms)      { std::lock_guard<std::mutex> lk(stateMutex_); thresholds_.lostTimeoutMs = ms; }
-void CrsfLink::setDegradedLq(int lq)         { std::lock_guard<std::mutex> lk(stateMutex_); thresholds_.degradedLq = lq; }
-void CrsfLink::setInstrumentStaleMs(int ms)  { std::lock_guard<std::mutex> lk(stateMutex_); thresholds_.instrumentStaleMs = ms; }
+void CrsfLink::setLostTimeoutMs(int ms) { std::lock_guard<std::mutex> lk(stateMutex_); thresholds_.lostTimeoutMs = ms; }
+void CrsfLink::setDegradedLq(int lq) { std::lock_guard<std::mutex> lk(stateMutex_); thresholds_.degradedLq = lq; }
+void CrsfLink::setInstrumentStaleMs(int ms) { std::lock_guard<std::mutex> lk(stateMutex_); thresholds_.instrumentStaleMs = ms; }
 
 #define CRSF_CFG(stmt) do { std::lock_guard<std::mutex> lk(stateMutex_); \
     auto c = mapper_.config(); stmt; mapper_.setConfig(c); } while (0)
 
-void CrsfLink::setYawSigned(bool s)                 { CRSF_CFG(c.yawSigned = s); }
-void CrsfLink::setCellCount(int n)                  { CRSF_CFG(c.cellCount = static_cast<uint8_t>(std::max(0, n))); }
+void CrsfLink::setYawSigned(bool s) { CRSF_CFG(c.yawSigned = s); }
+void CrsfLink::setCellCount(int n) { CRSF_CFG(c.cellCount = static_cast<uint8_t>((std::max)(0, n))); }
 void CrsfLink::setCellVoltageThresholds(float w, float cr) { CRSF_CFG(c.warningCellV = w; c.criticalCellV = cr); }
-void CrsfLink::setBatteryCapacityMah(int mah)       { CRSF_CFG(c.capacityMah = static_cast<uint16_t>(std::max(0, mah))); }
-void CrsfLink::setMinSatsForFix(int s)              { CRSF_CFG(c.minSatsForFix = static_cast<uint8_t>(std::max(0, s))); }
-void CrsfLink::setGpsAltitudeFallback(bool on)      { CRSF_CFG(c.gpsAltitudeFallback = on); }
+void CrsfLink::setBatteryCapacityMah(int mah) { CRSF_CFG(c.capacityMah = static_cast<uint16_t>((std::max)(0, mah))); }
+void CrsfLink::setMinSatsForFix(int s) { CRSF_CFG(c.minSatsForFix = static_cast<uint8_t>((std::max)(0, s))); }
+void CrsfLink::setGpsAltitudeFallback(bool on) { CRSF_CFG(c.gpsAltitudeFallback = on); }
 #undef CRSF_CFG

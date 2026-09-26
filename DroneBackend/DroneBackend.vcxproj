@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -127,7 +127,7 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalLibraryDirectories>C:\openCVBuild\build\install\x64\vc18\lib;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\libs</AdditionalLibraryDirectories>
-      <AdditionalDependencies>C:\opencv\build\x64\vc16\lib\opencv_world4120d.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>C:\opencv\build\x64\vc16\lib\opencv_world4120d.lib;setupapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -144,20 +144,27 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>C:\openCVBuild\build\install\x64\vc18\lib\opencv_world4130.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>C:\openCVBuild\build\install\x64\vc18\lib\opencv_world4130.lib;setupapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>C:\openCVBuild\build\install\x64\vc18\lib;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\libs</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="BaroBMP280.h" />
+    <ClInclude Include="CrsfLink.h" />
+    <ClInclude Include="CrsfProtocol.h" />
+    <ClInclude Include="CrsfStateMapper.h" />
     <ClInclude Include="DetectionLink.h" />
     <ClInclude Include="DroneLink.h" />
     <ClInclude Include="GPSneoM10.h" />
     <ClInclude Include="IMUSensor.h" />
     <ClInclude Include="MagQMC5883L.h" />
+    <ClInclude Include="SerialPortScan.h" />
     <ClInclude Include="VideoLink.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="CrsfLink.cpp" />
+    <ClCompile Include="CrsfProtocol.cpp" />
+    <ClCompile Include="CrsfStateMapper.cpp" />
     <ClCompile Include="DetectionLink.cpp" />
     <ClCompile Include="DroneLink.cpp" />
     <ClCompile Include="GPSneoM10.cpp" />
@@ -165,9 +172,10 @@
     <ClCompile Include="Bindings.cpp" />
     <ClCompile Include="BaroBMP280.cpp" />
     <ClCompile Include="MagQMC5883L.cpp" />
+    <ClCompile Include="SerialPortScan.cpp" />
     <ClCompile Include="VideoLink.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
-</Project>
+</Project>
