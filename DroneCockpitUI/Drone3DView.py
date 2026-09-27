@@ -1,6 +1,8 @@
 import tkinter as tk
 import math
 
+import link_mode
+
 
 class Drone3DView(tk.Canvas):
     """
@@ -34,6 +36,17 @@ class Drone3DView(tk.Canvas):
         green   |Δ| <  15°   headings agree
         yellow  |Δ| <  30°   monitor
         red     |Δ| ≥  30°   heading adjustment required
+
+    LINK-AWARE (see link_mode.py)
+    ─────────────────────────────
+    On the radio (ELRS) link the attitude comes from CRSF ATTITUDE frames
+    at a much lower rate than MSP, and there is no independent
+    magnetometer. update_orientation(..., source="ELRS", stale_ms=n):
+      • the strip badge reads "FC·RF" and no mag ghost / Δ badge is drawn
+        (the radio heading IS the FC yaw — nothing to cross-check);
+      • when stale_ms != 0 the instrument is hatched over and a
+        "ATTITUDE STALE n.ns" / "NO ATTITUDE DATA" banner is drawn, so a
+        frozen horizon can never be mistaken for level flight.
     """
 
     MARGIN = 2
@@ -115,13 +128,20 @@ class Drone3DView(tk.Canvas):
                            pitch:       float,
                            yaw:         float = 0.0,
                            mag_heading: float = None,
-                           mag_valid:   bool  = False):
+                           mag_valid:   bool  = False,
+                           source:      str   = "USB",
+                           stale_ms:    int   = 0):
         """
         roll, pitch  — FC attitude in degrees
         yaw          — FC gyro-integrated yaw (degrees)
         mag_heading  — magnetometer heading 0–360° (or None / invalid)
         mag_valid    — True when the mag has a good lock
+        source       — "USB" (MSP) or "ELRS" (radio link)
+        stale_ms     — 0 = fresh; otherwise attitude age in ms (-1 = never)
         """
+        radio = source == link_mode.RADIO
+        if radio:
+            mag_valid = False     # radio heading is the FC yaw itself
         W = self.winfo_width()
         H = self.winfo_height()
         if W < 10 or H < 10:
@@ -166,9 +186,12 @@ class Drone3DView(tk.Canvas):
 
         self._draw_adi_bezel()
         self._draw_hud_numerics(roll, pitch, level)
-        self._draw_compass_strip(tape_heading, mag_marker, drift, mag_valid)
+        self._draw_compass_strip(tape_heading, mag_marker, drift, mag_valid,
+                                 radio)
 
-        if level != "safe":
+        if stale_ms:
+            self._draw_stale_overlay(stale_ms)
+        elif level != "safe":
             self._draw_warning_banner(level, max_tilt)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -399,7 +422,8 @@ class Drone3DView(tk.Canvas):
                             tape_heading: float,
                             mag_marker:   float | None,
                             drift:        float,
-                            mag_valid:    bool):
+                            mag_valid:    bool,
+                            radio:        bool = False):
         """
         tape_heading  — drives the scrolling tape: always the FC gyro yaw.
         mag_marker    — magnetometer heading plotted as a cyan ghost diamond
@@ -501,8 +525,8 @@ class Drone3DView(tk.Canvas):
 
         # ── Source badge (top-left of strip) ─────────────────────────────────
         # Tape is always GYRO.  Show MAG LOCK when mag provides a ghost marker.
-        badge_txt = "GYRO"
-        badge_clr = "#FFAA00"
+        badge_txt = "FC·RF" if radio else "GYRO"
+        badge_clr = link_mode.C_RADIO if radio else "#FFAA00"
         self.create_text(x0 + 4, y0 + 4, anchor="nw",
                          text=badge_txt,
                          fill=badge_clr,
@@ -544,6 +568,23 @@ class Drone3DView(tk.Canvas):
     # ══════════════════════════════════════════════════════════════════════════
     # 9. WARNING BANNER
     # ══════════════════════════════════════════════════════════════════════════
+
+    def _draw_stale_overlay(self, stale_ms: int):
+        """Hatch the ADI and say how old the attitude is."""
+        self.create_rectangle(self.adi_x0, self.adi_y0,
+                              self.adi_x1, self.adi_y1,
+                              fill=self.C_BLACK, stipple="gray50", outline="")
+        txt = ("NO ATTITUDE DATA" if stale_ms < 0 else
+               f"ATTITUDE {link_mode.stale_text(stale_ms)}")
+        M  = self.MARGIN
+        bw = 120
+        self.create_rectangle(self.cx - bw, M + 36,
+                              self.cx + bw, M + 57,
+                              fill=self.C_BLACK, outline=link_mode.C_STALE_FG,
+                              width=1)
+        self.create_text(self.cx, M + 46, text=txt,
+                         fill=link_mode.C_STALE_FG,
+                         font=("Consolas", 10, "bold"))
 
     def _draw_warning_banner(self, level: str, max_tilt: float):
         if level == "critical":

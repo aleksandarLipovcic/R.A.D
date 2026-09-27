@@ -96,3 +96,8 @@ _M_TO_FT    = 3.28084    # meters -> feet
 `ui_data` dict keeps the raw MSP-native units, matching the convention
 `telemetry_worker.py` uses throughout (see
 [workers.md](workers.md#_build_ui_datastate-source--the-one-and-only-translation-point)).
+
+## USB vs radio link
+
+On the ELRS radio link this widget changes what it shows. See
+[link-mode.md](link-mode.md) for the exact behaviour.

@@ -18,10 +18,24 @@ LAYOUT FIXES (this version):
      condenses the voltage display into a single row to save vertical space.
   5. Mode label wraps when text is too long for the available space.
   6. Sensors row wraps to multiple lines when too narrow to fit all pills.
+
+LINK-AWARE (see link_mode.py):
+  A small tag at the right of the ARM row shows the active source
+  (USB / RADIO). On the radio (ELRS) link:
+    • FC metrics (CPU, loop time, I2C errors, PID profile), motor outputs
+      and RC channels are not carried — they show a grey "USB" placeholder
+      and flat bars instead of zeros.
+    • Sensor pills the radio cannot confirm read "MAG?" / "RNG?" rather
+      than looking like a missing sensor.
+    • Battery values older than link_mode.STALE_SLOW_MS turn the state
+      badge to "STALE".
+    • LINK QUALITY is the real ELRS uplink LQ.
 """
 
 import tkinter as tk
 import time
+
+import link_mode
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 _BG       = "#0f0f1a"
@@ -171,6 +185,11 @@ class FCStatusWidget(tk.Frame):
         self._mode_lbl.pack(anchor="w", fill="x", expand=True)
         # Keep a reference to update wraplength on resize
         self._mode_blk = mode_blk
+
+        # Source tag (USB / RADIO), right edge of the ARM row
+        self._src_lbl = tk.Label(p1, text="", bg=_BG2, fg=link_mode.C_USB,
+                                  font=_F_TINY)
+        self._src_lbl.pack(side="right", padx=(4, 8), anchor="n", pady=6)
 
         # ── P1b: Battery strip (full layout) ──────────────────────────────────
         self._bat_strip = tk.Frame(self, bg=_BG3,
@@ -660,6 +679,10 @@ class FCStatusWidget(tk.Frame):
     # =========================================================================
 
     def _redraw_cpu(self):
+        if not link_mode.available(self._last_data, "cpu_load"):
+            self._cpu_inner.place(x=0, y=0, width=0, relheight=1.0)
+            self._cpu_lbl.config(text=link_mode.NA_SHORT, fg=link_mode.C_NA_FG)
+            return
         cpu = max(0, min(100, int(self._last_data.get("cpu_load_percent", 0))))
         w = self._cpu_outer.winfo_width()
         if w < 4:
@@ -761,12 +784,27 @@ class FCStatusWidget(tk.Frame):
 
         self.after(500, self._tick)
 
+    @staticmethod
+    def _show_na_channel(mode, outer, bar, lbl, dot, anchor, rely):
+        """One motor/RC channel the active link does not carry."""
+        if mode == "bars":
+            bar.place(x=0, rely=rely, relwidth=1.0, height=1, anchor=anchor)
+            bar.config(bg=_DIM_FG)
+            lbl.config(text=link_mode.NA_SHORT, fg=link_mode.C_NA_FG)
+        else:
+            cv, d, ll = dot
+            cv.itemconfig(d, fill=_DIM_FG)
+            ll.config(fg=link_mode.C_NA_FG)
+
     # =========================================================================
     # Public update
     # =========================================================================
 
     def update_fc_status(self, data: dict):
         self._last_data = data
+        radio = link_mode.is_radio(data)
+        src_txt, src_col = link_mode.source_tag(data)
+        self._src_lbl.config(text=src_txt, fg=src_col)
 
         # ── ARM + mode ────────────────────────────────────────────────────────
         armed = bool(data.get("armed", False))
@@ -817,6 +855,8 @@ class FCStatusWidget(tk.Frame):
             fg=pcol if pct >= 0 else _DIM_FG)
 
         sfg, sbg = _BAT_STATE_COLORS.get(state, (_DIM_FG, _BORDER))
+        if link_mode.stale_ms(data, "battery"):
+            state, sfg, sbg = "STALE", _BG, link_mode.C_STALE_FG
         self._bat_state_lbl.config(text=state, fg=sfg, bg=sbg)
         self._bat_state_lbl_c.config(text=state, fg=sfg, bg=sbg)
         self._bat_strip.config(
@@ -835,6 +875,9 @@ class FCStatusWidget(tk.Frame):
         for sname, key in _SENSORS:
             present = bool(data.get(key, False))
             cv, dot, lbl, pill = self._sensor_refs[sname]
+            # The radio link only proves the sensors behind the frames it
+            # carries; anything else is "unknown", not "missing".
+            lbl.config(text=sname if (present or not radio) else sname + "?")
             if present:
                 cv.itemconfig(dot, fill=_GREEN)
                 cv.config(bg=_BG2)
@@ -848,13 +891,28 @@ class FCStatusWidget(tk.Frame):
 
         # ── CPU / metrics ─────────────────────────────────────────────────────
         self.after_idle(self._redraw_cpu)
-        self._lbl_cycle.config(text=f"{float(data.get('fc_cycle_ms', 0)):.2f}")
-        i2c = int(data.get("i2c_error_count", 0))
-        self._lbl_i2c.config(text=str(i2c), fg=_RED if i2c > 0 else _VALUE_FG)
-        self._lbl_pid.config(text=str(int(data.get("pid_profile", 0)) + 1))
+        if link_mode.available(data, "cpu_load"):
+            self._lbl_cycle.config(text=f"{float(data.get('fc_cycle_ms', 0)):.2f}",
+                                   fg=_VALUE_FG)
+            i2c = int(data.get("i2c_error_count", 0))
+            self._lbl_i2c.config(text=str(i2c), fg=_RED if i2c > 0 else _VALUE_FG)
+            self._lbl_pid.config(text=str(int(data.get("pid_profile", 0)) + 1),
+                                 fg=_VALUE_FG)
+        else:
+            for lbl in (self._lbl_cycle, self._lbl_i2c, self._lbl_pid):
+                lbl.config(text=link_mode.NA_SHORT, fg=link_mode.C_NA_FG)
 
         # ── Motors ────────────────────────────────────────────────────────────
+        motors_ok = link_mode.available(data, "motors")
+        if self._motor_mode == "bars":
+            self._mot_unit_lbl.config(
+                text="(us)" if motors_ok else "(" + link_mode.NA_LONG + ")")
         for i, key in enumerate(_MOTOR_KEYS):
+            if not motors_ok:
+                self._show_na_channel(self._motor_mode, self._motor_outers[i],
+                                      self._motor_bars[i], self._motor_lbls[i],
+                                      self._motor_dots[i], anchor="sw", rely=1.0)
+                continue
             us    = int(data.get(key, 0))
             valid = us >= 1000
             ratio = (us - 1000) / 1000.0 if valid else 0.0
@@ -880,7 +938,13 @@ class FCStatusWidget(tk.Frame):
                 ll.config(fg=_VALUE_FG if valid else _DIM_FG)
 
         # ── RC channels ───────────────────────────────────────────────────────
+        rc_ok = link_mode.available(data, "rc_channels")
         for i, (ch_name, key) in enumerate(_RC_CHANNELS):
+            if not rc_ok:
+                self._show_na_channel(self._rc_mode, self._rc_outers[i],
+                                      self._rc_bars[i], self._rc_lbls[i],
+                                      self._rc_dots[i], anchor="w", rely=0.5)
+                continue
             us    = int(data.get(key, 0))
             valid = us >= 1000
             ratio = (us - 1000) / 1000.0 if valid else 0.5
@@ -918,7 +982,7 @@ class FCStatusWidget(tk.Frame):
         lq = int(data.get("rc_link_quality", -1))
         if lq >= 0:
             self._lq_lbl.config(
-                text=f"{lq}%",
+                text=f"ELRS {lq}%" if radio else f"{lq}%",
                 fg=_RED if lq < 30 else _ORANGE if lq < 70 else _GREEN)
         else:
             rc_count = int(data.get("rc_channel_count", 0))

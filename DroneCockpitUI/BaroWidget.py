@@ -25,11 +25,22 @@ Key proportions (tape canvas):
 VSI canvas:
   Fixed width = clamp(W_total * 0.22, 44, 80) px
   Axis at 40% of VSI width; labels to the right of axis
+
+Altitude source tag (header, right side) — see link_mode.py:
+  BARO · USB        barometer via MSP over the cable
+  BARO · RADIO      barometer frame over ELRS
+  GPS Δ HOME · RADIO no baro frame on the radio link; CrsfLink derives the
+                    altitude from GPS altitude relative to the arming point
+  NO ALT · RADIO    radio link, neither source available yet
+  STALE n.ns        radio link, the altitude source has stopped updating —
+                    the tape keeps the last value, drawn as-is
 """
 
 import tkinter as tk
 import time
 import collections
+
+import link_mode
 
 
 class BaroWidget(tk.Frame):
@@ -121,6 +132,12 @@ class BaroWidget(tk.Frame):
             bg=self.C_FRAME, fg=self.C_DIM,
             font=("Consolas", 9, "bold")
         ).pack(side="left")
+        self._src_lbl = tk.Label(
+            hdr, text="",
+            bg=self.C_FRAME, fg=link_mode.C_USB,
+            font=("Consolas", 7, "bold")
+        )
+        self._src_lbl.pack(side="right")
 
         # Row 1 — canvas area managed by place() inside _cv_outer
         self._cv_outer = tk.Frame(self, bg=self.C_FRAME)
@@ -424,7 +441,27 @@ class BaroWidget(tk.Frame):
 
     # ── Public update ─────────────────────────────────────────────────────────
 
+    def _update_source_tag(self, data: dict):
+        if not link_mode.is_radio(data):
+            self._src_lbl.config(text="BARO · USB", fg=link_mode.C_USB)
+            return
+        src = str(data.get("altitude_source", "NONE")).upper()
+        if src == "GPS":
+            text, group = "GPS Δ HOME · RADIO", "gps"
+        elif src == "BARO":
+            text, group = "BARO · RADIO", "baro"
+        else:
+            self._src_lbl.config(text="NO ALT · RADIO", fg=link_mode.C_NA_FG)
+            return
+        old = link_mode.stale_ms(data, group)
+        if old:
+            self._src_lbl.config(text=link_mode.stale_text(old),
+                                 fg=link_mode.C_STALE_FG)
+        else:
+            self._src_lbl.config(text=text, fg=link_mode.C_RADIO)
+
     def update_baro(self, data: dict):
+        self._update_source_tag(data)
         valid    = data.get("baro_valid", False)
         alt_cm   = int(data.get("baro_altitude_cm",      0)) if valid else 0
         vario_cm = int(data.get("baro_vario_cm_per_sec", 0)) if valid else 0

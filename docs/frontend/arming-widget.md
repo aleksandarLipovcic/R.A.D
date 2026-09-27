@@ -64,3 +64,8 @@ specific checks elsewhere in Section A.
   `<Configure>` event, adapting to available width.
 - Detail-label wraplength is recalculated on every canvas resize so text
   never overflows its cell.
+
+## USB vs radio link
+
+On the ELRS radio link this widget changes what it shows. See
+[link-mode.md](link-mode.md) for the exact behaviour.

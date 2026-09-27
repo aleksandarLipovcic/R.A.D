@@ -16,6 +16,7 @@
   </Folder>
   <Folder Name="/docs/modules/">
     <File Path="docs/modules/bindings.md" />
+    <File Path="docs/modules/command-uplink.md" />
     <File Path="docs/modules/crsf-protocol.md" />
     <File Path="docs/modules/crsflink.md" />
     <File Path="docs/modules/detectionlink.md" />
@@ -34,6 +35,7 @@
     <File Path="docs/frontend/fpv-widget.md" />
     <File Path="docs/frontend/gps-widget.md" />
     <File Path="docs/frontend/imu-widget.md" />
+    <File Path="docs/frontend/link-mode.md" />
     <File Path="docs/frontend/mag-widget.md" />
     <File Path="docs/frontend/map-tiles.md" />
     <File Path="docs/frontend/osd-overlay-controls.md" />

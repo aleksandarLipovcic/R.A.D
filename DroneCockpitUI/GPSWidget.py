@@ -14,6 +14,16 @@ FIXES applied (v7):
      text that was easy to miss.
 
   (all prior v6/v5/v4 fixes retained)
+
+Link-aware (see link_mode.py):
+  USB   — MSP GPS: real fix type, HDOP, satellite list.
+  RADIO — CRSF GPS carries position, speed, course, altitude and the
+          satellite count only. The fix readout says "RF FIX" (a fix
+          inferred from the satellite count, not a reported 3D fix), HDOP
+          reads "n/a", and the satellite table shows why it is empty. When
+          GPS frames stop arriving the fix readout turns to "STALE" and the
+          last known position stays on the map — for search & rescue the
+          last position before a link loss is what matters most.
 """
 
 import tkinter as tk
@@ -23,6 +33,8 @@ import threading
 import queue
 import urllib.request
 import base64
+
+import link_mode
 
 
 # ── Thresholds ─────────────────────────────────────────────────────────────
@@ -68,6 +80,26 @@ _C = {
 
 # ── Fonts ───────────────────────────────────────────────────────────────────
 _FF  = "Courier New"
+
+
+def _fix_status(raw_valid, fix_type, radio=False, stale=False):
+    """
+    (text, colour) for the fix readout. Same 6-character width in every
+    case so the HUD columns never shift.
+    """
+    if stale:
+        return "STALE ", _C["amber"]
+    if radio:
+        # CRSF has no fix type: CrsfStateMapper reports 2 when a non-zero
+        # position has >= 4 satellites. Never label that a "3D FIX".
+        if raw_valid and fix_type >= 2:
+            return "RF FIX", _C["green"]
+        return "NO FIX", _C["red"]
+    if raw_valid and fix_type >= 2:
+        return "3D FIX", _C["green"]
+    if raw_valid and fix_type == 1:
+        return "2D FIX", _C["amber"]
+    return "NO FIX", _C["red"]
 _FL  = (_FF,  8, "bold")
 _FLM = (_FF,  9, "bold")
 _FV  = (_FF, 14, "bold")
@@ -161,6 +193,7 @@ class _SatPanel(tk.Frame):
                          width=self.SAT_PANEL_W, **kwargs)
         self.pack_propagate(False)
         self._sv_data = []
+        self._note    = None   # why the list is empty (e.g. radio link)
         self._build()
 
     def _build(self):
@@ -209,8 +242,9 @@ class _SatPanel(tk.Frame):
     def _scroll(self, event):
         self._cv.yview_scroll(int(-event.delta / 120), "units")
 
-    def update_satellites(self, sv_list: list):
+    def update_satellites(self, sv_list: list, note: str = None):
         self._sv_data = sv_list or []
+        self._note    = note
         self._redraw()
 
     def _redraw(self):
@@ -219,7 +253,8 @@ class _SatPanel(tk.Frame):
 
         if not self._sv_data:
             self._cv.create_text(w // 2, 40,
-                text="No satellite data", fill=_C["dim"],
+                text=self._note or "No satellite data",
+                fill=link_mode.C_NA_FG if self._note else _C["dim"],
                 font=(_FF, 9), justify="center")
             self._cv.configure(scrollregion=(0, 0, w, 80))
             return
@@ -676,12 +711,8 @@ class _MapCanvas(tk.Frame):
         brg        = d.get("brg",    0)
         comp_v     = d.get("comp_valid", False)
 
-        if raw_valid and fix_type >= 2:
-            fix_txt, fix_col = "3D FIX", _C["green"]
-        elif raw_valid and fix_type == 1:
-            fix_txt, fix_col = "2D FIX", _C["amber"]
-        else:
-            fix_txt, fix_col = "NO FIX", _C["red"]
+        fix_txt, fix_col = _fix_status(raw_valid, fix_type,
+                                       d.get("radio", False), d.get("stale", False))
 
         pos_col = _C["text"] if pos_usable else (_C["amber"] if raw_valid else _C["dim"])
         ok_pos  = raw_valid and fix_type >= 1
@@ -1311,19 +1342,18 @@ class _NavPanel(tk.Frame):
         brg        = d.get("brg",        0)
         heartbeat  = d.get("heartbeat",  None)
 
-        if raw_valid and fix_type >= 2:
-            self._fix_lbl.config(text="3D FIX", fg=_C["green"])
-        elif raw_valid and fix_type == 1:
-            self._fix_lbl.config(text="2D FIX", fg=_C["amber"])
-        else:
-            self._fix_lbl.config(text="NO FIX", fg=_C["red"])
+        fix_txt, fix_col = _fix_status(raw_valid, fix_type,
+                                       d.get("radio", False), d.get("stale", False))
+        self._fix_lbl.config(text=fix_txt, fg=fix_col)
 
         self._sat_lbl.config(
             text=f"{num_sat:3d}" if raw_valid else " --",
             fg=_C["green"] if (raw_valid and num_sat >= 6)
                else _C["amber"] if raw_valid else _C["dim"])
 
-        if raw_valid and hdop < 99.0:
+        if not d.get("hdop_avail", True):
+            self._hdop_lbl.config(text="  n/a", fg=link_mode.C_NA_FG)
+        elif raw_valid and hdop < 99.0:
             hcol = (_C["green"] if hdop < 1.0
                     else _C["amber"] if hdop < 2.0 else _C["red"])
             self._hdop_lbl.config(text=f"{hdop:5.2f}", fg=hcol)
@@ -1530,13 +1560,16 @@ class GPSWidget(tk.Frame):
     def _center_on_drone(self):
         if self._map_mode: self._map_canvas.center_drone()
 
-    def _update_toolbar_status(self, raw_valid, fix_type, num_sat, hdop):
+    def _update_toolbar_status(self, raw_valid, fix_type, num_sat, hdop,
+                               hdop_avail=True):
         sat_col = (_C["green"] if (raw_valid and num_sat >= 6)
                    else _C["amber"] if raw_valid else _C["dim"])
         self._sat_count_lbl.config(
             text=f"{num_sat:3d}" if raw_valid else " --",
             fg=sat_col)
-        if raw_valid and hdop < 99.0:
+        if not hdop_avail:
+            self._hdop_lbl.config(text="   n/a", fg=link_mode.C_NA_FG)
+        elif raw_valid and hdop < 99.0:
             hdop_col = (_C["green"] if hdop < 1.0
                         else _C["amber"] if hdop < 2.0 else _C["red"])
             self._hdop_lbl.config(text=f"{hdop:6.2f}", fg=hdop_col)
@@ -1652,6 +1685,9 @@ class GPSWidget(tk.Frame):
         brg        = int(ui_data.get("gps_bearing_to_home",   0))
         heartbeat  = ui_data.get("gps_heartbeat",         None)
         trk        = (course_dd / 10.0) % 360.0
+        radio      = link_mode.is_radio(ui_data)
+        stale      = bool(link_mode.stale_ms(ui_data, "gps")) and raw_valid
+        hdop_avail = link_mode.available(ui_data, "hdop")
 
         nav = dict(
             raw_valid=raw_valid, comp_valid=comp_valid,
@@ -1661,6 +1697,7 @@ class GPSWidget(tk.Frame):
             gs_cms=gs_cms, trk=trk,
             dist_m=dist_m, brg=brg,
             heartbeat=heartbeat,
+            radio=radio, stale=stale, hdop_avail=hdop_avail,
         )
 
         if heartbeat is not None and heartbeat != self._prev_heartbeat:
@@ -1671,7 +1708,8 @@ class GPSWidget(tk.Frame):
             fill=_C["hb_on"] if self._hb_state else _C["hb_off"])
 
         if self._map_mode:
-            self._update_toolbar_status(raw_valid, fix_type, num_sat, hdop)
+            self._update_toolbar_status(raw_valid, fix_type, num_sat, hdop,
+                                        hdop_avail)
             self._map_canvas.update_position(lat, lon, raw_valid and fix_type >= 2)
             self._map_canvas.update_hud(nav)
         else:
@@ -1679,7 +1717,10 @@ class GPSWidget(tk.Frame):
 
         raw_sv = ui_data.get("gps_sv_list", [])
         norm   = _normalize_sv_list(raw_sv)
-        self._sat_panel.update_satellites(norm)
+        sv_note = (None if link_mode.available(ui_data, "sat_list") else
+                   "Satellite list: USB only\n(not carried by the radio link)\n\n"
+                   f"{num_sat} satellites in use")
+        self._sat_panel.update_satellites(norm, sv_note)
         if (self._sat_toplevel and self._sat_toplevel.winfo_exists()
                 and hasattr(self, "_sat_toplevel_panel")):
-            self._sat_toplevel_panel.update_satellites(norm)
+            self._sat_toplevel_panel.update_satellites(norm, sv_note)

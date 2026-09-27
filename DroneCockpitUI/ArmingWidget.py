@@ -22,6 +22,21 @@ cleared by the pilot without physically unplugging the cable.  Individual
 hardware health items (gyro, acc, I2C) are already covered by their own
 dedicated checks below.
 
+LINK-AWARE AUTO CHECKS (see link_mode.py):
+  Each evaluator returns (passed, detail) where passed is True / False, or
+  None = "this link cannot verify it". None rows get a grey dot and do not
+  block the banner, but the banner never shows a plain READY TO ARM while
+  any check is unverified — it shows
+    Orange "READY — n CHECK(S) NEED USB"
+  so the crew knows those items must be confirmed on the bench (cable).
+  On the radio (ELRS) link:
+    • MOTORS IDLE is unverifiable (no motor outputs over CRSF).
+    • GYRO / ACC pass only because attitude frames arrive — the detail
+      says so.
+    • GPS FIX is a satellite-count fix (no fix type / HDOP over CRSF).
+    • Betaflight's "!ERR" flight-mode text (arming blocked) fails the RC
+      LINK row with "FC REPORTS ARMING BLOCKED" — the reasons need USB.
+
 LAYOUT / SCROLL FIXES:
   1. Header and banner are pinned outside the scroll area — always visible.
   2. Sections A + B live inside a Canvas-backed scrollable frame; vertical
@@ -32,6 +47,8 @@ LAYOUT / SCROLL FIXES:
 """
 
 import tkinter as tk
+
+import link_mode
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 _BG       = "#0f0f1a"
@@ -59,11 +76,15 @@ _F_RESET   = ("Consolas",  8, "bold")
 
 def _check_gyro(data):
     ok = bool(data.get("sensor_gyro_present", False))
+    if link_mode.is_radio(data):
+        return ok, "ATTITUDE RECEIVED (RADIO)" if ok else "NO ATTITUDE FRAMES"
     return ok, "ONLINE" if ok else "NOT DETECTED"
 
 
 def _check_acc(data):
     ok = bool(data.get("sensor_acc_present", False))
+    if link_mode.is_radio(data):
+        return ok, "ATTITUDE RECEIVED (RADIO)" if ok else "NO ATTITUDE FRAMES"
     return ok, "ONLINE" if ok else "NOT DETECTED"
 
 
@@ -97,6 +118,8 @@ def _check_battery(data):
 
 
 def _check_rc_link(data):
+    if data.get("arming_blocked", False):
+        return False, "FC REPORTS ARMING BLOCKED — REASONS VIA USB"
     lq       = int(data.get("rc_link_quality", -1))
     rc_count = int(data.get("rc_channel_count", 0))
 
@@ -125,6 +148,14 @@ def _check_gps(data):
     sats     = int(data.get("gps_num_sats", 0) or data.get("gps_num_sat", 0))
     hdop     = float(data.get("gps_hdop", 99.0))
 
+    if link_mode.is_radio(data):
+        if link_mode.stale_ms(data, "gps"):
+            return False, "GPS DATA STALE (RADIO)"
+        if fix_type < 2:
+            return False, f"NO FIX  ({sats} sats, radio)"
+        if sats < 6:
+            return False, f"FIX  {sats} SATS — NEED >= 6"
+        return True, f"FIX  {sats} SATS  (radio, no HDOP)"
     if fix_type < 2:
         return False, f"NO 3D FIX  ({sats} sats)"
     if sats < 6:
@@ -134,6 +165,8 @@ def _check_gps(data):
 
 
 def _check_motors(data):
+    if not link_mode.available(data, "motors"):
+        return None, "NOT ON RADIO LINK — VERIFY ON USB"
     vals  = [int(data.get(f"motor_{i}_us", 0)) for i in range(1, 5)]
     armed = bool(data.get("armed", False))
     if all(v == 0 for v in vals):
@@ -433,8 +466,12 @@ class ArmingWidget(tk.Frame):
             # Restore colour state when grid is rebuilt after a resize.
             if chk_id in self._auto_state:
                 passed = self._auto_state[chk_id]
-                cv.itemconfig(dot, fill=_GREEN if passed else _RED)
-                name_lbl.config(fg=_VALUE_FG if passed else _RED)
+                if passed is None:
+                    cv.itemconfig(dot, fill=link_mode.C_NA_FG)
+                    name_lbl.config(fg=link_mode.C_NA_FG)
+                else:
+                    cv.itemconfig(dot, fill=_GREEN if passed else _RED)
+                    name_lbl.config(fg=_VALUE_FG if passed else _RED)
 
     # =========================================================================
     # Banner
@@ -447,15 +484,23 @@ class ArmingWidget(tk.Frame):
             self._banner_frame.config(highlightbackground=_BORDER)
             return
 
-        auto_ok = all(self._auto_state.get(cid, False)
-                      for cid, _, _ in _AUTO_CHECKS)
-
-        n_auto_bad   = sum(1 for cid, _, _ in _AUTO_CHECKS
-                           if not self._auto_state.get(cid, False))
+        # None = "cannot be verified on this link": not a failure, but it
+        # keeps the banner from ever claiming a plain READY TO ARM.
+        states = [self._auto_state.get(cid, False) for cid, _, _ in _AUTO_CHECKS]
+        n_auto_bad   = sum(1 for st in states if st is False)
+        n_unverified = sum(1 for st in states if st is None)
+        auto_ok      = n_auto_bad == 0
         n_manual_bad = sum(1 for v in self._manual_vars.values() if not v.get())
         remaining    = n_auto_bad + n_manual_bad
 
-        if remaining == 0:
+        if remaining == 0 and n_unverified:
+            word = "CHECK" if n_unverified == 1 else "CHECKS"
+            self._count_lbl.config(text=f"{n_unverified} {word.lower()} need USB",
+                                   fg=_ORANGE)
+            self._banner_lbl.config(
+                text=f"o  READY — {n_unverified} {word} NEED USB", fg=_ORANGE, bg=_BG)
+            self._banner_frame.config(highlightbackground=_ORANGE)
+        elif remaining == 0:
             self._count_lbl.config(text="ALL CHECKS PASSED", fg=_GREEN)
             self._banner_lbl.config(text="v  READY TO ARM", fg=_GREEN, bg=_BG)
             self._banner_frame.config(highlightbackground=_GREEN)
@@ -488,7 +533,11 @@ class ArmingWidget(tk.Frame):
 
             _rf, cv, dot, name_lbl, detail_lbl = self._auto_rows[chk_id]
 
-            if passed:
+            if passed is None:
+                cv.itemconfig(dot, fill=link_mode.C_NA_FG)
+                name_lbl.config(fg=link_mode.C_NA_FG)
+                detail_lbl.config(text=f"--  {detail}", fg=link_mode.C_NA_FG)
+            elif passed:
                 cv.itemconfig(dot, fill=_GREEN)
                 name_lbl.config(fg=_VALUE_FG)
                 detail_lbl.config(text=f"OK  {detail}", fg=_TICK_OK)

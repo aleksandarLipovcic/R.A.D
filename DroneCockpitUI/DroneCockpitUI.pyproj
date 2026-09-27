@@ -58,6 +58,7 @@
     <Compile Include="MapTiles.py" />
     <Compile Include="check_backend.py" />
     <Compile Include="radio_link_indicator.py" />
+    <Compile Include="link_mode.py" />
     <Compile Include="osd_overlay_controls.py" />
     <Compile Include="prefetch_tiles.py" />
     <Compile Include="NNTraining\class_map.py" />

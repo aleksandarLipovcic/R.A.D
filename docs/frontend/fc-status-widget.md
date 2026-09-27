@@ -41,3 +41,8 @@ over a previous version:
 - The flight-mode label wraps when its text is too long for the available
   space, and the sensor-presence row wraps to multiple lines when too
   narrow to fit every pill on one line.
+
+## USB vs radio link
+
+On the ELRS radio link this widget changes what it shows. See
+[link-mode.md](link-mode.md) for the exact behaviour.

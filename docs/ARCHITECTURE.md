@@ -180,6 +180,16 @@ Betaflight/INAV, and each side excludes the other's port (see
 When the radio link is lost, nothing is cleared: the last known values,
 especially the last GPS position, stay on screen and on the detection map.
 
+Every instrument adapts to the active link through `link_mode.py`. Data
+the radio doesn't carry shows a grey "USB" placeholder instead of a zero,
+old data is marked STALE, and the arming checklist never claims READY TO
+ARM for checks it can't verify. See
+[frontend/link-mode.md](frontend/link-mode.md).
+
+The link is **drone → laptop only** today. Commands from the laptop to
+the drone (gimbal, emergency RTH, movement) are a design proposal in
+[modules/command-uplink.md](modules/command-uplink.md).
+
 ## 4. Data flow: one detection, end to end
 
 1. `DroneLink::communicationLoop()` polls the FC, eventually producing GPS,

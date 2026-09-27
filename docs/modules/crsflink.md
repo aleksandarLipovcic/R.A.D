@@ -23,7 +23,8 @@ Betaflight ──CRSF telemetry──► RP4TD (ELRS RX) ══ELRS 2.4 GHz═�
 EdgeTX copies every telemetry frame it receives from the ELRS module to its
 USB virtual COM port unchanged. That port is output-only, so
 **`CrsfLink` only listens.** Nothing is ever written to the Pocket's port,
-and nothing can reach the drone this way.
+and nothing can reach the drone this way. Sending commands to the drone is a
+separate design proposal: [command-uplink.md](command-uplink.md).
 
 It is built the same way as `DroneLink`: it owns its own worker thread and
 its own lifecycle, and it publishes a thread-safe `DroneState` snapshot.
@@ -155,7 +156,8 @@ All setters can be called at any time from any thread.
 > **Cell-count auto-detect** uses `ceil(V / 4.35)` on the **first** voltage
 > reading. If the radio connects mid-flight to a pack that is already
 > sagging, the guess can be one cell low, which makes every battery warning
-> wrong. Set the count explicitly for missions.
+> wrong. Set the count explicitly for missions. The cockpit does this at
+> startup from `RADIO_BATTERY_CELLS` (default 4) in `DroneCockpitUI.py`.
 
 ## Threading & locking
 

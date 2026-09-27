@@ -50,3 +50,8 @@ additionally set on the heading box itself so it never grows past the size
 its row/column assigns it, no matter how large a font is requested —
 previously the box would size itself to fit the font first and crowd out
 everything else.
+
+## USB vs radio link
+
+On the ELRS radio link this widget changes what it shows. See
+[link-mode.md](link-mode.md) for the exact behaviour.

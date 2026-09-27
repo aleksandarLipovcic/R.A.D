@@ -1,6 +1,8 @@
 import tkinter as tk
 import time
 
+import link_mode
+
 
 class IMUWidget(tk.Frame):
     """
@@ -15,6 +17,17 @@ class IMUWidget(tk.Frame):
                Flash cadence 500 ms ON / 500 ms OFF per DO-160 / EASA conventions.
 
     All three states keep the numeric value fully legible at all times.
+
+    Link-aware (see link_mode.py):
+      USB   — every cell live, as above.
+      RADIO — the ELRS link carries attitude only. Rotation and G-force
+              cells show a grey "USB" placeholder (never a fake 0 that would
+              flash the vertical-G cell red), the heading-drift readout and
+              ADJUST HEADING are disabled (the radio heading IS the FC yaw,
+              so there is nothing to cross-check), and the latency footer
+              shows attitude age / rate / link quality instead of MSP RTT.
+              Attitude older than link_mode.STALE_ATTITUDE_MS is drawn in the
+              muted "stale" colour so a frozen horizon is never read as live.
     Flashing is managed by a single shared _tick() loop that walks a registry
     of currently-flashing cells.  Adding / removing cells is O(1).
 
@@ -116,6 +129,8 @@ class IMUWidget(tk.Frame):
         self._mag_valid        = False
         self._last_data        = {}
 
+        self._radio         = False   # True while the ELRS link feeds us
+
         self._current_tier  = None
         self._tier_widgets  = {}
         self._diag_visible  = False
@@ -185,7 +200,23 @@ class IMUWidget(tk.Frame):
         WARN  — solid amber bg, black text, amber border
         CRIT  — enter flash registry (flashing red), white text, red border
         """
-        if state == "warn":
+        if state == "na":        # not carried by the active link
+            self._unregister_crit(lbl)
+            lbl.config(
+                text=value_text,
+                bg=link_mode.C_NA_BG,
+                fg=link_mode.C_NA_FG,
+                highlightbackground=self.C_SAFE_BDR,
+            )
+        elif state == "stale":   # real value, but too old to trust
+            self._unregister_crit(lbl)
+            lbl.config(
+                text=value_text,
+                bg=self.C_SAFE_BG,
+                fg=link_mode.C_STALE_FG,
+                highlightbackground=self.C_SAFE_BDR,
+            )
+        elif state == "warn":
             self._unregister_crit(lbl)
             lbl.config(
                 text=value_text,
@@ -282,6 +313,7 @@ class IMUWidget(tk.Frame):
             "compact": self._build_compact,
             "tiny":    self._build_tiny,
         }[tier]()
+        self._apply_link_mode()   # new widgets start with USB labels
 
     def _build_full(self):
         c = self._container
@@ -389,6 +421,12 @@ class IMUWidget(tk.Frame):
         drift_lbl.grid(row=0, column=col, padx=(0, 8), pady=4)
         self._tier_widgets["drift_lbl"] = drift_lbl
 
+        # Source tag, right-aligned (column 10 is the stretch column)
+        src_lbl = tk.Label(hdr, text="", font=("Consolas", 7, "bold"),
+                           fg=link_mode.C_USB, bg=self.C_HEADER_BG)
+        src_lbl.grid(row=0, column=11, padx=(4, 8), pady=4)
+        self._tier_widgets["src_lbl"] = src_lbl
+
     def _build_col_headers(self, parent, row, font_size, labels):
         frm = tk.Frame(parent, bg=self.C_COL_HDR_BG)
         frm.grid(row=row, column=0, sticky="ew", padx=4, pady=0)
@@ -456,11 +494,12 @@ class IMUWidget(tk.Frame):
         ]:
             row_f = tk.Frame(diag, bg=self.C_HEADER_BG)
             row_f.pack(fill="x", padx=8, pady=1)
-            tk.Label(row_f, text=f"{label}:",
-                     font=("Consolas", 8),
-                     fg=self.C_LABEL, bg=self.C_HEADER_BG,
-                     width=13, anchor="w",
-                     ).pack(side="left")
+            name = tk.Label(row_f, text=f"{label}:",
+                            font=("Consolas", 8),
+                            fg=self.C_LABEL, bg=self.C_HEADER_BG,
+                            width=13, anchor="w")
+            name.pack(side="left")
+            self._tier_widgets[key + "_name"] = name
             val = tk.Label(row_f, text="— ms",
                            font=("Consolas", 8, "bold"),
                            fg=self.C_NEUTRAL, bg=self.C_HEADER_BG)
@@ -582,6 +621,13 @@ class IMUWidget(tk.Frame):
         self._render(data)
 
     def _render(self, data: dict):
+        radio   = link_mode.is_radio(data)
+        raw_imu = link_mode.available(data, "raw_imu")
+        att_old = link_mode.stale_ms(data, "attitude")
+        if radio != self._radio:
+            self._radio = radio
+            self._apply_link_mode()
+
         gx = data.get("gx", 0) / self.GYRO_SCALE
         gy = data.get("gy", 0) / self.GYRO_SCALE
         gz = data.get("gz", 0) / self.GYRO_SCALE
@@ -589,7 +635,7 @@ class IMUWidget(tk.Frame):
         ay = data.get("ay", 0) / self.ACCEL_SCALE
         az = data.get("az", 0) / self.ACCEL_SCALE
 
-        if self.is_calibrating:
+        if self.is_calibrating and raw_imu:
             self.calib_samples.append((gx, gy, gz))
             if len(self.calib_samples) >= 50:
                 self._finish_calibration(self.calib_samples)
@@ -603,7 +649,9 @@ class IMUWidget(tk.Frame):
         pitch          = data.get("pitch", 0.0)
         now            = time.monotonic()
         mag_heading    = data.get("mag_heading_deg", 0.0)
-        mag_valid      = data.get("mag_valid", False)
+        # On the radio link "mag heading" is the FC's own fused yaw — there
+        # is no independent magnetometer to cross-check against.
+        mag_valid      = data.get("mag_valid", False) and link_mode.available(data, "raw_mag")
         fc_yaw_trimmed = data.get("yaw", 0.0) % 360
 
         self._last_mag_heading = mag_heading
@@ -620,8 +668,17 @@ class IMUWidget(tk.Frame):
                        self.C_WARN_BG    if abs_drift >= self.DRIFT_WARN_DEG else
                        self.C_SAFE_FG)
                 drift_lbl.config(text=f"{drift:>+6.1f}°", fg=clr)
+            elif not link_mode.available(data, "raw_mag"):
+                drift_lbl.config(text=link_mode.NA_LONG, fg=link_mode.C_NA_FG)
             else:
                 drift_lbl.config(text="NO MAG", fg=self.C_LABEL)
+
+        src_lbl = self._tier_widgets.get("src_lbl")
+        if src_lbl:
+            txt, clr = link_mode.source_tag(data)
+            if att_old:
+                txt, clr = link_mode.stale_text(att_old), link_mode.C_STALE_FG
+            src_lbl.config(text=txt, fg=clr)
 
         # ── Heading-button flash ──────────────────────────────────────────────
         if mag_valid and abs_drift >= self.DRIFT_CRIT_DEG:
@@ -646,6 +703,8 @@ class IMUWidget(tk.Frame):
                 "warn": self.C_WARN_BG,
                 "safe": self.C_BG,
             }[worst]
+            if att_old:
+                fg, bg = link_mode.C_STALE_FG, self.C_BG
             summary.config(
                 text=f"R:{roll:>5.1f}°  P:{pitch:>5.1f}°  Y:{fc_yaw_trimmed:>5.1f}°",
                 fg=fg, bg=bg,
@@ -666,19 +725,43 @@ class IMUWidget(tk.Frame):
             if not cells:
                 continue
 
+            if is_yaw:
+                # A heading is not a tilt: without a mag reference there is
+                # nothing to alarm on (the old code ran it through the
+                # roll/pitch limits, so any heading past 30° flashed red).
+                ang_state = self._drift_state(abs_drift) if mag_valid else "safe"
+            else:
+                ang_state = self._angle_state(ang_val)
+            if att_old:
+                ang_state = "stale"
+            self._apply_cell_state(cells["ang"], f"{ang_val:>7.1f}", ang_state)
+
+            if not raw_imu:
+                self._apply_cell_state(cells["rot"], link_mode.NA_SHORT, "na")
+                self._apply_cell_state(cells["acc"], link_mode.NA_SHORT, "na")
+                continue
+
             rot_state = self._gyro_state_label(key, abs(rot_val), now)
             acc_state = self._accel_state(acc_val, is_yaw)
-            ang_state = (self._drift_state(abs_drift) if (is_yaw and mag_valid)
-                         else self._angle_state(ang_val))
-
             self._apply_cell_state(cells["rot"], f"{rot_val:>7.2f}", rot_state)
             self._apply_cell_state(cells["acc"], f"{acc_val:>7.3f}", acc_state)
-            self._apply_cell_state(cells["ang"], f"{ang_val:>7.1f}", ang_state)
 
         # ── Diag panel ────────────────────────────────────────────────────────
         if self._diag_visible:
             show_var = self._tier_widgets.get("show_diag")
-            if show_var is None or show_var.get():
+            if (show_var is None or show_var.get()) and radio:
+                att_age = link_mode.age_ms(data, "attitude")
+                rate    = float(data.get("rate_attitude_hz", 0.0))
+                lq      = int(data.get("rc_link_quality", -1))
+                rl = self._tier_widgets.get("rtt_lbl")
+                ol = self._tier_widgets.get("oneway_lbl")
+                cl = self._tier_widgets.get("cycle_lbl")
+                if rl: rl.config(text=f"{att_age:>6d} ms" if att_age >= 0 else "  never",
+                                 fg=link_mode.C_STALE_FG if att_old else self.C_NEUTRAL)
+                if ol: ol.config(text=f"{rate:>6.1f} Hz", fg=self.C_NEUTRAL)
+                if cl: cl.config(text=f"{lq:>6d} %" if lq >= 0 else "  --- %",
+                                 fg=self.C_NEUTRAL)
+            elif show_var is None or show_var.get():
                 rtt      = data.get("rtt_ms",      0.0)
                 fc_cycle = data.get("fc_cycle_ms", 0.0)
                 rl = self._tier_widgets.get("rtt_lbl")
@@ -687,6 +770,37 @@ class IMUWidget(tk.Frame):
                 if rl: rl.config(text=f"{rtt:>6.2f} ms")
                 if ol: ol.config(text=f"{rtt/2:>6.2f} ms")
                 if cl: cl.config(text=f"{fc_cycle:>6.2f} ms")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Link mode (USB ↔ radio)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    _DIAG_NAMES = {
+        False: {"rtt_lbl": "TOTAL RTT", "oneway_lbl": "EST ONE-WAY",
+                "cycle_lbl": "FC CYCLE"},
+        True:  {"rtt_lbl": "ATT AGE", "oneway_lbl": "ATT RATE",
+                "cycle_lbl": "RADIO LQ"},
+    }
+
+    def _apply_link_mode(self):
+        """Relabel/enable the parts that differ between USB and radio."""
+        names = self._DIAG_NAMES[self._radio]
+        for key, text in names.items():
+            lbl = self._tier_widgets.get(key + "_name")
+            if lbl:
+                lbl.config(text=f"{text}:")
+        btn = self._tier_widgets.get("adj_btn")
+        if btn:
+            if self._radio:
+                self._stop_flash()
+                btn.config(state="disabled",
+                           disabledforeground=link_mode.C_NA_FG)
+            else:
+                btn.config(state="normal")
+        if self._radio and self.is_calibrating:
+            # No raw gyro on the radio link — abandon a running calibration.
+            self.is_calibrating = False
+            self.calib_samples = []
 
     # ══════════════════════════════════════════════════════════════════════════
     # Calibration

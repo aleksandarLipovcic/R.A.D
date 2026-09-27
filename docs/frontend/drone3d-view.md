@@ -58,3 +58,8 @@ This is why `telemetry_worker.py`'s pilot-adjustable **yaw trim** exists
 gyro-integrated yaw this widget compares against is exactly the trimmed
 value the worker produces, so correcting the trim is how a pilot brings
 the two sources back into agreement after a mismatch is noticed here.
+
+## USB vs radio link
+
+On the ELRS radio link this widget changes what it shows. See
+[link-mode.md](link-mode.md) for the exact behaviour.

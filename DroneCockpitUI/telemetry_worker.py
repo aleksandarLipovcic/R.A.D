@@ -412,9 +412,14 @@ class TelemetryWorker:
             "altitude_source": radio.altitude_source if radio is not None else "BARO",
             # Per-instrument data age in ms (-1 = never). Only meaningful on
             # ELRS; on USB everything is refreshed every poll → 0.
-            "age_attitude_ms": int(radio.attitude_age_ms) if radio is not None else 0,
-            "age_gps_ms":      int(radio.gps_age_ms) if radio is not None else 0,
-            "age_battery_ms":  int(radio.battery_age_ms) if radio is not None else 0,
+            "age_attitude_ms":    int(radio.attitude_age_ms) if radio is not None else 0,
+            "age_gps_ms":         int(radio.gps_age_ms) if radio is not None else 0,
+            "age_battery_ms":     int(radio.battery_age_ms) if radio is not None else 0,
+            "age_flight_mode_ms": int(radio.flight_mode_age_ms) if radio is not None else 0,
+            "age_baro_ms":        int(radio.baro_age_ms) if radio is not None else 0,
+            # Measured ELRS frame rates (Hz), for the instrument footers
+            "rate_attitude_hz":   float(radio.attitude_hz) if radio is not None else 0.0,
+            "rate_gps_hz":        float(radio.gps_hz) if radio is not None else 0.0,
         }
 
         try:

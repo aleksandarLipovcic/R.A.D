@@ -23,7 +23,9 @@ single recurring update loop that feeds fresh data to each widget.
    Right after the hub, `self.radio = DroneBackend.CrsfLink()` is
    created (or `None`, with a console note, if the `.pyd` has no
    `CrsfLink`). This is the ELRS telemetry source, see
-   [../modules/crsflink.md](../modules/crsflink.md).
+   [../modules/crsflink.md](../modules/crsflink.md). Its battery cell
+   count is set from `RADIO_BATTERY_CELLS` (default 4) before
+   `start_auto()`.
 2. `TelemetryWorker(self.hub, radio=self.radio)` is created (not started
    yet, see [workers.md](workers.md)).
 3. `self.video_link = DroneBackend.VideoLink()` is created, `VideoWorker`
@@ -185,7 +187,7 @@ Each tick:
    | Widget | Rate |
    |---|---|
    | IMU, Baro, FC Status, Arming, Mag | every tick (~50 Hz) |
-   | ADI (`Drone3DView`) | every 3rd tick (~17 Hz) |
+   | ADI (`Drone3DView`) | every 3rd tick (~17 Hz); also gets `source` and `stale_ms` from `link_mode` |
    | GPS (`GPSWidget`) | every 5th tick (~10 Hz) — the heaviest, map redraw |
 
 Detection records are pumped on a **separate** `after()` job

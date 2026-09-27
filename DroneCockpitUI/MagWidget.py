@@ -2,6 +2,8 @@ import tkinter as tk
 import tkinter.font as tkfont
 import math
 
+import link_mode
+
 
 class MagWidget(tk.Frame):
     """
@@ -49,6 +51,16 @@ class MagWidget(tk.Frame):
       assigned width *and* height (both are measured now -- previously
       only width was checked, which is what let the text overflow
       vertically even when it technically fit horizontally).
+
+    Link-aware (see link_mode.py):
+      USB   — magnetometer heading, raw XYZ bars, both calibration buttons.
+      RADIO — the ELRS link carries no magnetometer data. The rose and the
+              heading readout show the FC's fused heading (from the CRSF
+              attitude frame), labelled "FC HEADING · RADIO"; the XYZ bars
+              show a grey "USB" placeholder; both calibration buttons are
+              disabled ("USB ONLY"), because calibration commands go to the
+              FC over the cable. A heading older than
+              link_mode.STALE_ATTITUDE_MS is flagged STALE in the status line.
     """
 
     # ── Cockpit colour palette ───────────────────────────────────────────────
@@ -144,6 +156,8 @@ class MagWidget(tk.Frame):
         super().__init__(parent, bg=self.C_BG)
         self._last_heading  = 0.0
         self._valid         = False
+        self._radio         = False   # ELRS link feeding the widget
+        self._stale_ms      = 0       # heading age when stale (radio only)
         self._on_mag_cal    = on_mag_calibrate
         self._on_acc_cal    = on_acc_calibrate
         self._current_tier  = None
@@ -899,12 +913,18 @@ class MagWidget(tk.Frame):
         if hint:
             hint.config(fg=self.C_BG)
 
+        hdg_label = self._tier_widgets.get("hdg_label")
+        if hdg_label:
+            hdg_label.config(text="FC HEADING · RADIO" if self._radio
+                             else "MAGNETIC HEADING")
+
         hdg_norm = heading % 360.0
         cardinal = self._cardinal_for(hdg_norm)
         hdg_text = f"{hdg_norm:05.1f}° {cardinal}"
 
         if hdg_val:
-            hdg_val.config(text=hdg_text, fg=self.C_SAFE)
+            hdg_val.config(text=hdg_text,
+                           fg=link_mode.C_STALE_FG if self._stale_ms else self.C_SAFE)
             # Re-measure font fit whenever text content changes (cardinal
             # length changes between single-char "N" and two-char "NW" etc.)
             hdg_box = self._tier_widgets.get("hdg_box")
@@ -917,7 +937,13 @@ class MagWidget(tk.Frame):
                     self._resize_hdg_font(w, h)
 
         if status:
-            status.config(text="⬤  LOCK", fg=self.C_GREEN)
+            if self._stale_ms:
+                status.config(text="⬤  " + link_mode.stale_text(self._stale_ms),
+                              fg=link_mode.C_STALE_FG)
+            elif self._radio:
+                status.config(text="⬤  FC HDG · RADIO", fg=link_mode.C_RADIO)
+            else:
+                status.config(text="⬤  LOCK", fg=self.C_GREEN)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Raw field bars
@@ -926,6 +952,20 @@ class MagWidget(tk.Frame):
     def _draw_bars(self, mx: int, my: int, mz: int):
         bars = self._tier_widgets.get("bars")
         if not bars:
+            return
+
+        if self._radio:
+            # Raw field is not carried by the radio link — empty bars with a
+            # grey placeholder instead of a misleading "0".
+            for entry in bars.values():
+                cv = entry["canvas"]
+                cv.delete("all")
+                W = cv.winfo_width() or 120
+                H = cv.winfo_height() or 13
+                cv.create_rectangle(1, 1, W - 1, H - 1,
+                                    fill=self.C_BAR_BG, outline="#1a2535")
+                entry["label"].config(text=link_mode.NA_SHORT.rjust(5),
+                                      fg=link_mode.C_NA_FG)
             return
 
         peak = max(abs(mx), abs(my), abs(mz), 1)
@@ -957,7 +997,7 @@ class MagWidget(tk.Frame):
                 cv.create_rectangle(mid - bar_px, 2, mid,          H - 2,
                                     fill=color, outline="")
 
-            entry["label"].config(text=f"{raw:>5d}")
+            entry["label"].config(text=f"{raw:>5d}", fg=self.C_TEXT)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Calibration button handlers
@@ -992,6 +1032,8 @@ class MagWidget(tk.Frame):
         acc_cal_act = data.get("acc_cal_active",             False)
         acc_cal_rem = data.get("acc_cal_seconds_remaining",  0)
 
+        self._radio        = link_mode.is_radio(data)
+        self._stale_ms     = link_mode.stale_ms(data, "attitude") if self._radio else 0
         self._valid        = valid
         self._last_heading = heading
 
@@ -1023,7 +1065,11 @@ class MagWidget(tk.Frame):
                     text=f"Rotate on all axes — {seconds_remaining:2d}s",
                     fg=self.C_WARN)
         else:
-            if mag_btn:
+            if mag_btn and self._radio:
+                mag_btn.config(state="disabled",
+                               text="⊕  CAL MAG: " + link_mode.NA_LONG,
+                               disabledforeground=link_mode.C_NA_FG)
+            elif mag_btn:
                 mag_btn.config(
                     state="normal" if self._on_mag_cal else "disabled",
                     text="⊕  CALIBRATE MAG" if self._current_tier == "full"
@@ -1042,7 +1088,11 @@ class MagWidget(tk.Frame):
                     text=f"Keep level & still — {seconds_remaining:2d}s",
                     fg=self.C_BTN_ACC_FG)
         else:
-            if acc_btn:
+            if acc_btn and self._radio:
+                acc_btn.config(state="disabled",
+                               text="⊕  CAL GYRO: " + link_mode.NA_LONG,
+                               disabledforeground=link_mode.C_NA_FG)
+            elif acc_btn:
                 acc_btn.config(
                     state="normal" if self._on_acc_cal else "disabled",
                     text="⊕  CALIBRATE GYRO/ACC" if self._current_tier == "full"

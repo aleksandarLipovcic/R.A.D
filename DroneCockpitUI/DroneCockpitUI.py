@@ -122,6 +122,7 @@ from tkinter import simpledialog, messagebox
 
 from telemetry_worker import TelemetryWorker
 from radio_link_indicator import RadioLinkIndicator
+import link_mode
 from video_worker      import VideoWorker
 from detection_worker  import DetectionWorker
 
@@ -224,6 +225,12 @@ def _vlog(msg: str) -> None:
 #
 UI_REFRESH_MS  = 20          # ~50 Hz Tk pump — keeps UI snappy
 RECONNECT_MS   = 2000
+
+# ELRS radio link: battery pack cell count. CrsfLink otherwise guesses it
+# from the FIRST voltage it sees (ceil(V / 4.35)), which reads one cell low
+# if the radio connects mid-flight to a sagging pack — and then every
+# battery warning is wrong. 0 = let CrsfLink guess.
+RADIO_BATTERY_CELLS = 4
 
 # FPV status polling: how often VideoWorker checks VideoLink's cheap
 # atomic status fields (connected / fps / device name) for the overlay
@@ -1696,6 +1703,8 @@ class DroneCockpitApp:
         # pump start immediately so instruments come alive from whichever
         # source (USB or ELRS) is available first.
         if self.radio is not None:
+            if hasattr(self.radio, "set_cell_count"):
+                self.radio.set_cell_count(RADIO_BATTERY_CELLS)
             self.radio.start_auto()      # non-blocking, auto-reconnects forever
         self._worker.start()
         self._schedule_update()
@@ -3336,6 +3345,8 @@ class DroneCockpitApp:
                 yaw=ui_data["yaw"],
                 mag_heading=ui_data["mag_heading_deg"],
                 mag_valid=ui_data["mag_valid"],
+                source=link_mode.source(ui_data),
+                stale_ms=link_mode.stale_ms(ui_data, "attitude"),
             )
 
         # ── Heavy widget — GPS map (~10 Hz) ──────────────────────────────────

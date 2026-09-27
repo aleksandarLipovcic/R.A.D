@@ -125,8 +125,10 @@ all. Notable transformations performed here rather than anywhere else:
   `available_hdop`, `available_arming_flags` and `available_cpu_load`
   flags. All are `False` on ELRS, so widgets can show "USB only" instead of
   zeros. It also gets `arming_blocked`, `gps_waiting`, `altitude_source`
-  and `age_attitude_ms` / `age_gps_ms` / `age_battery_ms` (−1 = never;
-  always 0 on USB). On ELRS with valid link statistics, `rc_link_quality`
+  and `age_attitude_ms` / `age_gps_ms` / `age_battery_ms` /
+  `age_flight_mode_ms` / `age_baro_ms` (−1 = never; always 0 on USB), plus
+  `rate_attitude_hz` / `rate_gps_hz`. Widgets read these only through
+  [`link_mode.py`](link-mode.md). On ELRS with valid link statistics, `rc_link_quality`
   is the real uplink LQ %.
 - Every field is read via `getattr(state, "field", default)` rather than
   direct attribute access — a `DroneBackend.pyd` built before some field

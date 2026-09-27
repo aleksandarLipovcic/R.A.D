@@ -54,3 +54,8 @@ PX_PER_M_BASE = 6.0    # base pixels-per-meter at REF_H
 REF_H         = 340.0  # reference canvas height the base scale was tuned for
 LABEL_STEP    = 10      # meters between tape labels
 ```
+
+## USB vs radio link
+
+On the ELRS radio link this widget changes what it shows. See
+[link-mode.md](link-mode.md) for the exact behaviour.

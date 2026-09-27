@@ -71,3 +71,8 @@ used across every other widget in this app:
 | MEDIUM | h ≥ 150, w ≥ 290 |
 | COMPACT | h ≥ 90, w ≥ 190 |
 | TINY | h < 90 or w < 190 |
+
+## USB vs radio link
+
+On the ELRS radio link this widget changes what it shows. See
+[link-mode.md](link-mode.md) for the exact behaviour.

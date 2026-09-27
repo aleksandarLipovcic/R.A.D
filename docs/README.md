@@ -28,7 +28,10 @@ compiled via pybind11) and the Python/Tkinter cockpit UI
    [modules/crsf-protocol.md](modules/crsf-protocol.md) (`CrsfProtocol`
    framing/decoders, `CrsfStateMapper` frames → `DroneState`), and COM
    port discovery is in
-   [modules/serial-port-scan.md](modules/serial-port-scan.md).
+   [modules/serial-port-scan.md](modules/serial-port-scan.md). Sending
+   commands from the laptop to the drone (gimbal, emergency, movement) is
+   **not implemented yet**; the design proposal is in
+   [modules/command-uplink.md](modules/command-uplink.md).
 5. **[modules/videolink.md](modules/videolink.md)** — `VideoLink`: analog
    video capture, the link-state machine, native GDI rendering, and the
    software OSD overlay.
@@ -78,6 +81,7 @@ One file per module/widget under [`frontend/`](FRONTEND.md) — see
 | `FCStatusWidget.py` | [frontend/fc-status-widget.md](frontend/fc-status-widget.md) |
 | `ArmingWidget.py` | [frontend/arming-widget.md](frontend/arming-widget.md) |
 | `radio_link_indicator.py` | [frontend/radio-link-indicator.md](frontend/radio-link-indicator.md) |
+| `link_mode.py` (USB vs radio behaviour of every widget) | [frontend/link-mode.md](frontend/link-mode.md) |
 | `FPVWidget.py` | [frontend/fpv-widget.md](frontend/fpv-widget.md) |
 | `DetectionMapWidget.py` | [frontend/detection-map-widget.md](frontend/detection-map-widget.md) |
 | `MapTiles.py`, `prefetch_tiles.py` | [frontend/map-tiles.md](frontend/map-tiles.md) |
