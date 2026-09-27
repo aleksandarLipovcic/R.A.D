@@ -123,6 +123,8 @@ from tkinter import simpledialog, messagebox
 from telemetry_worker import TelemetryWorker
 from radio_link_indicator import RadioLinkIndicator
 import link_mode
+from dual_layer import DualLayerPanel, LayerSwitch
+from radio_panels import RadioAttitudePanel, RadioNavPanel, RadioFlightPanel
 from video_worker      import VideoWorker
 from detection_worker  import DetectionWorker
 
@@ -428,6 +430,17 @@ _DEFAULT_PANELS = {
     "fpv":       {"x": 480, "y": 450, "w": 480, "h": 320, "visible": True},
 }
 
+# Title-bar text per face for the dual-layer panels: (USB, radio)
+_LAYER_TITLES = {
+    "imu":       ("MPU-6500  —  IMU / Attitude",
+                  "RADIO  —  Attitude & Link Quality"),
+    "mag":       ("QMC5883L  —  Magnetometer",
+                  "RADIO  —  Heading & Home"),
+    "fc_status": ("FC Status  —  Armed · Mode · Sensors · CPU",
+                  "RADIO  —  Flight & ELRS Link"),
+}
+PANEL_TITLE_RADIO_FG = "#44aaff"
+
 _PANEL_LABELS = {
     "imu":       "IMU / Attitude",
     "mag":       "Magnetometer",
@@ -537,6 +550,12 @@ class DraggablePanel(tk.Frame):
     Floating, draggable, resizable instrument panel on a Canvas workspace.
     """
 
+    def set_title(self, title: str, fg: str = None) -> None:
+        """Change the title-bar text (e.g. USB ↔ radio face). Geometry,
+        z-order, visibility and the saved layout are untouched."""
+        self._title_text = title
+        self._title_lbl.config(text=f"  {title}", fg=fg or PANEL_TITLE_FG)
+
     def __init__(self, workspace: tk.Canvas, name: str, title: str,
                  x: int, y: int, w: int, h: int,
                  locked_ref: list,
@@ -584,6 +603,7 @@ class DraggablePanel(tk.Frame):
             font=("Consolas", 9, "bold"), anchor="w",
         )
         self._title_lbl.pack(side="left", fill="x", expand=True)
+        self._title_text = title
 
         self._z_btn = tk.Label(
             self._title_bar, text="⬆⬇",
@@ -1449,6 +1469,8 @@ class DroneCockpitApp:
         # this attribute and picked up by _update_loop on the Tk thread.
         self._usb_probe_running = False
         self._usb_probe_result = None      # (port, ok) from the last probe
+        # Debounced USB/radio decision for the dual-layer panels
+        self._layer_switch = LayerSwitch()
         self._usb_retry_job = None
         self._usb_port = None
         self._usb_unhealthy_since = None   # monotonic time the cable link went bad
@@ -3090,19 +3112,29 @@ class DroneCockpitApp:
             return p
 
         # ── IMU ───────────────────────────────────────────────────────────────
-        p = _panel("imu", "MPU-6500  —  IMU / Attitude")
-        self.imu_view = IMUWidget(p.content,
+        # Panels with a second, radio-link face (dual_layer.py): the USB
+        # widget and its radio counterpart share one DraggablePanel, and
+        # _switch_link_layer() swaps them — nothing moves or needs to be
+        # reselected when the telemetry source changes.
+        p = _panel("imu", _LAYER_TITLES["imu"][0])
+        self.imu_panel = DualLayerPanel(p.content)
+        self.imu_view = IMUWidget(self.imu_panel,
                                   on_adjust_heading=self._apply_heading_trim)
-        self.imu_view.pack(fill="both", expand=True)
+        self.imu_panel.set_faces(self.imu_view, "update_ui",
+                                 RadioAttitudePanel(self.imu_panel), "update_radio")
+        self.imu_panel.pack(fill="both", expand=True)
 
         # ── Magnetometer ──────────────────────────────────────────────────────
-        p = _panel("mag", "QMC5883L  —  Magnetometer")
+        p = _panel("mag", _LAYER_TITLES["mag"][0])
+        self.mag_panel = DualLayerPanel(p.content)
         self.mag_view = MagWidget(
-            p.content,
+            self.mag_panel,
             on_mag_calibrate=self.hub.start_mag_calibration,
             on_acc_calibrate=self.hub.start_acc_calibration,
         )
-        self.mag_view.pack(fill="both", expand=True)
+        self.mag_panel.set_faces(self.mag_view, "update_mag",
+                                 RadioNavPanel(self.mag_panel), "update_radio")
+        self.mag_panel.pack(fill="both", expand=True)
 
         # ── ADI ───────────────────────────────────────────────────────────────
         p = _panel("adi", "ADI  —  Attitude Direction Indicator")
@@ -3120,9 +3152,15 @@ class DroneCockpitApp:
         self.gps_view.pack(fill="both", expand=True)
 
         # ── FC Status ─────────────────────────────────────────────────────────
-        p = _panel("fc_status", "FC Status  —  Armed · Mode · Sensors · CPU")
-        self.fc_status_view = FCStatusWidget(p.content)
-        self.fc_status_view.pack(fill="both", expand=True)
+        p = _panel("fc_status", _LAYER_TITLES["fc_status"][0])
+        self.fc_status_panel = DualLayerPanel(p.content)
+        self.fc_status_view = FCStatusWidget(self.fc_status_panel)
+        self.fc_status_panel.set_faces(
+            self.fc_status_view, "update_fc_status",
+            RadioFlightPanel(self.fc_status_panel,
+                             timer_provider=self.fc_status_view.flight_timer),
+            "update_radio")
+        self.fc_status_panel.pack(fill="both", expand=True)
 
         # ── Arming Diagnostics ────────────────────────────────────────────────
         p = _panel("arming", "Arming Diagnostics  —  Pre-flight Checklist")
@@ -3215,9 +3253,24 @@ class DroneCockpitApp:
         t.start()
         self._usb_retry_job = self.root.after(RECONNECT_MS, self._auto_connect)
 
+    def _switch_link_layer(self, radio: bool) -> None:
+        """Show the radio (or USB) face of every dual-layer panel."""
+        for name, dual in (("imu", self.imu_panel), ("mag", self.mag_panel),
+                           ("fc_status", self.fc_status_panel)):
+            dual.show_radio(radio)
+            self._panels[name].set_title(
+                _LAYER_TITLES[name][1 if radio else 0],
+                PANEL_TITLE_RADIO_FG if radio else None)
+        print(f"[UI] panels switched to {'RADIO' if radio else 'USB'} layout")
+
     def _update_link_status(self) -> None:
         """Tk thread, every pump tick: USB label + radio traffic light."""
         link = self._worker.get_link_status()
+
+        # ── USB ↔ radio panel faces (debounced, all panels at once) ─────────
+        if self._layer_switch.observe(link.get("active_source", "NONE"),
+                                      time.monotonic()):
+            self._switch_link_layer(self._layer_switch.radio)
 
         # ── Radio indicator ──────────────────────────────────────────────────
         self.radio_indicator.update_status(link)
@@ -3318,7 +3371,7 @@ class DroneCockpitApp:
         # ── Fast widgets — update every frame ────────────────────────────────
         if self._frame_counters["imu"] >= _THROTTLE["imu"]:
             self._frame_counters["imu"] = 0
-            self.imu_view.update_ui(ui_data)
+            self.imu_panel.feed(ui_data)
 
         if self._frame_counters["baro"] >= _THROTTLE["baro"]:
             self._frame_counters["baro"] = 0
@@ -3326,7 +3379,7 @@ class DroneCockpitApp:
 
         if self._frame_counters["fc_status"] >= _THROTTLE["fc_status"]:
             self._frame_counters["fc_status"] = 0
-            self.fc_status_view.update_fc_status(ui_data)
+            self.fc_status_panel.feed(ui_data)
 
         if self._frame_counters["arming"] >= _THROTTLE["arming"]:
             self._frame_counters["arming"] = 0
@@ -3334,7 +3387,7 @@ class DroneCockpitApp:
 
         if self._frame_counters["mag"] >= _THROTTLE["mag"]:
             self._frame_counters["mag"] = 0
-            self.mag_view.update_mag(ui_data)
+            self.mag_panel.feed(ui_data)
 
         # ── Medium widget — 3-D attitude view (~17 Hz) ────────────────────────
         if self._frame_counters["adi"] >= _THROTTLE["adi"]:

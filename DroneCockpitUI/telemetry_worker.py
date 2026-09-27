@@ -421,6 +421,9 @@ class TelemetryWorker:
             "rate_attitude_hz":   float(radio.attitude_hz) if radio is not None else 0.0,
             "rate_gps_hz":        float(radio.gps_hz) if radio is not None else 0.0,
         }
+        # ELRS link statistics + home point for the radio faces of the
+        # dual-layer panels (radio_panels.py). Zero/False on USB.
+        elrs_data.update(_radio_link_fields(radio))
 
         try:
             bat_state_str = state.battery_state.name
@@ -540,4 +543,36 @@ def _empty_link_status(radio_present: bool) -> dict:
         "rate_total_hz": 0.0,
         "reconnect_count": 0, "link_lost_count": 0, "crc_errors": 0,
         "radio_armed": False,
+    }
+
+def _radio_link_fields(radio) -> dict:
+    """ELRS link statistics for ui_data; neutral defaults when radio is None."""
+    def g(name, default, cast):
+        if radio is None:
+            return default
+        try:
+            return cast(getattr(radio, name, default))
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "elrs_link_stats_valid":  g("link_stats_valid", False, bool),
+        "elrs_uplink_lq":         g("uplink_lq", 0, int),
+        "elrs_uplink_rssi1_dbm":  g("uplink_rssi1_dbm", 0, int),
+        "elrs_uplink_rssi2_dbm":  g("uplink_rssi2_dbm", 0, int),
+        "elrs_uplink_snr":        g("uplink_snr", 0, int),
+        "elrs_active_antenna":    g("active_antenna", 0, int),
+        "elrs_rf_mode_index":     g("rf_mode_index", 0, int),
+        "elrs_tx_power_mw":       g("tx_power_mw", 0, int),
+        "elrs_downlink_lq":       g("downlink_lq", 0, int),
+        "elrs_downlink_rssi_dbm": g("downlink_rssi_dbm", 0, int),
+        "elrs_downlink_snr":      g("downlink_snr", 0, int),
+        "age_link_stats_ms":      g("link_stats_age_ms", -1, int),
+        "rate_battery_hz":        g("battery_hz", 0.0, float),
+        "rate_flight_mode_hz":    g("flight_mode_hz", 0.0, float),
+        "rate_total_hz":          g("total_frame_hz", 0.0, float),
+        "radio_link_lost_count":  g("link_lost_count", 0, int),
+        "radio_reconnect_count":  g("reconnect_count", 0, int),
+        "radio_crc_errors":       g("crc_errors", 0, int),
+        "home_set":               g("home_set", False, bool),
     }

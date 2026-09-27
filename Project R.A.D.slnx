@@ -31,6 +31,7 @@
     <File Path="docs/frontend/baro-widget.md" />
     <File Path="docs/frontend/detection-map-widget.md" />
     <File Path="docs/frontend/drone3d-view.md" />
+    <File Path="docs/frontend/dual-layer.md" />
     <File Path="docs/frontend/fc-status-widget.md" />
     <File Path="docs/frontend/fpv-widget.md" />
     <File Path="docs/frontend/gps-widget.md" />

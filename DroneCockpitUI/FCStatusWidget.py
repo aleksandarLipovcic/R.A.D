@@ -130,6 +130,7 @@ class FCStatusWidget(tk.Frame):
         self._motor_mode       = "bars"
         self._rc_mode          = "bars"
         self._bat_compact      = False
+        self._timer_state      = (0, None, False)   # (elapsed_s, remaining_s|None, armed)
         self._build_ui()
         self.bind("<Configure>", self._on_resize)
         self._tick()
@@ -137,6 +138,22 @@ class FCStatusWidget(tk.Frame):
     # =========================================================================
     # Public
     # =========================================================================
+
+    def flight_timer(self) -> tuple:
+        """
+        (elapsed_s, remaining_s or None, armed) — the ONE flight timer of the
+        cockpit. The radio face of this panel (radio_panels.py) shows it, so
+        switching USB ↔ radio mid-flight never restarts the clock.
+        """
+        return self._timer_state
+
+    def on_hidden_data(self, data: dict):
+        """
+        Called by DualLayerPanel while the radio face is showing: keep the
+        armed state current so the flight timer keeps running, without the
+        cost of redrawing a hidden panel.
+        """
+        self._last_data = data
 
     def set_planned_duration(self, minutes: float):
         self._planned_sec = int(minutes * 60)
@@ -741,6 +758,10 @@ class FCStatusWidget(tk.Frame):
         self._was_armed = armed
 
         elapsed = int(time.monotonic() - self._arm_start) if (armed and self._arm_start) else 0
+        self._timer_state = (
+            elapsed,
+            max(0, self._planned_sec - elapsed) if self._planned_sec > 0 else None,
+            armed)
         em, es  = divmod(elapsed, 60)
         self._elapsed_lbl.config(
             text=f"{em:02d}:{es:02d}",

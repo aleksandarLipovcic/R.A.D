@@ -29,6 +29,12 @@ doesn't carry. Those zeros looked like real readings: the IMU flashed a
 red vertical-G alarm at "0 g", the GPS said "3D FIX", motors read idle,
 and the calibration buttons looked usable.
 
+> The IMU, Magnetometer and FC Status panels go one step further: on the
+> radio link they switch to a dedicated radio face (see
+> [dual-layer.md](dual-layer.md)). The per-frame adaptations below still
+> apply to their USB faces during the ~1 s switch-over, and to every other
+> panel all the time.
+
 ## The three rules
 
 Every widget follows the same three rules, through `link_mode.py`:

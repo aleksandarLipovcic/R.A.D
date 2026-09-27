@@ -44,5 +44,7 @@ over a previous version:
 
 ## USB vs radio link
 
-On the ELRS radio link this widget changes what it shows. See
-[link-mode.md](link-mode.md) for the exact behaviour.
+On the ELRS radio link this panel switches, about 1 s after the change,
+to its radio face, `RadioFlightPanel` (flight & ELRS link; shares this widget's flight timer). See [dual-layer.md](dual-layer.md). During
+the switch-over this widget adapts per frame as described in
+[link-mode.md](link-mode.md).

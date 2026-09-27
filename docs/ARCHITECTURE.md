@@ -184,7 +184,11 @@ Every instrument adapts to the active link through `link_mode.py`. Data
 the radio doesn't carry shows a grey "USB" placeholder instead of a zero,
 old data is marked STALE, and the arming checklist never claims READY TO
 ARM for checks it can't verify. See
-[frontend/link-mode.md](frontend/link-mode.md).
+[frontend/link-mode.md](frontend/link-mode.md). The IMU, Magnetometer and
+FC Status panels also have a dedicated radio face (attitude & link quality,
+heading & home, flight & ELRS link). All three swap in place about 1 s
+after the source changes, without moving any panel. See
+[frontend/dual-layer.md](frontend/dual-layer.md).
 
 The link is **drone → laptop only** today. Commands from the laptop to
 the drone (gimbal, emergency RTH, movement) are a design proposal in

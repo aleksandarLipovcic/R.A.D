@@ -82,6 +82,7 @@ One file per module/widget under [`frontend/`](FRONTEND.md) — see
 | `ArmingWidget.py` | [frontend/arming-widget.md](frontend/arming-widget.md) |
 | `radio_link_indicator.py` | [frontend/radio-link-indicator.md](frontend/radio-link-indicator.md) |
 | `link_mode.py` (USB vs radio behaviour of every widget) | [frontend/link-mode.md](frontend/link-mode.md) |
+| `dual_layer.py`, `radio_panels.py` (radio faces of the IMU / Mag / FC Status panels) | [frontend/dual-layer.md](frontend/dual-layer.md) |
 | `FPVWidget.py` | [frontend/fpv-widget.md](frontend/fpv-widget.md) |
 | `DetectionMapWidget.py` | [frontend/detection-map-widget.md](frontend/detection-map-widget.md) |
 | `MapTiles.py`, `prefetch_tiles.py` | [frontend/map-tiles.md](frontend/map-tiles.md) |

@@ -169,7 +169,11 @@ Each tick:
    panel's status text doesn't blank out just because the separate MSP
    link hiccuped or is mid-reconnect.
 2. Calls `_update_link_status()` on **every** tick, even with no live
-   source. It feeds `worker.get_link_status()` to the
+   source. It first feeds the active source to `LayerSwitch`, and once a
+   change has held for 1 s, `_switch_link_layer()` swaps the IMU, Mag and
+   FC Status panels to their radio or USB face (see
+   [dual-layer.md](dual-layer.md)). Those three panels are fed through
+   `DualLayerPanel.feed()`. It feeds `worker.get_link_status()` to the
    [`RadioLinkIndicator`](radio-link-indicator.md) and its tooltips,
    picks up the result of a finished USB probe, and sets the USB label
    (`USB: connected COMx` / `link degraded` / `searching...` /

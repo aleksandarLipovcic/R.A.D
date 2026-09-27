@@ -128,7 +128,10 @@ all. Notable transformations performed here rather than anywhere else:
   and `age_attitude_ms` / `age_gps_ms` / `age_battery_ms` /
   `age_flight_mode_ms` / `age_baro_ms` (−1 = never; always 0 on USB), plus
   `rate_attitude_hz` / `rate_gps_hz`. Widgets read these only through
-  [`link_mode.py`](link-mode.md). On ELRS with valid link statistics, `rc_link_quality`
+  [`link_mode.py`](link-mode.md). On ELRS the frame also carries the
+  link statistics for the radio panel faces (`elrs_*`, `age_link_stats_ms`,
+  counters, `home_set`; see `_radio_link_fields()` and
+  [dual-layer.md](dual-layer.md#data-used-by-the-radio-faces)). On ELRS with valid link statistics, `rc_link_quality`
   is the real uplink LQ %.
 - Every field is read via `getattr(state, "field", default)` rather than
   direct attribute access — a `DroneBackend.pyd` built before some field
