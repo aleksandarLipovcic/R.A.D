@@ -12,7 +12,7 @@ Displays arm state, flight mode, battery detail, sensor presence, FC
 performance metrics (CPU load, I2C errors), motor outputs, and RC channel
 values — everything `telemetry_worker.py`'s `_build_ui_data()` exposes
 under the FC-status/battery/motor/RC keys (see
-[workers.md](workers.md#_build_ui_datastate--the-one-and-only-translation-point)).
+[workers.md](workers.md#_build_ui_datastate-source--the-one-and-only-translation-point)).
 
 ## Priority-tiered layout
 

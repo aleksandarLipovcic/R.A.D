@@ -1,95 +1,31 @@
-# Project R.A.D. — Documentation
+# Project R.A.D. (Rescue and Detection)
 
-**R.A.D.** (Rescue and Detection) is a drone ground control station: a hybrid
-C++/Python system that talks to a Betaflight flight controller over MSP,
-captures and renders an analog FPV feed, and runs a real-time YOLO detection
-pipeline that georeferences what it sees onto a map.
+A search-and-rescue drone ground control station. A C++ core
+(`DroneBackend.pyd`, pybind11) talks to a Betaflight flight controller over
+MSP (USB cable) and over CRSF telemetry via ExpressLRS (RadioMaster Pocket),
+captures and renders the analog FPV feed, and runs a YOLO detection pipeline
+that georeferences what it sees onto a map. A Python/Tkinter cockpit
+(`DroneCockpitUI/DroneCockpitUI.py`) drives it all.
 
-This folder documents the whole app: the C++ core (`DroneBackend.pyd`,
-compiled via pybind11) and the Python/Tkinter cockpit UI
-(`DroneCockpitUI.py`) that drives it.
+## Repository layout
 
-## Reading order
-
-1. **[ARCHITECTURE.md](ARCHITECTURE.md)** — the big picture: process layout
-   (C++ core + Python UI + their worker threads), the "provider" decoupling
-   pattern shared by every link class, the two telemetry trampolines, the
-   Tk update loop, and how a frame/telemetry sample flows end to end.
-2. **[modules/dronelink.md](modules/dronelink.md)** — `DroneLink`: the MSP
-   serial link to the flight controller, `DroneState`, polling cadence,
-   calibration, GPS UBX passthrough.
-3. **[modules/sensors.md](modules/sensors.md)** — the sensor helper classes
-   that turn raw MSP payloads into physical units: `GPSNeoM10`, `IMUSensor`,
-   `MagQMC5883L`, `BaroBMP280`.
-4. **[modules/videolink.md](modules/videolink.md)** — `VideoLink`: analog
-   video capture, the link-state machine, native GDI rendering, and the
-   software OSD overlay.
-5. **[modules/detectionlink.md](modules/detectionlink.md)** — `DetectionLink`:
-   the YOLO inference pipeline, dual preview/inference threads, object
-   tracking, and the three georeferencing strategies.
-6. **[modules/bindings.md](modules/bindings.md)** — `Bindings.cpp`: the
-   pybind11 surface (`DroneBackend` module) exposed to Python, organized by
-   the C++ class it wraps.
-7. **[FRONTEND.md](FRONTEND.md)** — index for the Python/Tkinter cockpit UI;
-   links out to one page per file/module under `frontend/` (app shell,
-   workers, each instrument widget, detection map, tile cache, OSD
-   controls, build tooling).
-
-## Module map
-
-### C++ backend (`DroneBackend.pyd`)
-
-| C++ class      | File(s)                              | Owns                                            | Exposed to Python as        |
-|----------------|---------------------------------------|--------------------------------------------------|------------------------------|
-| `DroneLink`    | `DroneLink.h/.cpp`                    | MSP serial worker thread, `DroneState`           | `DroneBackend.DroneLink`     |
-| `GPSNeoM10`    | `GPSneoM10.h/.cpp`                    | Static GPS/UBX parsers + frame builders          | `GPSReading`, `SVInfoEntry`, `NavStatus`, `GPSConfig*` |
-| `IMUSensor`    | `IMUSensor.h/.cpp`                    | Raw→scaled IMU unit conversion                   | `DroneBackend.IMUSensor`     |
-| `MagQMC5883L`  | `MagQMC5883L.h/.cpp`                  | Heading computation, MSP checksum helper         | (used internally by `DroneLink::parseDebug`) |
-| `BaroBMP280`   | `BaroBMP280.h/.cpp`                   | `MSP_ALTITUDE` parsing + unit scaling             | (used internally by `DroneLink::parseBaro`) |
-| `VideoLink`    | `VideoLink.h/.cpp`                    | Capture thread, native render window, OSD overlay | `DroneBackend.VideoLink`     |
-| `DetectionLink`| `Detectionlink.h/.cpp`                | Preview + inference threads, tracker, georeferencing | `DroneBackend.DetectionLink` |
-| —              | `Bindings.cpp`                        | pybind11 module definition (`PYBIND11_MODULE(DroneBackend, m)`) | — |
-
-### Python frontend
-
-One file per module/widget under [`frontend/`](FRONTEND.md) — see
-[FRONTEND.md](FRONTEND.md) for the full index. Quick map:
-
-| Module | Doc page |
+| Folder | Contents |
 |---|---|
-| `DroneCockpitUI.py` (entry point, `DroneCockpitApp`) | [frontend/app-shell.md](frontend/app-shell.md) |
-| `telemetry_worker.py`, `video_worker.py`, `detection_worker.py` | [frontend/workers.md](frontend/workers.md) |
-| `IMUWidget.py` | [frontend/imu-widget.md](frontend/imu-widget.md) |
-| `MagWidget.py` | [frontend/mag-widget.md](frontend/mag-widget.md) |
-| `Drone3DView.py` | [frontend/drone3d-view.md](frontend/drone3d-view.md) |
-| `BaroWidget.py` | [frontend/baro-widget.md](frontend/baro-widget.md) |
-| `GPSWidget.py` | [frontend/gps-widget.md](frontend/gps-widget.md) |
-| `FCStatusWidget.py` | [frontend/fc-status-widget.md](frontend/fc-status-widget.md) |
-| `ArmingWidget.py` | [frontend/arming-widget.md](frontend/arming-widget.md) |
-| `FPVWidget.py` | [frontend/fpv-widget.md](frontend/fpv-widget.md) |
-| `DetectionMapWidget.py` | [frontend/detection-map-widget.md](frontend/detection-map-widget.md) |
-| `MapTiles.py`, `prefetch_tiles.py` | [frontend/map-tiles.md](frontend/map-tiles.md) |
-| `osd_overlay_controls.py`, `osd_layout.json` | [frontend/osd-overlay-controls.md](frontend/osd-overlay-controls.md) |
-| `Setup_Project.py`, `DroneTest.py` | [frontend/setup-tools.md](frontend/setup-tools.md) |
+| [`DroneBackend/`](DroneBackend/) | C++ backend → `DroneBackend.pyd` (Visual Studio project) |
+| [`DroneCockpitUI/`](DroneCockpitUI/) | Python cockpit UI, test suites, `NNTraining/` model pipeline |
+| [`IMUTests/`](IMUTests/) | GoogleTest project for the C++ IMU parser |
+| [`docs/`](docs/) | Software documentation |
+| [`Doxygen_conf/`](Doxygen_conf/) | Doxygen configuration + comment filter |
+| [`Hardware_progress/`](Hardware_progress/) | Build photos and mechanical drawings |
+| [`Software_progress/`](Software_progress/) | UI screenshots |
 
-## Screenshots
+## Documentation
 
-Add UI screenshots under `docs/images/` (e.g. `main-window.png`,
-`gps-widget.png`, `detection-preview.png`) and reference them from the
-relevant page — [FRONTEND.md](FRONTEND.md)/`modules/*.md` for widget-level
-shots, this README for a single "main window" overview shot. No images are
-included yet.
+Start at **[docs/README.md](docs/README.md)** for the reading order, then:
 
-## Conventions used throughout this documentation
-
-- **MSP** = MultiWii Serial Protocol, the wire protocol Betaflight speaks to
-  a companion computer. Command IDs referenced here are Betaflight 4.5.x
-  values (see `namespace MSP` in `DroneLink.h`).
-- Struct/field names are given in their **C++ form**; the pybind11 layer
-  renames everything to `snake_case` for the Python side (see
-  [modules/bindings.md](modules/bindings.md)).
-- "Provider pattern" refers to a recurring design choice in this codebase:
-  a class exposes a `setXProvider(std::function<...>)` setter instead of
-  taking a concrete dependency, so e.g. `DetectionLink` never needs to know
-  `DroneLink` exists. This is explained once in
-  [ARCHITECTURE.md](ARCHITECTURE.md) and referenced from every module page.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): the big picture (threads,
+  telemetry sources, data flow)
+- [docs/modules/](docs/modules/): one page per C++ unit
+- [docs/FRONTEND.md](docs/FRONTEND.md): index of the Python UI pages
+- [DroneCockpitUI/NNTraining/documentation_for_training/](DroneCockpitUI/NNTraining/documentation_for_training/README.md):
+  the detection-model training pipeline

@@ -5,13 +5,14 @@
 `root.mainloop()` at the bottom of the file)
 **Depends on:** `DroneBackend.pyd`, every widget module (see
 [../FRONTEND.md](../FRONTEND.md) for the full list), `telemetry_worker.py`,
-`video_worker.py`, `detection_worker.py`, `osd_overlay_controls.py`
+`video_worker.py`, `detection_worker.py`, `osd_overlay_controls.py`,
+`radio_link_indicator.py`
 
 ## Responsibility
 
 This is the whole application: it owns the Tk root window, creates the
-three C++ link objects (`DroneLink`, `VideoLink`, `DetectionLink`) and
-their Python worker wrappers, builds every instrument panel, and runs the
+C++ link objects (`DroneLink`, `CrsfLink`, `VideoLink`, `DetectionLink`)
+and their Python worker wrappers, builds every instrument panel, and runs the
 single recurring update loop that feeds fresh data to each widget.
 
 ## Startup sequence (`DroneCockpitApp.__init__`)
@@ -19,8 +20,12 @@ single recurring update loop that feeds fresh data to each widget.
 1. `self.hub = DroneBackend.DroneLink()` is created, then `_setup_ui()`
    builds every panel widget — **before** anything is connected, so a
    connection failure never leaves half the UI missing.
-2. `TelemetryWorker(self.hub)` is created (not started yet — see
-   [workers.md](workers.md)).
+   Right after the hub, `self.radio = DroneBackend.CrsfLink()` is
+   created (or `None`, with a console note, if the `.pyd` has no
+   `CrsfLink`). This is the ELRS telemetry source, see
+   [../modules/crsflink.md](../modules/crsflink.md).
+2. `TelemetryWorker(self.hub, radio=self.radio)` is created (not started
+   yet, see [workers.md](workers.md)).
 3. `self.video_link = DroneBackend.VideoLink()` is created, `VideoWorker`
    is started immediately, and `_start_video_autoconnect()` kicks off — the
    FPV capture dongle is treated as an independent USB device with its own
@@ -52,8 +57,11 @@ single recurring update loop that feeds fresh data to each widget.
 8. `DetectionMapWidget` is **not** created here — it's built on first
    open (`_open_detection_window()`), so a pilot who never opens the
    detection window never pays for an unused `Toplevel` + `Treeview`.
-9. `_auto_connect()` is called, which only starts `TelemetryWorker` and the
-   Tk update pump once a real serial connection to the FC succeeds.
+9. Telemetry **no longer waits for the USB cable**:
+   `self.radio.start_auto()` (non-blocking, reconnects forever),
+   `self._worker.start()` and `_schedule_update()` run immediately, and
+   `_auto_connect()` then starts the USB probe on a background thread.
+   The instruments come alive from whichever source is live first.
 
 ## Panel workspace
 
@@ -117,8 +125,9 @@ labels was causing Tk to mis-size/clip buttons on some platforms.
 
 ## Telemetry trampolines
 
-Two small no-arg methods build a `DroneBackend.TelemetrySnapshot` straight
-from `hub.get_latest_state()` and are handed to the C++ side as provider
+Two small no-arg methods build a `DroneBackend.TelemetrySnapshot` from
+`self._worker.get_active_state()` (the USB **or** ELRS state, whichever
+currently feeds the instruments, or `None` → `valid = False`) and are handed to the C++ side as provider
 callables. They look interchangeable — the C++ header comments even
 suggest reusing one — but they are **deliberately not the same function**,
 and merging them breaks the OSD:
@@ -131,11 +140,22 @@ and merging them breaks the OSD:
 | `altitude_m` source | `gps.altitude_m` | **barometer** (`state.baro_altitude_cm`, converted) — keeps the OSD altitude in agreement with `BaroWidget` instead of silently depending on GPS |
 | `gimbal_pan/tilt_deg` | `_get_camera_mount_angle()` — a manual, toolbar-editable stand-in; the SimpleBGC gimbal is physically installed but not electrically wired yet, so there's no live readback to use | not read by the OSD |
 
-Both are safe to call from a non-Tk thread: `DroneLink.get_latest_state()`
-is already a thread-safe, mutex-protected snapshot copy (see
-[../modules/dronelink.md](../modules/dronelink.md)), so calling it twice
-per cycle from two different C++ threads is just two small extra
-mutex-guarded copies, not a correctness concern.
+Both are safe to call from a non-Tk thread: `get_active_state()` only
+takes mutex-protected snapshot copies from `DroneLink` / `CrsfLink` (see
+[../modules/dronelink.md](../modules/dronelink.md)). Note that each call
+copies **both** states (radio and USB) to pick the source. At the OSD's
+per-frame rate this is the main cost of the trampoline.
+
+Two related helpers follow the same source rule:
+
+- `_detection_gps_status()` explains why georeferencing is off. On the
+  radio link, HDOP is reported as 9999, so the text says "HDOP n/a on
+  radio link" and "need >=5 sats on radio link".
+- `_get_current_drone_fix()` places the drone marker on the detection map.
+  When no source is live but the radio reports `TELEMETRY_LOST`, it
+  **keeps the last known position** from `CrsfLink` instead of removing
+  the marker. Where the drone was when the link dropped is exactly what a
+  rescue crew needs.
 
 ## The Tk update loop (`_update_loop`)
 
@@ -146,13 +166,19 @@ Each tick:
    **independently** of the telemetry connection check, so the video
    panel's status text doesn't blank out just because the separate MSP
    link hiccuped or is mid-reconnect.
-2. Checks `TelemetryWorker.is_connected`; if the worker has lost the link,
-   either triggers `_reconnect()` (hub itself is down) or shows a
-   "Waiting for data..." status (hub is up, first frame hasn't arrived
-   yet) and reschedules.
-3. Drains `TelemetryWorker.get_frame()` (non-blocking; `None` if nothing
+2. Calls `_update_link_status()` on **every** tick, even with no live
+   source. It feeds `worker.get_link_status()` to the
+   [`RadioLinkIndicator`](radio-link-indicator.md) and its tooltips,
+   picks up the result of a finished USB probe, and sets the USB label
+   (`USB: connected COMx` / `link degraded` / `searching...` /
+   `not connected (radio active)`). This is also where USB drop detection
+   lives (see [Reconnect handling](#reconnect-handling)).
+3. If `TelemetryWorker.is_connected` is false (neither USB nor ELRS is
+   live), the instruments keep their last values and the loop just
+   reschedules. The indicator and USB label explain why.
+4. Drains `TelemetryWorker.get_frame()` (non-blocking; `None` if nothing
    new this tick).
-4. Feeds the resulting `ui_data` dict to each widget **on a per-widget
+5. Feeds the resulting `ui_data` dict to each widget **on a per-widget
    throttle** — a `_frame_counters` dict compared against a `_THROTTLE`
    divisor per key, so expensive widgets don't set the pace for cheap ones:
 
@@ -168,19 +194,33 @@ see [detection-map-widget.md](detection-map-widget.md).
 
 ## Reconnect handling
 
-`_reconnect()` (called from `_update_loop()` when the hub itself reports
-disconnected) stops the current `TelemetryWorker`, disconnects the hub,
-shows a "Link lost — reconnecting..." status, and **replaces**
-`self._worker` with a brand-new `TelemetryWorker` instance (re-applying the
-saved yaw trim) rather than reusing the old one — ensuring the worker's
-internal state starts clean on every reconnect cycle. `_auto_connect()`
-then retries via `DroneBackend.auto_detect_f405()` on a timer
-(`RECONNECT_MS`) until a port opens.
+Only the **USB** link is handled here. `CrsfLink` finds and reconnects the
+Pocket on its own worker thread, and the telemetry worker keeps running
+through both.
+
+- **`_auto_connect()`** starts one background `UsbProbe` thread (a no-op
+  if a probe is already running or the hub is connected). The thread calls
+  `DroneBackend.auto_detect_fc(exclude=[radio port])`, which does an MSP
+  handshake and never picks the Pocket (see
+  [../modules/serial-port-scan.md](../modules/serial-port-scan.md)). On an
+  older `.pyd` it falls back to `auto_detect_f405()`. It then calls
+  `hub.connect(port)` and, on success,
+  `radio.set_excluded_ports([port])`. The `(port, ok)` result is handed
+  back through `_usb_probe_result` and consumed on the Tk thread by
+  `_update_link_status()`. A failed probe schedules a retry after
+  `RECONNECT_MS` (2 s) via `_schedule_usb_retry()`.
+- **Drop detection:** if the hub is connected but `usb_healthy` stays
+  false for `USB_DROP_AFTER_S` (5 s), `_reconnect()` runs.
+- **`_reconnect()`** calls `hub.disconnect()` (which joins the poll thread)
+  on a background `UsbDrop` thread, clears the radio's excluded ports, and
+  schedules a new probe. The `TelemetryWorker` is **not** replaced any
+  more. It simply falls over to ELRS if the radio link is up.
 
 ## Shutdown (`shutdown()`)
 
 Bound to `WM_DELETE_WINDOW`. Order matters here — persists the active
 layout first, cancels both `after()` jobs, then stops things in dependency
-order: `TelemetryWorker` → `hub.disconnect()` → `VideoWorker` →
+order: `TelemetryWorker` → `hub.disconnect()` → `radio.disconnect()` (if
+present) → `VideoWorker` →
 `fpv_view.detach()` → `video_link.disconnect()` → `DetectionWorker` →
 `detection_link.stop()` → `root.destroy()`.

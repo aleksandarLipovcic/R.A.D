@@ -25,6 +25,17 @@ alongside the class it wraps — it doesn't repeat *why* a field exists, only
 | `DroneBackend.GPSProtocol` | `GPSProtocol` | plain enum |
 | `DroneBackend.BatteryState` | `BatteryState` | plain enum: `OK`/`WARNING`/`CRITICAL`/`NOT_PRESENT`/`INIT` |
 
+## `RadioLinkStatus` / `RadioLinkStats`
+
+ELRS link types, filled only by `CrsfLink` (see
+[crsflink.md](crsflink.md#link-status--radiolinkstatus)).
+
+| Python | C++ | Notes |
+|---|---|---|
+| `DroneBackend.RadioLinkStatus` | `RadioLinkStatus` | enum, exported to module scope: `NO_RADIO`, `WAITING`, `TELEMETRY_OK`, `DEGRADED`, `TELEMETRY_LOST` |
+| `DroneBackend.RadioLinkStats` | `RadioLinkStats` | read-only. **Status:** `status`, `status_str`, `port_name`. **Link statistics:** `link_stats_valid`, `uplink_rssi1_dbm`, `uplink_rssi2_dbm`, `uplink_lq`, `uplink_snr`, `active_antenna`, `rf_mode_index`, `tx_power_mw`, `downlink_rssi_dbm`, `downlink_lq`, `downlink_snr`. **Ages (ms, −1 = never):** `ms_since_last_frame`, `attitude_age_ms`, `gps_age_ms`, `battery_age_ms`, `flight_mode_age_ms`, `baro_age_ms`, `link_stats_age_ms`. **Rates (Hz):** `attitude_hz`, `gps_hz`, `battery_hz`, `flight_mode_hz`, `baro_hz`, `vario_hz`, `link_stats_hz`, `total_frame_hz`. **Counters:** `frames_total`, `crc_errors`, `reconnect_count`, `link_lost_count`. **CRSF hints:** `raw_flight_mode`, `arming_blocked`, `gps_waiting`. **Home:** `home_set`, `home_lat`, `home_lon`, `home_alt_m`. **Altitude:** `altitude_source` (`"BARO"`/`"GPS"`/`"NONE"`) |
+| `DroneBackend.SerialPortInfo` | `SerialPortInfo` | read-only: `port`, `friendly_name`, `bus_description` (USB product string), `vid`, `pid`; has a readable `__repr__`. See [serial-port-scan.md](serial-port-scan.md) |
+
 ## `DroneState` / `DroneLink` / `IMUSensor`
 
 `DroneBackend.DroneState` exposes essentially every field described in
@@ -42,14 +53,38 @@ calibration progress (`mag_cal_active`, `mag_cal_seconds_remaining`,
 (`arming_disable_flags`, `arming_disable_str`), motor/RC counts
 (`motor_count`, `rc_channel_count` — the underlying arrays are accessed
 through `to_dict()`, see below), nested GPS objects (`gps`, `sv_list`,
-`sv_info_valid`, `sv_source`, `nav_status`), and link diagnostics
-(`last_rtt_ms`, `fc_cycle_ms`, `link_healthy`, `packet_count`).
+`sv_info_valid`, `sv_source`, `nav_status`), link diagnostics
+(`last_rtt_ms`, `fc_cycle_ms`, `link_healthy`, `packet_count`), and the
+telemetry source (`link_source`, `radio`).
 
 A `.def("to_dict", [](const DroneState& s) {...})` lambda is provided as a
 convenience so Python code can pull a plain `dict` snapshot (including the
 fixed-size C arrays like `motor_values`/`rc_channels`, which aren't
 directly exposable as `def_readonly` array fields) instead of touching
 every attribute individually.
+
+### `DroneState` additions for the radio link
+
+- `link_source`: `"USB"` (DroneLink, MSP) or `"ELRS"` (CrsfLink, CRSF).
+- `radio`: a `RadioLinkStats`, meaningful only when
+  `link_source == "ELRS"`.
+
+`to_dict()` now builds the dict first and then appends these keys:
+
+| Key(s) | Meaning |
+|---|---|
+| `link_source` | as above |
+| `available_raw_imu`, `available_raw_mag`, `available_motors`, `available_rc_channels`, `available_sat_list`, `available_hdop`, `available_arming_flags`, `available_cpu_load` | `True` on USB, `False` on ELRS. Widgets should show "USB only" instead of zeros |
+| `radio_status`, `radio_status_int`, `radio_port` | link status string / int, Pocket COM port |
+| `elrs_link_stats_valid`, `elrs_uplink_lq`, `elrs_uplink_rssi1_dbm`, `elrs_uplink_rssi2_dbm`, `elrs_uplink_snr`, `elrs_active_antenna`, `elrs_rf_mode_index`, `elrs_tx_power_mw`, `elrs_downlink_rssi_dbm`, `elrs_downlink_lq`, `elrs_downlink_snr` | ELRS `LINK_STATISTICS` |
+| `age_last_frame_ms`, `age_attitude_ms`, `age_gps_ms`, `age_battery_ms`, `age_flight_mode_ms`, `age_baro_ms`, `age_link_stats_ms` | data ages, −1 = never |
+| `rate_attitude_hz`, `rate_gps_hz`, `rate_battery_hz`, `rate_flight_mode_hz`, `rate_baro_hz`, `rate_vario_hz`, `rate_link_stats_hz`, `rate_total_hz` | measured update rates |
+| `radio_frames_total`, `radio_crc_errors`, `radio_reconnect_count`, `radio_link_lost_count` | counters |
+| `raw_flight_mode`, `arming_blocked`, `gps_waiting`, `home_set`, `home_lat`, `home_lon`, `altitude_source` | CRSF hints and laptop-side home point |
+
+`rc_link_quality` in `to_dict()` is the real ELRS uplink LQ % when
+`link_source == "ELRS"` and link statistics are valid. Otherwise the old
+rssi-based value is used.
 
 `DroneBackend.DroneLink`:
 
@@ -74,6 +109,32 @@ every attribute individually.
 | `IMUSensor(hub)` | `py::init<DroneLink*>()`, `hub` is a positional/keyword arg |
 | `get_raw_data()` | lambda around `IMUSensor::getRawData()`, converts `IMUData` to a Python-friendly return |
 | `get_scaled_data()` | lambda around `IMUSensor::getScaledData()`, converts `IMUScaled` similarly |
+
+## `CrsfLink`
+
+`DroneBackend.CrsfLink`, the ELRS telemetry link (see
+[crsflink.md](crsflink.md)). Every blocking call releases the GIL
+(`py::call_guard<py::gil_scoped_release>`) so the Tk UI keeps running.
+
+| Python method | Wraps |
+|---|---|
+| `CrsfLink()` | `py::init<>()` |
+| `start_auto()` | `startAuto` — non-blocking, auto-detect + auto-reconnect. **Preferred.** *(releases GIL)* |
+| `connect_auto(timeout_ms=3000)` | `connectAuto` — blocking scan *(releases GIL)* |
+| `connect(port_name)` | `connect` — fixed port, re-opened after unplug *(releases GIL)* |
+| `disconnect()` | `disconnect` *(releases GIL)* |
+| `is_connected()` | `isConnected` — Pocket's port open; says nothing about the drone |
+| `is_running()` | `isRunning` |
+| `get_latest_state()` | `getLatestState` — `DroneState` copy with `link_source == "ELRS"` |
+| `get_status()` | `getStatus` → `RadioLinkStatus` |
+| `get_port_name()` | `getPortName` |
+| `get_last_scan_report()` | `getLastScanReport` — text log of the last port scan |
+| `set_excluded_ports(ports)` | `setExcludedPorts` |
+| `set_port_name_hints(hints)` | `setPortNameHints` |
+| `set_scan_interval_ms(ms)`, `set_probe_ms(ms)`, `set_assert_dtr(on)` | scanner tuning |
+| `set_lost_timeout_ms(ms)`, `set_degraded_lq(lq_percent)`, `set_instrument_stale_ms(ms)` | status thresholds |
+| `set_yaw_signed(signed)`, `set_cell_count(cells)`, `set_cell_voltage_thresholds(warning_v, critical_v)`, `set_battery_capacity_mah(mah)`, `set_min_sats_for_fix(sats)`, `set_gps_altitude_fallback(on)` | mapper configuration |
+| `CrsfLink.enumerate_ports()` (static) | `EnumerateSerialPorts()` |
 
 ## `VideoLink`
 
@@ -169,7 +230,9 @@ readonly, since Python code builds these to feed into
 
 | Python | C++ |
 |---|---|
-| `DroneBackend.auto_detect_f405()` | `AutoDetectF405()` — scans `COM1`–`COM29`, returns the first port that opens |
+| `DroneBackend.enumerate_serial_ports()` | `EnumerateSerialPorts()` → `list[SerialPortInfo]`, with USB product names so the FC and the Pocket can be told apart |
+| `DroneBackend.auto_detect_fc(exclude_ports=[], timeout_ms=300)` | `AutoDetectFlightController()` — returns the first port that answers an MSP request, or `"NOT_FOUND"`. Never picks the radio. *(releases GIL)* |
+| `DroneBackend.auto_detect_f405()` | `AutoDetectF405()` — **legacy**: scans `COM1`–`COM29`, returns the first port that opens. With the Pocket plugged in this can return the radio; use `auto_detect_fc()` instead |
 
 ## Naming convention (for anyone adding a new binding)
 

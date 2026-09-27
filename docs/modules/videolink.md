@@ -134,7 +134,7 @@ never leak into `getLatestFrame()` / `DetectionLink`'s input.
   pattern as `DetectionLink` (see [ARCHITECTURE.md](../ARCHITECTURE.md#3-the-provider-decoupling-pattern)).
   The header comment suggests wiring the *same* callable passed to
   `DetectionLink::setTelemetryProvider()`, but the actual Python wiring
-  (`DroneCockpitApp`, see [FRONTEND.md](FRONTEND.md#telemetry-trampolines))
+  (`DroneCockpitApp`, see [app-shell.md](../frontend/app-shell.md#telemetry-trampolines))
   deliberately uses **two separate trampolines** — the OSD's `valid`/
   `altitude_m` semantics differ from DetectionLink's (GPS-fix-gated vs.
   FC-link-gated; GPS altitude vs. barometer altitude), and sharing one

@@ -4,7 +4,7 @@
 **Depends on:** `GPSNeoM10` (parsers), `MagQMC5883L` (used inside
 `parseDebug`), `BaroBMP280` (used inside `parseBaro`)
 **Exposed to Python as:** `DroneBackend.DroneLink` (see
-[bindings.md](bindings.md#dronelink))
+[bindings.md](bindings.md#dronestate--dronelink--imusensor))
 
 ## Responsibility
 
@@ -21,7 +21,10 @@ disconnect()      → keepRunning = false → join thread → closeSerialPort()
 ```
 
 `AutoDetectF405()` (free function, not a method) scans `COM1`–`COM29` and
-returns the first port that opens successfully, for cockpit auto-connect UX.
+returns the first port that opens. It is **legacy**: with the RadioMaster
+Pocket plugged in, it can return the radio's port. The cockpit now uses
+`AutoDetectFlightController()`, which requires an MSP reply (see
+[serial-port-scan.md](serial-port-scan.md)).
 
 ## The polling loop (`communicationLoop()`)
 
@@ -77,6 +80,12 @@ calibration progress, FC status/arming diagnostics, motor outputs, RC
 channels, GPS (`GPSReading`), satellite list (`vector<SVInfoEntry>`), nav
 status, and link diagnostics (`lastRttMs`, `fcCycleMs`, `linkHealthy`,
 `packetCount`).
+
+`DroneState` is shared by **both** telemetry links. `linkSource` says which
+one produced a snapshot: `"USB"` (this class, the default) or `"ELRS"`
+([`CrsfLink`](crsflink.md)). The `radio` member (`RadioLinkStats`) and the
+`RadioLinkStatus` enum are declared in `DroneLink.h` too, but only
+`CrsfLink` fills them. On the USB path they stay at their defaults.
 
 It is written exclusively by the worker thread and read only through
 `getLatestState()`, which takes `dataMutex` and returns a copy — never a

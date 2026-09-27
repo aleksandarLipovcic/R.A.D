@@ -55,7 +55,7 @@ A scrollable per-satellite table (`update_satellites(sv_list)`) showing
 GNSS constellation, SVID, C/N₀ (signal strength), quality, and lock status
 per satellite — fed the already-normalized list `telemetry_worker.py`
 builds from the backend's `sv_list` (see
-[workers.md](workers.md#_build_ui_datastate--the-one-and-only-translation-point)).
+[workers.md](workers.md#_build_ui_datastate-source--the-one-and-only-translation-point)).
 `_cols()`/`_draw_col_header()`/`_redraw()` handle the actual per-row
 rendering.
 
@@ -95,4 +95,4 @@ _M_TO_FT    = 3.28084    # meters -> feet
 (cm/s, meters) and are converted here at display time — the underlying
 `ui_data` dict keeps the raw MSP-native units, matching the convention
 `telemetry_worker.py` uses throughout (see
-[workers.md](workers.md#_build_ui_datastate--the-one-and-only-translation-point)).
+[workers.md](workers.md#_build_ui_datastate-source--the-one-and-only-translation-point)).

@@ -11,20 +11,26 @@ own `after()`-scheduled pump decides when to read what they've produced
 
 ## `telemetry_worker.py` — `TelemetryWorker`
 
-**Wraps:** `DroneBackend.DroneLink`
-**Consumed by:** every instrument widget, via `DroneCockpitApp._update_loop`
+**Wraps:** `DroneBackend.DroneLink` (USB/MSP) **and**, optionally,
+`DroneBackend.CrsfLink` (ELRS radio)
+**Consumed by:** every instrument widget, via `DroneCockpitApp._update_loop`;
+the toolbar's [`RadioLinkIndicator`](radio-link-indicator.md) and USB label,
+via `get_link_status()`; the OSD/detection trampolines, via
+`get_active_state()`
 
 ```
-TelemetryWorker(hub, poll_hz=60)
+TelemetryWorker(hub, radio=None)
   .start() / .stop()
-  .get_frame() -> dict | None      # non-blocking
-  .is_connected -> bool             # property
+  .get_frame() -> dict | None        # non-blocking
+  .is_connected -> bool               # property: a source is live
+  .get_link_status() -> dict          # USB + ELRS status, always available
+  .get_active_state() -> DroneState | None   # thread-safe, for C++ trampolines
   .set_yaw_trim(trim) / .get_yaw_trim()
   .get_last_state_snapshot() -> (raw_yaw, mag_heading, mag_valid)
   .last_error: str | None
 ```
 
-Polls `hub.get_latest_state()` at `POLL_HZ` (60) into a bounded
+Polls the active source's `get_latest_state()` at `POLL_HZ` (60) into a bounded
 `queue.Queue(maxsize=3)`. A full queue drops the **oldest** frame before
 inserting the new one — the Tk thread is guaranteed to eventually see the
 freshest telemetry, never an ever-growing backlog. `get_frame()` drains the
@@ -43,20 +49,54 @@ lock:
   thread can recompute a heading-trim delta without needing a full
   `ui_data` frame.
 
+### Two telemetry sources — USB vs ELRS
+
+`radio` is `None` when the loaded `DroneBackend.pyd` predates `CrsfLink`.
+In that case the worker behaves as USB-only, and `get_link_status()`
+reports `radio_status = "DISABLED"`.
+
+On every poll, `_pick_source()` returns `(source, state, radio_state)`,
+choosing in this order:
+
+1. **USB** if the cable link is connected **and** `link_healthy`;
+2. **ELRS** if `radio_state.radio.status_str` is `TELEMETRY_OK` or
+   `DEGRADED` (`RADIO_LIVE`);
+3. **USB** if the cable is connected but momentarily unhealthy;
+4. **none**: no frame is produced and `is_connected` goes `False`.
+
+`radio_state` is always returned, even while USB is active, so the radio
+indicator keeps showing the real radio status. Both `get_latest_state()`
+calls are mutex-protected C++ snapshots.
+
+**`get_active_state()`** runs the same selection and returns only the
+state (or `None`). This is what `_get_osd_telemetry()`,
+`_get_detection_telemetry()`, `_detection_gps_status()` and
+`_get_current_drone_fix()` call, so the OSD, georeferencing and map marker
+always use **the same source the instruments show**. It is safe to call
+from the C++ capture and inference threads.
+
+**`get_link_status()`** returns a flat dict built by
+`_build_link_status()`: `active_source`, `usb_connected`, `usb_healthy`,
+`radio_present`, `radio_status`, `radio_port`, `link_stats_valid`,
+uplink/downlink LQ/RSSI/SNR, `tx_power_mw`, `age_*_ms`, `rate_*_hz`,
+`reconnect_count`, `link_lost_count`, `crc_errors`, `radio_armed`. The
+worker replaces the whole dict at once (an atomic reference swap), so the
+Tk thread reads it without a lock. It is rebuilt at `_STATUS_HZ` (10 Hz)
+while frames flow, and on every idle pass (`_IDLE_S`, 0.1 s) while no
+source is live, so the indicator reacts within about 100 ms.
+
 ### Connection handling (`_run`)
 
-If `hub.is_connected()` is false, the worker just clears its own
-`_connected` event and sleeps `RECONNECT_S` (2.0 s) before checking again —
-it does **not** try to reconnect anything itself. Reconnect orchestration
-(disconnecting the hub, replacing the worker instance, calling
-`auto_detect_f405()` again) is `DroneCockpitApp`'s job
-(`_reconnect()`/`_auto_connect()`), not this worker's. If `get_latest_state()`
-raises, the exception message is stored in `last_error`, `_connected` is
-cleared, and the loop pauses briefly (0.1 s) before retrying — deliberately
-short so a spinning failure doesn't burn CPU, but the Tk thread ultimately
-decides what a repeated failure means for the app's connection state.
+The worker never connects or reconnects anything itself. `CrsfLink`
+reconnects on its own thread, and the USB probe / drop / re-probe cycle
+belongs to `DroneCockpitApp` (`_auto_connect()`, `_reconnect()`, see
+[app-shell.md](app-shell.md#reconnect-handling)). When no source is live,
+the worker clears `_connected`, refreshes the link status and sleeps
+`_IDLE_S`. `RECONNECT_S` is still defined but no longer used. If a backend
+call raises, the message goes to `last_error`, `_connected` is cleared, and
+the loop pauses 0.1 s before retrying.
 
-### `_build_ui_data(state)` — the one and only translation point
+### `_build_ui_data(state, source)` — the one and only translation point
 
 This is the **single place** in the whole frontend that touches the raw
 `DroneBackend.DroneState` pybind11 object. Every widget consumes the flat
@@ -79,6 +119,15 @@ all. Notable transformations performed here rather than anywhere else:
 - `sensor_status` (a bitmask) is unpacked into individual
   `sensor_{acc,baro,mag,gps,rangefinder,gyro}_present` booleans so widgets
   never do their own bit tests.
+- **Source and ELRS keys.** Every frame gets `link_source` (`"USB"` /
+  `"ELRS"`) and the `available_raw_imu`, `available_raw_mag`,
+  `available_motors`, `available_rc_channels`, `available_sat_list`,
+  `available_hdop`, `available_arming_flags` and `available_cpu_load`
+  flags. All are `False` on ELRS, so widgets can show "USB only" instead of
+  zeros. It also gets `arming_blocked`, `gps_waiting`, `altitude_source`
+  and `age_attitude_ms` / `age_gps_ms` / `age_battery_ms` (−1 = never;
+  always 0 on USB). On ELRS with valid link statistics, `rc_link_quality`
+  is the real uplink LQ %.
 - Every field is read via `getattr(state, "field", default)` rather than
   direct attribute access — a `DroneBackend.pyd` built before some field
   was added degrades to a sane default instead of raising an
