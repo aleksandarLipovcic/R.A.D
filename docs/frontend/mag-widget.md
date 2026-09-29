@@ -53,10 +53,11 @@ everything else.
 
 ## USB vs radio link
 
-On the ELRS radio link this panel switches, about 1 s after the change,
-to its radio face, `RadioNavPanel` (heading & home). See [dual-layer.md](dual-layer.md). During
-the switch-over this widget adapts per frame as described in
-[link-mode.md](link-mode.md).
+The same widget serves both links. On the ELRS radio link it shows the FC
+heading, replaces the raw-field bars with a HOME / NAVIGATION row, and
+keeps the calibration buttons disabled. A cyan **H** arrow on the rose
+points home on both links whenever a home point is known. See
+[dual-layer.md](dual-layer.md#what-it-does) and [link-mode.md](link-mode.md).
 
 ## Calibration safety
 

@@ -159,3 +159,13 @@ never leak into `getLatestFrame()` / `DetectionLink`'s input.
 | `osdLayout_` (map) | Python/Tk thread (settings panel, drag overlay) | capture thread (`paintFrameDirect`) | `osdMutex_` (a map isn't atomic-friendly, but writes are rare — only on user interaction) |
 | OSD timer state | capture thread only | capture thread only | none needed — single-thread-owned |
 | `osdStackUsedPx_` | capture thread only (per-frame scratch, zeroed each frame) | capture thread only | none needed |
+
+## Repainting uncovered areas (`WM_PAINT`)
+
+Frames are painted from the capture thread outside `WM_PAINT`. The window
+procedure also handles `WM_PAINT`. It validates the window, and unless a
+frame arrived in the last 250 ms, it fills the uncovered rectangle black
+(`paintExposed()`, called on the UI thread). `paintMutex_` serialises all
+drawing into the shared CS_OWNDC context between the two threads. Without
+this, moving or resizing panels over the video area left stale pixels
+("ghost lines") whenever no video was streaming.

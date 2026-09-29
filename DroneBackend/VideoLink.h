@@ -319,6 +319,12 @@ private:
     // hidden, instead of continuing to draw into an invisible window.
     std::atomic<bool> windowVisible_{ true };
 
+    // paintMutex_ serialises GDI drawing into the render window between the
+    // capture thread (paintFrame / paintNoSignalFrame) and the Tk thread's
+    // WM_PAINT handling (paintExposed). Both draw through the same CS_OWNDC
+    // device context, and a DC must not be used from two threads at once.
+    std::mutex paintMutex_;
+
     // ── Off-screen back buffer ──────────────────────────────────────
     //
     // paintFrame() composites the background video frame plus the
@@ -523,6 +529,15 @@ private:
     // meantime -- this window doesn't implement WM_PAINT repainting, so
     // nothing else will refresh it while no frames are flowing).
     void paintNoSignalFrame();
+
+public:
+    // Called from the render window's WM_PAINT (Tk/UI thread) with the area
+    // Windows wants redrawn, e.g. after a panel edge or another window
+    // moved over it. Without this, uncovered areas kept stale pixels --
+    // visible as "ghost" border lines across the FPV panel while resizing
+    // with no live video. With live video the next frame covers it anyway.
+    void paintExposed(const RECT& rc);
+private:
 
     // Attempts to re-open the current capture device and read one frame.
     // Returns true and leaves cap opened/streaming on success. Called

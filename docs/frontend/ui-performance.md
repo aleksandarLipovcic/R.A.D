@@ -42,11 +42,9 @@ The absolute numbers differ on the Windows laptop, but the proportions hold.
    - `MagWidget` redraws the rose and readout only when the heading (0.1°),
      validity, link or size changed, and the raw bars only when the values
      changed.
-   - `RadioNavPanel` does the same at 0.5° resolution.
    - The satellite table skips identical lists.
 4. **Never create Tk font objects per update.** The heading font fit
-   measures text per font size **once** (`MagWidget._hdg_text_extent`,
-   also used by `RadioNavPanel`). It used to create about 12 font objects
+   measures text per font size **once** (`MagWidget._hdg_text_extent`). It used to create about 12 font objects
    per update.
 5. **One batched redraw per idle cycle for canvases.** The GPS map's
    `_request_redraw()` merges position, overlay, pulse, pan, zoom and
@@ -70,3 +68,30 @@ simulated `DroneBackend` under a virtual display. The harness wraps each
 widget's update method with a timer and probes the idle delay with
 `after_idle`. When adding a widget, measure its update call. Anything above
 ~2 ms at its update rate is worth a "redraw only what changed" check.
+
+## Measuring on the real laptop: `COCKPIT_PERF=1`
+
+`ui_perf.py` is an opt-in monitor, off unless the environment variable is
+set:
+
+```
+set COCKPIT_PERF=1
+python DroneCockpitUI.py
+```
+
+Every 10 s it prints the real UI tick rate and cost, the repaint (idle)
+delay, and each instrument's update rate and cost. Tick rate well below
+50 Hz, tick max above ~20 ms, or idle delay p95 above ~20 ms point at the
+slow part.
+
+## Ghost lines in the FPV panel (native video window)
+
+The live video is painted by `VideoLink` into its own native window. That
+window ignored `WM_PAINT`, so when a panel edge or another window moved
+across it without live video, the uncovered area kept its old pixels,
+visible as border lines while resizing the FPV panel. `VideoLinkWndProc`
+now handles `WM_PAINT` and fills the uncovered area (`paintExposed()`),
+unless live frames are flowing, in which case the next frame covers it.
+A `paintMutex_` serialises this with the capture thread's drawing, since
+both use the same device context. This is a C++ change, so rebuild
+`DroneBackend`.

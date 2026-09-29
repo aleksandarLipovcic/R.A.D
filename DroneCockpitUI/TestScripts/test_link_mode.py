@@ -232,8 +232,9 @@ def test_mag_radio(host):
     assert link_mode.NA_LONG in tw["mag_btn"].cget("text")
     assert tw["acc_btn"].cget("state") == "disabled"
     assert "RADIO" in tw["status"].cget("text")
-    if "bars" in tw:
-        assert tw["bars"]["X"]["label"].cget("text").strip() == link_mode.NA_SHORT
+    if "home_frame" in tw:              # full layout: home row replaces raw bars
+        assert tw["home_frame"].winfo_ismapped()
+        assert not tw["bars_frame"].winfo_ismapped()
 
     w.update_mag(_frame("USB"))
     host.update()

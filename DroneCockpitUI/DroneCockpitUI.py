@@ -124,7 +124,8 @@ from telemetry_worker import TelemetryWorker
 from radio_link_indicator import RadioLinkIndicator
 import link_mode
 from dual_layer import DualLayerPanel, LayerSwitch
-from radio_panels import RadioAttitudePanel, RadioNavPanel, RadioFlightPanel
+import ui_perf
+from radio_panels import RadioAttitudePanel, RadioFlightPanel
 from video_worker      import VideoWorker
 from detection_worker  import DetectionWorker
 
@@ -1788,6 +1789,9 @@ class DroneCockpitApp:
         self._schedule_update()
         self._auto_connect()             # USB probe on a background thread
 
+        # Opt-in performance report (set COCKPIT_PERF=1) — see ui_perf.py
+        ui_perf.install(self)
+
     # =========================================================================
     # Native FPV window sync — keeps VideoLink's off-Tk render HWND's
     # OS-level Z-order/visibility matching whatever the Tk panels are doing.
@@ -3177,20 +3181,23 @@ class DroneCockpitApp:
         self.imu_view = IMUWidget(self.imu_panel,
                                   on_adjust_heading=self._apply_heading_trim)
         self.imu_panel.set_faces(self.imu_view, "update_ui",
-                                 RadioAttitudePanel(self.imu_panel), "update_radio")
+                                 RadioAttitudePanel(self.imu_panel,
+                                                    latency_var=self.imu_view._show_latency),
+                                 "update_radio")
         self.imu_panel.pack(fill="both", expand=True)
 
         # ── Magnetometer ──────────────────────────────────────────────────────
+        # One widget for both links: MagWidget itself adapts to the radio
+        # link (FC heading, home row instead of raw-field bars, calibration
+        # disabled), so the pilot keeps the same rose and heading readout.
+        # Only the panel title changes with the link.
         p = _panel("mag", _LAYER_TITLES["mag"][0])
-        self.mag_panel = DualLayerPanel(p.content)
         self.mag_view = MagWidget(
-            self.mag_panel,
+            p.content,
             on_mag_calibrate=self.hub.start_mag_calibration,
             on_acc_calibrate=self.hub.start_acc_calibration,
         )
-        self.mag_panel.set_faces(self.mag_view, "update_mag",
-                                 RadioNavPanel(self.mag_panel), "update_radio")
-        self.mag_panel.pack(fill="both", expand=True)
+        self.mag_view.pack(fill="both", expand=True)
 
         # ── ADI ───────────────────────────────────────────────────────────────
         p = _panel("adi", "ADI  —  Attitude Direction Indicator")
@@ -3311,9 +3318,10 @@ class DroneCockpitApp:
 
     def _switch_link_layer(self, radio: bool) -> None:
         """Show the radio (or USB) face of every dual-layer panel."""
-        for name, dual in (("imu", self.imu_panel), ("mag", self.mag_panel),
+        for name, dual in (("imu", self.imu_panel), ("mag", None),
                            ("fc_status", self.fc_status_panel)):
-            dual.show_radio(radio)
+            if dual is not None:        # mag: one link-aware widget, title only
+                dual.show_radio(radio)
             self._panels[name].set_title(
                 _LAYER_TITLES[name][1 if radio else 0],
                 PANEL_TITLE_RADIO_FG if radio else None)
@@ -3457,7 +3465,7 @@ class DroneCockpitApp:
 
         if self._frame_counters["mag"] >= _THROTTLE["mag"]:
             self._frame_counters["mag"] = 0
-            self.mag_panel.feed(ui_data)
+            self.mag_view.update_mag(ui_data)
 
         # ── Medium widget — 3-D attitude view (~17 Hz) ────────────────────────
         if self._frame_counters["adi"] >= _THROTTLE["adi"]:

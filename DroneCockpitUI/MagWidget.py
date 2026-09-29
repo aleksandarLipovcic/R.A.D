@@ -104,6 +104,7 @@ class MagWidget(tk.Frame):
     C_BTN_MAG_FG = "#00ff88"
     C_BTN_ACC_BG = "#080a20"
     C_BTN_ACC_FG = "#44aaff"
+    C_HOME       = "#00e5ff"   # home-direction marker (both links)
 
     MAG_SCALE_MIN = 800.0
     _mag_scale    = 800.0
@@ -175,6 +176,8 @@ class MagWidget(tk.Frame):
         self._radio         = False   # ELRS link feeding the widget
         self._armed         = False   # calibration is refused while armed
         self._last_drawn    = None    # what the rose/readout currently show
+        self._home_bearing  = None    # absolute bearing to home, or None
+        self._bottom_is_home = False  # full tier: home row instead of bars
         self._last_bars     = None
         self._stale_ms      = 0       # heading age when stale (radio only)
         self._on_mag_cal    = on_mag_calibrate
@@ -298,6 +301,21 @@ class MagWidget(tk.Frame):
                  fg=self.C_LABEL, bg=self.C_BG,
                  ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 2))
         self._build_bars_into(bars_frame, start_row=1, bar_height=13)
+
+        # Radio link: the raw field isn't carried, so the same row shows
+        # home / navigation data instead (swapped by _apply_bottom_row()).
+        home_frame = tk.Frame(c, bg=self.C_BG)
+        tk.Label(home_frame, text="HOME / NAVIGATION  ·  RADIO",
+                 font=("Consolas", 7, "bold"), fg=self.C_LABEL, bg=self.C_BG,
+                 ).pack(anchor="w", pady=(0, 2))
+        home_lbl = tk.Label(home_frame, text="HOME NOT SET",
+                            font=("Consolas", 9, "bold"), justify="left",
+                            fg=self.C_TEXT, bg=self.C_BG, anchor="w")
+        home_lbl.pack(anchor="w", fill="x")
+        self._tier_widgets["bars_frame"] = bars_frame
+        self._tier_widgets["home_frame"] = home_frame
+        self._tier_widgets["home_lbl"]   = home_lbl
+        self._bottom_is_home = False
 
     # ── COMPACT ───────────────────────────────────────────────────────────────
     def _build_compact(self):
@@ -811,6 +829,8 @@ class MagWidget(tk.Frame):
                            fill=self.C_SAFE,
                            font=("Consolas", f_overlay, "bold"))
 
+        self._draw_home_marker(cv, cx, cy, r, heading)
+
     # ══════════════════════════════════════════════════════════════════════════
     # Rose side-gutter heading — uses the blank space beside a height-bound
     # compass rose to show ONE big, prominent heading readout right next to
@@ -823,6 +843,27 @@ class MagWidget(tk.Frame):
     # dead-center first and bolting the box onto whatever space is left on
     # one side.
     # ══════════════════════════════════════════════════════════════════════════
+
+    def _draw_home_marker(self, cv, cx, cy, r, heading):
+        """Cyan arrow + "H" towards home — drawn LAST so the heading
+        overlay box on the rose can never hide it."""
+        if self._home_bearing is None:
+            return
+        rad = math.radians((self._home_bearing - heading) - 90)
+        hx0 = cx + int(r * 0.30) * math.cos(rad)
+        hy0 = cy + int(r * 0.30) * math.sin(rad)
+        hx1 = cx + int(r * 0.86) * math.cos(rad)
+        hy1 = cy + int(r * 0.86) * math.sin(rad)
+        cv.create_line(hx0, hy0, hx1, hy1, fill=self.C_HOME, width=3,
+                       arrow=tk.LAST,
+                       arrowshape=(max(6, int(r * 0.14)),
+                                   max(7, int(r * 0.16)),
+                                   max(3, int(r * 0.06))))
+        lx = cx + int(r * 0.97) * math.cos(rad)
+        ly = cy + int(r * 0.97) * math.sin(rad)
+        cv.create_text(lx, ly, text="H", fill=self.C_HOME,
+                       font=("Consolas", max(7, int(r * 0.13)), "bold"))
+
 
     def _compute_side_heading_layout(self, gutter_px, r, H):
         """Binary-search the largest font (bounded by the worst-case string
@@ -1058,6 +1099,13 @@ class MagWidget(tk.Frame):
         self._valid        = valid
         self._last_heading = heading
 
+        # Home direction: from MSP_COMP_GPS on USB, from the laptop-side home
+        # point on radio (only once CrsfLink has set one at arming).
+        home_ok = bool(data.get("gps_comp_valid", False)) and \
+            (not self._radio or bool(data.get("home_set", False)))
+        self._home_bearing = ((int(data.get("gps_bearing_to_home", 0)) + 360) % 360
+                              if home_ok else None)
+
         w    = self.winfo_width()
         h    = self.winfo_height()
         tier = self._classify(w, h)
@@ -1069,17 +1117,62 @@ class MagWidget(tk.Frame):
         # Redraw only what changed (performance: this widget is updated at
         # the full UI rate, but the heading usually moves far slower).
         rose_key = (round(heading, 1), valid, self._radio, bool(self._stale_ms),
-                    tier, w, h)
+                    tier, w, h, self._home_bearing)
         if rose_key != self._last_drawn:
             self._last_drawn = rose_key
             self._draw_rose()
             self._update_readout_widgets(heading, valid)
+        self._apply_bottom_row(data)
         bars_key = (mx, my, mz, self._radio, tier)
-        if bars_key != self._last_bars:
+        if bars_key != self._last_bars and not self._bottom_is_home:
             self._last_bars = bars_key
             self._draw_bars(mx, my, mz)
         self._update_mag_cal_ui(mag_cal_act, mag_cal_rem)
         self._update_acc_cal_ui(acc_cal_act, acc_cal_rem)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Full tier bottom row: raw field bars (USB) or home / navigation (radio)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _apply_bottom_row(self, data: dict):
+        bars = self._tier_widgets.get("bars_frame")
+        home = self._tier_widgets.get("home_frame")
+        if bars is None or home is None:
+            return
+        want_home = self._radio
+        if want_home != self._bottom_is_home:
+            self._bottom_is_home = want_home
+            if want_home:
+                bars.grid_remove()
+                home.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+            else:
+                home.grid_remove()
+                bars.grid()
+                self._last_bars = None          # redraw bars on return
+        if not want_home:
+            return
+        parts = []                      # line 1: home; line 2: speed / altitude
+        if self._home_bearing is not None:
+            dist = float(data.get("gps_dist_to_home_m", 0.0))
+            rel = (self._home_bearing - self._last_heading + 540.0) % 360.0 - 180.0
+            turn = "ON COURSE" if abs(rel) <= 10 else \
+                f"TURN {'R' if rel > 0 else 'L'} {abs(rel):.0f}°"
+            dist_txt = f"{dist:.0f} m" if dist < 1000 else f"{dist / 1000:.2f} km"
+            parts.append(f"HOME {dist_txt}  BRG {self._home_bearing:03d}°  {turn}")
+        else:
+            parts.append("HOME NOT SET")
+        line2 = []
+        if data.get("gps_raw_valid", False):
+            line2.append(f"GS {float(data.get('gps_ground_speed_cms', 0)) * 0.036:.1f} km/h")
+        if data.get("baro_valid", False):
+            line2.append(f"ALT {int(data.get('baro_altitude_cm', 0)) / 100.0:+.1f} m")
+        if line2:
+            parts.append("   ".join(line2))
+        stale = link_mode.stale_ms(data, "gps")
+        self._tier_widgets["home_lbl"].config(
+            text="\n".join(parts),
+            fg=link_mode.C_STALE_FG if stale else
+               (self.C_HOME if self._home_bearing is not None else link_mode.C_NA_FG))
 
     # ══════════════════════════════════════════════════════════════════════════
     # Calibration UI state

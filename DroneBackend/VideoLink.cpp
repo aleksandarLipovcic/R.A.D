@@ -850,14 +850,42 @@ void VideoLink::disconnect() {
 // =============================================================================
 
 static LRESULT CALLBACK VideoLinkWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    // We paint from the capture thread via a cached DC outside of
-    // WM_PAINT, so this proc just needs to suppress the default
-    // background erase (which would otherwise cause visible flicker
-    // between frames) and defer everything else to Windows' default
-    // handling.
+    // Frames are painted from the capture thread via a cached DC outside of
+    // WM_PAINT. This proc suppresses the default background erase (which
+    // would flicker between frames) and handles WM_PAINT itself: when a
+    // panel edge or another window uncovers part of the video area,
+    // Windows asks for a repaint, and ignoring it left the old pixels on
+    // screen (ghost lines while resizing the FPV panel with no video).
     if (msg == WM_ERASEBKGND)
         return 1;
+    if (msg == WM_PAINT) {
+        RECT rc;
+        const BOOL dirty = GetUpdateRect(hwnd, &rc, FALSE);
+        // Validate first (instead of BeginPaint/EndPaint, which would clip
+        // the shared CS_OWNDC context the capture thread also draws with).
+        ValidateRect(hwnd, nullptr);
+        auto* self = reinterpret_cast<VideoLink*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (dirty && self)
+            self->paintExposed(rc);
+        return 0;
+    }
     return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+void VideoLink::paintExposed(const RECT& rc) {
+    // With live video, the next frame (<= ~33 ms) repaints the whole
+    // window; drawing here too would only fight the capture thread.
+    const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (nowMs - lastFrameTimeMs_.load() < 250)
+        return;
+
+    std::lock_guard<std::mutex> lock(paintMutex_);
+    HDC hdc = renderHdc_.load();
+    if (!hdc)
+        return;
+    static HBRUSH blackBrush = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+    FillRect(hdc, &rc, blackBrush);
 }
 
 void VideoLink::createRenderWindow(HWND parent, int x, int y, int w, int h) {
@@ -889,6 +917,9 @@ void VideoLink::createRenderWindow(HWND parent, int x, int y, int w, int h) {
     HWND hwnd = CreateWindowExW(
         0, clsName, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
         x, y, w, h, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+
+    if (hwnd)   // lets VideoLinkWndProc reach paintExposed() on WM_PAINT
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
 
     renderHwnd_.store(hwnd);
     windowVisible_.store(true);
@@ -1635,6 +1666,8 @@ void VideoLink::paintFrame(const cv::Mat& frame) {
     if (destW <= 0 || destH <= 0)
         return;
 
+    std::lock_guard<std::mutex> paintLock(paintMutex_);   // see paintExposed()
+
     // ── Off-screen back buffer ───────────────────────────────────────
     // Composite background + banner into an off-screen memory DC first,
     // then copy the finished result to the screen with one BitBlt --
@@ -1811,6 +1844,7 @@ void VideoLink::paintNoSignalFrame() {
     if (!GetClientRect(hwnd, &rc))
         return;
 
+    std::lock_guard<std::mutex> paintLock(paintMutex_);   // see paintExposed()
     static HBRUSH noSignalBrush = CreateSolidBrush(RGB(90, 0, 0));
     FillRect(hdc, &rc, noSignalBrush);
 

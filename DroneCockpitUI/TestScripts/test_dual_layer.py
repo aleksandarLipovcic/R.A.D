@@ -6,7 +6,7 @@
 #   UT-LAYER-002  Switch time from a source change is < 2 s at the UI rate
 #   UT-LAYER-003  DualLayerPanel: one face visible, feed routing, hidden hook
 #   UT-LAYER-004  RadioAttitudePanel: tilt alarms, stale, link footer
-#   UT-LAYER-005  RadioNavPanel: home arrow, turn cue, home-not-set
+#   UT-LAYER-005  MagWidget on radio: home row + home marker on the rose
 #   UT-LAYER-006  RadioFlightPanel: link bars, stale stats, shared timer
 #   UT-LAYER-007  FCStatusWidget keeps the flight timer while hidden
 #   UT-LAYER-008  TelemetryWorker link-statistics fields
@@ -179,43 +179,45 @@ def test_attitude_panel_stale(host):
 
 
 # ---------------------------------------------------------------------------
-# UT-LAYER-005  RadioNavPanel
+# UT-LAYER-005  Magnetometer: one widget for both links, home on the rose
 # ---------------------------------------------------------------------------
-def test_nav_panel_home(host):
-    from radio_panels import RadioNavPanel
-    p = _mount(host, RadioNavPanel(host))
-    p.update_radio(_radio(yaw=0.0))            # home due east, nose north
-    assert p._rows["dist"].cget("text") == "420 m"
-    assert p._rows["brg"].cget("text") == "090°"
-    assert p._rows["turn"].cget("text") == "R 90°"
-    assert p._home_rel == pytest.approx(90.0)
-
-    p.update_radio(_radio(yaw=85.0))
-    assert p._rows["turn"].cget("text") == "ON COURSE"
-
-    p.update_radio(_radio(gps_dist_to_home_m=2500.0))
-    assert p._rows["dist"].cget("text") == "2.50 km"
+def _mag(host):
+    from MagWidget import MagWidget
+    host.geometry("720x320")
+    return _mount(host, MagWidget(host, on_mag_calibrate=lambda: None,
+                                  on_acc_calibrate=lambda: None))
 
 
-def test_nav_panel_home_not_set(host):
-    from radio_panels import RadioNavPanel
-    p = _mount(host, RadioNavPanel(host))
-    p.update_radio(_radio(home_set=False))
-    assert p._home_rel is None
-    assert p._rows["dist"].cget("text") == "HOME NOT SET"
-    assert p._rows["brg"].cget("text") == "---"
+def _rose_texts(w):
+    cv = w._tier_widgets["rose"]
+    return [cv.itemcget(i, "text") for i in cv.find_all() if cv.type(i) == "text"]
 
 
-def test_nav_panel_heading_readout_and_cal_buttons(host):
-    from radio_panels import RadioNavPanel
-    p = _mount(host, RadioNavPanel(host))
-    p.update_radio(_radio(yaw=214.0))
-    assert p._hdg_lbl.cget("text") == "214.0° SW"
-    assert "RADIO" in p._status.cget("text")
-    assert all(b.cget("state") == "disabled" for b in p._cal_btns)
-    assert "USB ONLY" in p._cal_btns[0].cget("text")
-    p.update_radio(_radio(armed=True))
-    assert "DISARM FIRST" in p._cal_btns[0].cget("text")
+def test_mag_radio_home_row_replaces_bars(host):
+    w = _mag(host)
+    w.update_mag(_radio(yaw=0.0, mag_heading_deg=0.0))
+    host.update()
+    assert w._current_tier == "full"
+    assert w._bottom_is_home
+    assert not w._tier_widgets["bars_frame"].winfo_ismapped()
+    txt = w._tier_widgets["home_lbl"].cget("text")
+    assert "HOME 420 m" in txt and "BRG 090°" in txt and "TURN R 90°" in txt
+    assert w._home_bearing == 90
+    assert "H" in _rose_texts(w)            # home marker on the rose
+
+    w.update_mag(_frame("USB"))             # back on USB: bars again
+    host.update()
+    assert not w._bottom_is_home
+    assert w._tier_widgets["bars_frame"].winfo_ismapped()
+
+
+def test_mag_radio_home_not_set(host):
+    w = _mag(host)
+    w.update_mag(_radio(home_set=False))
+    host.update()
+    assert w._home_bearing is None
+    assert "HOME NOT SET" in w._tier_widgets["home_lbl"].cget("text")
+    assert "H" not in _rose_texts(w)
 
 
 # ---------------------------------------------------------------------------
@@ -264,3 +266,19 @@ def test_worker_radio_link_fields_defaults():
     assert d["elrs_link_stats_valid"] is False
     assert d["age_link_stats_ms"] == -1
     assert d["home_set"] is False
+
+
+# ---------------------------------------------------------------------------
+# UT-LAYER-009  Attitude footer toggle shared between the two IMU faces
+# ---------------------------------------------------------------------------
+def test_attitude_footer_toggle_shared(host):
+    from radio_panels import RadioAttitudePanel
+    var = tk.BooleanVar(host, value=False)
+    p = _mount(host, RadioAttitudePanel(host, latency_var=var))
+    p.update_radio(_radio())
+    host.update()
+    assert not p._foot_frame.winfo_ismapped()
+    var.set(True)                   # e.g. toggled on the USB IMU face
+    p.update_radio(_radio())
+    host.update()
+    assert p._foot_frame.winfo_ismapped()

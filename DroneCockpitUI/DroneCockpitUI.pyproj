@@ -60,6 +60,7 @@
     <Compile Include="radio_link_indicator.py" />
     <Compile Include="link_mode.py" />
     <Compile Include="dual_layer.py" />
+    <Compile Include="ui_perf.py" />
     <Compile Include="radio_panels.py" />
     <Compile Include="osd_overlay_controls.py" />
     <Compile Include="prefetch_tiles.py" />

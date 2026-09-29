@@ -1,24 +1,41 @@
 # Dual-layer panels — a USB face and a radio face per slot
 
 **Files:** `dual_layer.py` (`DualLayerPanel`, `LayerSwitch`),
-`radio_panels.py` (`RadioAttitudePanel`, `RadioNavPanel`,
-`RadioFlightPanel`), wiring in `DroneCockpitUI.py`
+`radio_panels.py` (`RadioAttitudePanel`, `RadioFlightPanel`), wiring in `DroneCockpitUI.py`
 (`_setup_ui`, `_update_link_status`, `_switch_link_layer`)
-**Tests:** `TestScripts/test_dual_layer.py` (UT-LAYER-001 … 008)
+**Tests:** `TestScripts/test_dual_layer.py` (UT-LAYER-001 … 009)
 
 ## What it does
 
-Three instrument panels have a second face designed for the ELRS radio
-link. When the telemetry source changes, **every panel swaps face in place
+Two instrument panels have a second face designed for the ELRS radio
+link, and a third, the magnetometer, adapts in place (see below). When the telemetry source changes, **every panel swaps face in place
 within about one second**. Position, size, z-order, visibility and the
 saved layout profile stay exactly as they were, so neither the pilot nor
 the operator has to reselect or rearrange anything.
 
 | Panel slot | USB face (cable, MSP) | Radio face (ELRS, CRSF) |
 |---|---|---|
-| `imu` | `IMUWidget`: rotation, G-force, angles, heading drift, MSP latency | `RadioAttitudePanel`: large ROLL / PITCH / HEADING with the same tilt alarms (amber ≥ 15°, flashing red ≥ 30°), plus attitude age, attitude frame rate, uplink LQ and RSSI |
-| `mag` | `MagWidget`: magnetometer rose, raw XYZ field, calibration | `RadioNavPanel`: same layout as the USB magnetometer. A heading-up compass rose with a cyan **HOME** arrow, a large auto-sized FC heading readout and status line, HOME distance / bearing / **TURN L/R** cue / ground speed / altitude, and the CAL MAG / CAL GYRO buttons in the same place (disabled: "USB ONLY", or "DISARM FIRST" while armed) |
+| `imu` | `IMUWidget`: rotation, G-force, angles, heading drift, MSP latency | `RadioAttitudePanel`: large ROLL / PITCH / HEADING with the same tilt alarms (amber ≥ 15°, flashing red ≥ 30°); footer with attitude age, frame rate, uplink LQ and RSSI behind the ⏱ toggle (off by default, one setting shared with the USB face's "Link latency") |
+| `mag` | `MagWidget` | **the same `MagWidget`** — no separate face (see below) |
 | `fc_status` | `FCStatusWidget`: arm/mode, battery, timer, sensors, CPU/loop/I2C, motors, RC | `RadioFlightPanel`: arm/mode, battery, the same flight timer, full **ELRS link statistics** (uplink/downlink LQ, RSSI per antenna, SNR, TX power, RF mode), frame rates, link-lost / reconnect / CRC counters |
+
+**Magnetometer — one widget for both links.** A separate radio face was
+tried and dropped: the pilot should see the *same* compass rose and heading
+readout on both links, with the same responsive layouts (the heading box
+moves beside the rose when there is room). On the radio link `MagWidget`:
+
+- shows the FC heading ("FC HEADING · RADIO", status "FC HDG · RADIO" or
+  STALE);
+- draws a cyan **H** arrow towards home on the rose (on USB too, whenever
+  the FC reports a home point);
+- in the full layout, replaces the raw-field bar row (no raw
+  magnetometer over CRSF) with a **HOME / NAVIGATION** row: distance,
+  bearing, TURN L/R, ground speed, altitude — or **HOME NOT SET** until
+  the drone is armed with a usable GPS fix;
+- keeps both calibration buttons in place but disabled ("USB ONLY", or
+  "DISARM FIRST" while armed).
+
+Only the panel title changes ("RADIO — Heading & Home").
 
 The other panels (ADI, altitude/VSI, GPS map, arming checklist, FPV) carry
 the same kind of data on both links. They stay single-face and adapt
@@ -37,7 +54,7 @@ LayerSwitch.observe(source, now) ── True once the new source has held for LA
         │
         ▼
 DroneCockpitApp._switch_link_layer(radio)
-        ├─ DualLayerPanel.show_radio(radio)   × imu, mag, fc_status  (grid swap)
+        ├─ DualLayerPanel.show_radio(radio)   × imu, fc_status       (grid swap)
         └─ DraggablePanel.set_title(...)       × imu, mag, fc_status
 ```
 
@@ -90,7 +107,7 @@ Everything comes from the normal `ui_data` frame. On ELRS,
 `radio_link_lost_count`, `radio_reconnect_count`, `radio_crc_errors` and
 `home_set`. On USB they are zero/False.
 
-`RadioNavPanel` uses the home point that `CrsfStateMapper` computes at
+`MagWidget` uses the home point that `CrsfStateMapper` computes at
 arming (`gps_dist_to_home_m`, `gps_bearing_to_home`, `home_set`). Before
 arming with a usable GPS fix it shows **HOME NOT SET**.
 
