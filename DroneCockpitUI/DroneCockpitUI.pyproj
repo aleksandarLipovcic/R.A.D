@@ -113,6 +113,15 @@
     <Compile Include="TestScripts\msp_probe.py">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="TestScripts\radio_sniff.py">
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="TestScripts\test_link_mode.py">
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="TestScripts\test_dual_layer.py">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="TestScripts\sv_baud_probe.py">
       <SubType>Code</SubType>
     </Compile>
