@@ -866,13 +866,13 @@ static LRESULT CALLBACK VideoLinkWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         ValidateRect(hwnd, nullptr);
         auto* self = reinterpret_cast<VideoLink*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         if (dirty && self)
-            self->paintExposed(rc);
+            self->paintExposed(rc.left, rc.top, rc.right, rc.bottom);
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-void VideoLink::paintExposed(const RECT& rc) {
+void VideoLink::paintExposed(int left, int top, int right, int bottom) {
     // With live video, the next frame (<= ~33 ms) repaints the whole
     // window; drawing here too would only fight the capture thread.
     const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -885,6 +885,7 @@ void VideoLink::paintExposed(const RECT& rc) {
     if (!hdc)
         return;
     static HBRUSH blackBrush = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+    const RECT rc{ left, top, right, bottom };
     FillRect(hdc, &rc, blackBrush);
 }
 

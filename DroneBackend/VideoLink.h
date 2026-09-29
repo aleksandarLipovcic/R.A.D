@@ -536,7 +536,8 @@ public:
     // moved over it. Without this, uncovered areas kept stale pixels --
     // visible as "ghost" border lines across the FPV panel while resizing
     // with no live video. With live video the next frame covers it anyway.
-    void paintExposed(const RECT& rc);
+    // (Plain ints: this header deliberately avoids <windows.h> / RECT.)
+    void paintExposed(int left, int top, int right, int bottom);
 private:
 
     // Attempts to re-open the current capture device and read one frame.
