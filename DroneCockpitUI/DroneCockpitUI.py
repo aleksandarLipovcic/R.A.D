@@ -226,6 +226,7 @@ def _vlog(msg: str) -> None:
 # independently of this value.
 #
 UI_REFRESH_MS  = 20          # ~50 Hz Tk pump — keeps UI snappy
+UI_MIN_IDLE_MS = 5           # minimum gap between ticks, for Tk repaint/idle work
 RECONNECT_MS   = 2000
 
 # ELRS radio link: battery pack cell count. CrsfLink otherwise guesses it
@@ -405,16 +406,20 @@ _DEFAULT_PROFILE_NAME = "Default"
 
 # ── Per-widget throttle divisors (frames between updates) ────────────────────
 #   1 = every Tk pump cycle, 3 = every third, etc.
+#   Rates are chosen per instrument (50 Hz pump): what moves fast and matters
+#   in flight (attitude) gets 25 Hz; numbers a human reads get ~10-17 Hz;
+#   the pre-flight checklist 5 Hz. Updating text faster than ~10 Hz only
+#   costs CPU — nobody can read it — and starves Tk's repaint work.
 _THROTTLE = {
-    "imu":       1,
-    "baro":      1,
-    "fc_status": 1,
-    "arming":    1,
-    "mag":       1,
+    "imu":       2,   # 25 Hz
+    "baro":      2,   # 25 Hz — altitude tape / VSI
+    "fc_status": 5,   # 10 Hz
+    "arming":    10,  #  5 Hz
+    "mag":       3,   # ~17 Hz — compass redraws only when the heading moves
     "fpv":       5,   # status/FPS text only now — video itself is painted natively
                        # by VideoLink outside the Tk pump entirely, so this just
                        # needs to be readable (~10 Hz at a 20 ms pump), not fast
-    "adi":       3,   # 3-D canvas — heavy redraw, 17 Hz is plenty
+    "adi":       2,   # 25 Hz — the primary flight instrument
     "gps":       5,   # map widget — heaviest, 10 Hz is plenty
 }
 
@@ -651,6 +656,16 @@ class DraggablePanel(tk.Frame):
         self._right_edge.bind("<B1-Motion>",      self._resize_h)
         self._bottom_edge.bind("<ButtonPress-1>", self._resize_start)
         self._bottom_edge.bind("<B1-Motion>",     self._resize_v)
+        for w_ in (self._grip, self._right_edge, self._bottom_edge):
+            w_.bind("<ButtonRelease-1>", self._resize_end)
+
+        # Pointer motion is batched: every <B1-Motion> only records the
+        # target geometry, and one timer applies it (~30 Hz). Applying on
+        # every event re-laid-out the whole panel dozens to hundreds of
+        # times a second and made dragging/resizing feel stuck.
+        self._pending_xy = None
+        self._pending_wh = None
+        self._geom_job   = None
 
     # =========================================================================
     # Z-order
@@ -705,6 +720,43 @@ class DraggablePanel(tk.Frame):
     def _set_xy(self, x, y):
         self._ws.coords(self._item, x, y)
 
+    _GEOM_APPLY_MS = 33
+
+    def _queue_geometry(self, xy=None, wh=None):
+        if xy is not None:
+            self._pending_xy = xy
+        if wh is not None:
+            self._pending_wh = (max(MIN_PANEL_W, wh[0]), max(MIN_PANEL_H, wh[1]))
+        if self._geom_job is None:
+            self._geom_job = self.after(self._GEOM_APPLY_MS, self._flush_geometry)
+
+    def _flush_geometry(self):
+        """Apply the latest queued position/size (and refresh snap guides)."""
+        if self._geom_job is not None:
+            try:
+                self.after_cancel(self._geom_job)
+            except Exception:
+                pass
+            self._geom_job = None
+        moved = self._pending_xy is not None
+        if moved:
+            self._set_xy(*self._pending_xy)
+            self._pending_xy = None
+        if self._pending_wh is not None:
+            self._set_wh(*self._pending_wh)
+            self._pending_wh = None
+        if moved:
+            self._draw_snap_guides()
+
+    def _target_xywh(self):
+        """Geometry including not-yet-applied pointer motion."""
+        x, y, w, h = self._get_xywh()
+        if self._pending_xy is not None:
+            x, y = self._pending_xy
+        if self._pending_wh is not None:
+            w, h = self._pending_wh
+        return x, y, w, h
+
     # =========================================================================
     # Drag with snap guides
     # =========================================================================
@@ -719,12 +771,12 @@ class DraggablePanel(tk.Frame):
         dx = event.x_root - self._drag_x
         dy = event.y_root - self._drag_y
         self._drag_x, self._drag_y = event.x_root, event.y_root
-        cx, cy, cw, ch = self._get_xywh()
-        self._ws.coords(self._item, cx + dx, cy + dy)
-        self._draw_snap_guides()
+        cx, cy, cw, ch = self._target_xywh()
+        self._queue_geometry(xy=(cx + dx, cy + dy))
 
     def _drag_end(self, event):
         if self._locked_ref[0]: return
+        self._flush_geometry()
         self._apply_snap()
         self._clear_snap_guides()
 
@@ -852,22 +904,26 @@ class DraggablePanel(tk.Frame):
         dx = event.x_root - self._drag_x
         dy = event.y_root - self._drag_y
         self._drag_x, self._drag_y = event.x_root, event.y_root
-        cw, ch = self._get_wh()
-        self._set_wh(cw + dx, ch + dy)
+        _, _, cw, ch = self._target_xywh()
+        self._queue_geometry(wh=(cw + dx, ch + dy))
 
     def _resize_h(self, event):
         if self._locked_ref[0]: return
         dx = event.x_root - self._drag_x
         self._drag_x = event.x_root
-        cw, ch = self._get_wh()
-        self._set_wh(cw + dx, ch)
+        _, _, cw, ch = self._target_xywh()
+        self._queue_geometry(wh=(cw + dx, ch))
 
     def _resize_v(self, event):
         if self._locked_ref[0]: return
         dy = event.y_root - self._drag_y
         self._drag_y = event.y_root
-        cw, ch = self._get_wh()
-        self._set_wh(cw, ch + dy)
+        _, _, cw, ch = self._target_xywh()
+        self._queue_geometry(wh=(cw, ch + dy))
+
+    def _resize_end(self, event):
+        if self._locked_ref[0]: return
+        self._flush_geometry()
 
     # =========================================================================
     # Context menu
@@ -3317,12 +3373,26 @@ class DroneCockpitApp:
     # Update loop  —  Tk main thread only
     # =========================================================================
 
+    def _reschedule_update(self, t0: float) -> None:
+        """
+        Fixed-rate pump: aim for one tick every UI_REFRESH_MS measured from
+        the START of this tick (the old code waited UI_REFRESH_MS after the
+        work, so a 19 ms tick made the real rate ~25 Hz). Always leave at
+        least UI_MIN_IDLE_MS so Tk can run its idle work — repainting moved
+        or resized panels happens there, and starving it is what left ghost
+        images on screen and made dragging feel sluggish.
+        """
+        spent_ms = (time.monotonic() - t0) * 1000.0
+        delay = max(UI_MIN_IDLE_MS, int(UI_REFRESH_MS - spent_ms))
+        self._update_job = self.root.after(delay, self._update_loop)
+
     def _schedule_update(self) -> None:
         if self._update_job is None:
             self._update_job = self.root.after(UI_REFRESH_MS, self._update_loop)
 
     def _update_loop(self) -> None:
         self._update_job = None
+        t0 = time.monotonic()
 
         # ── FPV status/FPS text — independent of telemetry connection state ──
         # This runs every pump tick's throttle check regardless of whether
@@ -3346,14 +3416,14 @@ class DroneCockpitApp:
         # No live source (neither USB nor ELRS): instruments keep their last
         # values; the red radio indicator / USB label explain the situation.
         if not self._worker.is_connected:
-            self._update_job = self.root.after(UI_REFRESH_MS, self._update_loop)
+            self._reschedule_update(t0)
             return
 
         # ── Drain queue — get the freshest frame only ─────────────────────────
         ui_data = self._worker.get_frame()
         if ui_data is None:
             # Worker is alive but no new frame this tick — reschedule and yield
-            self._update_job = self.root.after(UI_REFRESH_MS, self._update_loop)
+            self._reschedule_update(t0)
             return
 
         # ── Feed widgets with per-widget throttling ───────────────────────────
@@ -3407,7 +3477,7 @@ class DroneCockpitApp:
             self._frame_counters["gps"] = 0
             self.gps_view.update_gps(ui_data)
 
-        self._update_job = self.root.after(UI_REFRESH_MS, self._update_loop)
+        self._reschedule_update(t0)
 
     # =========================================================================
     # Clean shutdown

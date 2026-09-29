@@ -17,7 +17,7 @@ the operator has to reselect or rearrange anything.
 | Panel slot | USB face (cable, MSP) | Radio face (ELRS, CRSF) |
 |---|---|---|
 | `imu` | `IMUWidget`: rotation, G-force, angles, heading drift, MSP latency | `RadioAttitudePanel`: large ROLL / PITCH / HEADING with the same tilt alarms (amber ≥ 15°, flashing red ≥ 30°), plus attitude age, attitude frame rate, uplink LQ and RSSI |
-| `mag` | `MagWidget`: magnetometer rose, raw XYZ field, calibration | `RadioNavPanel`: heading-up compass with a cyan **HOME** arrow, plus HDG, distance and bearing to home, **TURN L/R** cue, ground speed, altitude |
+| `mag` | `MagWidget`: magnetometer rose, raw XYZ field, calibration | `RadioNavPanel`: same layout as the USB magnetometer. A heading-up compass rose with a cyan **HOME** arrow, a large auto-sized FC heading readout and status line, HOME distance / bearing / **TURN L/R** cue / ground speed / altitude, and the CAL MAG / CAL GYRO buttons in the same place (disabled: "USB ONLY", or "DISARM FIRST" while armed) |
 | `fc_status` | `FCStatusWidget`: arm/mode, battery, timer, sensors, CPU/loop/I2C, motors, RC | `RadioFlightPanel`: arm/mode, battery, the same flight timer, full **ELRS link statistics** (uplink/downlink LQ, RSSI per antenna, SNR, TX power, RF mode), frame rates, link-lost / reconnect / CRC counters |
 
 The other panels (ADI, altitude/VSI, GPS map, arming checklist, FPV) carry

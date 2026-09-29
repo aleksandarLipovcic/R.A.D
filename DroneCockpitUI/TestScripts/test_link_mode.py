@@ -368,3 +368,40 @@ def test_baro_source_tag(host, overrides, expected):
         else _frame("ELRS", **overrides)
     w.update_baro(frame)
     assert w._src_lbl.cget("text") == expected
+
+
+# ---------------------------------------------------------------------------
+# UT-LINK-010  Calibration refused while armed (USB magnetometer)
+# ---------------------------------------------------------------------------
+def test_mag_calibration_disabled_while_armed(host):
+    from MagWidget import MagWidget
+    calls = []
+    w = _mount(host, MagWidget(host, on_mag_calibrate=lambda: calls.append("mag"),
+                               on_acc_calibrate=lambda: calls.append("acc")))
+    w.update_mag(_frame("USB", armed=True))
+    host.update()
+    assert w._tier_widgets["mag_btn"].cget("state") == "disabled"
+    assert "DISARM" in w._tier_widgets["mag_btn"].cget("text")
+    w._on_mag_cal_pressed()
+    assert calls == []
+    w.update_mag(_frame("USB", armed=False))
+    host.update()
+    assert w._tier_widgets["mag_btn"].cget("state") == "normal"
+
+
+# ---------------------------------------------------------------------------
+# UT-LINK-011  IMU latency footer: hidden by default, toggle works
+# ---------------------------------------------------------------------------
+def test_imu_latency_footer_toggle(host):
+    from IMUWidget import IMUWidget
+    w = _mount(host, IMUWidget(host))
+    w.update_ui(_frame("USB"))
+    host.update()
+    assert not w._diag_visible
+    w._show_latency.set(True)
+    w._on_latency_toggle()
+    host.update()
+    assert w._diag_visible
+    w._show_latency.set(False)
+    w._on_latency_toggle()
+    assert not w._diag_visible

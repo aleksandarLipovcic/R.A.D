@@ -4,6 +4,22 @@ import math
 
 import link_mode
 
+# Pixel extent (width, linespace) of the worst-case heading string per font
+# size. Measuring needs a Tk font object, and creating one is slow — the two
+# font-fit searches below used to create ~12 of them per update at 50 Hz.
+# The result only depends on the size, so measure each size once.
+_EXTENT_CACHE: dict = {}
+_EXTENT_TEXT = "270.0° NW"
+
+
+def _hdg_text_extent(size: int) -> tuple:
+    ext = _EXTENT_CACHE.get(size)
+    if ext is None:
+        font = tkfont.Font(family="Consolas", size=size, weight="bold")
+        ext = (font.measure(_EXTENT_TEXT), font.metrics("linespace"))
+        _EXTENT_CACHE[size] = ext
+    return ext
+
 
 class MagWidget(tk.Frame):
     """
@@ -157,6 +173,9 @@ class MagWidget(tk.Frame):
         self._last_heading  = 0.0
         self._valid         = False
         self._radio         = False   # ELRS link feeding the widget
+        self._armed         = False   # calibration is refused while armed
+        self._last_drawn    = None    # what the rose/readout currently show
+        self._last_bars     = None
         self._stale_ms      = 0       # heading age when stale (radio only)
         self._on_mag_cal    = on_mag_calibrate
         self._on_acc_cal    = on_acc_calibrate
@@ -574,9 +593,7 @@ class MagWidget(tk.Frame):
 
         while lo <= hi:
             mid  = (lo + hi) // 2
-            font = tkfont.Font(family="Consolas", size=mid, weight="bold")
-            text_w = font.measure(test_text)
-            text_h = font.metrics("linespace")
+            text_w, text_h = _hdg_text_extent(mid)
             if text_w <= available_w and text_h <= available_h:
                 best = mid
                 lo   = mid + 1
@@ -822,9 +839,8 @@ class MagWidget(tk.Frame):
         best = lo
         while lo <= hi:
             mid  = (lo + hi) // 2
-            font = tkfont.Font(family="Consolas", size=mid, weight="bold")
-            if font.measure(test_text) <= avail_w and \
-               font.metrics("linespace") <= avail_h:
+            text_w, text_h = _hdg_text_extent(mid)
+            if text_w <= avail_w and text_h <= avail_h:
                 best = mid
                 lo = mid + 1
             else:
@@ -1004,6 +1020,8 @@ class MagWidget(tk.Frame):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _on_mag_cal_pressed(self):
+        if self._armed or self._radio:
+            return          # belt and braces: the button is disabled anyway
         if self._on_mag_cal:
             self._on_mag_cal()
         btn = self._tier_widgets.get("mag_btn")
@@ -1011,6 +1029,8 @@ class MagWidget(tk.Frame):
             btn.config(state="disabled", text="⊕  CALIBRATING MAG…")
 
     def _on_acc_cal_pressed(self):
+        if self._armed or self._radio:
+            return
         if self._on_acc_cal:
             self._on_acc_cal()
         btn = self._tier_widgets.get("acc_btn")
@@ -1033,6 +1053,7 @@ class MagWidget(tk.Frame):
         acc_cal_rem = data.get("acc_cal_seconds_remaining",  0)
 
         self._radio        = link_mode.is_radio(data)
+        self._armed        = bool(data.get("armed", False))
         self._stale_ms     = link_mode.stale_ms(data, "attitude") if self._radio else 0
         self._valid        = valid
         self._last_heading = heading
@@ -1043,10 +1064,20 @@ class MagWidget(tk.Frame):
         if tier != self._current_tier:
             self._build_tier(tier)
             self._current_tier = tier
+            self._last_drawn = None
 
-        self._draw_rose()
-        self._draw_bars(mx, my, mz)
-        self._update_readout_widgets(heading, valid)
+        # Redraw only what changed (performance: this widget is updated at
+        # the full UI rate, but the heading usually moves far slower).
+        rose_key = (round(heading, 1), valid, self._radio, bool(self._stale_ms),
+                    tier, w, h)
+        if rose_key != self._last_drawn:
+            self._last_drawn = rose_key
+            self._draw_rose()
+            self._update_readout_widgets(heading, valid)
+        bars_key = (mx, my, mz, self._radio, tier)
+        if bars_key != self._last_bars:
+            self._last_bars = bars_key
+            self._draw_bars(mx, my, mz)
         self._update_mag_cal_ui(mag_cal_act, mag_cal_rem)
         self._update_acc_cal_ui(acc_cal_act, acc_cal_rem)
 
@@ -1065,7 +1096,10 @@ class MagWidget(tk.Frame):
                     text=f"Rotate on all axes — {seconds_remaining:2d}s",
                     fg=self.C_WARN)
         else:
-            if mag_btn and self._radio:
+            if mag_btn and self._armed:
+                mag_btn.config(state="disabled", text="⊕  CAL MAG: DISARM FIRST",
+                               disabledforeground=self.C_WARN)
+            elif mag_btn and self._radio:
                 mag_btn.config(state="disabled",
                                text="⊕  CAL MAG: " + link_mode.NA_LONG,
                                disabledforeground=link_mode.C_NA_FG)
@@ -1088,7 +1122,10 @@ class MagWidget(tk.Frame):
                     text=f"Keep level & still — {seconds_remaining:2d}s",
                     fg=self.C_BTN_ACC_FG)
         else:
-            if acc_btn and self._radio:
+            if acc_btn and self._armed:
+                acc_btn.config(state="disabled", text="⊕  CAL GYRO: DISARM FIRST",
+                               disabledforeground=self.C_WARN)
+            elif acc_btn and self._radio:
                 acc_btn.config(state="disabled",
                                text="⊕  CAL GYRO: " + link_mode.NA_LONG,
                                disabledforeground=link_mode.C_NA_FG)

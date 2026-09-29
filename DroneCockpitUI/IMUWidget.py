@@ -130,6 +130,10 @@ class IMUWidget(tk.Frame):
         self._last_data        = {}
 
         self._radio         = False   # True while the ELRS link feeds us
+        # Latency / link footer (RTT, one-way, FC cycle — or attitude age /
+        # rate / LQ on radio). Off by default: constantly changing numbers
+        # distract the pilot. One setting shared by every layout tier.
+        self._show_latency  = tk.BooleanVar(self, value=False)
 
         self._current_tier  = None
         self._tier_widgets  = {}
@@ -271,6 +275,11 @@ class IMUWidget(tk.Frame):
         diag = self._tier_widgets.get("diag")
         if diag is None:
             return
+        if not self._show_latency.get():
+            if self._diag_visible:
+                diag.grid_forget()
+                self._diag_visible = False
+            return
 
         if total_h is None:
             total_h = self.winfo_height()
@@ -379,11 +388,9 @@ class IMUWidget(tk.Frame):
         col = 0
 
         if full:
-            show_diag = tk.BooleanVar(value=True)
-            self._tier_widgets["show_diag"] = show_diag
             chk = tk.Checkbutton(
                 hdr, text="Link latency",
-                variable=show_diag,
+                variable=self._show_latency,
                 command=self._on_latency_toggle,
                 font=("Consolas", 8),
                 fg=self.C_LABEL, bg=self.C_HEADER_BG,
@@ -393,6 +400,22 @@ class IMUWidget(tk.Frame):
                 bd=0, highlightthickness=0,
             )
             chk.grid(row=0, column=col, padx=(8, 4), pady=4)
+            col += 1
+        else:
+            # Narrower tiers: a compact toggle for the same setting
+            lat_btn = tk.Checkbutton(
+                hdr, text="⏱", indicatoron=False,
+                variable=self._show_latency,
+                command=self._on_latency_toggle,
+                font=("Consolas", 8), width=2,
+                fg=self.C_LABEL, bg=self.C_HEADER_BG,
+                selectcolor="#1e3a50",
+                activebackground=self.C_HEADER_BG,
+                activeforeground=self.C_NEUTRAL,
+                bd=0, highlightthickness=0,
+            )
+            lat_btn.grid(row=0, column=col, padx=(6, 2), pady=4)
+            self._tier_widgets["lat_btn"] = lat_btn
             col += 1
 
         adj_btn = tk.Button(
@@ -525,17 +548,9 @@ class IMUWidget(tk.Frame):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _on_latency_toggle(self):
-        show_var = self._tier_widgets.get("show_diag")
-        if show_var is None:
-            return
-        diag = self._tier_widgets.get("diag")
-        if diag is None:
-            return
-        if show_var.get():
-            self._refit_diag()
-        else:
-            diag.grid_forget()
-            self._diag_visible = False
+        # _refit_diag() shows the footer if the setting is on and it fits,
+        # and hides it otherwise.
+        self._refit_diag()
 
     # ══════════════════════════════════════════════════════════════════════════
     # Heading adjust + heading-button flash
@@ -748,8 +763,7 @@ class IMUWidget(tk.Frame):
 
         # ── Diag panel ────────────────────────────────────────────────────────
         if self._diag_visible:
-            show_var = self._tier_widgets.get("show_diag")
-            if (show_var is None or show_var.get()) and radio:
+            if radio:
                 att_age = link_mode.age_ms(data, "attitude")
                 rate    = float(data.get("rate_attitude_hz", 0.0))
                 lq      = int(data.get("rc_link_quality", -1))
@@ -761,7 +775,7 @@ class IMUWidget(tk.Frame):
                 if ol: ol.config(text=f"{rate:>6.1f} Hz", fg=self.C_NEUTRAL)
                 if cl: cl.config(text=f"{lq:>6d} %" if lq >= 0 else "  --- %",
                                  fg=self.C_NEUTRAL)
-            elif show_var is None or show_var.get():
+            else:
                 rtt      = data.get("rtt_ms",      0.0)
                 fc_cycle = data.get("fc_cycle_ms", 0.0)
                 rl = self._tier_widgets.get("rtt_lbl")

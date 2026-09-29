@@ -16,6 +16,7 @@ small tightly-related group of files) in detail.
 |---|---|
 | [frontend/app-shell.md](frontend/app-shell.md) | `DroneCockpitUI.py` — `DroneCockpitApp`: startup sequence, the draggable panel workspace, `LayoutStore`/`LayoutManagerDialog`, the two telemetry trampolines, the Tk update loop, reconnect handling, shutdown |
 | [frontend/workers.md](frontend/workers.md) | `telemetry_worker.py`, `video_worker.py`, `detection_worker.py` — the three background daemon threads that bridge the C++ link objects to the Tk thread; `TelemetryWorker` picks USB (`DroneLink`) or ELRS (`CrsfLink`) per poll |
+| [frontend/ui-performance.md](frontend/ui-performance.md) | How the Tk thread is kept free: fixed-rate pump, per-instrument rates, redraw-only-on-change, batched drag/resize, bounded tile downloads — with before/after measurements |
 | [frontend/dual-layer.md](frontend/dual-layer.md) | `dual_layer.py`, `radio_panels.py` — the IMU, Magnetometer and FC Status panels swap to a dedicated radio-link face in place, within about 1 s of the telemetry source changing |
 | [frontend/link-mode.md](frontend/link-mode.md) | `link_mode.py` — how every instrument adapts to the USB cable vs the ELRS radio link (placeholders, stale data, unverifiable checks) |
 | [frontend/radio-link-indicator.md](frontend/radio-link-indicator.md) | `radio_link_indicator.py` — toolbar traffic light for the ELRS radio link + active-source tag |

@@ -33,6 +33,7 @@ import threading
 import queue
 import urllib.request
 import base64
+import time
 
 import link_mode
 
@@ -243,7 +244,10 @@ class _SatPanel(tk.Frame):
         self._cv.yview_scroll(int(-event.delta / 120), "units")
 
     def update_satellites(self, sv_list: list, note: str = None):
-        self._sv_data = sv_list or []
+        sv_list = sv_list or []
+        if sv_list == self._sv_data and note == self._note:
+            return              # nothing changed — skip the table rebuild
+        self._sv_data = sv_list
         self._note    = note
         self._redraw()
 
@@ -359,6 +363,8 @@ class _MapCanvas(tk.Frame):
       large pulsing banner centred in the visible map strip.
     """
     TILE_SIZE = 256
+    _TILE_WORKERS     = 4      # concurrent tile downloads
+    _TILE_RETRY_S     = 30.0   # a failed tile is not retried before this
     _OSM_URL  = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
     _UA       = "DroneCockpitGCS/1.0 (github educational project)"
     _ROSE_R   = 36
@@ -376,8 +382,22 @@ class _MapCanvas(tk.Frame):
         self._tile_img   = {}
         self._tile_queue = queue.Queue()
         self._tile_pend  = set()
+        self._tile_fail  = {}            # key -> monotonic time of last failure
+        self._tile_req   = queue.Queue() # keys waiting for a download worker
         self._pan_last   = None
         self._hud        = {}
+
+        # Redraw bookkeeping (performance): every caller asks for a redraw
+        # via _request_redraw(); one idle callback does the work, and the
+        # tile layer is only rebuilt when the view actually changed.
+        self._redraw_pending = False
+        self._tile_sig       = None
+
+        # A small fixed pool of download threads instead of one new thread
+        # per missing tile per redraw (offline that was hundreds of threads a
+        # minute, all fighting the Tk thread for the GIL).
+        for _ in range(self._TILE_WORKERS):
+            threading.Thread(target=self._tile_worker, daemon=True).start()
 
         self._no_fix_pulse = False   # toggles every 600 ms for warning animation
 
@@ -408,7 +428,7 @@ class _MapCanvas(tk.Frame):
     def _pulse_no_fix(self):
         self._no_fix_pulse = not self._no_fix_pulse
         if not self._fix_valid:
-            self._redraw()
+            self._request_redraw()
         self.after(600, self._pulse_no_fix)
 
     # ── HUD height mirror ─────────────────────────────────────────────────────
@@ -487,8 +507,16 @@ class _MapCanvas(tk.Frame):
         key = (z, x, y)
         if key in self._tile_img or key in self._tile_pend:
             return
+        failed = self._tile_fail.get(key)
+        if failed is not None and time.monotonic() - failed < self._TILE_RETRY_S:
+            return                      # offline / server error: back off
         self._tile_pend.add(key)
-        threading.Thread(target=self._fetch_tile, args=(z, x, y), daemon=True).start()
+        self._tile_req.put(key)
+
+    def _tile_worker(self):
+        while True:
+            key = self._tile_req.get()
+            self._fetch_tile(*key)
 
     def _fetch_tile(self, z, x, y):
         key = (z, x, y)
@@ -499,34 +527,58 @@ class _MapCanvas(tk.Frame):
             self._tile_queue.put((key, base64.b64encode(data).decode()))
         except Exception:
             self._tile_queue.put((key, None))
-        finally:
-            self._tile_pend.discard(key)
 
     def _poll_tiles(self):
         changed = False
         try:
             while True:
                 key, b64 = self._tile_queue.get_nowait()
+                self._tile_pend.discard(key)
                 if b64:
                     self._tile_img[key] = tk.PhotoImage(data=b64)
+                    self._tile_fail.pop(key, None)
                     changed = True
+                else:
+                    self._tile_fail[key] = time.monotonic()
         except queue.Empty:
             pass
         if changed:
-            self._redraw()
+            self._request_redraw()
         self.after(250, self._poll_tiles)
 
     # ── Redraw ────────────────────────────────────────────────────────────────
 
+    def _request_redraw(self):
+        """Coalesce redraw requests: at most one redraw per idle cycle."""
+        if not self._redraw_pending:
+            self._redraw_pending = True
+            self.after_idle(self._redraw)
+
     def _redraw(self):
+        self._redraw_pending = False
         if not self.winfo_ismapped():
             return
         w = self._cv.winfo_width()
         h = self._cv.winfo_height()
         if w < 4 or h < 4:
             return
-        self._cv.delete("all")
-        self._draw_tiles(w, h)
+        cv = self._cv
+        # The tile layer only depends on the view — rebuild it only when the
+        # view (size, zoom, centre to 1/4 px, HUD height, loaded tiles)
+        # changed. Otherwise just replace the marker + HUD overlay items.
+        cx_f, cy_f = self._center_tile_f()
+        sig = (w, h, self._zoom, round(cx_f * self.TILE_SIZE * 4),
+               round(cy_f * self.TILE_SIZE * 4), self._hud_height(w, h),
+               len(self._tile_img))
+        if sig != self._tile_sig:
+            cv.delete("all")
+            self._draw_tiles(w, h)
+            cv.addtag_all("tile")
+            self._tile_sig = sig
+        else:
+            cv.addtag_all("overlay")
+            cv.dtag("tile", "overlay")
+            cv.delete("overlay")
         self._draw_marker(w, h)
         self._draw_hud(w, h)
 
@@ -1020,7 +1072,7 @@ class _MapCanvas(tk.Frame):
 
     # ── Event handlers ────────────────────────────────────────────────────────
 
-    def _on_resize(self, _): self._redraw()
+    def _on_resize(self, _): self._request_redraw()
     def _on_pan_end(self, _): self._pan_last = None
 
     def _on_pan_start(self, event):
@@ -1040,7 +1092,7 @@ class _MapCanvas(tk.Frame):
         self._center_lon = new_xf / n * 360.0 - 180.0
         self._center_lat = math.degrees(
             math.atan(math.sinh(math.pi * (1.0 - 2.0 * new_yf / n))))
-        self._redraw()
+        self._request_redraw()
 
     def _on_scroll(self, event):
         if event.delta > 0: self._zoom_in()
@@ -1051,12 +1103,12 @@ class _MapCanvas(tk.Frame):
     def _zoom_in(self):
         if self._zoom < 19:
             self._zoom += 1
-            self._redraw()
+            self._request_redraw()
 
     def _zoom_out(self):
         if self._zoom > 2:
             self._zoom -= 1
-            self._redraw()
+            self._request_redraw()
 
     def _set_center_for_drone(self, lat, lon, w, h):
         """
@@ -1082,7 +1134,7 @@ class _MapCanvas(tk.Frame):
             h = self._cv.winfo_height() or 300
             self._set_center_for_drone(self._drone_lat, self._drone_lon, w, h)
         self._auto_center = True
-        self._redraw()
+        self._request_redraw()
 
     def update_position(self, lat, lon, fix_valid):
         self._fix_valid = fix_valid
@@ -1093,11 +1145,11 @@ class _MapCanvas(tk.Frame):
                 w = self._cv.winfo_width()  or 400
                 h = self._cv.winfo_height() or 300
                 self._set_center_for_drone(lat, lon, w, h)
-        self._redraw()
+        self._request_redraw()
 
     def update_hud(self, d: dict):
         self._hud = d
-        self._redraw()
+        self._request_redraw()
 
 
 # =============================================================================

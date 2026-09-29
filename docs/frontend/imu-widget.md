@@ -78,3 +78,11 @@ On the ELRS radio link this panel switches, about 1 s after the change,
 to its radio face, `RadioAttitudePanel`. See [dual-layer.md](dual-layer.md). During
 the switch-over this widget adapts per frame as described in
 [link-mode.md](link-mode.md).
+
+## Latency footer
+
+The RTT / one-way / FC-cycle footer (attitude age / rate / LQ on the radio
+link) is **hidden by default**, because constantly changing numbers distract
+the pilot. Show it with the "Link latency" checkbox (full layout) or the ⏱
+toggle (narrower layouts). One setting is shared by all layout tiers and
+survives resizing.

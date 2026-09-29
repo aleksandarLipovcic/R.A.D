@@ -190,9 +190,15 @@ Each tick:
 
    | Widget | Rate |
    |---|---|
-   | IMU, Baro, FC Status, Arming, Mag | every tick (~50 Hz) |
-   | ADI (`Drone3DView`) | every 3rd tick (~17 Hz); also gets `source` and `stale_ms` from `link_mode` |
-   | GPS (`GPSWidget`) | every 5th tick (~10 Hz) — the heaviest, map redraw |
+   | ADI (`Drone3DView`) | every 2nd tick (25 Hz); also gets `source` and `stale_ms` from `link_mode` |
+   | IMU, Baro | every 2nd tick (25 Hz) |
+   | Mag / Heading & Home | every 3rd tick (~17 Hz) |
+   | FC Status, GPS | every 5th tick (10 Hz) |
+   | Arming | every 10th tick (5 Hz) |
+
+   The pump is fixed-rate (`_reschedule_update()`) and always leaves Tk at
+   least 5 ms of idle time for repaints. See
+   [ui-performance.md](ui-performance.md).
 
 Detection records are pumped on a **separate** `after()` job
 (`_pump_detection_records()`), only while the detection window is open —

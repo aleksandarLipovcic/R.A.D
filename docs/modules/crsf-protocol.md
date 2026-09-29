@@ -56,7 +56,7 @@ copies the first two into `RadioLinkStats::framesTotal` / `crcErrors`.
 | VARIO | `0x07` | `decodeVario` | `Vario`: vertical speed cm/s |
 | BATTERY | `0x08` | `decodeBattery` | `Battery`: V and A (0.1 resolution), mAh drawn (uint24), remaining % |
 | BARO_ALTITUDE | `0x09` | `decodeBaroAltitude` | `BaroAltitude`: cm. If bit 15 is set: coarse mode, whole metres. Otherwise: decimetres with a +10000 offset |
-| LINK_STATISTICS | `0x14` | `decodeLinkStats` | `LinkStats`: uplink RSSI ant. 1/2 (dBm, the wire stores the magnitude), LQ %, SNR, active antenna, RF mode index, TX power (enum → mW via `txPowerEnumToMw`), downlink RSSI/LQ/SNR |
+| LINK_STATISTICS | `0x14` | `decodeLinkStats` | `LinkStats`: uplink RSSI ant. 1/2 in dBm (ExpressLRS sends a **signed** byte, 0xFB = −5 dBm; the CRSF spec's unsigned magnitude, 70 = −70 dBm, is also accepted: bytes ≥ 128 are signed, < 128 a magnitude), LQ %, SNR, active antenna, RF mode index, TX power (enum → mW via `txPowerEnumToMw`), downlink RSSI/LQ/SNR |
 | ATTITUDE | `0x1E` | `decodeAttitude` | `Attitude`: pitch/roll/yaw in degrees (wire: int16 radians × 10000, order **pitch, roll, yaw**). Yaw is normalised to [0, 360); `rawYaw` is kept for bench checks |
 | FLIGHT_MODE | `0x21` | `decodeFlightMode` | null-terminated ASCII string, e.g. `"STAB"`, `"ACRO*"` |
 

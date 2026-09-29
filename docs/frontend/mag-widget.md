@@ -57,3 +57,9 @@ On the ELRS radio link this panel switches, about 1 s after the change,
 to its radio face, `RadioNavPanel` (heading & home). See [dual-layer.md](dual-layer.md). During
 the switch-over this widget adapts per frame as described in
 [link-mode.md](link-mode.md).
+
+## Calibration safety
+
+Both calibration buttons are disabled while the FC reports **armed**
+("DISARM FIRST") and on the radio link ("USB ONLY", because calibration
+commands go over the cable). The click handlers refuse in both cases too.

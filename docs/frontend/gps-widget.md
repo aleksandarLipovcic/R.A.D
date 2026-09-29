@@ -101,3 +101,11 @@ _M_TO_FT    = 3.28084    # meters -> feet
 
 On the ELRS radio link this widget changes what it shows. See
 [link-mode.md](link-mode.md) for the exact behaviour.
+
+## Map redraw and tile downloads (performance)
+
+All map redraw requests are merged into one idle-time redraw
+(`_request_redraw()`). The tile layer is only rebuilt when the view changes.
+Tiles are downloaded by a fixed pool of 4 threads, and failed tiles are
+retried after 30 s at the earliest. See
+[ui-performance.md](ui-performance.md).

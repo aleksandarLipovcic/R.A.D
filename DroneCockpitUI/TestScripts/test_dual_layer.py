@@ -202,10 +202,20 @@ def test_nav_panel_home_not_set(host):
     p = _mount(host, RadioNavPanel(host))
     p.update_radio(_radio(home_set=False))
     assert p._home_rel is None
-    assert p._rows["dist"].cget("text") == "---"
-    texts = [p._cv.itemcget(i, "text") for i in p._cv.find_all()
-             if p._cv.type(i) == "text"]
-    assert "HOME NOT SET" in texts
+    assert p._rows["dist"].cget("text") == "HOME NOT SET"
+    assert p._rows["brg"].cget("text") == "---"
+
+
+def test_nav_panel_heading_readout_and_cal_buttons(host):
+    from radio_panels import RadioNavPanel
+    p = _mount(host, RadioNavPanel(host))
+    p.update_radio(_radio(yaw=214.0))
+    assert p._hdg_lbl.cget("text") == "214.0° SW"
+    assert "RADIO" in p._status.cget("text")
+    assert all(b.cget("state") == "disabled" for b in p._cal_btns)
+    assert "USB ONLY" in p._cal_btns[0].cget("text")
+    p.update_radio(_radio(armed=True))
+    assert "DISARM FIRST" in p._cal_btns[0].cget("text")
 
 
 # ---------------------------------------------------------------------------

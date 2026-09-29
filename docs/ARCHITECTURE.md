@@ -241,10 +241,16 @@ widget so expensive widgets don't set the pace for cheap ones:
 
 | Widget | Rate | Reasoning |
 |---|---|---|
-| IMU, Baro, FC Status, Arming, Mag | every tick (~50 Hz) | Cheap Tk redraws, values change fast (IMU especially) |
-| FPV status/FPS text | every 5th tick (~10 Hz) | Only text — the video pixels bypass this loop entirely (see §1) |
-| ADI (`Drone3DView`) | every 3rd tick (~17 Hz) | Canvas redraw with trig, a bit heavier |
-| GPS (`GPSWidget`) | every 5th tick (~10 Hz) | The heaviest — map tile redraw |
+| ADI (`Drone3DView`) | every 2nd tick (25 Hz) | Primary flight instrument — smooth attitude |
+| IMU, Baro | every 2nd tick (25 Hz) | Values change fast |
+| Mag / Heading & Home | every 3rd tick (~17 Hz) | Redraws only when the heading moves |
+| FC Status, GPS | every 5th tick (10 Hz) | Text a human reads; map redraw batched |
+| Arming | every 10th tick (5 Hz) | Pre-flight checklist |
+| FPV status/FPS text | every 5th tick (10 Hz) | Only text — the video pixels bypass this loop entirely (see §1) |
+
+The pump is fixed-rate and always leaves Tk idle time for repaints. The
+measurements and the rules that keep the UI responsive are in
+[frontend/ui-performance.md](frontend/ui-performance.md).
 
 The FPV status counter is updated **independently** of the telemetry
 connection check — the video panel's status text must not blank out just

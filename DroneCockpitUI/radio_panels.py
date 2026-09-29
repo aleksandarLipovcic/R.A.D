@@ -32,6 +32,7 @@ import math
 import tkinter as tk
 
 import link_mode
+from MagWidget import _hdg_text_extent
 
 # ── Shared palette (matches the USB widgets) ─────────────────────────────────
 BG        = "#0a0a10"
@@ -256,52 +257,129 @@ class RadioAttitudePanel(tk.Frame):
 
 class RadioNavPanel(tk.Frame):
     """
-    Heading & home on the radio link. The ELRS link has no magnetometer
-    data, but it does carry the FC's heading and GPS — and CrsfLink
-    computes the home point at arming. For search & rescue the question in
-    this slot becomes "which way is home, and how far?":
+    Heading & home on the radio link — same layout as the USB magnetometer
+    panel (rose | big heading readout | status | calibration buttons) so the
+    pilot finds everything in the same place, plus what the radio link adds:
 
-      • heading-up compass: aircraft symbol fixed pointing up, cardinals
-        rotate, a cyan arrow points to HOME;
-      • HDG, HOME distance, bearing, TURN L/R cue, ground speed, altitude.
+      • heading-up compass rose: aircraft symbol fixed nose-up, cardinals
+        rotate, a cyan arrow points to HOME (home point from CrsfLink,
+        set when the drone is armed with a usable GPS fix);
+      • big FC heading readout (auto-sized like MagWidget's) + status line
+        (FC HDG · RADIO / STALE n.ns);
+      • HOME distance, bearing, TURN L/R cue, ground speed, altitude;
+      • CAL MAG / CAL GYRO buttons, shown in the same place but disabled —
+        calibration commands go to the FC over the USB cable (the radio
+        link is receive-only), and never while armed.
     """
+
+    _HDG_MIN_PT, _HDG_MAX_PT = 9, 36
 
     def __init__(self, parent):
         super().__init__(parent, bg=BG)
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
-        hdr, self._tag = _header(self, "HEADING & HOME  ·  RADIO LINK")
-        hdr.grid(row=0, column=0, columnspan=2, sticky="ew", padx=4, pady=(4, 2))
+        self.columnconfigure(0, weight=3)   # rose gets most of the extra width
+        self.columnconfigure(1, weight=2)
+        self.rowconfigure(0, weight=1)
+        # No inner title strip: the panel title already says what this is,
+        # and this panel is often only ~250 px tall.
 
-        self._cv = tk.Canvas(self, bg=BG, highlightthickness=0)
-        self._cv.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
-        self._cv.bind("<Configure>", lambda e: self._draw())
+        self._cv = tk.Canvas(self, bg=BG, highlightthickness=0, width=120)
+        self._cv.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        self._cv.bind("<Configure>", lambda e: self._draw(force=True))
 
         col = tk.Frame(self, bg=BG)
-        col.grid(row=1, column=1, sticky="ns", padx=(0, 8), pady=4)
+        col.grid(row=0, column=1, sticky="nsew", padx=(0, 6), pady=4)
+        col.columnconfigure(0, weight=1)
+        col.rowconfigure(1, weight=1, minsize=38)   # heading box never collapses
+
+        top = tk.Frame(col, bg=BG)
+        top.grid(row=0, column=0, sticky="ew")
+        tk.Label(top, text="FC HEADING", bg=BG, fg=LABEL, font=F_TINY
+                 ).pack(side="left")
+        self._tag = tk.Label(top, text="RADIO", bg=BG, fg=link_mode.C_RADIO,
+                             font=F_TINY)
+        self._tag.pack(side="right")
+        # Big heading readout — box never grows with its font (like MagWidget)
+        self._hdg_box = tk.Frame(col, bg="#080f18", highlightthickness=2,
+                                 highlightbackground="#1e4a6a")
+        self._hdg_box.grid(row=1, column=0, sticky="nsew", pady=2)
+        self._hdg_box.grid_propagate(False)
+        self._hdg_box.pack_propagate(False)
+        self._hdg_lbl = tk.Label(self._hdg_box, text="---.- ---", bg="#080f18",
+                                 fg=CYAN, font=("Consolas", 18, "bold"))
+        self._hdg_lbl.pack(expand=True)
+        self._hdg_box.bind("<Configure>", self._fit_heading_font)
+        self._hdg_font = 0
+
+        self._status = tk.Label(col, text="⬤  WAITING", bg=BG, fg=DIM, font=F_HDR)
+        self._status.grid(row=2, column=0, pady=(2, 1))
+
+        # One label/value pair per row keeps this column narrow, so the
+        # compass rose gets the width.
+        info = tk.Frame(col, bg=BG)
+        info.grid(row=3, column=0, sticky="ew")
+        info.columnconfigure(1, weight=1)
         self._rows = {}
-        for key, name in (("hdg", "HDG"), ("dist", "HOME"), ("brg", "BRG HOME"),
-                          ("turn", "TURN"), ("gs", "GND SPD"), ("alt", "ALT")):
-            tk.Label(col, text=name, bg=BG, fg=LABEL, font=F_TINY, anchor="w"
-                     ).pack(anchor="w")
-            lbl = tk.Label(col, text="---", bg=BG, fg=TEXT, font=F_VALUE,
-                           anchor="w")
-            lbl.pack(anchor="w", pady=(0, 3))
+        for r, (key, name) in enumerate((("dist", "HOME"), ("brg", "BRG"),
+                                         ("turn", "TURN"), ("gs", "GS"),
+                                         ("alt", "ALT"))):
+            tk.Label(info, text=name, bg=BG, fg=LABEL, font=F_TINY, anchor="w",
+                     width=5).grid(row=r, column=0, sticky="w")
+            lbl = tk.Label(info, text="---", bg=BG, fg=TEXT, font=F_HDR, anchor="w")
+            lbl.grid(row=r, column=1, sticky="w")
             self._rows[key] = lbl
+        # "hdg" kept for callers/tests that read the numeric heading
+        self._rows["hdg"] = self._hdg_lbl
+
+        btns = tk.Frame(col, bg=BG)
+        btns.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+        btns.columnconfigure(0, weight=1)
+        self._cal_btns = []
+        for r, (text, fg, bg) in enumerate((("⊕  CAL MAG", "#00ff88", "#082210"),
+                                            ("⊕  CAL GYRO", "#44aaff", "#080a20"))):
+            b = tk.Button(btns, text=text, font=F_TINY, fg=fg, bg=bg, relief="flat",
+                          bd=0, pady=4, state="disabled",
+                          disabledforeground=link_mode.C_NA_FG)
+            b.grid(row=r, column=0, sticky="ew", pady=(0 if r == 0 else 2, 0))
+            self._cal_btns.append(b)
+        self._cal_state = None
 
         self._hdg = 0.0
         self._home_rel = None     # relative bearing to home, or None
         self._hdg_stale = False
+        self._drawn = None
+
+    # ── heading font fit (cached text metrics, see MagWidget) ────────────────
+    def _fit_heading_font(self, event=None):
+        w = self._hdg_box.winfo_width() - 14
+        h = self._hdg_box.winfo_height() - 8
+        if w < 20 or h < 10:
+            return
+        lo, hi, best = self._HDG_MIN_PT, self._HDG_MAX_PT, self._HDG_MIN_PT
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            tw, th = _hdg_text_extent(mid)
+            if tw <= w and th <= h:
+                best, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+        if best != self._hdg_font:
+            self._hdg_font = best
+            self._hdg_lbl.config(font=("Consolas", best, "bold"))
 
     # ── drawing ──────────────────────────────────────────────────────────────
     def _pt(self, cx, cy, r, ang_deg):
         a = math.radians(ang_deg)
         return cx + r * math.sin(a), cy - r * math.cos(a)
 
-    def _draw(self):
+    def _draw(self, force=False):
         cv = self._cv
-        cv.delete("all")
         w, h = cv.winfo_width(), cv.winfo_height()
+        key = (round(self._hdg * 2), None if self._home_rel is None
+               else round(self._home_rel * 2), self._hdg_stale, w, h)
+        if key == self._drawn and not force:
+            return                      # nothing visible changed
+        self._drawn = key
+        cv.delete("all")
         r = min(w, h) / 2 - 10
         if r < 20:
             return
@@ -331,9 +409,6 @@ class RadioNavPanel(tk.Frame):
                            arrowshape=(14, 16, 6))
             hx, hy = self._pt(cx, cy, r * 0.9, self._home_rel)
             cv.create_text(hx, hy, text="H", fill=CYAN, font=("Consolas", 10, "bold"))
-        else:
-            cv.create_text(cx, cy + r * 0.45, text="HOME NOT SET",
-                           fill=link_mode.C_NA_FG, font=F_HDR)
         # Aircraft symbol (always nose-up in a heading-up display)
         s = max(8, r / 6)
         cv.create_polygon(cx, cy - s, cx + s * 0.7, cy + s * 0.8, cx, cy + s * 0.4,
@@ -349,8 +424,14 @@ class RadioNavPanel(tk.Frame):
 
         self._hdg = float(data.get("yaw", 0.0)) % 360.0
         self._hdg_stale = bool(att_old)
-        self._rows["hdg"].config(text=f"{self._hdg:05.1f}°",
-                                 fg=link_mode.C_STALE_FG if att_old else CYAN)
+        card = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")[int((self._hdg + 22.5) // 45) % 8]
+        self._hdg_lbl.config(text=f"{self._hdg:05.1f}° {card}",
+                             fg=link_mode.C_STALE_FG if att_old else CYAN)
+        if att_old:
+            self._status.config(text="⬤  " + link_mode.stale_text(att_old),
+                                fg=link_mode.C_STALE_FG)
+        else:
+            self._status.config(text="⬤  FC HDG · RADIO", fg=link_mode.C_RADIO)
 
         home_ok = bool(data.get("gps_comp_valid", False)) and \
             (bool(data.get("home_set", False)) or not link_mode.is_radio(data))
@@ -362,15 +443,13 @@ class RadioNavPanel(tk.Frame):
             self._home_rel = rel
             self._rows["dist"].config(text=_fmt_dist(dist), fg=gps_fg)
             self._rows["brg"].config(text=f"{brg:03d}°", fg=gps_fg)
-            if abs(rel) <= 10:
-                turn = "ON COURSE"
-            else:
-                turn = f"{'R' if rel > 0 else 'L'} {abs(rel):.0f}°"
+            turn = "ON COURSE" if abs(rel) <= 10 else f"{'R' if rel > 0 else 'L'} {abs(rel):.0f}°"
             self._rows["turn"].config(text=turn, fg=GREEN if abs(rel) <= 10 else AMBER)
         else:
             self._home_rel = None
-            for key in ("dist", "brg", "turn"):
-                self._rows[key].config(text="---", fg=DIM)
+            self._rows["dist"].config(text="HOME NOT SET", fg=link_mode.C_NA_FG)
+            self._rows["brg"].config(text="---", fg=DIM)
+            self._rows["turn"].config(text="---", fg=DIM)
 
         if data.get("gps_raw_valid", False):
             kmh = float(data.get("gps_ground_speed_cms", 0)) * 0.036
@@ -381,10 +460,17 @@ class RadioNavPanel(tk.Frame):
         if data.get("baro_valid", False):
             alt = int(data.get("baro_altitude_cm", 0)) / 100.0
             src = str(data.get("altitude_source", "BARO")).upper()
-            unit = " (GPS)" if src == "GPS" else ""
-            self._rows["alt"].config(text=f"{alt:+.1f} m{unit}", fg=TEXT)
+            self._rows["alt"].config(text=f"{alt:+.1f} m" + (" GPS" if src == "GPS" else ""),
+                                     fg=TEXT)
         else:
             self._rows["alt"].config(text="---", fg=DIM)
+
+        armed = bool(data.get("armed", False))
+        if armed != self._cal_state:
+            self._cal_state = armed
+            suffix = "DISARM FIRST" if armed else "USB ONLY"
+            for b, name in zip(self._cal_btns, ("CAL MAG", "CAL GYRO")):
+                b.config(text=f"⊕ {name} · {suffix}")
         self._draw()
 
 

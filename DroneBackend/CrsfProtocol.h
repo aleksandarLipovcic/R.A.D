@@ -89,7 +89,7 @@ private:
 // ── Decoded telemetry structs (units already converted) ─────────────────────
 
 struct LinkStats {                 // 0x14
-    int     uplinkRssi1Dbm = 0;    // negative dBm (payload stores magnitude)
+    int     uplinkRssi1Dbm = 0;    // dBm, negative (ELRS: signed byte; spec: magnitude)
     int     uplinkRssi2Dbm = 0;
     uint8_t uplinkLq = 0;          // 0–100 %
     int8_t  uplinkSnr = 0;         // dB

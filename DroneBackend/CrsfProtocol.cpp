@@ -16,6 +16,15 @@ namespace {
         return (static_cast<uint32_t>(p[0]) << 16) |
                (static_cast<uint32_t>(p[1]) << 8) | p[2];
     }
+    // RSSI byte in LINK_STATISTICS. The CRSF spec says "dBm * -1" as an
+    // unsigned magnitude (70 -> -70 dBm), but ExpressLRS sends the dBm value
+    // as a signed int8 (0xFB -> -5 dBm, seen on the bench with a Pocket and
+    // RP4TD). Both conventions fit in one byte without overlap for any real
+    // RSSI: >= 128 can only be a negative int8, < 128 only a magnitude.
+    inline int rssiDbm(uint8_t b) {
+        return b >= 128 ? static_cast<int>(static_cast<int8_t>(b))
+                        : -static_cast<int>(b);
+    }
     inline int32_t be32s(const uint8_t* p) {
         return static_cast<int32_t>(
             (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
@@ -101,14 +110,14 @@ uint16_t txPowerEnumToMw(uint8_t e) {
 bool decodeLinkStats(const Frame& f, LinkStats& o) {
     if (f.type != Type::LINK_STATISTICS || f.payload.size() < 10) return false;
     const uint8_t* p = f.payload.data();
-    o.uplinkRssi1Dbm  = -static_cast<int>(p[0]);
-    o.uplinkRssi2Dbm  = -static_cast<int>(p[1]);
+    o.uplinkRssi1Dbm  = rssiDbm(p[0]);
+    o.uplinkRssi2Dbm  = rssiDbm(p[1]);
     o.uplinkLq        = p[2];
     o.uplinkSnr       = static_cast<int8_t>(p[3]);
     o.activeAntenna   = p[4];
     o.rfModeIndex     = p[5];
     o.txPowerMw       = txPowerEnumToMw(p[6]);
-    o.downlinkRssiDbm = -static_cast<int>(p[7]);
+    o.downlinkRssiDbm = rssiDbm(p[7]);
     o.downlinkLq      = p[8];
     o.downlinkSnr     = static_cast<int8_t>(p[9]);
     return true;
