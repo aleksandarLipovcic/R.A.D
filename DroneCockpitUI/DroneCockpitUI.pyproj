@@ -57,6 +57,7 @@
     <Compile Include="export_model.py" />
     <Compile Include="MapTiles.py" />
     <Compile Include="check_backend.py" />
+    <Compile Include="NNTraining\export_nn_boxes.py" />
     <Compile Include="radio_link_indicator.py" />
     <Compile Include="link_mode.py" />
     <Compile Include="dual_layer.py" />

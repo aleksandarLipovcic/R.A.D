@@ -3271,7 +3271,7 @@ class DroneCockpitApp:
             port, ok = "NOT_FOUND", False
             try:
                 exclude = []
-                if self.radio is not None and self.radio.get_port_name():
+                if self.radio is not None and self.radio.get_port_name(): 
                     exclude.append(self.radio.get_port_name())
                 if hasattr(DroneBackend, "auto_detect_fc"):
                     # MSP handshake — never mistakes the Pocket for the FC
