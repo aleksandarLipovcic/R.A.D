@@ -75,6 +75,7 @@
     <Compile Include="NNTraining\review_labels.py" />
     <Compile Include="NNTraining\verify_pipeline_assumptions.py" />
     <Compile Include="NNTraining\predict_test.py" />
+    <Compile Include="NNTraining\fpv_eval.py" />
     <Compile Include="NNTraining\mosaic_guard.py" />
     <Compile Include="NNTraining\vram_diagnostic.py" />
     <Compile Include="NNTraining\prepare_datasets.py" />

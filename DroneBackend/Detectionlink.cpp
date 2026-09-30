@@ -211,21 +211,38 @@ bool DetectionLink::start() {
     // (which always works) rather than leaving the app dead in the water
     // on a machine/build without CUDA DNN support.
     usingCuda_.store(false);
+    usingCudaFp16_.store(false);
     if (useCuda_.load()) {
-        try {
-            impl_->net.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
-            impl_->net.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA);
-            cv::Mat dummy(inputSize_.load(), inputSize_.load(), CV_8UC3, cv::Scalar(114, 114, 114));
-            cv::Mat blob = cv::dnn::blobFromImage(dummy, 1.0 / 255.0,
-                cv::Size(inputSize_.load(), inputSize_.load()), cv::Scalar(), true, false);
-            impl_->net.setInput(blob);
-            impl_->net.forward();
+        // A dummy forward() is the only real proof a target works (see
+        // above). FP16 is tried first when enabled: on RTX-class GPUs it is
+        // typically 1.5-2x faster with practically identical detections;
+        // its output is also checked for NaN/Inf, which a model with
+        // FP16-overflowing layers would produce, before it is trusted.
+        auto probe = [&](int target) -> bool {
+            try {
+                impl_->net.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
+                impl_->net.setPreferableTarget(target);
+                cv::Mat dummy(inputSize_.load(), inputSize_.load(), CV_8UC3, cv::Scalar(114, 114, 114));
+                cv::Mat blob = cv::dnn::blobFromImage(dummy, 1.0 / 255.0,
+                    cv::Size(inputSize_.load(), inputSize_.load()), cv::Scalar(), true, false);
+                impl_->net.setInput(blob);
+                cv::Mat out = impl_->net.forward();
+                return !out.empty() && cv::checkRange(out);
+            }
+            catch (const cv::Exception&) {
+                return false;
+            }
+        };
+        if (useCudaFp16_.load() && probe(cv::dnn::DNN_TARGET_CUDA_FP16)) {
+            usingCuda_.store(true);
+            usingCudaFp16_.store(true);
+        }
+        else if (probe(cv::dnn::DNN_TARGET_CUDA)) {
             usingCuda_.store(true);
         }
-        catch (const cv::Exception&) {
+        else {
             impl_->net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
             impl_->net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
-            usingCuda_.store(false);
         }
     }
     else {
@@ -458,8 +475,7 @@ void DetectionLink::inferenceLoop() {
         // confirmed track alive through a dip (see ObjectTracker.h). Only
         // CONFIRMED tracks ever produce records.
         syncTrackerConfig();
-        const float highConf = confidenceThreshold_.load();
-        const float lowConf = std::min(trackLowConfidence_.load(), highConf);
+        const float lowConf = tracker_.config().lowConfidence;   // set by syncTrackerConfig()
         std::vector<RawDetection> candidates;
         std::vector<trk::Detection> trackerInput;
         candidates.reserve(rawAll.size());
@@ -716,88 +732,116 @@ std::vector<DetectionLink::RawDetection> DetectionLink::runInference(const cv::M
         return results;
     }
 
-    // YOLO26 (and Ultralytics' "end-to-end" exports generally) bakes NMS
-    // directly into the graph: output shape [1, maxDetections, 6], one
-    // row per candidate slot, already deduplicated by the model itself.
-    // This is NOT the older [1, 4+numClasses, numBoxes] "raw logits"
-    // layout the previous version of this function assumed (that one
-    // needed a manual per-class argmax + cv::dnn::NMSBoxes pass; this one
-    // needs neither, since NMS already happened inside the model) --
-    // confirmed against your own export.py output ("output shape(s)
-    // (1, 300, 6)"), not guessed.
+    // Two ONNX layouts are accepted, told apart by the output shape:
     //
-    // Each row is [x1, y1, x2, y2, confidence, classIndex] in *input*
-    // (letterboxed, inputSize x inputSize) pixel space, corner format --
-    // not center+size. Rows beyond however many real detections the
-    // model found are zero-padded (confidence ~0) up to the fixed 300,
-    // so filter by confidence rather than assuming a "real" row count.
+    //   END-TO-END [1, maxDetections, 6] -- YOLO26's default export (and
+    //   export_model.py's): NMS is inside the graph. Each row is
+    //   [x1, y1, x2, y2, confidence, classIndex], corner format, in *input*
+    //   (letterboxed) pixel space; unused rows are zero-padded.
     //
-    // Verify this column order against your own export in Netron (the
-    // export script prints a netron.app link) if boxes ever come out
-    // wrong -- the two usual suspects for "wrong in a consistent way"
-    // are corner-vs-center+size here, and normalized-vs-pixel
-    // coordinates (pixel-space values land in roughly 0-inputSize;
-    // normalized ones in 0-1 -- easy to tell apart by printing one row's
-    // raw values on a test frame).
-    cv::Mat out = output.reshape(1, output.size[1]);   // -> [maxDetections, 6]
+    //   RAW [1, 4 + numClasses, numAnchors] -- `end2end=False` exports
+    //   (train.py --export-only, older YOLO versions): per anchor
+    //   [cx, cy, w, h, score_0 .. score_nc-1] with sigmoid already applied,
+    //   channel-major. Needs a class argmax + NMS here (class-aware,
+    //   IoU 0.7, max 300 -- Ultralytics' own predict defaults), so it gives
+    //   the same boxes model.predict() would.
+    //
+    // Anything else is reported once and the pass is skipped. If boxes
+    // ever come out wrong in a consistent way, turn on
+    // DETECTIONLINK_VERBOSE_LOGGING to print raw rows (corner vs centre
+    // format, pixel vs normalized coordinates are the usual suspects).
+    struct ModelBox { float x1, y1, x2, y2, conf; int cls; };
+    std::vector<ModelBox> boxes;
 
-    // One-time diagnostic (now gated behind DETECTIONLINK_VERBOSE_LOGGING --
-    // see macro def near the top of this file): prints the first handful
-    // of real (non-padding) rows' raw model-space values before any of
-    // the corner/pixel-space assumptions below are applied to them. Was
-    // used to confirm the [x1,y1,x2,y2,conf,cls] layout and pixel-space
-    // (not normalized) coordinates against this export -- that's now
-    // confirmed for yolo26m_main.onnx, so it's off by default. If a
-    // future re-export ever produces wrong/invisible boxes again,
-    // re-enable the macro and check:
-    //   - x1/y1/x2/y2 all sitting in roughly 0.0-1.0 -> the export is
-    //     normalized, not pixel-space; every ox1/oy1/ox2/oy2 below needs
-    //     an extra "* inputSize" before the letterbox-undo math.
-    //   - x2 < x1 or y2 < y1 fairly often -> this likely isn't
-    //     corner-format [x1,y1,x2,y2] at all; re-check in Netron whether
-    //     it's actually [cx,cy,w,h] (center + size) instead.
-    //   - values in roughly 0-inputSize range with x2>x1, y2>y1 -> this
-    //     assumption is fine; the degenerate box is coming from somewhere
-    //     else (e.g. a genuinely near-zero-confidence garbage row).
-    static std::atomic<int> debugRowsLogged{ 0 };
+    const int d1 = output.dims == 3 ? output.size[1] : (output.dims == 2 ? output.size[0] : 0);
+    const int d2 = output.dims == 3 ? output.size[2] : (output.dims == 2 ? output.size[1] : 0);
+    const float* data = reinterpret_cast<const float*>(output.data);
+    const bool endToEnd = d2 == 6 && d1 >= 6;
+    const bool rawLayout = !endToEnd && d1 > 4 && d2 > d1;
+    if (output.type() != CV_32F || (!endToEnd && !rawLayout)) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr,
+                "[DetectionLink] unsupported model output layout (dims=%d, %d x %d) -- "
+                "expected [1, N, 6] (end-to-end) or [1, 4+classes, anchors] (raw). "
+                "Re-export the model with export_model.py.\n",
+                output.dims, d1, d2);
+        }
+        return results;
+    }
 
-    for (int i = 0; i < out.rows; ++i) {
-        float x1 = out.at<float>(i, 0);
-        float y1 = out.at<float>(i, 1);
-        float x2 = out.at<float>(i, 2);
-        float y2 = out.at<float>(i, 3);
-        float conf = out.at<float>(i, 4);
-        int classIndex = static_cast<int>(std::round(out.at<float>(i, 5)));
-
-        if (conf < 0.001f)   // padding rows; the real threshold is applied by the caller
-            continue;
+    if (endToEnd) {
+        boxes.reserve(static_cast<size_t>(d1));
+        for (int i = 0; i < d1; ++i) {
+            const float* r = data + static_cast<size_t>(i) * 6;
+            if (r[4] < 0.001f)   // padding rows; the real threshold is applied by the caller
+                continue;
+            boxes.push_back({ r[0], r[1], r[2], r[3], r[4], static_cast<int>(std::lround(r[5])) });
+        }
+    }
+    else {
+        const int numClasses = d1 - 4;
+        const int numAnchors = d2;
+        constexpr float kRawScoreFloor = 0.01f;   // callers filter far higher; this only bounds NMS work
+        std::vector<cv::Rect2d> nmsRects;
+        std::vector<float> nmsScores;
+        std::vector<ModelBox> cand;
+        for (int a = 0; a < numAnchors; ++a) {
+            int best = 0;
+            float bestScore = data[static_cast<size_t>(4) * numAnchors + a];
+            for (int c = 1; c < numClasses; ++c) {
+                const float v = data[static_cast<size_t>(4 + c) * numAnchors + a];
+                if (v > bestScore) { bestScore = v; best = c; }
+            }
+            if (bestScore < kRawScoreFloor)
+                continue;
+            const float cx = data[a], cy = data[numAnchors + a];
+            const float w = data[static_cast<size_t>(2) * numAnchors + a];
+            const float h = data[static_cast<size_t>(3) * numAnchors + a];
+            cand.push_back({ cx - w * 0.5f, cy - h * 0.5f, cx + w * 0.5f, cy + h * 0.5f, bestScore, best });
+            // Class-aware NMS in one call: every class is shifted to its own
+            // far-away region, so boxes of different classes never overlap.
+            const double off = static_cast<double>(best) * (inputSize + 1) * 4.0;
+            nmsRects.emplace_back(cx - w * 0.5 + off, cy - h * 0.5 + off, w, h);
+            nmsScores.push_back(bestScore);
+        }
+        std::vector<int> keep;
+        cv::dnn::NMSBoxes(nmsRects, nmsScores, kRawScoreFloor, 0.7f, keep, 1.0f, 300);
+        boxes.reserve(keep.size());
+        for (int k : keep)
+            boxes.push_back(cand[static_cast<size_t>(k)]);
+    }
 
 #if DETECTIONLINK_VERBOSE_LOGGING
-        if (debugRowsLogged.load() < 8) {
-            int n = debugRowsLogged.fetch_add(1);
-            DL_LOG_ERR(
-                "[DetectionLink] DEBUG row %d: model-space x1=%.2f y1=%.2f "
-                "x2=%.2f y2=%.2f conf=%.3f cls=%d (inputSize=%d) -- see "
-                "runInference()'s comment above this loop for how to read "
-                "these.\n",
-                n, x1, y1, x2, y2, conf, classIndex, inputSize);
-        }
+    static std::atomic<int> debugRowsLogged{ 0 };
+    for (const auto& b : boxes) {
+        if (debugRowsLogged.load() >= 8)
+            break;
+        const int n = debugRowsLogged.fetch_add(1);
+        DL_LOG_ERR("[DetectionLink] DEBUG row %d (%s): model-space x1=%.2f y1=%.2f x2=%.2f "
+                   "y2=%.2f conf=%.3f cls=%d (inputSize=%d)\n",
+                   n, endToEnd ? "end-to-end" : "raw", b.x1, b.y1, b.x2, b.y2, b.conf, b.cls, inputSize);
+    }
 #endif
 
+    results.reserve(boxes.size());
+    for (const auto& b : boxes) {
         // Undo letterbox: from inputSize-space back to original frame.
-        float ox1 = (x1 - padX) / static_cast<float>(scale);
-        float oy1 = (y1 - padY) / static_cast<float>(scale);
-        float ox2 = (x2 - padX) / static_cast<float>(scale);
-        float oy2 = (y2 - padY) / static_cast<float>(scale);
+        const float ox1 = (b.x1 - padX) / static_cast<float>(scale);
+        const float oy1 = (b.y1 - padY) / static_cast<float>(scale);
+        const float ox2 = (b.x2 - padX) / static_cast<float>(scale);
+        const float oy2 = (b.y2 - padY) / static_cast<float>(scale);
 
         RawDetection d;
-        d.classIndex = classIndex;
-        d.confidence = conf;
+        d.classIndex = b.cls;
+        d.confidence = b.conf;
         d.x = static_cast<int>(std::max(0.0f, ox1));
         d.y = static_cast<int>(std::max(0.0f, oy1));
-        d.w = static_cast<int>(std::max(0.0f, ox2 - ox1));
-        d.h = static_cast<int>(std::max(0.0f, oy2 - oy1));
-        results.push_back(d);
+        d.w = static_cast<int>(std::max(0.0f, std::min(ox2, static_cast<float>(origW)) - d.x));
+        d.h = static_cast<int>(std::max(0.0f, std::min(oy2, static_cast<float>(origH)) - d.y));
+        if (d.w > 0 && d.h > 0)
+            results.push_back(d);
     }
     return results;
 }
@@ -1218,10 +1262,32 @@ namespace {
     }
 }
 
+void DetectionLink::setClassConfidenceThreshold(const std::string& className, float threshold) {
+    std::lock_guard<std::mutex> lock(classThresholdsMutex_);
+    classConfidenceThresholds_[className] = threshold;
+}
+
+void DetectionLink::clearClassConfidenceThresholds() {
+    std::lock_guard<std::mutex> lock(classThresholdsMutex_);
+    classConfidenceThresholds_.clear();
+}
+
 void DetectionLink::syncTrackerConfig() {
     trk::Config& c = tracker_.config();
     c.highConfidence = confidenceThreshold_.load();
-    c.lowConfidence = std::min(trackLowConfidence_.load(), c.highConfidence);
+    c.classHighConfidence.clear();
+    float lowestHigh = c.highConfidence;
+    {
+        std::lock_guard<std::mutex> lock(classThresholdsMutex_);
+        for (size_t i = 0; i < classNames_.size(); ++i) {
+            auto it = classConfidenceThresholds_.find(classNames_[i]);
+            if (it == classConfidenceThresholds_.end())
+                continue;
+            c.classHighConfidence[static_cast<int>(i)] = it->second;
+            lowestHigh = std::min(lowestHigh, it->second);
+        }
+    }
+    c.lowConfidence = std::min(trackLowConfidence_.load(), lowestHigh);
     c.confirmHits = std::max(1, trackConfirmHits_.load());
     c.maxLostMs = std::max(0, trackLostMemoryMs_.load());
     c.minLostPasses = std::max(0, trackMaxMissedPasses_.load());

@@ -172,6 +172,13 @@ public:
     // it's ever turned into a DetectionRecord.
     void setConfidenceThreshold(float t) { confidenceThreshold_.store(t); }
 
+    // Per-class override of the confidence threshold above, by class name
+    // (as in the .names file). Classes without an entry use the global
+    // one. fpv_eval.py writes tuned values to <model>.thresholds.json,
+    // which the cockpit loads at startup. Safe to change at runtime.
+    void setClassConfidenceThreshold(const std::string& className, float threshold);
+    void clearClassConfidenceThresholds();
+
     // Square input side the ONNX model expects (letterboxed). MUST match
     // whatever imgsz the .onnx was exported at -- this does NOT have to
     // match training imgsz (you can train at 960 and export/infer at a
@@ -190,6 +197,13 @@ public:
     // isUsingCuda() after start() to confirm which one you actually got.
     void setUseCuda(bool enabled) { useCuda_.store(enabled); }
     bool isUsingCuda() const { return usingCuda_.load(); }
+
+    // With CUDA: try the half-precision target first (DNN_TARGET_CUDA_FP16,
+    // typically 1.5-2x faster on RTX GPUs). start() verifies it with a
+    // dummy pass (no exception, no NaN/Inf) and falls back to FP32 CUDA,
+    // then CPU. Default on; isUsingCudaFp16() says what was engaged.
+    void setUseCudaFp16(bool enabled) { useCudaFp16_.store(enabled); }
+    bool isUsingCudaFp16() const { return usingCudaFp16_.load(); }
 
     // Real-world width, in meters, of one object class as it would be
     // measured face-on (e.g. a person's shoulder width ~0.5m, a car's
@@ -552,6 +566,10 @@ private:
     std::atomic<int> inputSize_{ 640 };
     std::atomic<bool> useCuda_{ false };
     std::atomic<bool> usingCuda_{ false };
+    std::atomic<bool> useCudaFp16_{ true };
+    std::atomic<bool> usingCudaFp16_{ false };
+    mutable std::mutex classThresholdsMutex_;
+    std::unordered_map<std::string, float> classConfidenceThresholds_;
     std::atomic<double> minGroundRayComponent_{ 0.12 };
     std::atomic<double> triangulationMinBaselineM_{ 5.0 };
     std::atomic<double> triangulationMinBearingSpreadDeg_{ 5.0 };

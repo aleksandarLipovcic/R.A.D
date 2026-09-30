@@ -56,6 +56,7 @@ struct Detection {
 
 struct Config {
     float highConfidence   = 0.45f;  // may start tracks (DetectionLink: its confidence threshold)
+    std::map<int, float> classHighConfidence;  // per-class override of highConfidence
     float lowConfidence    = 0.15f;  // may only extend confirmed tracks
     float instantConfirm   = 0.70f;  // confidence that confirms a new track immediately
     int   confirmHits      = 2;      // matches needed to confirm otherwise
@@ -112,6 +113,10 @@ public:
     explicit ObjectTracker(const Config& cfg = Config()) : cfg_(cfg) {}
 
     Config& config() { return cfg_; }
+    float highFor(int classIndex) const {
+        auto it = cfg_.classHighConfidence.find(classIndex);
+        return it != cfg_.classHighConfidence.end() ? it->second : cfg_.highConfidence;
+    }
     const Config& config() const { return cfg_; }
 
     // classIndex → group. Classes in the same group may match each other

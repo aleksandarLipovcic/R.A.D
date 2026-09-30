@@ -55,11 +55,11 @@ def main():
     model = YOLO(str(WEIGHTS))
 
     # opset=12 is broadly compatible with OpenCV's ONNX importer across
-    # OpenCV versions; simplify=True runs onnx-simplifier so the graph
-    # matches the [1, 4+numClasses, N] layout DetectionLink::runInference
-    # assumes (Ultralytics' default export layout -- if you ever see
-    # nonsensical boxes after swapping models, this shape assumption is
-    # the first thing to re-check, per the comment in runInference()).
+    # OpenCV versions; simplify=True runs onnx-simplifier. YOLO26's default
+    # export is end-to-end: output [1, 300, 6] = [x1, y1, x2, y2, conf, cls]
+    # per row, NMS inside the model. DetectionLink::runInference() reads
+    # that layout, and also the raw [1, 4+numClasses, anchors] layout of an
+    # end2end=False export (then it runs NMS itself).
     exported_path = model.export(format="onnx", imgsz=EXPORT_IMGSZ, opset=12, simplify=True)
 
     final_onnx = MODEL_DIR / "yolo26m_main.onnx"

@@ -65,6 +65,11 @@ flowchart TD
    - **[predict_test.py](ml-pipeline/predict-test.md)** — visual sanity
      check against a real test-flight video before trusting a checkpoint
      in the air.
+   - **[fpv_eval.py](ml-pipeline/fpv-eval.md)** — *measures* the
+     exported `.onnx` on our own labelled FPV frames (same preprocessing
+     and output parsing as `DetectionLink`), compares inference variants
+     (deinterlace, flip, tiles) on accuracy and time, and writes per-class
+     confidence thresholds the cockpit loads.
    - **[vram_diagnostic.py](ml-pipeline/vram-diagnostic.md)** — root-causes
      a suspected VRAM leak independent of a full training run.
    - **[verify_pipeline_assumptions.py](ml-pipeline/verify-pipeline-assumptions.md)** —

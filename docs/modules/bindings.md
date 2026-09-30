@@ -206,8 +206,10 @@ readonly, since Python code builds these to feed into
 | `set_horizontal_fov_deg(fov)` | `setHorizontalFovDeg` |
 | `set_detection_interval_ms(ms)` | `setDetectionIntervalMs` |
 | `set_confidence_threshold(t)` | `setConfidenceThreshold` |
+| `set_class_confidence_threshold(name, t)` / `clear_class_confidence_thresholds()` | `setClassConfidenceThreshold` / `clearClassConfidenceThresholds` |
 | `set_input_size(size)` | `setInputSize` |
 | `set_use_cuda(enabled)` / `is_using_cuda()` | `setUseCuda`/`isUsingCuda` |
+| `set_use_cuda_fp16(enabled)` / `is_using_cuda_fp16()` | `setUseCudaFp16`/`isUsingCudaFp16` |
 | `set_known_object_width(class_name, width_m)` | `setKnownObjectWidth` |
 | `clear_known_object_widths()` | `clearKnownObjectWidths` |
 | `set_min_ground_ray_component(v)` | `setMinGroundRayComponent` |

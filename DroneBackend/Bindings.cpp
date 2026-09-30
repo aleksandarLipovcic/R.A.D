@@ -973,6 +973,12 @@ PYBIND11_MODULE(DroneBackend, m) {
         .def("set_confidence_threshold", &DetectionLink::setConfidenceThreshold,
             py::arg("threshold"),
             "Raw model confidence below which a detection is discarded.")
+        .def("set_class_confidence_threshold", &DetectionLink::setClassConfidenceThreshold,
+            py::arg("class_name"), py::arg("threshold"),
+            "Per-class override of set_confidence_threshold (class name as "
+            "in the .names file). fpv_eval.py writes tuned values to "
+            "<model>.thresholds.json.")
+        .def("clear_class_confidence_thresholds", &DetectionLink::clearClassConfidenceThresholds)
         .def("set_input_size", &DetectionLink::setInputSize,
             py::arg("size"),
             "Square side (pixels) the ONNX model expects, letterboxed. "
@@ -992,6 +998,13 @@ PYBIND11_MODULE(DroneBackend, m) {
         .def("is_using_cuda", &DetectionLink::isUsingCuda,
             "True only if set_use_cuda(True) was called AND start() "
             "proved the CUDA backend actually works on this machine/build.")
+        .def("set_use_cuda_fp16", &DetectionLink::setUseCudaFp16,
+            py::arg("enabled"),
+            "With CUDA, try half precision first (typically 1.5-2x faster "
+            "on RTX GPUs). start() verifies it (no exception, no NaN/Inf) "
+            "and falls back to FP32 CUDA. Default True.")
+        .def("is_using_cuda_fp16", &DetectionLink::isUsingCudaFp16,
+            "True if start() engaged the FP16 CUDA target.")
         .def("set_known_object_width", &DetectionLink::setKnownObjectWidth,
             py::arg("class_name"), py::arg("width_m"),
             "Real-world width in metres for one class, measured face-on "

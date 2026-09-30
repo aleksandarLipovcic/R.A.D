@@ -261,7 +261,7 @@ UpdateResult ObjectTracker::update(const cv::Mat& frame, const std::vector<Detec
             if (detTaken[i])
                 continue;
             const float c = dets[i].confidence;
-            const bool high = c >= cfg_.highConfidence;
+            const bool high = c >= highFor(dets[i].classIndex);
             if (lowStage ? (high || c < cfg_.lowConfidence) : !high)
                 continue;
             for (size_t k = 0; k < tracks_.size(); ++k) {
@@ -325,7 +325,7 @@ UpdateResult ObjectTracker::update(const cv::Mat& frame, const std::vector<Detec
 
     // 4. Confident, unmatched detections start new tracks.
     for (size_t i = 0; i < dets.size(); ++i) {
-        if (detTaken[i] || dets[i].confidence < cfg_.highConfidence)
+        if (detTaken[i] || dets[i].confidence < highFor(dets[i].classIndex))
             continue;
         TrackInfo t;
         t.id = nextId_++;

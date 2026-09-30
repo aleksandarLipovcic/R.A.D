@@ -297,6 +297,18 @@ DETECTION_POLL_HZ = 4
 # interval ever needs to come down).
 DETECTION_USE_CUDA = True
 
+# With CUDA: try half precision (DNN_TARGET_CUDA_FP16) first -- typically
+# 1.5-2x faster on the RTX 3060 with practically identical detections.
+# DetectionLink::start() verifies it with a dummy pass (no exception, no
+# NaN/Inf) and falls back to FP32 CUDA on its own. The backend line printed
+# after start() says which one ran ("CUDA FP16" / "CUDA" / "CPU").
+DETECTION_CUDA_FP16 = True
+
+# Per-class confidence thresholds tuned on our own FPV footage by
+# NNTraining/fpv_eval.py (eval --write-thresholds). Loaded if present next
+# to the model; classes not in it use DetectionLink's global threshold.
+DETECTION_THRESHOLDS_PATH = os.path.splitext(DETECTION_MODEL_PATH)[0] + ".thresholds.json"
+
 # Horizontal FOV of the actual camera in degrees, used for every
 # pixel-offset -> ray-angle calculation in georeferencing (see
 # DetectionLink::setHorizontalFovDeg() / computeWorldRay() in
@@ -1746,12 +1758,16 @@ class DroneCockpitApp:
         # stale .pyd might not have yet.
         if hasattr(self.detection_link, "set_use_cuda"):
             self.detection_link.set_use_cuda(DETECTION_USE_CUDA)
+            if hasattr(self.detection_link, "set_use_cuda_fp16"):
+                self.detection_link.set_use_cuda_fp16(DETECTION_CUDA_FP16)
         elif DETECTION_USE_CUDA:
             print(
                 "[DetectionLink] WARNING: this build of DroneBackend has no "
                 "set_use_cuda() -- rebuild DroneBackend from current source "
                 "to get it. Continuing on CPU."
             )
+
+        self._load_class_thresholds()
 
         # DetectionWorker only ever does cheap, mutex-protected reads off
         # DetectionLink (status counters + incremental record pulls) --
@@ -2337,7 +2353,10 @@ class DroneCockpitApp:
             # since that's a real problem worth surfacing.
             if hasattr(self.detection_link, "is_using_cuda"):
                 backend = "CUDA" if self.detection_link.is_using_cuda() else "CPU"
-                _vlog(f"[DetectionLink] inference backend: {backend}")
+                if backend == "CUDA" and getattr(self.detection_link, "is_using_cuda_fp16", lambda: False)():
+                    print("[DetectionLink] inference backend: CUDA FP16")
+                else:
+                    _vlog(f"[DetectionLink] inference backend: {backend}")
                 if DETECTION_USE_CUDA and backend == "CPU":
                     print(
                         "[DetectionLink] NOTE: DETECTION_USE_CUDA=True but "
@@ -2491,6 +2510,24 @@ class DroneCockpitApp:
         win.geometry(f"{win_w}x{win_h}+{max(0, x)}+{max(0, y)}")
         win.lift()
         win.focus_force()
+
+    def _load_class_thresholds(self) -> None:
+        """Per-class confidence thresholds from fpv_eval.py, if present."""
+        if not os.path.exists(DETECTION_THRESHOLDS_PATH):
+            return
+        if not hasattr(self.detection_link, "set_class_confidence_threshold"):
+            print("[DetectionLink] WARNING: thresholds file found but this DroneBackend "
+                  "has no set_class_confidence_threshold() -- rebuild DroneBackend.")
+            return
+        try:
+            with open(DETECTION_THRESHOLDS_PATH, "r", encoding="utf-8") as f:
+                thresholds = json.load(f).get("thresholds", {})
+            for name, value in thresholds.items():
+                self.detection_link.set_class_confidence_threshold(str(name), float(value))
+            print(f"[DetectionLink] per-class thresholds from "
+                  f"{os.path.basename(DETECTION_THRESHOLDS_PATH)}: {thresholds}")
+        except (OSError, ValueError, AttributeError, TypeError) as e:
+            print(f"[DetectionLink] WARNING: could not read {DETECTION_THRESHOLDS_PATH}: {e}")
 
     def _open_detection_window(self) -> None:
         """

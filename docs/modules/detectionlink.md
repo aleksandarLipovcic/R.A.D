@@ -40,8 +40,10 @@ for why this is structured as callables rather than concrete dependencies.
 | `setHorizontalFovDeg(fov)` | 90.0 | Camera horizontal FOV — must match the camera's real datasheet FOV, same assumption used for `VideoLink`'s capture config |
 | `setDetectionIntervalMs(ms)` | 250 | Detection-pass cadence, independent of the ~30–60 fps capture loop |
 | `setConfidenceThreshold(t)` | 0.4 | Raw model confidence floor, applied before a detection becomes a `DetectionRecord` |
+| `setClassConfidenceThreshold(name, t)` / `clearClassConfidenceThresholds()` | none | Per-class override of the threshold above. The cockpit loads tuned values from `<model>.thresholds.json`, written by `NNTraining/fpv_eval.py` |
 | `setInputSize(size)` | 640 | Square letterboxed input side. **Must match the ONNX export's `imgsz`**, not necessarily the training `imgsz` — mismatch silently scales every box wrong with no crash. `yolo_main_run` was trained at 960; if exported at 960, call `setInputSize(960)` |
 | `setUseCuda(enabled)` / `isUsingCuda()` | false | Opt into CUDA backend/target; needs an OpenCV build with CUDA support (stock pip/vcpkg wheels lack it). Falls back to CPU silently if unavailable — check `isUsingCuda()` after `start()` |
+| `setUseCudaFp16(enabled)` / `isUsingCudaFp16()` | true | With CUDA, try `DNN_TARGET_CUDA_FP16` first (typically 1.5–2× faster on RTX GPUs). `start()` verifies it with a dummy pass (no exception, no NaN/Inf in the output) and otherwise falls back to FP32 CUDA, then CPU |
 | `setKnownObjectWidth(class, meters)` / `clearKnownObjectWidths()` | none set | Real-world face-on width per class, enabling object-size ranging for that class (see below) |
 | `setMinGroundRayComponent(v)` | 0.12 (~7°) | Below this ray-downward-component, ground-plane ranging is distrusted in favor of object-size ranging (or used as a last resort if unavailable) |
 | `setTriangulationMinBaselineM(m)` | 5.0 | Minimum drone movement between bearing observations before a triangulated fix is trusted |
@@ -55,6 +57,20 @@ for why this is structured as callables rather than concrete dependencies.
 | `setTrackCameraMotionCompensation(on)` | true | Compensate drone yaw/pan between passes |
 | `setTrackMoveThresholdM(m)` | 3.0 | Ground movement needed before a continuing track gets a fresh `DetectionRecord` |
 | `setTrackRefreshIntervalMs(ms)` | 10000 | Even a static, continuously-tracked object gets a periodic fresh record so it doesn't look stale |
+
+## Model output layouts
+
+`runInference()` letterboxes the frame to `inputSize × inputSize` and
+reads either ONNX layout, told apart by the output shape:
+
+| Layout | Shape | Rows | Post-processing |
+|---|---|---|---|
+| End-to-end (YOLO26 default, `export_model.py`, `train.py --export-only`) | `[1, N, 6]` | `[x1, y1, x2, y2, conf, cls]`, zero-padded | none; NMS is inside the model |
+| Raw (`end2end=False`) | `[1, 4+classes, anchors]` | `[cx, cy, w, h, score…]`, channel-major, sigmoid applied | class argmax, class-aware NMS (IoU 0.7, max 300; Ultralytics' `predict()` defaults) |
+
+Any other shape is reported once on stderr and the pass is skipped. Tested
+by running this `Detectionlink.cpp` against `yolo26n` exported both ways and
+comparing with Ultralytics' `predict()`.
 
 ## Dual-thread design
 

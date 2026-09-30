@@ -1547,14 +1547,17 @@ def find_latest_best_pt() -> Path:
 
 
 def export_for_cpp(weights_path: Path):
-    """Exports with end2end=False (one-to-many head) so ONNX output
-    shape stays (1, nc+4, N) -- what DetectionLink::runInference()
-    parses via manual class-argmax + cv::dnn::NMSBoxes."""
-    print(f"\nExporting {weights_path} to ONNX (one-to-many head, NMS "
-          f"still required on the C++ side)...")
+    """Exports YOLO26's native end-to-end (NMS-free, one-to-one) head:
+    ONNX output (1, 300, 6) rows of [x1, y1, x2, y2, conf, cls] -- the
+    same layout export_model.py produces and the deployed
+    yolo26m_main.onnx has. DetectionLink::runInference() also accepts the
+    raw (1, 4+nc, anchors) layout of an end2end=False export (it then runs
+    NMS itself), but that is the one-to-many training head, so the model
+    would not be the one that was validated -- keep end-to-end."""
+    print(f"\nExporting {weights_path} to ONNX (end-to-end head, NMS inside "
+          f"the model)...")
     model = YOLO(str(weights_path))
-    onnx_path = model.export(format="onnx", opset=17, simplify=True,
-                              end2end=False, nms=False)
+    onnx_path = model.export(format="onnx", opset=17, simplify=True)
     onnx_path = Path(onnx_path)
 
     names_path = onnx_path.with_suffix(".names")
