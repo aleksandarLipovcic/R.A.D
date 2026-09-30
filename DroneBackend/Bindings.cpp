@@ -883,16 +883,16 @@ PYBIND11_MODULE(DroneBackend, m) {
         .def_readonly("class_name", &DetectionRecord::className)
         .def_readonly("confidence", &DetectionRecord::confidence)
         .def_readonly("track_id", &DetectionRecord::trackId,
-            "Identity assigned by DetectionLink's IoU-based tracker, NOT "
+            "Identity assigned by DetectionLink's object tracker, NOT "
             "a fresh id per pass -- every record sharing the same "
-            "track_id is (as far as position-based tracking can tell) "
-            "the same physical object at a different moment. A given "
+            "track_id is the same physical object at a different "
+            "moment. A given "
             "track only gets a new record when it's first seen, once it "
             "has moved far enough on the map, or periodically if it's "
             "been static a while (see set_track_move_threshold_m / "
-            "set_track_refresh_interval_ms). NOT appearance-based re-ID: "
-            "an object that leaves frame and comes back gets a new "
-            "track_id.")
+            "set_track_refresh_interval_ms). An object out of view for "
+            "a while keeps its track_id if it re-appears near where it "
+            "was last seen (see set_track_reid_radius_m).")
         .def_readonly("bbox_x", &DetectionRecord::bboxX)
         .def_readonly("bbox_y", &DetectionRecord::bboxY)
         .def_readonly("bbox_w", &DetectionRecord::bboxW)
@@ -1029,20 +1029,41 @@ PYBIND11_MODULE(DroneBackend, m) {
             "but almost no actual parallax to triangulate with.")
         .def("set_track_iou_threshold", &DetectionLink::setTrackIouThreshold,
             py::arg("iou"),
-            "Minimum IoU (0-1, default 0.3) between a raw box and a "
-            "track's last matched box, same class, to count as the same "
-            "object across passes. Lower catches faster-moving objects "
-            "at the cost of more false merges between nearby same-class "
-            "objects; raise it if two objects passing near each other "
-            "get incorrectly tracked as one.")
+            "Minimum IoU (0-1, default 0.1) for a box-overlap match. The "
+            "tracker also matches on the predicted centre position and "
+            "appearance, so fast objects no longer need a lower value.")
         .def("set_track_max_missed_passes", &DetectionLink::setTrackMaxMissedPasses,
             py::arg("passes"),
-            "How many consecutive passes a track may go unmatched "
-            "(occlusion, a missed detection) before it's dropped. "
-            "Default 6 (~1.5s at the default 250ms interval). Once "
-            "dropped, the object reappearing starts a brand new "
-            "track_id -- this tracker is position/IoU-based, not "
-            "appearance re-ID.")
+            "Minimum number of passes a lost track is kept (together with "
+            "set_track_lost_memory_ms: whichever is longer), so slow CPU "
+            "passes don't expire a track after one miss. Default 6.")
+        .def("set_track_lost_memory_ms", &DetectionLink::setTrackLostMemoryMs,
+            py::arg("ms"),
+            "How long a confirmed object that is no longer detected "
+            "(occlusion, missed passes) keeps its track_id. Default 5000.")
+        .def("set_track_low_confidence", &DetectionLink::setTrackLowConfidence,
+            py::arg("confidence"),
+            "Detections between this and the confidence threshold may keep "
+            "a confirmed track alive but never start one or create a "
+            "record on their own. Default 0.15.")
+        .def("set_track_confirm_hits", &DetectionLink::setTrackConfirmHits,
+            py::arg("hits"),
+            "Passes a new object must be seen before its first record "
+            "(1 = at once). Default 2; confidence >= 0.70 confirms at once.")
+        .def("set_track_reid_radius_m", &DetectionLink::setTrackReidRadiusM,
+            py::arg("meters"),
+            "Geographic re-identification: an object that re-appears "
+            "within this distance of where a lost object of the same "
+            "group (person / vehicle) was last seen, and looks alike, "
+            "gets the old track_id. Default 10; 0 disables.")
+        .def("set_track_reid_window_ms", &DetectionLink::setTrackReidWindowMs,
+            py::arg("ms"),
+            "How long a lost object can be re-identified geographically. "
+            "Default 120000 (2 min).")
+        .def("set_track_camera_motion_compensation",
+            &DetectionLink::setTrackCameraMotionCompensation, py::arg("enabled"),
+            "Compensate drone yaw/pan between passes (phase correlation). "
+            "Default True.")
         .def("set_track_move_threshold_m", &DetectionLink::setTrackMoveThresholdM,
             py::arg("meters"),
             "Minimum ground movement, in meters, between a track's last "

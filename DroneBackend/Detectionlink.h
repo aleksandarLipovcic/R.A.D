@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <unordered_map>
 
+#include "ObjectTracker.h"
+
 // Forward declaration only -- DetectionLink never includes VideoLink.h.
 // The relationship is the same one-way "give me a frame, I don't need
 // to know what you are" decoupling VideoLink already uses toward
@@ -77,13 +79,13 @@ struct DetectionRecord {
 
     // Identity assigned by the tracker in inferenceLoop(), NOT a fresh
     // value per pass. Every DetectionRecord sharing the same trackId is
-    // (as far as position/IoU-based tracking can tell) the SAME physical
-    // object observed at a different moment -- see the "Object tracking
-    // / re-identification" block below runInference() for how this is
-    // assigned and its limitations (it is not appearance-based re-ID; an
-    // object that leaves frame and comes back gets a new trackId). Use
-    // this to group a pin's position history instead of assuming one
-    // DetectionRecord == one physical sighting worth showing separately.
+    // the SAME physical object observed at a different moment -- see the
+    // "Object tracking / re-identification" block of setters below for
+    // how it is kept (motion, appearance, lost-track memory, geographic
+    // re-ID). Use this to group a pin's position history instead of
+    // assuming one DetectionRecord == one physical sighting. className is
+    // the track's voted class (stable even if the model flickers between
+    // car and other_vehicle).
     uint64_t trackId = 0;
 
     // Pixel-space box in the source frame, kept so the screenshot can be
@@ -235,48 +237,70 @@ public:
     // method's own doc comment.
     void setTriangulationMinBearingSpreadDeg(double deg) { triangulationMinBearingSpreadDeg_.store(deg); }
 
-    // ── Object tracking / re-identification (call before or during start()) ──
+    // ── Object tracking / re-identification (safe to change at runtime) ──
     //
-    // Detection passes run every detectionIntervalMs_ (default 250ms) --
-    // fast enough that the same physical object is almost always caught
-    // on several consecutive passes while it's in frame. Without the
-    // tracker below, that produced one DetectionRecord (and one saved
-    // screenshot) PER PASS for what is visually a single sighting -- a
-    // car sitting in frame for 10 seconds at 4 passes/sec turned into 40
-    // near-identical records. The tracker below is a lightweight,
-    // position-only re-identification: it matches each pass's raw boxes
-    // against the previous pass's tracked boxes by IoU (+ same class),
-    // NOT by any learned appearance embedding. That means:
-    //   - it re-identifies an object continuously visible pass-to-pass
-    //     reliably, since consecutive-pass boxes overlap heavily at 4Hz;
-    //   - it CANNOT re-identify an object that leaves frame and comes
-    //     back later, or two same-class objects that cross paths -- both
-    //     get treated as distinct tracks (new trackId). True appearance
-    //     re-ID would need an embedding model and is out of scope here;
-    //     this is the "as close as possible" version with what
-    //     runInference() already produces.
-    // A matched, continuing track does NOT get a new DetectionRecord
-    // every pass -- only when setTrackMoveThresholdM() worth of map
-    // movement has accumulated, or setTrackRefreshIntervalMs() has
-    // elapsed since its last record (so a long-dwelling static object
-    // still gets a periodically refreshed confidence/timestamp/screenshot
-    // rather than looking stale forever). A brand-new track always gets
-    // an initial record immediately, same as today's behavior.
+    // Detection passes run every detectionIntervalMs_ (default 250ms), so
+    // the same physical object is caught on many passes while it is in
+    // frame. Every pass goes through trk::ObjectTracker (ObjectTracker.h,
+    // which documents the algorithm) so that one physical object keeps ONE
+    // trackId and produces records only when something new happened:
+    //   - camera-motion compensation (drone yaw/pan no longer breaks the
+    //     match), motion prediction (a crossing car that moves more than
+    //     its own width between passes), IoU + centre distance + colour
+    //     histogram association, vehicle classes that the model confuses
+    //     (car / large_vehicle / motorcycle / other_vehicle) matched as one
+    //     group with a voted class;
+    //   - weak detections (between setTrackLowConfidence() and the
+    //     confidence threshold) only keep an existing track alive -- they
+    //     never create records on their own;
+    //   - a new track must be seen twice (or once very confidently) before
+    //     its first record -- single-pass false alarms never become pins;
+    //   - an unseen track is remembered for setTrackLostMemoryMs() (a car
+    //     behind a tree, a missed pass or two) and keeps its trackId;
+    //   - after that it is archived with its last map position; an object
+    //     of the same group that re-appears within setTrackReidRadiusM()
+    //     of that position (and looks alike) within setTrackReidWindowMs()
+    //     inherits the old trackId instead of becoming a new object.
+    // A continuing track gets a new DetectionRecord only when
+    // setTrackMoveThresholdM() worth of map movement has accumulated, or
+    // setTrackRefreshIntervalMs() has elapsed since its last record.
 
-    // Minimum IoU (0-1) between a raw detection's box and a track's most
-    // recently matched box, same class, for them to be considered the
-    // same object. Default 0.3. Lower catches faster-moving objects at
-    // the cost of more false merges between nearby same-class objects;
-    // raise it if two separate objects passing near each other are
-    // incorrectly being tracked as one.
+    // Minimum IoU (0-1) for a box-overlap match. Default 0.1. Matching
+    // also works on predicted centre distance, so this no longer needs to
+    // be lowered for fast objects.
     void setTrackIouThreshold(double v) { trackIouThreshold_.store(v); }
 
-    // How many consecutive passes a track is allowed to go unmatched
-    // (object briefly occluded, a missed detection, momentary confidence
-    // dip below threshold) before it's dropped. Default 6 (~1.5s at the
-    // default 250ms interval). Once dropped, the object reappearing
-    // starts a brand new track/trackId -- see the re-ID limitation above.
+    // Minimum number of passes a lost track is kept (together with
+    // setTrackLostMemoryMs(): whichever is LONGER), so slow CPU passes of
+    // several seconds each don't expire tracks after a single miss.
+    // Default 6.
     void setTrackMaxMissedPasses(int n) { trackMaxMissedPasses_.store(n); }
+
+    // How long, in ms, a confirmed track that is no longer detected stays
+    // predicted and matchable with its trackId. Default 5000.
+    void setTrackLostMemoryMs(int ms) { trackLostMemoryMs_.store(ms); }
+
+    // Detections between this and the confidence threshold may extend an
+    // already confirmed track (keeps it alive through a weak pass) but
+    // never start one. Default 0.15; set >= the confidence threshold to
+    // disable.
+    void setTrackLowConfidence(float c) { trackLowConfidence_.store(c); }
+
+    // Passes a new track must be matched before its first record (1 =
+    // record at once, like the old tracker). Default 2. A detection with
+    // confidence >= 0.70 confirms at once regardless.
+    void setTrackConfirmHits(int n) { trackConfirmHits_.store(n < 1 ? 1 : n); }
+
+    // Geographic re-identification of an object that was out of view
+    // longer than the lost memory: radius in meters (default 10, 0
+    // disables) and how long an archived object can be re-found, in ms
+    // (default 120000).
+    void setTrackReidRadiusM(double m) { trackReidRadiusM_.store(m); }
+    void setTrackReidWindowMs(int ms) { trackReidWindowMs_.store(ms); }
+
+    // Camera-motion compensation (phase correlation of consecutive
+    // inference frames). Default on; costs ~1 ms per pass.
+    void setTrackCameraMotionCompensation(bool on) { trackCameraMotion_.store(on); }
 
     // Minimum ground movement, in meters, between a track's last-recorded
     // position and its current one before a new DetectionRecord is
@@ -421,7 +445,7 @@ private:
 
     // Bundles the outcome of running both ranging methods for one raw
     // detection -- computed ONCE per raw detection per pass, up front,
-    // then used both to decide (in updateTracks(), via move-threshold
+    // then used both to decide (in shouldRecordAgain(), via move-threshold
     // comparison against a track's last recorded position) whether this
     // sighting is "new" enough to log, and -- if so -- to fill in the
     // DetectionRecord without re-deriving the ray/ranging a second time.
@@ -436,7 +460,7 @@ private:
         // (north/east, unit length -- see computeWorldRay()), filled
         // whenever the ray itself could be computed, REGARDLESS of
         // whether ground-plane/triangulation/object-size ranging
-        // actually produced a position. This is what lets updateTracks()
+        // actually produced a position. This is what lets inferenceLoop()
         // log a bearing observation for triangulation on every pass a
         // track is seen, not only the passes where it happened to get
         // georeferenced some other way -- an un-ranged sighting today is
@@ -452,74 +476,67 @@ private:
     // Owned and touched ONLY by inferenceLoop() -- previewLoop() never
     // -- unlike records_/lastAnnotatedFrame_, this is never read from
     // Python or any other thread, so it needs no mutex of its own.
-    struct Track {
-        uint64_t trackId = 0;
-        int classIndex = -1;
-        int lastX = 0, lastY = 0, lastW = 0, lastH = 0;  // last matched pixel-space box
+    //
+    // tracker_ keeps identities (pixel space); ObjectState is what
+    // DetectionLink adds per object on top: the public trackId (which
+    // geographic re-ID may carry over from an archived object), the record
+    // policy state and the bearing history for triangulation.
+    struct ObjectState {
+        uint64_t trackId = 0;          // public id (DetectionRecord::trackId)
+        bool recorded = false;         // at least one DetectionRecord written
         bool lastGeoreferenced = false;
-        double lastLat = 0.0, lastLon = 0.0;             // position at the last WRITTEN record
-        int64_t lastSeenMs = 0;       // last pass this track was matched
-        int64_t lastRecordMs = 0;     // last pass a DetectionRecord was written for this track
-        int missedPasses = 0;
+        double lastLat = 0.0, lastLon = 0.0;   // position at the last WRITTEN record
+        int64_t lastRecordMs = 0;      // last pass a DetectionRecord was written
 
-        // Rolling history of this track's bearing observations (see
+        // Last georeferenced sighting (recorded or not) -- where an
+        // archived object is looked for by geographic re-ID.
+        bool seenGeo = false;
+        double seenLat = 0.0, seenLon = 0.0;
+
+        // Rolling history of this object's bearing observations (see
         // BearingObservation above), oldest first, capped at
         // kMaxBearingHistoryPerTrack (Detectionlink.cpp) -- appended to
-        // on EVERY pass this track is seen (matched or freshly created),
-        // regardless of whether that pass's own ranging succeeded, so a
-        // string of un-ranged forward-flight sightings still accumulates
-        // useful parallax for rangeByTriangulation() once the drone has
-        // moved enough.
+        // on EVERY pass the object is seen, regardless of whether that
+        // pass's own ranging succeeded, so a string of un-ranged
+        // forward-flight sightings still accumulates useful parallax for
+        // rangeByTriangulation() once the drone has moved enough.
         std::vector<BearingObservation> bearingHistory;
     };
-    std::vector<Track> tracks_;
+    struct ArchivedObject {
+        ObjectState state;
+        int group = 0;
+        cv::Mat hist;                  // appearance when it was lost
+        int64_t archivedMs = 0;
+    };
+
+    trk::ObjectTracker tracker_;
+    std::unordered_map<uint64_t, ObjectState> objects_;   // tracker id -> state
+    std::vector<ArchivedObject> archive_;
     uint64_t nextTrackId_ = 1;
 
-    // IoU between a raw detection's box and a track's last matched box.
-    static double trackIou(const RawDetection& raw, const Track& track);
+    // Applies the atomics above to tracker_'s config (every pass, so the
+    // setters work at runtime).
+    void syncTrackerConfig();
 
-    // Pure/read-only greedy IoU+class matching of this pass's raw
-    // detections against tracks_ AS THEY STOOD AT THE END OF THE
-    // PREVIOUS PASS -- no mutation, no new tracks created. Returns, per
-    // rawDetections index, the matched tracks_ index or -1. Factored out
-    // of updateTracks() so inferenceLoop() can look up an existing
-    // track's bearingHistory (to feed rangeByTriangulation() via
-    // computeGeoCandidate()) BEFORE updateTracks() itself runs and
-    // mutates tracks_ -- both call sites use this exact same function,
-    // so the "preview" match inferenceLoop() sees for history lookup is
-    // guaranteed identical to the "real" match updateTracks() commits
-    // (same algorithm, same inputs, called before either mutates
-    // anything).
-    std::vector<int> matchRawToTracks(const std::vector<RawDetection>& rawDetections) const;
+    // Looks for an archived object this newly confirmed one is (same
+    // group, within the re-ID radius, similar appearance); on success
+    // moves its state into `obj` (keeping the old trackId) and returns
+    // true.
+    bool reidentify(ObjectState& obj, int group, const cv::Mat& hist,
+                    double lat, double lon, int64_t nowMs);
 
-    // Matches this pass's raw detections against tracks_ (using the
-    // already-computed matchedTrackIdx from matchRawToTracks() above --
-    // see that function's comment for why this isn't recomputed here),
-    // updates tracks_ in place (position, bearingHistory, missed-pass
-    // aging), ages out/removes tracks that exceeded
-    // trackMaxMissedPasses_, and returns, for each raw detection (by
-    // index into rawDetections, parallel array), the trackId it was
-    // assigned (existing or freshly created) plus whether a new
-    // DetectionRecord should be written for it this pass. geoCandidates
-    // and matchedTrackIdx must both be the same size as rawDetections
-    // (index-parallel) -- see setTrackMoveThresholdM() /
-    // setTrackRefreshIntervalMs() for what "should [record]" means for a
-    // continuing (already-tracked) detection; a brand new track is
-    // always recorded. telemetry is only used here to stamp each
-    // BearingObservation with the drone's position at this pass.
-    struct TrackAssignment {
-        uint64_t trackId = 0;
-        bool shouldRecord = false;
-    };
-    std::vector<TrackAssignment> updateTracks(
-        const std::vector<RawDetection>& rawDetections,
-        const std::vector<GeoCandidate>& geoCandidates,
-        const std::vector<int>& matchedTrackIdx,
-        const TelemetrySnapshot& telemetry,
-        int64_t nowMs);
+    // Record policy for a continuing object: moved far enough, refresh
+    // interval elapsed, or georeferencing appeared/disappeared.
+    bool shouldRecordAgain(const ObjectState& obj, const GeoCandidate& geo, int64_t nowMs) const;
 
-    std::atomic<double> trackIouThreshold_{ 0.3 };
+    std::atomic<double> trackIouThreshold_{ 0.1 };
     std::atomic<int> trackMaxMissedPasses_{ 6 };
+    std::atomic<int> trackLostMemoryMs_{ 5000 };
+    std::atomic<float> trackLowConfidence_{ 0.15f };
+    std::atomic<int> trackConfirmHits_{ 2 };
+    std::atomic<double> trackReidRadiusM_{ 10.0 };
+    std::atomic<int> trackReidWindowMs_{ 120000 };
+    std::atomic<bool> trackCameraMotion_{ true };
     std::atomic<double> trackMoveThresholdM_{ 3.0 };
     std::atomic<int> trackRefreshIntervalMs_{ 10000 };
 

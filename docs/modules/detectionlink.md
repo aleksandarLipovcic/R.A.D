@@ -1,6 +1,7 @@
 # `DetectionLink` — YOLO detection, tracking & georeferencing
 
-**Files:** `Detectionlink.h`, `Detectionlink.cpp`
+**Files:** `Detectionlink.h`, `Detectionlink.cpp`, `ObjectTracker.h`, `ObjectTracker.cpp`
+**Tests:** `tests/tracker_sim.cpp` (tracker simulation, old vs new)
 **Depends on:** OpenCV `dnn` (ONNX inference), `VideoLink` (frame source
 only, via pointer — see the provider pattern), a telemetry provider
 callable
@@ -45,8 +46,13 @@ for why this is structured as callables rather than concrete dependencies.
 | `setMinGroundRayComponent(v)` | 0.12 (~7°) | Below this ray-downward-component, ground-plane ranging is distrusted in favor of object-size ranging (or used as a last resort if unavailable) |
 | `setTriangulationMinBaselineM(m)` | 5.0 | Minimum drone movement between bearing observations before a triangulated fix is trusted |
 | `setTriangulationMinBearingSpreadDeg(deg)` | 5.0 | Minimum angular spread between bearing observations — guards the "moved far but flew straight at the object" degenerate case |
-| `setTrackIouThreshold(v)` | 0.3 | Minimum IoU (same class) to match a raw detection to an existing track |
-| `setTrackMaxMissedPasses(n)` | 6 (~1.5 s at 250 ms) | Passes a track survives unmatched before being dropped |
+| `setTrackIouThreshold(v)` | 0.1 | Minimum IoU for a box-overlap match (centre distance and appearance also match, see below) |
+| `setTrackMaxMissedPasses(n)` | 6 | Minimum passes a lost track is kept — together with the lost memory, whichever is longer (slow CPU passes) |
+| `setTrackLostMemoryMs(ms)` | 5000 | How long an unseen confirmed object keeps its `trackId` |
+| `setTrackLowConfidence(c)` | 0.15 | Detections between this and the confidence threshold only keep a confirmed track alive |
+| `setTrackConfirmHits(n)` | 2 | Passes before a new object's first record (confidence ≥ 0.70 confirms at once) |
+| `setTrackReidRadiusM(m)` / `setTrackReidWindowMs(ms)` | 10 / 120000 | Geographic re-identification of an object that was out of view longer than the lost memory |
+| `setTrackCameraMotionCompensation(on)` | true | Compensate drone yaw/pan between passes |
 | `setTrackMoveThresholdM(m)` | 3.0 | Ground movement needed before a continuing track gets a fresh `DetectionRecord` |
 | `setTrackRefreshIntervalMs(ms)` | 10000 | Even a static, continuously-tracked object gets a periodic fresh record so it doesn't look stale |
 
@@ -89,45 +95,105 @@ sequenceDiagram
 ## Object tracking / re-identification
 
 Without a tracker, a car sitting in frame for 10 seconds at 4 passes/sec
-(the default 250 ms interval) produced 40 near-identical
-`DetectionRecord`s and screenshots. The tracker is deliberately lightweight:
-**position-only re-identification** — it matches each pass's raw boxes
-against the previous pass's tracked boxes by IoU + same class, **not** by
-any learned appearance embedding.
+(the default 250 ms interval) produces 40 near-identical
+`DetectionRecord`s and screenshots. The first tracker matched each pass's
+boxes to the previous pass's by IoU ≥ 0.3 and identical class only. In
+flight that still logged the same object over and over:
 
-Consequences of that design choice, stated directly in the code:
+| Situation | Why IoU-only failed |
+|---|---|
+| Crossing car | Between passes it moves more than its own width, so the boxes no longer overlap |
+| Drone yaw / pan | The whole image shifts; even parked cars lose their overlap |
+| `car` ↔ `other_vehicle` flicker | Different class → new track |
+| One weak pass below the confidence threshold | Track starved, then a new one |
+| Two cars / people crossing | Greedy IoU swapped identities |
+| Single-pass false alarm | Recorded immediately |
 
-- Reliable for an object continuously visible pass-to-pass (consecutive-pass
-  boxes overlap heavily at 4 Hz).
-- **Cannot** re-identify an object that leaves frame and returns later, or
-  two same-class objects that cross paths — both become distinct tracks
-  (new `trackId`). True appearance re-ID would need an embedding model and
-  is explicitly out of scope.
+`trk::ObjectTracker` (`ObjectTracker.h/.cpp`, OpenCV core + imgproc only,
+no Win32, no threads) replaces it. Per pass:
 
-Flow per pass:
+1. **Camera motion.** `cv::phaseCorrelate` on a 320-px-wide grayscale copy
+   of this and the previous inference frame gives the global image shift;
+   every track is moved by it. The detection boxes of both passes are
+   blanked out first, so a big moving vehicle isn't mistaken for a pan.
+2. **Prediction.** Each track has a velocity (alpha-beta filter on real
+   time, so slow CPU passes are handled) and is predicted to *now*.
+3. **Association score** = IoU + centre distance in object sizes + HSV
+   colour-histogram similarity, inside a gate that widens the longer the
+   track has been unseen. A track seen only once has no velocity yet, so
+   it gets a wide gate, but only for a detection that also looks alike.
+   Greedy best-first assignment.
+4. **Class groups.** Vehicle classes (`car`, `large_vehicle`,
+   `motorcycle`, `other_vehicle`: any name containing car, vehicle, truck,
+   bus, motor or van) may match each other with a small penalty; `person`
+   only matches `person`. The class written to records and drawn on the
+   preview is a confidence-weighted **vote** over the track's history.
+5. **Two stages (the ByteTrack idea).** Detections ≥ the confidence
+   threshold are matched first. Weaker ones (≥ `setTrackLowConfidence`)
+   may then only extend a confirmed track. They never start one or create
+   a record on their own.
+6. **Life cycle.** *Tentative* → *confirmed* after `setTrackConfirmHits`
+   matches (or at once with confidence ≥ 0.70). Only confirmed tracks are
+   recorded, so single-pass false alarms never become pins. An unseen
+   confirmed track is *lost*: still predicted and matchable with the same
+   `trackId` for `setTrackLostMemoryMs` (and at least
+   `setTrackMaxMissedPasses` passes).
+7. **Geographic re-ID** (in `DetectionLink`). A lost track that expires is
+   archived with its last georeferenced position, group and appearance.
+   When a new track is confirmed within `setTrackReidRadiusM` of an
+   archived object of the same group, with no contradicting appearance,
+   inside `setTrackReidWindowMs`, it inherits the old `trackId` and
+   bearing history and counts as a continuing object. A parked car the
+   drone flies back over doesn't become a new pin.
 
-1. `matchRawToTracks(rawDetections)` — pure/read-only greedy IoU+class
-   matching against `tracks_` as they stood at the end of the *previous*
-   pass. No mutation, no new tracks. Factored out specifically so
-   `inferenceLoop()` can look up an existing track's `bearingHistory` (for
-   triangulation, via `computeGeoCandidate()`) **before** `updateTracks()`
-   mutates anything — both call sites use this exact function, so the
-   "preview" match used for history lookup is guaranteed identical to the
-   "real" match `updateTracks()` commits.
-2. `updateTracks(...)` — updates `tracks_` in place using the already-computed
-   match indices (position, `bearingHistory`, missed-pass aging), ages out
-   tracks past `trackMaxMissedPasses_`, and returns a `TrackAssignment`
-   (trackId + `shouldRecord`) per raw detection. A brand-new track is always
-   recorded; a continuing track is recorded only once it has moved
-   `trackMoveThresholdM_` or `trackRefreshIntervalMs_` has elapsed since its
-   last record.
+On top of the tracker, `DetectionLink` keeps an `ObjectState` per track:
+the public `trackId`, record-policy state and `bearingHistory`. A new
+object is recorded on its first confirmed pass. A continuing one is
+recorded again only once it has moved `trackMoveThresholdM_`,
+`trackRefreshIntervalMs_` has elapsed, or its georeferencing appeared or
+disappeared (`shouldRecordAgain()`).
 
-`Track.bearingHistory` accumulates a `BearingObservation` on **every** pass
-a track is seen — matched or freshly created — regardless of whether that
-pass's own ranging succeeded. This means a string of un-ranged
-forward-flight sightings still builds up useful parallax for
+`bearingHistory` gets a `BearingObservation` on **every** confirmed pass
+the object is seen, whether or not that pass's own ranging succeeded. A
+string of un-ranged forward-flight sightings still builds up parallax for
 `rangeByTriangulation()` once the drone has moved enough (capped at
 `kMaxBearingHistoryPerTrack` in the `.cpp`).
+
+The live preview draws tentative and confirmed tracks with the voted
+class. Weak detections that match nothing are dropped as noise.
+
+### Measured (tests/tracker_sim.cpp)
+
+The simulator renders textured ground with coloured objects, pans the
+camera, and feeds the same noisy detections (jitter, misses, confidence
+dips, class flicker, false alarms) to a faithful copy of the old matcher
+and to the new tracker. **IDs per real object**, averaged over 5 seeds
+(1.00 = perfect):
+
+| Scenario | Old | New |
+|---|---|---|
+| Crossing cars, 4 Hz | 20.9 | 1.00 |
+| Static objects, drone yaw/pan | 21.3 | 1.00 |
+| Class flicker + confidence dips | 18.5 | 1.00 |
+| Occlusion 2 s | 3.0 | 1.00 |
+| Two cars passing each other (ID swaps) | 23.8 (3.2) | 1.00 (0) |
+| Slow CPU passes 1.5 s + pan | 9.8 | 1.00 |
+| Parking lot, 12 identical cars (ID swaps) | 3.55 (11.2) | 1.08 (0.6) |
+| Fast vehicles, 2× own width per pass | 8.6 | 1.00 |
+| 20 % missed detections + dips | 14.1 | 1.00 |
+| Sharp drone turn | 8.8 | 1.00 |
+| Pedestrians crossing, same colour | 4.5 | 1.00 |
+| False alarms 0.3/pass → false records | 23.4 | 0.2 |
+| Occlusion 7 s (> lost memory) | 2.0 | 2.0 (in flight, geographic re-ID covers this; not simulated) |
+
+Cost: about 3 ms per pass for a handful of objects; the model itself takes
+tens to hundreds of ms. Build and run on any machine with OpenCV:
+
+```
+cd DroneBackend/tests
+g++ -std=c++17 -O2 -I.. tracker_sim.cpp ../ObjectTracker.cpp $(pkg-config --cflags --libs opencv4) -o tracker_sim
+./tracker_sim
+```
 
 ## Georeferencing: three ranging strategies
 

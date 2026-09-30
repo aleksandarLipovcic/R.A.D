@@ -158,6 +158,7 @@
     <ClInclude Include="GPSneoM10.h" />
     <ClInclude Include="IMUSensor.h" />
     <ClInclude Include="MagQMC5883L.h" />
+    <ClInclude Include="ObjectTracker.h" />
     <ClInclude Include="SerialPortScan.h" />
     <ClInclude Include="VideoLink.h" />
   </ItemGroup>
@@ -172,6 +173,7 @@
     <ClCompile Include="Bindings.cpp" />
     <ClCompile Include="BaroBMP280.cpp" />
     <ClCompile Include="MagQMC5883L.cpp" />
+    <ClCompile Include="ObjectTracker.cpp" />
     <ClCompile Include="SerialPortScan.cpp" />
     <ClCompile Include="VideoLink.cpp" />
   </ItemGroup>

@@ -215,6 +215,12 @@ readonly, since Python code builds these to feed into
 | `set_triangulation_min_bearing_spread_deg(deg)` | `setTriangulationMinBearingSpreadDeg` |
 | `set_track_iou_threshold(v)` | `setTrackIouThreshold` |
 | `set_track_max_missed_passes(n)` | `setTrackMaxMissedPasses` |
+| `set_track_lost_memory_ms(ms)` | `setTrackLostMemoryMs` |
+| `set_track_low_confidence(c)` | `setTrackLowConfidence` |
+| `set_track_confirm_hits(n)` | `setTrackConfirmHits` |
+| `set_track_reid_radius_m(m)` | `setTrackReidRadiusM` |
+| `set_track_reid_window_ms(ms)` | `setTrackReidWindowMs` |
+| `set_track_camera_motion_compensation(on)` | `setTrackCameraMotionCompensation` |
 | `set_track_move_threshold_m(m)` | `setTrackMoveThresholdM` |
 | `set_track_refresh_interval_ms(ms)` | `setTrackRefreshIntervalMs` |
 | `start()` / `stop()` / `is_running()` | `start`/`stop`/`isRunning` |

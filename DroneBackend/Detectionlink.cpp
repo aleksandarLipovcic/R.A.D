@@ -26,6 +26,8 @@
 #include <filesystem>
 #include <algorithm>
 #include <iostream>
+#include <cctype>
+#include <map>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -231,6 +233,29 @@ bool DetectionLink::start() {
         impl_->net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
     }
 
+    // Tracker: fresh state per start() (trackIds keep counting up, so an
+    // id is never reused within a session). Vehicle classes the model
+    // confuses with each other form one group -- a car detected as
+    // other_vehicle on the next pass is still the same object.
+    {
+        std::map<int, int> groups;
+        for (size_t i = 0; i < classNames_.size(); ++i) {
+            std::string n = classNames_[i];
+            std::transform(n.begin(), n.end(), n.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (n == "person" || n == "people" || n == "pedestrian")
+                groups[static_cast<int>(i)] = 0;
+            else if (n.find("car") != std::string::npos || n.find("vehicle") != std::string::npos ||
+                     n.find("truck") != std::string::npos || n.find("bus") != std::string::npos ||
+                     n.find("motor") != std::string::npos || n.find("van") != std::string::npos)
+                groups[static_cast<int>(i)] = 1;
+        }
+        tracker_.setClassGroups(groups);
+        tracker_.reset();
+        objects_.clear();
+        archive_.clear();
+    }
+
     running_.store(true);
     previewWorker_ = std::thread(&DetectionLink::previewLoop, this);
     inferenceWorker_ = std::thread(&DetectionLink::inferenceLoop, this);
@@ -427,72 +452,117 @@ void DetectionLink::inferenceLoop() {
             std::chrono::steady_clock::now() - dbgInferStart).count();
         dbgInferMsAccum += dbgInferMs;
 
-        // Filter by confidence BEFORE handing detections to the tracker --
-        // a sub-threshold row shouldn't be allowed to start, extend, or
-        // keep alive a track any more than it should have produced a
-        // DetectionRecord under the old code.
-        std::vector<RawDetection> rawDetections;
-        rawDetections.reserve(rawAll.size());
-        for (const auto& raw : rawAll)
-            if (raw.confidence >= confidenceThreshold_.load())
-                rawDetections.push_back(raw);
+        // ── Tracking ─────────────────────────────────────────────────
+        // Everything down to the low-confidence floor goes to the tracker:
+        // confident detections may start tracks, weak ones may only keep a
+        // confirmed track alive through a dip (see ObjectTracker.h). Only
+        // CONFIRMED tracks ever produce records.
+        syncTrackerConfig();
+        const float highConf = confidenceThreshold_.load();
+        const float lowConf = std::min(trackLowConfidence_.load(), highConf);
+        std::vector<RawDetection> candidates;
+        std::vector<trk::Detection> trackerInput;
+        candidates.reserve(rawAll.size());
+        trackerInput.reserve(rawAll.size());
+        for (const auto& raw : rawAll) {
+            if (raw.confidence < lowConf)
+                continue;
+            candidates.push_back(raw);
+            trackerInput.push_back({ raw.classIndex, raw.confidence,
+                                     cv::Rect2f(static_cast<float>(raw.x), static_cast<float>(raw.y),
+                                                static_cast<float>(raw.w), static_cast<float>(raw.h)) });
+        }
+        const int64_t trackerNowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        trk::UpdateResult tracked = tracker_.update(frame, trackerInput, trackerNowMs);
 
-        // Peek-match this pass's boxes against tracks_ from previous
-        // passes BEFORE computing geo candidates -- purely so a matched
-        // track's accumulated bearingHistory can be handed to
-        // rangeByTriangulation() below. matchRawToTracks() is pure/
-        // read-only (see its header comment), so this is safe to call
-        // again inside updateTracks() afterward with the exact same
-        // result; we pass this result straight through instead of
-        // letting updateTracks() recompute it, so there's only one
-        // source of truth for "which track did this raw detection match"
-        // this pass.
-        std::vector<int> matchedTrackIdx = matchRawToTracks(rawDetections);
-
-        // Georeference every surviving raw detection ONCE, up front --
-        // both so updateTracks() below can compare a continuing track's
-        // fresh position against its last-recorded one (the actual
-        // "has it moved far enough to log again" check), and so the
-        // DetectionRecord-building code further down doesn't redo the
-        // same ray/ranging math a second time.
-        std::vector<GeoCandidate> geoCandidates;
-        geoCandidates.reserve(rawDetections.size());
-        for (size_t ri = 0; ri < rawDetections.size(); ++ri) {
-            const std::vector<BearingObservation>* history = nullptr;
-            if (matchedTrackIdx[ri] >= 0)
-                history = &tracks_[static_cast<size_t>(matchedTrackIdx[ri])].bearingHistory;
-            geoCandidates.push_back(
-                computeGeoCandidate(rawDetections[ri], frame.cols, frame.rows, telemetry, history));
+        // Tracks the tracker gave up on go to the archive (geographic
+        // re-ID); archived objects older than the re-ID window are dropped.
+        for (const auto& gone : tracked.removed) {
+            auto it = objects_.find(gone.id);
+            if (it == objects_.end())
+                continue;
+            if (it->second.recorded && it->second.seenGeo) {
+                ArchivedObject arc;
+                arc.state = std::move(it->second);
+                arc.group = gone.group;
+                arc.hist = gone.hist;
+                arc.archivedMs = nowMs;
+                archive_.push_back(std::move(arc));
+            }
+            objects_.erase(it);
+        }
+        {
+            const int64_t windowMs = trackReidWindowMs_.load();
+            archive_.erase(std::remove_if(archive_.begin(), archive_.end(),
+                [&](const ArchivedObject& a) { return nowMs - a.archivedMs > windowMs; }),
+                archive_.end());
         }
 
-        // Commit this pass's matches/new-tracks/aging, using the SAME
-        // matchedTrackIdx computed above -- see updateTracks()'s header
-        // comment for why it takes this instead of recomputing its own.
-        // assignments[i] corresponds to rawDetections[i]: which track it
-        // belongs to (existing or brand new), and whether that track's
-        // state (new track, moved enough, or refresh interval elapsed)
-        // warrants writing a DetectionRecord this pass -- see
-        // setTrackIouThreshold() etc. in the header for the full
-        // rationale and its position-only re-ID limitations.
-        auto assignments = updateTracks(rawDetections, geoCandidates, matchedTrackIdx, telemetry, nowMs);
-
+        // Georeference every tracked detection ONCE, up front -- with the
+        // object's bearing history, so rangeByTriangulation() gets its
+        // parallax -- both for the record policy and the record itself.
+        std::vector<RawDetection> rawDetections;       // what the preview draws
         int recordsThisPass = 0;
-        for (size_t i = 0; i < rawDetections.size(); ++i) {
-            const auto& raw = rawDetections[i];
-            const auto& assignment = assignments[i];
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            const trk::Assignment& as = tracked.assignments[i];
+            if (as.trackId == 0)
+                continue;                               // weak and unmatched: noise
+            RawDetection raw = candidates[i];
+            if (as.votedClass >= 0)
+                raw.classIndex = as.votedClass;         // stable class, no car/other_vehicle flicker
+            rawDetections.push_back(raw);
+            if (!as.confirmed)
+                continue;                               // tentative: not a record (yet)
 
-            if (!assignment.shouldRecord)
+            ObjectState& obj = objects_[as.trackId];
+            const GeoCandidate geo = computeGeoCandidate(raw, frame.cols, frame.rows, telemetry,
+                                                         &obj.bearingHistory);
+            if (geo.rayValid) {
+                BearingObservation obs;
+                obs.timestampMs = nowMs;
+                obs.droneLat = telemetry.latitude;
+                obs.droneLon = telemetry.longitude;
+                obs.unitNorth = geo.rayUnitNorth;
+                obs.unitEast = geo.rayUnitEast;
+                obj.bearingHistory.push_back(obs);
+                if (obj.bearingHistory.size() > kMaxBearingHistoryPerTrack)
+                    obj.bearingHistory.erase(obj.bearingHistory.begin());
+            }
+
+            bool shouldRecord;
+            if (obj.trackId == 0) {
+                // First confirmed sighting: an object seen before (out of
+                // view longer than the lost memory) keeps its old trackId
+                // and is treated as continuing; otherwise it is new.
+                const trk::TrackInfo* ti = tracker_.find(as.trackId);
+                if (geo.georeferenced && ti &&
+                    reidentify(obj, ti->group, ti->hist, geo.lat, geo.lon, nowMs)) {
+                    shouldRecord = shouldRecordAgain(obj, geo, nowMs);
+                }
+                else {
+                    obj.trackId = nextTrackId_++;
+                    shouldRecord = true;
+                }
+            }
+            else {
+                shouldRecord = shouldRecordAgain(obj, geo, nowMs);
+            }
+            if (geo.georeferenced) {
+                obj.seenGeo = true;
+                obj.seenLat = geo.lat;
+                obj.seenLon = geo.lon;
+            }
+            if (!shouldRecord)
                 continue;   // same object as an already-recorded sighting, nothing new to log yet
-
-            const GeoCandidate& geo = geoCandidates[i];
 
             DetectionRecord rec;
             rec.timestampMs = nowMs;
             rec.className = classNameFor(raw.classIndex);
-            rec.confidence = raw.confidence;
+            rec.confidence = candidates[i].confidence;
             rec.bboxX = raw.x; rec.bboxY = raw.y; rec.bboxW = raw.w; rec.bboxH = raw.h;
             rec.telemetry = telemetry;
-            rec.trackId = assignment.trackId;
+            rec.trackId = obj.trackId;
 
             if (geo.georeferenced) {
                 rec.latitude = geo.lat;
@@ -503,21 +573,13 @@ void DetectionLink::inferenceLoop() {
                 rec.georeferenced = true;
             }
 
-            // updateTracks() already matched/created the track and
-            // decided shouldRecord using this exact geo candidate; now
-            // that we're actually committing a record for it, stamp the
-            // track with this sighting's position/time so the NEXT
-            // pass's move-threshold/refresh-interval checks are measured
-            // from here, not from the sighting before it.
-            for (auto& t : tracks_) {
-                if (t.trackId == assignment.trackId) {
-                    t.lastRecordMs = nowMs;
-                    t.lastGeoreferenced = rec.georeferenced;
-                    t.lastLat = rec.latitude;
-                    t.lastLon = rec.longitude;
-                    break;
-                }
-            }
+            // The NEXT pass's move-threshold/refresh-interval checks are
+            // measured from this record.
+            obj.recorded = true;
+            obj.lastRecordMs = nowMs;
+            obj.lastGeoreferenced = rec.georeferenced;
+            obj.lastLat = rec.latitude;
+            obj.lastLon = rec.longitude;
 
             {
                 std::lock_guard<std::mutex> lock(recordsMutex_);
@@ -754,7 +816,7 @@ DetectionLink::GeoCandidate DetectionLink::computeGeoCandidate(const RawDetectio
         return geo;
 
     // Recorded regardless of whether any ranging method below succeeds
-    // -- this is what lets updateTracks() log a bearing observation for
+    // -- this is what lets inferenceLoop() log a bearing observation for
     // triangulation on every pass a track is seen, not only the passes
     // that happened to get georeferenced some other way.
     geo.rayValid = true;
@@ -1156,200 +1218,71 @@ namespace {
     }
 }
 
-double DetectionLink::trackIou(const RawDetection& raw, const Track& track) {
-    int ax2 = raw.x + raw.w, ay2 = raw.y + raw.h;
-    int bx2 = track.lastX + track.lastW, by2 = track.lastY + track.lastH;
-
-    int ix1 = std::max(raw.x, track.lastX);
-    int iy1 = std::max(raw.y, track.lastY);
-    int ix2 = std::min(ax2, bx2);
-    int iy2 = std::min(ay2, by2);
-
-    int iw = std::max(0, ix2 - ix1);
-    int ih = std::max(0, iy2 - iy1);
-    double interArea = static_cast<double>(iw) * ih;
-    if (interArea <= 0.0)
-        return 0.0;
-
-    double rawArea = static_cast<double>(raw.w) * raw.h;
-    double trackArea = static_cast<double>(track.lastW) * track.lastH;
-    double unionArea = rawArea + trackArea - interArea;
-    return unionArea > 0.0 ? interArea / unionArea : 0.0;
+void DetectionLink::syncTrackerConfig() {
+    trk::Config& c = tracker_.config();
+    c.highConfidence = confidenceThreshold_.load();
+    c.lowConfidence = std::min(trackLowConfidence_.load(), c.highConfidence);
+    c.confirmHits = std::max(1, trackConfirmHits_.load());
+    c.maxLostMs = std::max(0, trackLostMemoryMs_.load());
+    c.minLostPasses = std::max(0, trackMaxMissedPasses_.load());
+    c.minIou = static_cast<float>(trackIouThreshold_.load());
+    c.compensateCameraMotion = trackCameraMotion_.load();
 }
 
-std::vector<int> DetectionLink::matchRawToTracks(const std::vector<RawDetection>& rawDetections) const {
-    std::vector<int> matched(rawDetections.size(), -1);
-    std::vector<bool> rawTaken(rawDetections.size(), false);
-    std::vector<bool> trackTaken(tracks_.size(), false);
-
-    // Greedy IoU matching: consider every (raw detection, track) pair
-    // with matching class and IoU above threshold, take the best pair
-    // first, remove both from consideration, repeat. Simple O(n*m) --
-    // fine at the handful of simultaneous detections this app expects;
-    // swap for a proper Hungarian assignment only if that stops being
-    // true. Pure/read-only: does not touch tracks_ at all, so it's safe
-    // to call from inferenceLoop() as a "preview" match before
-    // updateTracks() runs its own (identical, since it's the same
-    // function) real assignment -- see this function's declaration in
-    // the header for why that split exists.
-    double iouThreshold = trackIouThreshold_.load();
-    while (true) {
-        double bestIou = iouThreshold;
-        int bestRawIdx = -1, bestTrackIdx = -1;
-        for (size_t ri = 0; ri < rawDetections.size(); ++ri) {
-            if (rawTaken[ri])
-                continue;
-            for (size_t ti = 0; ti < tracks_.size(); ++ti) {
-                if (trackTaken[ti])
-                    continue;
-                if (tracks_[ti].classIndex != rawDetections[ri].classIndex)
-                    continue;
-                double v = trackIou(rawDetections[ri], tracks_[ti]);
-                if (v > bestIou) {
-                    bestIou = v;
-                    bestRawIdx = static_cast<int>(ri);
-                    bestTrackIdx = static_cast<int>(ti);
-                }
-            }
-        }
-        if (bestRawIdx < 0)
-            break;   // no pair left clears the IoU threshold
-
-        rawTaken[bestRawIdx] = true;
-        trackTaken[bestTrackIdx] = true;
-        matched[bestRawIdx] = bestTrackIdx;
-    }
-    return matched;
-}
-
-std::vector<DetectionLink::TrackAssignment> DetectionLink::updateTracks(
-    const std::vector<RawDetection>& rawDetections,
-    const std::vector<GeoCandidate>& geoCandidates,
-    const std::vector<int>& matchedTrackIdx,
-    const TelemetrySnapshot& telemetry, int64_t nowMs) {
-
-    std::vector<TrackAssignment> assignments(rawDetections.size());
-    const size_t originalTrackCount = tracks_.size();   // tracks_ grows below as new tracks are appended
-    std::vector<bool> trackMatched(originalTrackCount, false);
-
-    for (size_t ri = 0; ri < rawDetections.size(); ++ri) {
-        int ti = matchedTrackIdx[ri];
-        if (ti < 0)
-            continue;   // handled in the "brand-new track" loop below
-
-        trackMatched[static_cast<size_t>(ti)] = true;
-
-        Track& track = tracks_[static_cast<size_t>(ti)];
-        const RawDetection& raw = rawDetections[ri];
-        track.lastX = raw.x; track.lastY = raw.y; track.lastW = raw.w; track.lastH = raw.h;
-        track.lastSeenMs = nowMs;
-        track.missedPasses = 0;
-
-        // A continuing track only earns a fresh DetectionRecord once it
-        // has moved far enough on the map since its last recorded
-        // position, or once the periodic refresh interval has elapsed --
-        // this is the actual "don't log the same object every frame"
-        // behavior; matching alone just keeps the track's identity
-        // (trackId) stable across passes.
-        bool shouldRecord = false;
-        int64_t sinceLastRecordMs = nowMs - track.lastRecordMs;
-        const GeoCandidate& geo = geoCandidates[ri];
-
-        if (sinceLastRecordMs >= trackRefreshIntervalMs_.load()) {
-            shouldRecord = true;
-        }
-        else if (track.lastGeoreferenced && geo.georeferenced) {
-            // Both this sighting and the last recorded one have a real
-            // position -- the actual "has this object moved enough on
-            // the map" check.
-            double movedM = approxGroundDistanceM(track.lastLat, track.lastLon, geo.lat, geo.lon);
-            shouldRecord = movedM >= trackMoveThresholdM_.load();
-        }
-        else if (track.lastGeoreferenced != geo.georeferenced) {
-            // Georeferencing just became available (or was lost) for a
-            // continuing track -- worth a fresh record either way, since
-            // it's a real state change a pilot reviewing the log would
-            // want to see, not something the refresh interval alone
-            // would reliably catch.
-            shouldRecord = true;
-        }
-        // else: neither this sighting nor the last record is
-        // georeferenced -- nothing meaningful to compare positionally,
-        // so leave shouldRecord false and rely purely on the refresh
-        // interval above to keep this track's entry from going stale.
-
-        // Append this pass's bearing observation regardless of whether
-        // shouldRecord ended up true -- an un-recorded sighting is still
-        // a real ray the drone took, and is exactly the parallax a
-        // FUTURE pass's rangeByTriangulation() needs. Only appended when
-        // computeGeoCandidate() actually got a ray (geo.rayValid) -- see
-        // that function for the one case it can't (telemetry invalid or
-        // a zero-size frame).
-        if (geo.rayValid) {
-            BearingObservation obs;
-            obs.timestampMs = nowMs;
-            obs.droneLat = telemetry.latitude;
-            obs.droneLon = telemetry.longitude;
-            obs.unitNorth = geo.rayUnitNorth;
-            obs.unitEast = geo.rayUnitEast;
-            track.bearingHistory.push_back(obs);
-            if (track.bearingHistory.size() > kMaxBearingHistoryPerTrack)
-                track.bearingHistory.erase(track.bearingHistory.begin());
-        }
-
-        assignments[ri].trackId = track.trackId;
-        assignments[ri].shouldRecord = shouldRecord;
-    }
-
-    // Unmatched raw detections start brand-new tracks -- always recorded
-    // immediately, same as the pre-tracking behavior for a first sighting.
-    for (size_t ri = 0; ri < rawDetections.size(); ++ri) {
-        if (matchedTrackIdx[ri] >= 0)
+bool DetectionLink::reidentify(ObjectState& obj, int group, const cv::Mat& hist,
+                               double lat, double lon, int64_t nowMs) {
+    const double radius = trackReidRadiusM_.load();
+    if (radius <= 0.0)
+        return false;
+    int best = -1;
+    double bestDist = radius;
+    for (size_t i = 0; i < archive_.size(); ++i) {
+        const ArchivedObject& a = archive_[i];
+        if (a.group != group || nowMs - a.archivedMs > trackReidWindowMs_.load())
             continue;
-        Track track;
-        track.trackId = nextTrackId_++;
-        track.classIndex = rawDetections[ri].classIndex;
-        track.lastX = rawDetections[ri].x; track.lastY = rawDetections[ri].y;
-        track.lastW = rawDetections[ri].w; track.lastH = rawDetections[ri].h;
-        track.lastSeenMs = nowMs;
-        track.missedPasses = 0;
-
-        const GeoCandidate& geo = geoCandidates[ri];
-        if (geo.rayValid) {
-            BearingObservation obs;
-            obs.timestampMs = nowMs;
-            obs.droneLat = telemetry.latitude;
-            obs.droneLon = telemetry.longitude;
-            obs.unitNorth = geo.rayUnitNorth;
-            obs.unitEast = geo.rayUnitEast;
-            track.bearingHistory.push_back(obs);
-        }
-
-        tracks_.push_back(track);
-
-        assignments[ri].trackId = track.trackId;
-        assignments[ri].shouldRecord = true;
+        const double d = approxGroundDistanceM(a.state.seenLat, a.state.seenLon, lat, lon);
+        if (d > bestDist)
+            continue;
+        // Appearance must not contradict: a red car where a white one was
+        // parked is a different car. (No histogram = position only.)
+        const double sim = trk::ObjectTracker::histSimilarity(a.hist, hist);
+        if (sim >= 0.0 && sim < 0.5)
+            continue;
+        best = static_cast<int>(i);
+        bestDist = d;
     }
+    if (best < 0)
+        return false;
+    // The archived bearing history is from the object's old sightings --
+    // still the same object, still useful parallax.
+    std::vector<BearingObservation> history = std::move(obj.bearingHistory);
+    obj = std::move(archive_[static_cast<size_t>(best)].state);
+    obj.bearingHistory.insert(obj.bearingHistory.end(), history.begin(), history.end());
+    while (obj.bearingHistory.size() > kMaxBearingHistoryPerTrack)
+        obj.bearingHistory.erase(obj.bearingHistory.begin());
+    archive_.erase(archive_.begin() + best);
+    return true;
+}
 
-    // Age out tracks that went too many consecutive passes unmatched --
-    // see setTrackMaxMissedPasses(). If the same physical object shows
-    // up again later it will be assigned a brand new trackId (the
-    // position-only re-ID limitation documented in the header). Only
-    // the tracks that existed BEFORE this pass's brand-new ones were
-    // appended above are eligible here -- a track created this very
-    // pass is trivially "matched" (missedPasses already 0) and isn't in
-    // trackMatched at all.
-    int maxMissed = trackMaxMissedPasses_.load();
-    for (size_t ti = 0; ti < originalTrackCount; ++ti) {
-        if (!trackMatched[ti])
-            tracks_[ti].missedPasses++;
+bool DetectionLink::shouldRecordAgain(const ObjectState& obj, const GeoCandidate& geo,
+                                      int64_t nowMs) const {
+    // A continuing object only earns a fresh DetectionRecord once it has
+    // moved far enough on the map since its last recorded position, or
+    // once the periodic refresh interval has elapsed -- this is the
+    // actual "don't log the same object every frame" behavior; tracking
+    // alone just keeps the identity (trackId) stable across passes.
+    if (!obj.recorded)
+        return true;
+    if (nowMs - obj.lastRecordMs >= trackRefreshIntervalMs_.load())
+        return true;
+    if (obj.lastGeoreferenced && geo.georeferenced) {
+        const double movedM = approxGroundDistanceM(obj.lastLat, obj.lastLon, geo.lat, geo.lon);
+        return movedM >= trackMoveThresholdM_.load();
     }
-    tracks_.erase(
-        std::remove_if(tracks_.begin(), tracks_.end(),
-            [maxMissed](const Track& t) { return t.missedPasses > maxMissed; }),
-        tracks_.end());
-
-    return assignments;
+    // Georeferencing just became available (or was lost): a real state
+    // change a pilot reviewing the log would want to see. Neither
+    // georeferenced: nothing to compare, rely on the refresh interval.
+    return obj.lastGeoreferenced != geo.georeferenced;
 }
 
 std::vector<DetectionRecord> DetectionLink::getAllRecords() const {
