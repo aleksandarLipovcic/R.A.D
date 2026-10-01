@@ -59,6 +59,7 @@ stale default -- e.g. --hide-classes other_vehicle given it's
 currently the weakest class.
 """
 
+import torch_dll_fix  # noqa: F401 -- before torch: use torch's own cuDNN (see module)
 import argparse
 import csv
 from collections import defaultdict

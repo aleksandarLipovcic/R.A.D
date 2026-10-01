@@ -55,6 +55,7 @@ Then:
     skewing the numbers you're trying to read.
 """
 
+import torch_dll_fix  # noqa: F401 -- before torch: use torch's own cuDNN (see module)
 import argparse
 import csv
 import sys

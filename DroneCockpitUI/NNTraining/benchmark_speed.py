@@ -56,6 +56,7 @@ Add --crop-width 1341 to drop the black bar on the right of real_video.mp4
 Results: speed_results.json (one entry per run) and a printed table.
 """
 
+import torch_dll_fix  # noqa: F401 -- before torch: use torch's own cuDNN (see module)
 import argparse
 import json
 import platform

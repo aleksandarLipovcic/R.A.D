@@ -15,6 +15,7 @@ B) If you already ran `yolo predict ... save_txt=True save_conf=True`, just
 
 Frame numbers in the csv are 0-based (first frame = 0), same as the reference.
 """
+import torch_dll_fix  # noqa: F401 -- before torch: use torch's own cuDNN (see module)
 import argparse, csv, re
 from pathlib import Path
 

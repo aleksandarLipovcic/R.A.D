@@ -112,6 +112,7 @@ USAGE:
         --rfdetr-weights datasets/specialist_finetune/rfdetr_data/runs/specialist_rfdetr/checkpoint_best_total.pth
 """
 
+import torch_dll_fix  # noqa: F401 -- before torch: use torch's own cuDNN (see module)
 import argparse
 import json
 import random

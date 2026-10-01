@@ -116,6 +116,7 @@ USAGE:
     python train.py --export-only [--weights PATH]
 """
 
+import torch_dll_fix  # noqa: F401 -- before torch: use torch's own cuDNN (see module)
 import argparse
 import csv
 import hashlib

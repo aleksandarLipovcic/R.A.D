@@ -151,6 +151,7 @@ beats picking one pairing over the other.
 -----------------------------------------------------------------------
 """
 
+import torch_dll_fix  # noqa: F401 -- before torch: use torch's own cuDNN (see module)
 import argparse
 import json
 import statistics

@@ -73,3 +73,20 @@ py -3.12 -m venv .venv312
 .venv312\Scripts\activate
 python setup.py
 ```
+
+## cuDNN version mismatch on Windows (`torch_dll_fix.py`)
+
+Symptom: training or GPU evaluation stops at the first convolution (often
+in Ultralytics' AMP check) with
+`CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH`.
+
+Cause: PyTorch ships its own cuDNN in `site-packages\torch\lib` (torch
+2.13+cu130 → cuDNN 9.20). cuDNN loads its sub-libraries by name and Windows
+also searches `PATH`, where the CUDA 13.3 toolkit installed for the OpenCV
+CUDA build puts a different cuDNN (`CUDA\v13.3\bin\x64`). Torch then gets
+a mix of two versions.
+
+Fix: every script that uses torch/Ultralytics starts with
+`import torch_dll_fix`. For that Python process only, it puts `torch\lib`
+first on `PATH`. The system `PATH` and the cockpit's OpenCV/CUDA setup are
+unchanged. A new script that imports torch should import it first too.

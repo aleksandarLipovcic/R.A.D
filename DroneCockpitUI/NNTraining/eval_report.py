@@ -45,6 +45,7 @@ Results are written after EVERY set, so a crash or Ctrl+C keeps what
 finished. A failing set is recorded and the rest still run.
 """
 
+import torch_dll_fix  # noqa: F401 -- before torch: use torch's own cuDNN (see module)
 import argparse
 import csv
 import gc

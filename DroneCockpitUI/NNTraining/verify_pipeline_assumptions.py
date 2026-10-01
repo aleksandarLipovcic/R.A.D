@@ -34,6 +34,7 @@ Six checks, each prints CONFIRMED / CONTRADICTED / INCONCLUSIVE:
      if you have one -- the actual number the whole exercise is for.
 """
 
+import torch_dll_fix  # noqa: F401 -- before torch: use torch's own cuDNN (see module)
 import argparse
 import random
 import sys
