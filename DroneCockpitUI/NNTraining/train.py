@@ -116,7 +116,6 @@ USAGE:
     python train.py --export-only [--weights PATH]
 """
 
-import torch_dll_fix  # noqa: F401 -- before torch: use torch's own cuDNN (see module)
 import argparse
 import csv
 import hashlib
@@ -135,6 +134,7 @@ if platform.system() != "Windows":
     _alloc_conf_parts.insert(0, "expandable_segments:True")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", ",".join(_alloc_conf_parts))
 
+import torch_dll_fix  # noqa: F401 -- before torch: use torch's own cuDNN (see module)
 import yaml
 from ultralytics import YOLO
 

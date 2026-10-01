@@ -74,19 +74,34 @@ py -3.12 -m venv .venv312
 python setup.py
 ```
 
-## cuDNN version mismatch on Windows (`torch_dll_fix.py`)
+## cuDNN version mismatch on Windows (`torch_dll_fix.py`, `cudnn_check.py`)
 
 Symptom: training or GPU evaluation stops at the first convolution (often
 in Ultralytics' AMP check) with
 `CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH`.
 
 Cause: PyTorch ships its own cuDNN in `site-packages\torch\lib` (torch
-2.13+cu130 → cuDNN 9.20). cuDNN loads its sub-libraries by name and Windows
-also searches `PATH`, where the CUDA 13.3 toolkit installed for the OpenCV
-CUDA build puts a different cuDNN (`CUDA\v13.3\bin\x64`). Torch then gets
-a mix of two versions.
+2.13+cu130 → cuDNN 9.20). The CUDA 13.3 toolkit installed for the OpenCV
+CUDA build has a different cuDNN in `CUDA\v13.3\bin\x64`. If any part of
+it gets into the Python process, torch runs on a mix of two versions. It
+can get in two ways:
 
-Fix: every script that uses torch/Ultralytics starts with
-`import torch_dll_fix`. For that Python process only, it puts `torch\lib`
-first on `PATH`. The system `PATH` and the cockpit's OpenCV/CUDA setup are
-unchanged. A new script that imports torch should import it first too.
+- **through `PATH`**: cuDNN loads its sub-libraries by name;
+- **through load order**: a DLL that's already loaded is reused by name,
+  so a CUDA `cv2` imported before torch brings the toolkit's
+  `cudnn64_9.dll` in first.
+
+Fix: every script that uses torch/Ultralytics imports `torch_dll_fix`
+before anything else. For that process only, it:
+
+- puts `torch\lib` first on `PATH`;
+- drops other `PATH` folders that contain a cuDNN;
+- imports torch immediately, so its own cuDNN is the one that loads.
+
+The system and the cockpit's OpenCV/CUDA setup are unchanged.
+
+Diagnosis: `python cudnn_check.py` runs a cuDNN convolution and lists the
+cuDNN/CUDA DLL files actually loaded. `--raw` skips the fix and
+`--raw --cv2-first` imports cv2 first, which shows which of the two causes
+applies. Last resort: `set RAD_DISABLE_CUDNN=1` turns cuDNN off. That works
+with any DLL mix, but convolutions run slower.
