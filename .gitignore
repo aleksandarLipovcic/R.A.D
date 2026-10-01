@@ -18,6 +18,9 @@ env/
 # YOLO/Machine Learning weights (too big for GitHub)
 *.pt
 *.onnx
+# ...except the released detection model, versioned on purpose
+# (GitHub limit: 100 MB per file; a yolo26m best.pt is ~40-45 MB)
+!YOLO26M model/*.pt
 
 # Test results
 TestResults/

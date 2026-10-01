@@ -9,6 +9,9 @@
     <File Path=".gitignore" />
     <File Path="README.md" />
   </Folder>
+  <Folder Name="/YOLO26M model/">
+    <File Path="YOLO26M model/best.pt" />
+  </Folder>
   <Folder Name="/docs/">
     <File Path="docs/ARCHITECTURE.md" />
     <File Path="docs/FRONTEND.md" />
