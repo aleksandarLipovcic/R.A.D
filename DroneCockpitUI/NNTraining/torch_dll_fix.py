@@ -15,7 +15,7 @@ THE PROBLEM IT FIXES
 
       CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH
 
-  Two ways it gets in, both handled here:
+  Three ways it gets in, all handled here:
     1. PATH: cuDNN 9 loads its sub-libraries by name, and Windows also
        searches PATH. -> torch\\lib goes first on PATH, and every other PATH
        folder holding a cuDNN DLL is dropped (this process only).
@@ -23,6 +23,15 @@ THE PROBLEM IT FIXES
        (a CUDA OpenCV build) is imported before torch, the toolkit's
        cudnn64_9.dll is already in the process when torch asks for its own.
        -> torch is imported HERE, first, so its cuDNN is the one loaded.
+    3. Lazy engine loading (the one that actually bit on the training PC):
+       cuDNN loads its engine sub-libraries only at the FIRST convolution.
+       torch does not ship cudnn_engines_tensor_ir64_9.dll, so cuDNN goes
+       looking for it -- and by then cv2 (CUDA build) has registered the
+       toolkit folder as a DLL directory, so the toolkit's (other version)
+       file is found -> mismatch. -> a tiny forward + backward cuDNN
+       convolution (FP32 and FP16) runs HERE, before cv2 is imported, so
+       cuDNN settles its engines while only torch's own files are visible.
+       Skip with RAD_CUDNN_WARMUP=0.
 
   Nothing on the system changes; the cockpit / OpenCV keep using the
   toolkit's cuDNN as before. No effect off Windows or without torch.
@@ -94,6 +103,23 @@ def loaded_modules(*needles):
 
 REMOVED_FROM_PATH = []
 FOREIGN_CUDNN_BEFORE_TORCH = []
+WARMUP = "not run"           # "ok", "not run", or the error text
+
+
+def _warmup_cudnn() -> str:
+    import torch
+    if not torch.cuda.is_available() or not torch.backends.cudnn.enabled:
+        return "not run"
+    try:
+        conv = torch.nn.Conv2d(3, 8, 3, padding=1).cuda()
+        x = torch.randn(2, 3, 32, 32, device="cuda", requires_grad=True)
+        conv(x).sum().backward()
+        with torch.autocast("cuda", dtype=torch.float16):
+            conv(x).float().sum().backward()
+        torch.cuda.synchronize()
+        return "ok"
+    except RuntimeError as e:
+        return str(e).splitlines()[0]
 
 
 def _apply() -> None:
@@ -116,6 +142,13 @@ def _apply() -> None:
         import torch
         torch.backends.cudnn.enabled = False
         print("[torch_dll_fix] RAD_DISABLE_CUDNN=1 -- cuDNN disabled (slower convolutions).")
+    global WARMUP
+    if os.environ.get("RAD_CUDNN_WARMUP", "1") == "1" and "cv2" not in sys.modules:
+        WARMUP = _warmup_cudnn()
+        if WARMUP not in ("ok", "not run"):
+            print(f"[torch_dll_fix] WARNING: cuDNN warm-up failed: {WARMUP}\n"
+                  "  Run `python cudnn_check.py` and send the output; to train anyway: "
+                  "set RAD_DISABLE_CUDNN=1")
     if FOREIGN_CUDNN_BEFORE_TORCH:
         print("[torch_dll_fix] WARNING: a foreign cuDNN was already loaded before torch:\n  "
               + "\n  ".join(FOREIGN_CUDNN_BEFORE_TORCH)

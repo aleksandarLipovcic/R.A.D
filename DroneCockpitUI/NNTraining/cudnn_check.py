@@ -19,7 +19,8 @@ if CV2_FIRST:
     print(f"cv2 {cv2.__version__} from {cv2.__file__}")
 if not RAW:
     import torch_dll_fix  # noqa: F401
-    print(f"torch_dll_fix: removed from PATH: {torch_dll_fix.REMOVED_FROM_PATH or 'nothing'}")
+    print(f"torch_dll_fix: removed from PATH: {torch_dll_fix.REMOVED_FROM_PATH or 'nothing'}; "
+          f"cuDNN warm-up before cv2: {torch_dll_fix.WARMUP}")
 
 import torch  # noqa: E402
 
