@@ -378,8 +378,12 @@ def merged_names(names: list[str]) -> tuple[list[str], np.ndarray]:
     return ["person", "vehicle"], remap
 
 
-def evaluate(det: OnnxDetector, samples, variant: str, names: list[str]) -> dict:
-    """samples: iterable of (BGR image, Nx5 gts [x1,y1,x2,y2,cls] in pixels)."""
+def evaluate(det: OnnxDetector, samples, variant: str, names: list[str], total: int = 0) -> dict:
+    """samples: iterable of (BGR image, Nx5 gts [x1,y1,x2,y2,cls] in pixels).
+    Prints progress with an ETA every ~20 frames (a CPU pass is ~1 s/frame,
+    tiles ~5 s/frame, so a run takes minutes and would otherwise look stuck)."""
+    t_start = time.perf_counter()
+    print(f"[{variant}] running on {total or '?'} frames ...", flush=True)
     remap = None
     if MERGE_VEHICLES:
         names, remap = merged_names(names)
@@ -392,6 +396,11 @@ def evaluate(det: OnnxDetector, samples, variant: str, names: list[str]) -> dict
         t0 = time.perf_counter()
         preds = run_variant(det, img, variant)
         t_total += time.perf_counter() - t0
+        if n_images % 20 == 0 or n_images == total:
+            el = time.perf_counter() - t_start
+            eta = f", about {el / n_images * (total - n_images) / 60:.0f} min left" if total else ""
+            print(f"  [{variant}] {n_images}/{total or '?'} frames, "
+                  f"{1000 * t_total / n_images:.0f} ms/frame{eta}", flush=True)
         if remap is not None:
             if len(preds):
                 preds = preds.copy()
@@ -475,7 +484,7 @@ def cmd_eval(args):
         sys.exit(f"no labelled images under {args.data} (images/ + labels/)")
     print(f"{len(items)} labelled frames ({skipped} without a label file skipped), "
           f"model {model.name}, input {det.imgsz}")
-    results = [evaluate(det, file_samples(items), v.strip(), names) for v in args.variants.split(",")]
+    results = [evaluate(det, file_samples(items), v.strip(), names, len(items)) for v in args.variants.split(",")]
     report(args, model, det, results, str(args.data), len(items))
 
 
@@ -635,13 +644,18 @@ def cmd_ref(args):
               f"{n_video} frames -- wrong video, or 1-based frame numbers?")
     print(f"evaluating {len(frames)} frames ({args.frames}, every {args.every}) of "
           f"{Path(args.video).name} ({n_video} frames)")
-    results = [evaluate(det, video_samples(Path(args.video), gt, frames), v.strip(), names)
+    results = [evaluate(det, video_samples(Path(args.video), gt, frames), v.strip(), names,
+                        len(frames))
                for v in args.variants.split(",")]
     report(args, model, det, results, f"{Path(args.video).name} + {Path(args.reference).name}",
            len(frames))
 
 
 def main():
+    try:
+        sys.stdout.reconfigure(line_buffering=True)   # progress shows up at once in cmd
+    except (AttributeError, ValueError):
+        pass
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
