@@ -19,7 +19,7 @@ R.A.D. runs as a single Windows process:
 The dividing line is deliberate and stated explicitly in the code comments:
 **raw pixel data does not cross into Python** except through two narrow,
 opt-in, low-rate exceptions: `DetectionLink::getLatestAnnotatedFrameJpeg()`
-(preview pane polled at ~5–6 fps, see
+(preview pane, polled every 40 ms while open, see
 [modules/detectionlink.md](modules/detectionlink.md)) and
 `VideoLink::getLatestFrame()` (only called where Python genuinely needs
 pixels, e.g. a future recording pipeline — the live pump in
@@ -137,7 +137,9 @@ snapshot (USB or ELRS, whichever currently feeds the instruments),
 because the two consumers need different validity/altitude semantics:
 
 - `_get_detection_telemetry()` sets `valid = gps.position_usable` (no GPS
-  fix ⇒ georeferencing must be skipped) and fills `altitude_m` from GPS.
+  fix ⇒ georeferencing must be skipped) and fills `altitude_m` from
+  `baro_altitude_cm` (height above the arming point), **not** GPS
+  altitude, which is above sea level.
 - `_get_osd_telemetry()` sets `valid` to "is the FC link up at all" (the
   OSD's altitude/horizon/compass elements need no GPS fix — they come from
   the barometer, IMU, and magnetometer respectively) and fills `altitude_m`
@@ -151,7 +153,7 @@ one's `valid` flag means what you need.
 
 ```mermaid
 flowchart TB
-    DroneLinkState["TelemetryWorker.get_active_state()\n(DroneLink or CrsfLink)"] --> DetT["_get_detection_telemetry()\nvalid = gps.position_usable\naltitude_m = GPS altitude"]
+    DroneLinkState["TelemetryWorker.get_active_state()\n(DroneLink or CrsfLink)"] --> DetT["_get_detection_telemetry()\nvalid = gps.position_usable\naltitude_m = baro (rel. to arming)"]
     DroneLinkState --> OsdT["_get_osd_telemetry()\nvalid = FC link up\naltitude_m = barometer altitude"]
     DetT -->|setTelemetryProvider| DetectionLink
     OsdT -->|setTelemetryProvider| VideoLink

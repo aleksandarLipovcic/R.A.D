@@ -55,9 +55,9 @@ for why this is structured as callables rather than concrete dependencies.
 | `setTilingBudgetMs(ms)` / `isTilingActive()` | 0 = auto | Tiled pass time above which (3× in a row) tiling suspends itself; auto = max(500 ms, 2 × interval) |
 | `setTiling(enabled)` / `isTiling()` | false (cockpit: on) | Each pass also runs the model on four overlapping 60 % tiles and merges the results (`runDetection()`). Small and distant objects are seen about 1.7× larger. On the FPV reference footage, recall at confidence 0.4 went from 0.32 to 0.50 for people and from 0.72 to 0.90 for vehicles. Costs about 5× inference per pass |
 | `setUseCudaFp16(enabled)` / `isUsingCudaFp16()` | true | With CUDA, try `DNN_TARGET_CUDA_FP16` first (typically 1.5–2× faster on RTX GPUs). `start()` verifies it with a dummy pass (no exception, no NaN/Inf in the output) and otherwise falls back to FP32 CUDA, then CPU |
-| `setKnownObjectWidth(class, meters)` / `clearKnownObjectWidths()` | none set | Real-world face-on width per class, enabling object-size ranging for that class (see below) |
+| `setKnownObjectWidth(class, meters)` / `clearKnownObjectWidths()` | none set (cockpit: person 0.5, car 1.8, large_vehicle 2.5, motorcycle 0.8, other_vehicle 2.0) | Real-world face-on width per class, enabling object-size ranging for that class (see below). Keys must match the `.names` file exactly; a key that matches no class is silently ignored |
 | `setCoarseRangeM(default, max)` | 60 / 150 m | Coarse fallback georeference (see "Position estimate"); default 0 disables it |
-| `setMinGroundRayComponent(v)` | 0.12 (~7°) | Below this ray-downward-component, ground-plane ranging is distrusted in favor of object-size ranging (or used as a last resort if unavailable) |
+| `setMinGroundRayComponent(v)` | 0.12 (~7°) | At or below this ray-downward-component, ground-plane ranging is not used at all; triangulation, object size and then the coarse fallback take over (see "Georeferencing") |
 | `setTriangulationMinBaselineM(m)` | 5.0 | Minimum drone movement between bearing observations before a triangulated fix is trusted |
 | `setTriangulationMinBearingSpreadDeg(deg)` | 5.0 | Minimum angular spread between bearing observations — guards the "moved far but flew straight at the object" degenerate case |
 | `setTrackIouThreshold(v)` | 0.1 | Minimum IoU for a box-overlap match (centre distance and appearance also match, see below) |
@@ -301,7 +301,7 @@ over 400 m.
 | `ground_plane` | from altitude error (3 m + 5 %), camera-tilt error (4°) and heading error (5°). Grows quickly as the ray flattens | Camera pointing down enough, altitude ≥ 2 m |
 | `triangulated` | max(10 m, 20 % of distance) | The object was seen from positions far enough apart |
 | `object_size` | max(10 m, 35 % of distance) | A real-world width is configured for the class |
-| **`coarse`** (fallback) | ≥ 50 m, typically 60–150 m | **Whenever none of the above works but GPS and heading are valid**, e.g. a shallow camera angle, no altitude, or radio-link telemetry. The pin goes along the camera bearing at the ground-plane distance clamped to 150 m, or 60 m when even that is unknown (`setCoarseRangeM`). Straight down means at the drone |
+| **`coarse`** (fallback) | ≥ 50 m, typically 60–150 m (camera looking almost straight down: the pin is at the drone, radius max(30 m, altitude)) | **Whenever none of the above works but GPS and heading are valid**, e.g. a shallow camera angle, no altitude, or radio-link telemetry. The pin goes along the camera bearing at the ground-plane distance clamped to 150 m, or 60 m when even that is unknown (`setCoarseRangeM`). Straight down means at the drone |
 
 So with a GPS fix every confirmed object gets a pin, and the radius says
 how far to trust it.
@@ -316,7 +316,9 @@ a moving object's pin follows it. The record's latitude/longitude are this
 - A coarse radius never shrinks, because every coarse fix uses the same
   distance guess.
 - Distance, bearing and method in the record are the latest pass's own
-  measurement.
+  measurement. `distanceM` is the slant range for `ground_plane` and
+  `object_size`, and the horizontal ground distance for `triangulated`
+  and `coarse`.
 
 Also new in each record: `sightings` (confirmed passes so far) and
 `bestConfidence`.
@@ -390,7 +392,7 @@ one struct instead of inventing a second telemetry type.
   ray re-derived later.
 - **Position:** the **fused** lat/lon, the `georeferenced` flag and the
   `uncertaintyM` radius, plus this pass's own `rangeMethod`, `distanceM`
-  and `bearingDeg`.
+  (slant or horizontal, see "Fusion over sightings") and `bearingDeg`.
 - **An optional `screenshotPath`.**
 - **The full `telemetry` snapshot**, stored verbatim for later
   re-derivation or debugging.
@@ -402,21 +404,24 @@ copilot UI groups them by `trackId` into one row.
 
 ## Live preview exception
 
-`getLatestAnnotatedFrameJpeg()` JPEG-encodes the most recent processed
-frame with detections drawn on it. This is a **deliberate, narrow**
-exception to the "raw pixel data never crosses into Python" rule — intended
-only to feed an optional, low-rate (poll at ~1–3 Hz) preview pane, **not**
-the pilot's primary video path (that stays on `VideoLink`/its native
-render window exactly as documented in [videolink.md](videolink.md)).
-Costs one resize + JPEG encode per call, done with the GIL released. The
-preview thread only produces frames while this function is being polled
-(nothing in the last 2 s means idle).
+`getLatestAnnotatedFrameJpeg()` JPEG-encodes (at most 640 px wide) the
+latest captured frame with the most recent detection pass's boxes drawn on
+it; `previewLoop()` redraws that frame every 40 ms. This is a
+**deliberate, narrow** exception to the "raw pixel data never crosses into
+Python" rule — intended only to feed the optional preview pane in the
+detection window (`DetectionMapWidget` polls it every 40 ms while the pane
+is on), **not** the pilot's primary video path (that stays on
+`VideoLink`/its native render window exactly as documented in
+[videolink.md](videolink.md)). Costs one resize + JPEG encode per call,
+done with the GIL released. The preview thread only produces frames while
+this function is being polled (nothing in the last 2 s means idle).
 
 ## Reading detection results from Python
 
 - `getAllRecords()` — full copy of every record since `start()` or the last
   `clearRecords()`. Mutex-protected; fine at UI refresh rate (a few Hz),
-  not meant to be called every frame.
+  not meant to be called every frame. Screenshots are written outside
+  that mutex, so a poll never waits on disk I/O.
 - `getRecordsSince(sinceId)` — incremental poll (pass 0 for everything) so
   the UI doesn't have to re-render the whole pin list every tick.
 - `getDetectionCount()`, `getLastPassDurationMs()`,
