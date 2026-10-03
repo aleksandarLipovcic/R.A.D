@@ -14,6 +14,10 @@ B) If you already ran `yolo predict ... save_txt=True save_conf=True`, just
        --source ..\\datasets\\test\\rad_fpv_part0.mp4 --out nn_boxes_part0.csv
 
 Frame numbers in the csv are 0-based (first frame = 0), same as the reference.
+
+--txt-dir DIR also writes one YOLO txt per frame (cls xc yc w h conf, 0-based
+names <video>_000000.txt, an empty file for a frame without boxes) -- the
+format compare_detections.py reads (use --pred-frame-base 0 there).
 """
 import torch_dll_fix  # noqa: F401 -- before torch: use torch's own cuDNN (see module)
 import argparse, csv, re
@@ -31,7 +35,8 @@ def main():
     p.add_argument("--imgsz", type=int, default=960)
     p.add_argument("--conf", type=float, default=0.10,
                    help="keep boxes down to this confidence; filter later")
-    p.add_argument("--device", default="cpu")
+    p.add_argument("--device", default="cpu", help="cpu, or 0 for the first GPU")
+    p.add_argument("--txt-dir", help="also write per-frame YOLO txt files here")
     a = p.parse_args()
 
     cap = cv2.VideoCapture(a.source)
@@ -69,6 +74,20 @@ def main():
         for r in rows:
             w.writerow([r[0], r[1], r[2], f"{r[3]:.4f}"] + [f"{v:.1f}" for v in r[4:]])
     print(f"wrote {len(rows)} boxes from {len({r[0] for r in rows})} frames -> {a.out}")
+
+    if a.txt_dir:
+        out = Path(a.txt_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        per_frame = {}
+        for r in rows:
+            per_frame.setdefault(r[0], []).append(r)
+        stem = Path(a.source).stem
+        for f in range(n_frames):
+            lines = [f"{r[1]} {(r[4] + r[6]) / 2 / W:.6f} {(r[5] + r[7]) / 2 / H:.6f} "
+                     f"{(r[6] - r[4]) / W:.6f} {(r[7] - r[5]) / H:.6f} {r[3]:.4f}"
+                     for r in per_frame.get(f, [])]
+            (out / f"{stem}_{f:06d}.txt").write_text("\n".join(lines) + ("\n" if lines else ""))
+        print(f"wrote {n_frames} per-frame txt files (0-based) -> {out}")
 
 
 if __name__ == "__main__":
