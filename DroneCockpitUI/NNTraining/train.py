@@ -103,6 +103,20 @@ BASELINE HISTORY (update after each real run):
                                             previously-skipped optical
                                             distortion -- see FIX note
                                             above)
+  yolo26m, 960px, unified, full 100ep (resumed at 66 and 88; finished
+                                       2026-10-03) -> blended val mAP50
+                                       0.647, mAP50-95 0.387 (P 0.712,
+                                       R 0.600). Held-out SARD TEST
+                                       (never trained on / selected on):
+                                       person mAP50 0.945, mAP50-95
+                                       0.599, P 0.946, R 0.889. Weakest
+                                       class other_vehicle (mAP50 0.420,
+                                       R 0.369). Val plateaued from ~66;
+                                       batch 2 x nbs 64 = 32-batch
+                                       accumulation makes the EMA span
+                                       ~31 epochs, so val lags train --
+                                       use --nbs 16 at batch 2 next time.
+                                       Full report: runs/eval_final.
 
 USAGE:
     python train.py                             # yolo26s, unified taxonomy
@@ -1179,6 +1193,16 @@ def parse_args():
                          "model converges on clean images -- matters for "
                          "small-object recall. Raise if small objects "
                          "still look weak in final-epoch samples.")
+    p.add_argument("--nbs", type=int, default=64,
+                    help="Nominal batch size: gradients are accumulated "
+                         "over nbs/batch batches per optimizer step (and "
+                         "the EMA used for val/best.pt updates once per "
+                         "step). At --batch 2 the default 64 means 32 "
+                         "batches per step and an EMA spanning ~31 epochs "
+                         "on this dataset, so val lags training badly; "
+                         "--nbs 16 (8 batches/step, EMA ~8 epochs) is the "
+                         "better choice at batch 1-2. Fresh runs only -- "
+                         "not honoured on --resume.")
     p.add_argument("--multi-scale", action="store_true",
                     help="Vary input size +/-50%% per batch. Costs more "
                          "VRAM headroom (prefer --imgsz 640 if enabling "
@@ -1839,6 +1863,7 @@ def train_with_model_fallback(args, data_path: str):
         mixup=args.mixup,
         mosaic=args.mosaic,
         close_mosaic=args.close_mosaic,
+        nbs=args.nbs,
         multi_scale=args.multi_scale,
         save_period=args.save_period,
     )
