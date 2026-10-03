@@ -153,7 +153,7 @@ never leak into `getLatestFrame()` / `DetectionLink`'s input.
 
 | State | Written by | Read by | Guard |
 |---|---|---|---|
-| `latestFrame` | capture thread | any thread (`getLatestFrame()`) | `frameMutex` |
+| `latestFrame` | capture thread | any thread (`getLatestFrame()`) | `frameMutex` — held only to copy the `cv::Mat` header (a reference); the pixel copy (`clone()`) happens **after** the lock is released. The capture thread decodes every frame into a fresh `Mat`, so the referenced buffer is never written again. `DetectionLink`'s 4 Hz frame grab therefore never blocks the capture/paint thread for a full-frame memcpy |
 | `linkState_`, `lastFrameTimeMs_` | capture thread | any thread | `std::atomic` |
 | `renderHwnd_`, `renderHdc_` | Python/Tk thread (attach/detach) | capture thread (every paint) | `std::atomic` |
 | `osdLayout_` (map) | Python/Tk thread (settings panel, drag overlay) | capture thread (`paintFrameDirect`) | `osdMutex_` (a map isn't atomic-friendly, but writes are rare — only on user interaction) |

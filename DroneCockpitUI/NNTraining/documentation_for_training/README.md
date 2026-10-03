@@ -91,6 +91,7 @@ A separate subproject (no runtime dependency on `DroneBackend.pyd` or
 | `mosaic_guard.py` | [ml-pipeline/mosaic-guard.md](ml-pipeline/mosaic-guard.md) |
 | `predict_test.py` | [ml-pipeline/predict-test.md](ml-pipeline/predict-test.md) |
 | `fpv_eval.py` | [ml-pipeline/fpv-eval.md](ml-pipeline/fpv-eval.md) |
+| `torch_dll_fix.py`, `cudnn_check.py` | [ml-pipeline/setup.md](ml-pipeline/setup.md#cudnn-version-mismatch-on-windows-torch_dll_fixpy-cudnn_checkpy) |
 | `vram_diagnostic.py` | [ml-pipeline/vram-diagnostic.md](ml-pipeline/vram-diagnostic.md) |
 | `verify_pipeline_assumptions.py` | [ml-pipeline/verify-pipeline-assumptions.md](ml-pipeline/verify-pipeline-assumptions.md) |
 | `check_label_gaps.py` | [ml-pipeline/check-label-gaps.md](ml-pipeline/check-label-gaps.md) |

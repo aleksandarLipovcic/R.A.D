@@ -48,12 +48,11 @@ essentially unlearned (mAP50 ~0.001–0.016) — hidden by default at the time
 so a pilot never saw a "detection" that was really just noise. xView is
 now inactive and those classes aren't part of the current unified taxonomy
 (see [class-map.md](class-map.md)), so **nothing is hidden by default
-anymore** (`DEFAULT_HIDDEN = []`). Per the current unified-taxonomy 5-epoch
-smoke-test baseline (blended val mAP50-95): person 0.215, car 0.517,
-large_vehicle 0.373, motorcycle 0.154, other_vehicle 0.090 — all weak-but-
-functional at this early stage, not non-functional like the old
-`shed`/`parking_lot` classes were, so there's no longer a clear default
-candidate to hide. If a class ends up looking genuinely broken on real
+anymore** (`DEFAULT_HIDDEN = []`). The full 100-epoch yolo26m run
+(blended val mAP50 0.647 / mAP50-95 0.387, SARD test person mAP50 0.945)
+has no non-functional class; the weakest is `other_vehicle` (mAP50 0.42),
+and on the project's own FPV footage vans/trucks (`large_vehicle`) are
+often labelled `car` — see [fpv-eval.md](fpv-eval.md). If a class ends up looking genuinely broken on real
 footage (visibly wrong boxes, not just low recall), pass `--hide-classes`
 explicitly for that test run rather than trusting a stale default — e.g.
 `--hide-classes other_vehicle`, currently the weakest class.

@@ -55,6 +55,22 @@ single recurring update loop that feeds fresh data to each widget.
    missing. The source comments spell out exactly what silently breaks per
    missing binding (wrong FOV skewing every bearing, no object-size
    ranging, no triangulation, CPU-only inference).
+   Detection settings (module-level constants near the top of the file):
+
+   | Constant | Default | Effect |
+   |---|---|---|
+   | `DETECTION_MODEL_PATH` | `models/yolo26m_main.onnx` | ONNX model (end-to-end or raw layout, see [../modules/detectionlink.md](../modules/detectionlink.md)) |
+   | `DETECTION_INPUT_SIZE` | 960 | network input size, must match training |
+   | `DETECTION_INTERVAL_MS` | 250 | minimum time between passes; the backend also rests ≥ half a pass (duty cycle) |
+   | `DETECTION_USE_CUDA` / `DETECTION_CUDA_FP16` | `True` / `True` | CUDA backend, FP16 when the GPU passes the NaN probe (falls back to FP32, then CPU) |
+   | `DETECTION_CONFIDENCE_THRESHOLD` | 0.25 | global score floor; tracks still need a confirmed high-confidence hit before a record is written |
+   | `DETECTION_TILING` | `True` | full frame + 4 overlapping tiles for small/distant people; suspended automatically if a tiled pass is too slow on this machine |
+   | `DETECTION_THRESHOLDS_PATH` | `<model>.thresholds.json` | optional per-class thresholds written by `fpv_eval.py --write-thresholds`, loaded by `_load_class_thresholds()` |
+
+   After the pyd import the console prints
+   `[DroneBackend] loaded <path> (built <date time>)`, so a stale build is
+   obvious. 20 s after detection starts, `_report_detection_speed()`
+   prints one line with the real pass time and whether tiling is active.
 7. `DetectionWorker` is started.
 8. `DetectionMapWidget` is **not** created here — it's built on first
    open (`_open_detection_window()`), so a pilot who never opens the
@@ -139,7 +155,7 @@ and merging them breaks the OSD:
 | Wired to | `DetectionLink.set_telemetry_provider()` | `VideoLink.set_telemetry_provider()` |
 | Called from | `DetectionLink`'s own C++ inference thread, once per pass | `VideoLink`'s own C++ capture/paint thread, once per painted frame |
 | `valid` means | GPS fix usable (`gps.position_usable`) — no fix ⇒ skip georeferencing | FC link is up at all — altitude/horizon/compass need no GPS fix |
-| `altitude_m` source | `gps.altitude_m` | **barometer** (`state.baro_altitude_cm`, converted) — keeps the OSD altitude in agreement with `BaroWidget` instead of silently depending on GPS |
+| `altitude_m` source | **barometer** (`state.baro_altitude_cm`): height above the take-off point, which ground-plane ranging needs. `gps.altitude_m` is above sea level and pushed every pin several times too far out | **barometer** (`state.baro_altitude_cm`, converted) — keeps the OSD altitude in agreement with `BaroWidget` instead of silently depending on GPS |
 | `gimbal_pan/tilt_deg` | `_get_camera_mount_angle()` — a manual, toolbar-editable stand-in; the SimpleBGC gimbal is physically installed but not electrically wired yet, so there's no live readback to use | not read by the OSD |
 
 Both are safe to call from a non-Tk thread: `get_active_state()` only

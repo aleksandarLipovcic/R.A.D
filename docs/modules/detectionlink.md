@@ -1,7 +1,9 @@
 # `DetectionLink` — YOLO detection, tracking & georeferencing
 
 **Files:** `Detectionlink.h`, `Detectionlink.cpp`, `ObjectTracker.h`, `ObjectTracker.cpp`
-**Tests:** `tests/tracker_sim.cpp` (tracker simulation, old vs new)
+**Tests:** `tests/tracker_sim.cpp` (tracker simulation, old vs new),
+`tests/detectionlink_run.cpp` (the real `DetectionLink` on an image, optional
+`tiles`), `NNTraining/fpv_eval.py` (accuracy on our own FPV footage)
 **Depends on:** OpenCV `dnn` (ONNX inference), `VideoLink` (frame source
 only, via pointer — see the provider pattern), a telemetry provider
 callable
@@ -10,11 +12,17 @@ callable
 
 ## Responsibility
 
-Runs a YOLO object-detection model against the live video feed, tracks
-detections across passes so one physical object produces one evolving
-record instead of a flood of near-duplicates, and turns each worthwhile
-detection into a georeferenced `DetectionRecord` (a map pin) using whichever
-of three ranging strategies fits the situation.
+Runs a YOLO object-detection model against the live video feed, without
+ever slowing the pilot's live view. It then does three more things:
+- **Tracks** detections across passes, so one physical object is one
+  track. A parked car is one object, not 20.
+- **Estimates where each object is.** Three ranging strategies, plus a
+  coarse bearing + distance fallback, each with an uncertainty radius.
+- **Fuses** the sightings of each object into one position whose radius
+  shrinks over time.
+
+The result is a `DetectionRecord` per object: a map pin with a "search
+here" radius for the copilot.
 
 ## Wiring (decoupled sources)
 
@@ -35,19 +43,20 @@ for why this is structured as callables rather than concrete dependencies.
 
 | Setter | Default | Purpose |
 |---|---|---|
-| `setModelPath(path)` | — | ONNX model path. Expects Ultralytics end-to-end/NMS-baked export layout (`[1, maxDetections, 6]` — confidence/class already resolved, NMS already applied in-graph). A sibling `.names` file (same stem) is auto-loaded for class labels; otherwise classes read as `class_N` |
+| `setModelPath(path)` | — | ONNX model path. Both Ultralytics layouts work, the end-to-end `[1, N, 6]` and the raw `[1, 4+classes, anchors]` (see "Model output layouts"). Export with `end2end=True` (`export_model.py` does). A sibling `.names` file (same stem) is auto-loaded for class labels; otherwise classes read as `class_N` |
 | `setScreenshotDir(dir)` | empty (disabled) | Where detection screenshots are written; detections are still recorded without one if left empty |
 | `setHorizontalFovDeg(fov)` | 90.0 | Camera horizontal FOV — must match the camera's real datasheet FOV, same assumption used for `VideoLink`'s capture config |
 | `setDetectionIntervalMs(ms)` | 250 | Detection-pass cadence, independent of the ~30–60 fps capture loop |
-| `setConfidenceThreshold(t)` | 0.4 | Raw model confidence floor, applied before a detection becomes a `DetectionRecord` |
+| `setConfidenceThreshold(t)` | 0.4 (cockpit: **0.25**) | Confidence a detection needs to start a track / become a record. The cockpit uses 0.25 because on our FPV footage the model is much less confident than on the public datasets (see "Current model") |
 | `setClassConfidenceThreshold(name, t)` / `clearClassConfidenceThresholds()` | none | Per-class override of the threshold above. The cockpit loads tuned values from `<model>.thresholds.json`, written by `NNTraining/fpv_eval.py` |
-| `setInputSize(size)` | 640 | Square letterboxed input side. **Must match the ONNX export's `imgsz`**, not necessarily the training `imgsz` — mismatch silently scales every box wrong with no crash. `yolo_main_run` was trained at 960; if exported at 960, call `setInputSize(960)` |
+| `setInputSize(size)` | 640 (cockpit: 960) | Square letterboxed input side. **Must match the ONNX export's `imgsz`**, not necessarily the training `imgsz` — mismatch silently scales every box wrong with no crash. The current model is trained and exported at 960 |
 | `setUseCuda(enabled)` / `isUsingCuda()` | false | Opt into CUDA backend/target; needs an OpenCV build with CUDA support (stock pip/vcpkg wheels lack it). Falls back to CPU silently if unavailable — check `isUsingCuda()` after `start()` |
 | `setMaxDutyCycle(d)` | 0.66 | Max share of time the inference thread may be busy; it rests ≥ pass × (1/d − 1) after each pass |
 | `setTilingBudgetMs(ms)` / `isTilingActive()` | 0 = auto | Tiled pass time above which (3× in a row) tiling suspends itself; auto = max(500 ms, 2 × interval) |
 | `setTiling(enabled)` / `isTiling()` | false (cockpit: on) | Each pass also runs the model on four overlapping 60 % tiles and merges the results (`runDetection()`). Small and distant objects are seen about 1.7× larger. On the FPV reference footage, recall at confidence 0.4 went from 0.32 to 0.50 for people and from 0.72 to 0.90 for vehicles. Costs about 5× inference per pass |
 | `setUseCudaFp16(enabled)` / `isUsingCudaFp16()` | true | With CUDA, try `DNN_TARGET_CUDA_FP16` first (typically 1.5–2× faster on RTX GPUs). `start()` verifies it with a dummy pass (no exception, no NaN/Inf in the output) and otherwise falls back to FP32 CUDA, then CPU |
 | `setKnownObjectWidth(class, meters)` / `clearKnownObjectWidths()` | none set | Real-world face-on width per class, enabling object-size ranging for that class (see below) |
+| `setCoarseRangeM(default, max)` | 60 / 150 m | Coarse fallback georeference (see "Position estimate"); default 0 disables it |
 | `setMinGroundRayComponent(v)` | 0.12 (~7°) | Below this ray-downward-component, ground-plane ranging is distrusted in favor of object-size ranging (or used as a last resort if unavailable) |
 | `setTriangulationMinBaselineM(m)` | 5.0 | Minimum drone movement between bearing observations before a triangulated fix is trusted |
 | `setTriangulationMinBearingSpreadDeg(deg)` | 5.0 | Minimum angular spread between bearing observations — guards the "moved far but flew straight at the object" degenerate case |
@@ -96,6 +105,27 @@ slow that path down. These are the safeguards:
 | `previewLoop()` | `BELOW_NORMAL`. It does no work at all unless the preview pane polled `get_latest_annotated_frame_jpeg()` within the last 2 s |
 | `get_latest_annotated_frame_jpeg` binding | Resize and JPEG encode run with the GIL released, so the Tk UI never waits on them |
 
+## Current model and its measured accuracy
+
+| | |
+|---|---|
+| Model | YOLO26m, 960 px input, 5 classes (person, car, large_vehicle, motorcycle, other_vehicle). Weights in `YOLO26M model/best.pt` (44 MB, stripped); cockpit ONNX `DroneCockpitUI/models/yolo26m_main.onnx` (local, not in Git) |
+| Training | 100 epochs on VisDrone + UAVDT + SARD (unified taxonomy), see `NNTraining/documentation_for_training/train.md` |
+| Public val (blended) | mAP50 0.647, mAP50-95 0.387 |
+| SARD **test** (never trained on) | person mAP50 0.945, P 0.946, R 0.889 |
+| **Our FPV footage** (`fpv_eval.py ref`, part0 + part1 reference labels) | car AP50 0.91; vans 0.36–0.46 (often called "car"); person 0.20 at IoU 0.5 / 0.53 at IoU 0.3 (10–20 px pedestrians: boxes imprecise); vehicles merged 0.95 |
+
+What the FPV results meant for the cockpit settings:
+- **Confidence threshold 0.25.** At 0.4 only ~32 % of people and ~71 % of
+  vehicles are found per frame; at 0.25 it's 46 % / 86 % at 65 % / 94 %
+  precision.
+- **Tiling on.** At confidence 0.4, person recall goes from 0.32 to 0.50
+  and vehicle recall from 0.72 to 0.90.
+
+The best-F thresholds on FPV are only 0.05–0.11, a domain gap between the
+training data and the analog camera. A fine-tune on FPV frames is the
+planned next step.
+
 ## Model output layouts
 
 `runInference()` letterboxes the frame to `inputSize × inputSize` and
@@ -118,13 +148,13 @@ sequenceDiagram
     participant PL as previewLoop (DetectionLink)
     participant IL as inferenceLoop (DetectionLink)
     CT->>PL: frame available (getLatestFrame)
-    loop every previewTick
+    loop every previewTick, only while the preview pane polls
         PL->>PL: grab frame + latestBoxes_ (boxesMutex_)
         PL->>PL: republish for UI preview
     end
-    loop every detectionIntervalMs_ (or slower)
+    loop every detectionIntervalMs_ (or slower), rest >= half a pass
         IL->>IL: grab own frame independently
-        IL->>IL: runInference() + tracker + record writing
+        IL->>IL: runDetection() + ObjectTracker + georef/fusion + records
         IL->>PL: publish latestBoxes_ (boxesMutex_)
     end
 ```
@@ -144,7 +174,8 @@ sequenceDiagram
   long a pass actually takes, if longer), and publishes only the resulting
   boxes for `previewLoop` to pick up.
 - The two threads never block on each other beyond the brief
-  `boxesMutex_` critical section.
+  `boxesMutex_` critical section. Both run at `BELOW_NORMAL` priority; see
+  "Protecting the live video" for the rest of the safeguards.
 
 ## Object tracking / re-identification
 
@@ -297,9 +328,9 @@ old moves the pin by at most the drone's speed × that age, small compared
 with the 50–100 m target. Without a valid GPS fix there's no position at
 all, and the copilot list shows "no GPS fix".
 
-## Georeferencing: three ranging strategies
+## Georeferencing: ranging strategies
 
-All three consume the same world-space ray, built once per raw detection:
+All of them consume the same world-space ray, built once per detection:
 
 `computeWorldRay(raw, frameW, frameH, telemetry, ...)` composes the pixel
 offset + horizontal FOV into a camera-space ray, then applies gimbal
@@ -322,11 +353,19 @@ easy-to-miss, the same class of bug as `MagQMC5883L`'s historical
 | **Bearings-only triangulation** | `rangeByTriangulation()` | Accumulated `BearingObservation` history for the same track + the current ray | Least-squares fit; needs **no** assumed object size and **no** altitude trust at all | Degenerates (returns invalid) with only one sighting, or when the drone flew straight at the object with no lateral offset (no real parallax) — guarded by `setTriangulationMinBaselineM()` and `setTriangulationMinBearingSpreadDeg()` |
 | **Apparent object size** | `rangeByObjectSize()` | A registered real-world width for that class (`setKnownObjectWidth()`) | `distance = (known width × focal length px) / (bbox width px)` — pinhole model; independent of altitude entirely, works at any gimbal angle including straight-ahead FPV shots | Only as accurate as the assumed real-world width and how face-on the object is viewed; only available for registered classes |
 
-`computeGeoCandidate()` tries these and picks a result rather than the
-first one found silently winning — this is why `RangeEstimate` carries a
-`method` string (`"ground_plane"`, `"triangulated"`, `"object_size"`) that
-ends up on every `DetectionRecord.rangeMethod`, so a reviewer can tell how
-much to trust a given pin.
+`computeGeoCandidate()` uses the first that works, in this order:
+
+1. ground-plane;
+2. triangulation;
+3. object size;
+4. otherwise the **coarse** fallback (`rangeCoarse()`): bearing plus a
+   rough distance, ≥ 50 m radius, used whenever GPS and heading are valid.
+
+Every result carries a `method` string (`"ground_plane"`, `"triangulated"`,
+`"object_size"`, `"coarse"`) and an uncertainty radius, both stored on the
+`DetectionRecord`, so a reviewer can tell how much to trust a given pin.
+See "Position estimate per object" above for the radius model and the
+per-object fusion.
 
 Flat-earth assumption is used throughout (`rangeByGroundPlane`) — explicitly
 called out as fine at the few-km ranges this is designed for, with a DEM
@@ -341,12 +380,25 @@ fix/sat count, home distance, ground speed, armed) that `DetectionLink`
 itself never reads — they ride along purely because `VideoLink` reuses this
 one struct instead of inventing a second telemetry type.
 
-`DetectionRecord` is the map-pin record: identity (`id`, `trackId`),
-timing, class/confidence, pixel-space box (kept so a screenshot can be
-re-cropped or the ray re-derived later), lat/lon + `georeferenced` flag,
-`rangeMethod`/`distanceM`/`bearingDeg`, an optional `screenshotPath`, and
-the full `telemetry` snapshot stored verbatim for later re-derivation or
-debugging.
+`DetectionRecord` is the map-pin record. It holds:
+- **Identity and timing:** `id`, `trackId` (one per physical object) and
+  the timestamp.
+- **Class and confidence:** the voted class, this pass's `confidence` and
+  the object's `bestConfidence`.
+- **Sightings:** confirmed passes so far.
+- **The pixel-space box**, kept so a screenshot can be re-cropped or the
+  ray re-derived later.
+- **Position:** the **fused** lat/lon, the `georeferenced` flag and the
+  `uncertaintyM` radius, plus this pass's own `rangeMethod`, `distanceM`
+  and `bearingDeg`.
+- **An optional `screenshotPath`.**
+- **The full `telemetry` snapshot**, stored verbatim for later
+  re-derivation or debugging.
+
+A record is written when an object is first confirmed, when its fused
+position has moved `trackMoveThresholdM`, and every
+`trackRefreshIntervalMs`. So several records can belong to one object; the
+copilot UI groups them by `trackId` into one row.
 
 ## Live preview exception
 
@@ -356,7 +408,9 @@ exception to the "raw pixel data never crosses into Python" rule — intended
 only to feed an optional, low-rate (poll at ~1–3 Hz) preview pane, **not**
 the pilot's primary video path (that stays on `VideoLink`/its native
 render window exactly as documented in [videolink.md](videolink.md)).
-Costs one JPEG encode per call — not meant to be polled per-tick.
+Costs one resize + JPEG encode per call, done with the GIL released. The
+preview thread only produces frames while this function is being polled
+(nothing in the last 2 s means idle).
 
 ## Reading detection results from Python
 

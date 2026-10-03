@@ -196,25 +196,38 @@ the drone (gimbal, emergency RTH, movement) are a design proposal in
 
 ## 4. Data flow: one detection, end to end
 
-1. `DroneLink::communicationLoop()` polls the FC, eventually producing GPS,
-   attitude, and gimbal-relevant fields inside `DroneState`.
-2. `VideoLink::captureLoop()` grabs a frame from the analog capture dongle.
-3. `DetectionLink::inferenceLoop()` wakes up on its own cadence, pulls the
-   latest frame via the wired `VideoLink*`, and a fresh `TelemetrySnapshot`
-   via the telemetry provider.
-4. `runInference()` produces raw pixel-space boxes; `matchRawToTracks()` +
-   `updateTracks()` assign/continue track IDs so one physical object doesn't
-   spam a new record every 250 ms.
-5. For each detection worth recording, `computeWorldRay()` turns the pixel
-   offset + camera FOV + gimbal/attitude/heading into a world-space unit
-   ray, and `computeGeoCandidate()` tries ground-plane intersection,
-   bearings-only triangulation, and object-size ranging (in that order of
-   applicability) to turn the ray into a lat/lon.
-6. The result is stored as a `DetectionRecord` (optionally with a saved
-   screenshot) and becomes available to Python via `getRecordsSince()`.
+1. `DroneLink` (USB, MSP) or `CrsfLink` (ELRS radio) keeps a `DroneState`
+   with GPS, attitude, heading and altitude relative to the arming point.
+   The cockpit's `_get_detection_telemetry()` turns whichever link is
+   active into a `TelemetrySnapshot`. The camera tilt/pan comes from the
+   📐 toolbar setting, because the gimbal doesn't report it yet.
+2. `VideoLink::captureLoop()` grabs a frame from the analog capture dongle
+   and paints it into the pilot's FPV window. It's an `ABOVE_NORMAL` thread
+   and is never blocked by detection (see the "Protecting the live video"
+   section in [modules/detectionlink.md](modules/detectionlink.md)).
+3. `DetectionLink::inferenceLoop()` (`BELOW_NORMAL`, duty-cycle limited)
+   wakes on its own cadence, pulls the latest frame and a fresh
+   `TelemetrySnapshot`.
+4. `runDetection()` runs the YOLO26m model, on the full frame and,
+   optionally, four overlapping tiles. `trk::ObjectTracker` then keeps one
+   identity per physical object: it compensates for camera motion, predicts
+   motion, matches by appearance, groups vehicle classes and confirms new
+   tracks before recording them. A parked car stays **one** track.
+5. For confirmed objects, `computeWorldRay()` turns pixel + FOV + camera
+   angle + attitude/heading into a world ray. `computeGeoCandidate()` tries
+   ground-plane, triangulation and object-size ranging, with a **coarse**
+   bearing + rough-distance fallback, and attaches an uncertainty radius.
+   The sightings of each object are fused into one position whose radius
+   shrinks over time.
+6. A `DetectionRecord` (fused lat/lon, `uncertainty_m`, `sightings`,
+   `best_confidence`, screenshot) is written for a new object, when it has
+   moved, and as a periodic refresh. Python reads it via
+   `getRecordsSince()`. The copilot's `DetectionMapWidget` shows **one row
+   and one pin with a radius circle per object**.
 
-See [modules/detectionlink.md](modules/detectionlink.md) for the detail of
-step 4–5, including why three separate ranging strategies exist.
+See [modules/detectionlink.md](modules/detectionlink.md) for steps 3–6
+and [frontend/detection-map-widget.md](frontend/detection-map-widget.md)
+for the copilot view.
 
 ## 5. MSP transport summary
 

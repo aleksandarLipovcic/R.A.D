@@ -54,7 +54,7 @@ Tests: `TestScripts/test_detection_map.py` (UT-DETMAP-001 … 004).
 | `set_drone_telemetry(lat, lon, valid)` | Every poll tick, independent of detections | Updates the drone's own position marker on the map. See below — this used to be broken |
 | `set_telemetry_status(valid, detail)` | Every poll tick | Updates a second, separate status line reflecting current GPS quality in near-real-time |
 | `set_detection_link(detection_link)` | Once, right after the window is created | Wires the live annotated-feed poll loop — **without this call the live feed pane never starts at all** |
-| `add_records(records)` | Whenever `DetectionWorker.get_new_records()` returns anything | Appends rows to the `Treeview`, updates track position history, triggers a map redraw |
+| `add_records(records)` | Whenever `DetectionWorker.get_new_records()` returns anything | Inserts a row for a new object or updates the existing row of a known `track_id` in place, updates track position history, triggers a map redraw |
 
 ### The `set_drone_telemetry()` fix
 
@@ -78,7 +78,7 @@ happens first.
 
 ### `add_records()` cost
 
-Explicitly kept cheap: a handful of `Treeview` inserts and canvas ovals per
+Explicitly kept cheap: a handful of `Treeview` inserts/updates and canvas ovals per
 call, no image decoding. Tile decoding (when a map tile needs it) happens
 lazily inside `_draw_tile_mosaic()` on redraw, never inside `add_records()`
 itself. Each record's `track_id` (falling back to `0` via `getattr` if an
@@ -121,7 +121,11 @@ standard Web Mercator pixel space (`_mercator_pixel`/`_mercator_lonlat`
 module-level functions, `_fit_zoom()` for auto-zoom-to-fit) — the same
 coordinate system the tiles themselves are drawn in, so pins line up with
 the imagery exactly rather than needing a separately-reconciled
-projection. A scale bar (`_draw_scale_bar`) and compass mark are drawn on
+projection. Each object gets **one** bright pin at its latest (fused) position —
+earlier positions of the same object are small faded breadcrumbs joined
+by a line, not separate detections — plus a dashed circle of its `uncertainty_m` radius, converted to pixels at
+the pin's latitude; the circle shrinks as more sightings are fused by the
+backend. A scale bar (`_draw_scale_bar`) and compass mark are drawn on
 top of the tile mosaic. Standard interactions are supported: mouse-wheel
 zoom (`_on_mouse_wheel`/`_zoom_at_point`, zooming toward the cursor
 position rather than the map center), click-drag panning

@@ -23,6 +23,24 @@ validating the pipeline itself. `--model auto` re-enables a
 below before being accepted. `yolo26m @ 960px` is described as the real
 target once a `yolo26s` smoke test looks right.
 
+## `--nbs` — nominal batch size (fresh runs only)
+
+Ultralytics accumulates gradients over `nbs / batch` batches per optimizer
+step, and the EMA weights used for validation and `best.pt` update once per
+step. At `--batch 2` the default `--nbs 64` means 32 batches per step and an
+EMA that spans ~31 epochs on this dataset, so the validation numbers lag
+training badly (the plateau seen in the full yolo26m run). `--nbs 16`
+(8 batches per step, EMA ≈ 8 epochs) is the better choice at batch 1–2.
+Not honoured on `--resume` (Ultralytics restores the original arguments).
+
+## cuDNN DLL fix on Windows
+
+`train.py` (and every other script that uses torch) imports
+`torch_dll_fix` right after setting `PYTORCH_CUDA_ALLOC_CONF` and before
+torch/cv2 — it makes torch use its own bundled cuDNN instead of a
+CUDA-toolkit copy on `PATH` (`CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH`).
+See [setup.md](setup.md#cudnn-version-mismatch-on-windows-torch_dll_fixpy-cudnn_checkpy).
+
 ## WDDM / VRAM-spillover guards
 
 On Windows, an over-budget CUDA allocation **silently spills into system
@@ -142,13 +160,16 @@ subproject and the cockpit's `DetectionLink` (see
 [modules/detectionlink.md](../modules/detectionlink.md)):
 
 ```python
-model.export(format="onnx", opset=17, simplify=True, end2end=False, nms=False)
+model.export(format="onnx", opset=17, simplify=True, end2end=True)
 ```
 
-`end2end=False` is deliberate — it keeps the ONNX output shape as
-`(1, nc+4, N)`, the raw one-to-many head output `DetectionLink::runInference()`
-parses via manual class-argmax + `cv::dnn::NMSBoxes` on the C++ side (NMS
-is **not** baked into the graph). A sibling `.names` file is written next
+`end2end=True` is passed explicitly (the Ultralytics default changed
+between versions) so the ONNX graph ends in YOLO26's one-to-one head:
+output `(1, N, 6)` = `x1, y1, x2, y2, score, class`, already deduplicated,
+no NMS needed. `DetectionLink::runInference()` reads **both** layouts — the
+end-to-end `(1, N, 6)` and the raw `(1, 4+nc, anchors)` of an older
+`end2end=False` export (class argmax + class-offset NMS on the C++ side) —
+so models exported before this change keep working. A sibling `.names` file is written next
 to the `.onnx`, one class name per line in index order — this is exactly
 the file `DetectionLink::setModelPath()` auto-loads for class labels (see
 [modules/detectionlink.md](../modules/detectionlink.md#configuration-surface-call-before-start-most-are-safe-at-runtime)),
@@ -189,6 +210,7 @@ python train.py --model yolo26s.pt --imgsz 640 --batch -1 --epochs 2
 python train.py --imgsz 960 --batch 1 --epochs 5   # smoke test at target imgsz
 python train.py --imgsz 640 --batch 4        # fallback if 960px trips WDDM probes
 python train.py --model yolo26m.pt --imgsz 960     # real target run
+python train.py --model yolo26m.pt --imgsz 960 --batch 2 --nbs 16  # faster EMA at small batch
 python train.py --data VisDrone.yaml --model yolo26n.pt --imgsz 640
 python train.py --resume [--name RUN_NAME]
 python train.py --export-only [--weights PATH]
@@ -205,3 +227,9 @@ python train.py --export-only [--weights PATH]
 | yolo26m, 640px, unified, 3-epoch smoke | mAP50 0.380 (**stale** — predates the pseudo-label `--apply` merge) |
 | yolo26s, 640px, unified, post-mosaic_guard | ~2GB VRAM, full-run mAP TBD |
 | yolo26m, 960px, unified, 5-epoch smoke (2026-08-19) | mAP50 0.576, mAP50-95 0.336 — all 8/9 degradation transforms now build cleanly, including the previously-skipped OpticalDistortion |
+| **yolo26m, 960px, unified, full 100 epochs (resumed at 66 and 88; finished 2026-10-03)** — the model in `YOLO26M model/best.pt` | blended val mAP50 **0.647**, mAP50-95 **0.387** (P 0.712, R 0.600). Held-out SARD **test** set (never trained or selected on): person mAP50 **0.945**, mAP50-95 0.599, P 0.946, R 0.889. Weakest class other_vehicle (mAP50 0.420). Val plateaued from ~epoch 66 — at batch 2 × nbs 64 the EMA averaged over ~31 epochs, hence the new `--nbs` option |
+
+Accuracy on the project's own FPV reference footage (what the copilot
+actually sees) is measured separately with
+[`fpv_eval.py`](fpv-eval.md); the numbers are summarised in
+`docs/modules/detectionlink.md` → "Current model and its measured accuracy".
