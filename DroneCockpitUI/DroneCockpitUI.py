@@ -201,6 +201,16 @@ _register_dll_directories()
 
 import DroneBackend
 
+# One line saying WHICH DroneBackend.pyd was loaded and when it was built,
+# so a stale build (Visual Studio left on Debug, or the link failing
+# because the cockpit still had the .pyd open) is obvious at a glance.
+try:
+    _pyd = getattr(DroneBackend, "__file__", "") or "?"
+    _built = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(_pyd))) if os.path.exists(_pyd) else "?"
+    print(f"[DroneBackend] loaded {_pyd} (built {_built})")
+except Exception:
+    pass
+
 # ── Verbose diagnostic logging ──────────────────────────────────────────────
 # Same convention as DETECTIONLINK_VERBOSE_LOGGING in Detectionlink.cpp:
 # routine/diagnostic console output (LayoutStore load/save confirmations,
