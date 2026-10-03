@@ -79,6 +79,27 @@ def match_frame(ref, pred, thr):
     return matches, [i for i in range(len(ref)) if i not in ur], [j for j in range(len(pred)) if j not in up]
 
 
+def match_frame_same_class(ref, pred, thr):
+    """Same-class pairs first (as in the report's section 14), then the
+    leftovers are paired regardless of class -- those are the class
+    confusions. A duplicate car+large_vehicle box on one car then counts
+    as one TP (car) and one FP (large_vehicle), not as a confusion."""
+    pairs = sorted(((iou(r, p), i, j) for i, r in enumerate(ref) for j, p in enumerate(pred)
+                    if r[0] == p[0]), reverse=True)
+    ur, up, matches = set(), set(), []
+    for v, i, j in pairs:
+        if v < thr:
+            break
+        if i in ur or j in up:
+            continue
+        ur.add(i); up.add(j); matches.append((i, j, v))
+    ri = [i for i in range(len(ref)) if i not in ur]
+    pj = [j for j in range(len(pred)) if j not in up]
+    m2, fn2, fp2 = match_frame([ref[i] for i in ri], [pred[j] for j in pj], thr)
+    matches += [(ri[i], pj[j], v) for i, j, v in m2]
+    return matches, [ri[i] for i in fn2], [pj[j] for j in fp2]
+
+
 def total_matches(ref, pred, shift, thr):
     """Sum of matched-box IoUs -- more sensitive to a 1-frame misalignment
     than a plain match count on slow-moving footage."""
@@ -99,6 +120,10 @@ def main():
                         "found and how well the boxes line up. Useful because the COCO "
                         "reference tends to call vans 'car' while a VisDrone-trained NN "
                         "calls them large_vehicle (van->large_vehicle in class_map).")
+    a.add_argument("--match-same-class", action="store_true",
+                   help="Pair same-class boxes first, then the rest regardless of class "
+                        "(the report's section-14 rule). Without it, boxes are paired by IoU "
+                        "only and the class is checked afterwards.")
     a = a.parse_args()
 
     ref = load_dir(Path(a.ref), a.ref_frame_base, a.ref_conf)
@@ -128,7 +153,7 @@ def main():
                  "x1n", "y1n", "x2n", "y2n"])
     for f in sorted(set(ref) | set(pred)):
         R, P = ref.get(f, []), pred.get(f, [])
-        matches, fn, fp = match_frame(R, P, a.iou)
+        matches, fn, fp = (match_frame_same_class if a.match_same_class else match_frame)(R, P, a.iou)
         for i, j, v in matches:
             rc, pc = R[i][0], P[j][0]
             if rc == pc:
