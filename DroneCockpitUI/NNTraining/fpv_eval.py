@@ -542,9 +542,20 @@ def cmd_ref(args):
     if n_video <= 0:
         sys.exit(f"cannot open {args.video}")
 
+    fps = 0.0
+    cap = cv2.VideoCapture(args.video)
+    if cap.isOpened():
+        fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    print(f"video: {Path(args.video).name}  {vw}x{vh}  {n_video} frames  {fps:.0f} fps")
+
     ref = Path(args.reference)
     if ref.is_dir():
         gt, info = load_reference_dir(ref, vw, vh, len(names), args.ref_frame_base)
+        if info["label_files"] != n_video:
+            print(f"  WARNING: {info['label_files']} label files but {n_video} video frames -- "
+                  f"is this the exact video the labels were made for (same cut, same "
+                  f"crop)? Normalized boxes are placed using THIS video's size.")
         print(f"reference: {info['label_files']} label files, {info['boxes']} boxes on "
               f"{info['frames_with_boxes']} frames ({info['box_format']}, classes by index = "
               f"{', '.join(names[:8])}{', ...' if len(names) > 8 else ''}); "
