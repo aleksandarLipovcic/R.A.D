@@ -1,7 +1,7 @@
 # `fpv_eval.py` — accuracy on our own FPV footage
 
 **File:** `fpv_eval.py`
-**Run:** `python fpv_eval.py {extract | eval} ...`
+**Run:** `python fpv_eval.py {extract | eval | ref} ...`
 **Needs:** `opencv-python` (or `-headless`) and `numpy`. It doesn't need PyTorch or Ultralytics.
 
 ## Responsibility
@@ -71,6 +71,35 @@ flight video ──extract──▶ frames + draft labels ──(correct in a la
    the global threshold, since a tiny sample would give a noisy
    threshold. The cockpit loads the file at start-up and prints
    `per-class thresholds from yolo26m_main.thresholds.json: {...}`.
+
+## Scoring against existing reference labels (`ref`)
+
+If a flight already has reference boxes, for example the keyframe +
+tracker labels in `part0_reference_boxes.csv` / `part1_reference_boxes.csv`,
+there is nothing to label. `ref` runs the model on the **raw** video and
+compares it frame by frame with the CSV:
+
+```
+python fpv_eval.py ref --model ../models/yolo26m_main.onnx --video ../datasets/test/rad_fpv_part0.mp4 --reference part0_reference_boxes.csv --every 5
+```
+
+- **Use the raw video, not the `*_reference_labeled.mp4` copy.** That copy
+  has the boxes drawn into the picture.
+- **Columns are recognised by their header names.** A frame column
+  (`frame`, `frame_idx`, …), a class column (`class` by name, or
+  `class_id`), and the box as `x1,y1,x2,y2` or `x,y,w,h` in pixels. Extra
+  columns such as `conf` are ignored. Frame numbers are 0-based. If the
+  header isn't recognised, the error message lists what was found.
+- **Class names must match the model's `.names`.** Rename them with
+  `--class-map truck=large_vehicle,bus=large_vehicle`. Classes that still
+  don't match are listed as "NOT counted" rather than silently dropped.
+- **`--frames labeled`** (the default) uses only frames that have
+  reference boxes. Use **`--frames all`** only if the reference covers the
+  whole video; frames without boxes then count as hard negatives, i.e.
+  any detection there is a false alarm.
+- **`--every 5`** uses every 5th frame. Neighbouring frames are almost
+  identical, so using all of them only costs time.
+- `--variants` and `--write-thresholds` work as in `eval`.
 
 ## Variants
 

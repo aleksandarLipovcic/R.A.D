@@ -11,7 +11,13 @@ and output parsing as DetectionLink::runInference() (both ONNX layouts),
 so a number here is a number the drone gets -- not what model.predict()
 in PyTorch would get.
 
-THREE COMMANDS
+COMMANDS  (extract / eval / ref)
+
+  0. ref -- if a flight ALREADY has reference boxes (CSV: frame, class,
+     box), skip labelling entirely and score the raw video against it:
+       python fpv_eval.py ref --model ../models/yolo26m_main.onnx \\
+           --video ../datasets/test/rad_fpv_part0.mp4 --reference part0_reference_boxes.csv
+     (columns found by header name; --class-map renames classes).
 
   1. extract -- frames from a flight video to label:
        python fpv_eval.py extract --video flight1.mp4 --out datasets/fpv_eval --every 15
@@ -325,16 +331,24 @@ def cmd_extract(args):
           + (f" with model pre-labels in {out / 'labels'} -- CORRECT THEM before evaluating" if det else ""))
 
 
-def evaluate(det: OnnxDetector, items, variant: str, names: list[str]) -> dict:
-    per_class = {c: ([], [], 0) for c in range(len(names))}
-    t_total = 0.0
-    fp_on_empty = 0
+def file_samples(items):
+    """(image, gts) per labelled image file (images/ + labels/ layout)."""
     for img_path, lbl_path in items:
         img = cv2.imread(str(img_path))
         if img is None:
             continue
         h, w = img.shape[:2]
-        gts = load_labels(lbl_path, w, h)
+        yield img, load_labels(lbl_path, w, h)
+
+
+def evaluate(det: OnnxDetector, samples, variant: str, names: list[str]) -> dict:
+    """samples: iterable of (BGR image, Nx5 gts [x1,y1,x2,y2,cls] in pixels)."""
+    per_class = {c: ([], [], 0) for c in range(len(names))}
+    t_total = 0.0
+    fp_on_empty = 0
+    n_images = 0
+    for img, gts in samples:
+        n_images += 1
         t0 = time.perf_counter()
         preds = run_variant(det, img, variant)
         t_total += time.perf_counter() - t0
@@ -354,26 +368,16 @@ def evaluate(det: OnnxDetector, items, variant: str, names: list[str]) -> dict:
         classes[name] = class_metrics(confs, tps, ng, F_BETA.get(name, 1.0))
     aps = [m["ap50"] for m in classes.values() if m.get("ap50") is not None]
     return {"variant": variant,
-            "images": len(items),
-            "ms_per_frame": round(1000 * t_total / max(1, len(items)), 1),
+            "images": n_images,
+            "ms_per_frame": round(1000 * t_total / max(1, n_images), 1),
             "map50": round(float(np.mean(aps)), 4) if aps else None,
             "false_alarms_on_empty_frames_at_0.25": fp_on_empty,
             "classes": classes}
 
 
-def cmd_eval(args):
-    model = Path(args.model)
-    det = OnnxDetector(model, args.imgsz, args.cuda)
-    names = det.names or [f"class_{i}" for i in range(100)]
-    items, skipped = labelled_images(Path(args.data))
-    if not items:
-        sys.exit(f"no labelled images under {args.data} (images/ + labels/)")
-    print(f"{len(items)} labelled frames ({skipped} without a label file skipped), "
-          f"model {model.name}, input {det.imgsz}")
-    results = []
-    for v in args.variants.split(","):
-        r = evaluate(det, items, v.strip(), names)
-        results.append(r)
+def report(args, model: Path, det: OnnxDetector, results: list, data_desc: str, n_frames: int):
+    """Prints the tables, writes fpv_eval.json and (optionally) the thresholds file."""
+    for r in results:
         print(f"\n=== {r['variant']}: mAP50 {r['map50']}  |  {r['ms_per_frame']} ms/frame (CPU/cv2 "
               f"unless --cuda)  |  false alarms on empty frames: {r['false_alarms_on_empty_frames_at_0.25']}")
         print(f"  {'class':15s} {'GT':>5s} {'AP50':>6s} {'thr':>6s} {'P':>6s} {'R':>6s}")
@@ -387,7 +391,7 @@ def cmd_eval(args):
     out = Path(args.out or f"runs/fpv_eval/{datetime.now():%Y%m%d_%H%M%S}")
     out.mkdir(parents=True, exist_ok=True)
     (out / "fpv_eval.json").write_text(json.dumps(
-        {"model": str(model), "data": str(args.data), "input_size": det.imgsz,
+        {"model": str(model), "data": data_desc, "input_size": det.imgsz,
          "results": results}, indent=2))
     print(f"\nwritten {out / 'fpv_eval.json'}")
 
@@ -401,9 +405,133 @@ def cmd_eval(args):
         path = model.with_suffix(".thresholds.json")
         path.write_text(json.dumps({
             "generated": datetime.now().isoformat(timespec="seconds"),
-            "source": f"fpv_eval.py on {len(items)} frames of {args.data}, variant '{base['variant']}'",
+            "source": f"fpv_eval.py on {n_frames} frames of {data_desc}, variant '{base['variant']}'",
             "thresholds": thr}, indent=2))
         print(f"written {path}: {thr}")
+
+
+def cmd_eval(args):
+    model = Path(args.model)
+    det = OnnxDetector(model, args.imgsz, args.cuda)
+    names = det.names or [f"class_{i}" for i in range(100)]
+    items, skipped = labelled_images(Path(args.data))
+    if not items:
+        sys.exit(f"no labelled images under {args.data} (images/ + labels/)")
+    print(f"{len(items)} labelled frames ({skipped} without a label file skipped), "
+          f"model {model.name}, input {det.imgsz}")
+    results = [evaluate(det, file_samples(items), v.strip(), names) for v in args.variants.split(",")]
+    report(args, model, det, results, str(args.data), len(items))
+
+
+# =============================================================================
+# Reference CSV (one row per box per frame) + the raw video
+# =============================================================================
+_FRAME_COLS = ("frame", "frame_idx", "frame_index", "frame_id", "frame_no")
+_CLASS_NAME_COLS = ("class", "class_name", "label", "name", "cls_name")
+_CLASS_ID_COLS = ("class_id", "cls", "cls_id", "category_id")
+
+
+def load_reference_csv(path: Path, names: list[str], class_map: dict, ref_names: list[str] | None):
+    """Returns ({frame: Nx5 [x1,y1,x2,y2,cls]}, report). Columns are found by
+    header name; boxes as x1,y1,x2,y2 or x,y,w,h (pixels). Class names go
+    through --class-map, then must match the model's .names."""
+    import csv
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        reader = csv.DictReader(fh)
+        cols = {c.strip().lower(): c for c in (reader.fieldnames or [])}
+
+        def pick(options):
+            return next((cols[o] for o in options if o in cols), None)
+
+        c_frame = pick(_FRAME_COLS)
+        c_name, c_id = pick(_CLASS_NAME_COLS), pick(_CLASS_ID_COLS)
+        corner = all(k in cols for k in ("x1", "y1", "x2", "y2"))
+        xywh = all(k in cols for k in ("x", "y", "w", "h"))
+        if c_frame is None or (c_name is None and c_id is None) or not (corner or xywh):
+            sys.exit(f"{path}: cannot recognise the columns {reader.fieldnames}.\n"
+                     f"  needed: a frame column {_FRAME_COLS}, a class column "
+                     f"{_CLASS_NAME_COLS + _CLASS_ID_COLS}, and x1,y1,x2,y2 or x,y,w,h. "
+                     f"Send the header line so the reader can be extended.")
+        index = {n: i for i, n in enumerate(names)}
+        frames, unknown, kept = {}, {}, 0
+        for row in reader:
+            if c_name is not None and row[c_name].strip():
+                cname = row[c_name].strip()
+            else:
+                cid = int(float(row[c_id]))
+                cname = ref_names[cid] if ref_names and cid < len(ref_names) else (
+                    names[cid] if cid < len(names) else str(cid))
+            cname = class_map.get(cname, cname)
+            if cname not in index:
+                unknown[cname] = unknown.get(cname, 0) + 1
+                continue
+            if corner:
+                x1, y1, x2, y2 = (float(row[cols[k]]) for k in ("x1", "y1", "x2", "y2"))
+            else:
+                x, y, w, h = (float(row[cols[k]]) for k in ("x", "y", "w", "h"))
+                x1, y1, x2, y2 = x, y, x + w, y + h
+            f = int(float(row[c_frame]))
+            frames.setdefault(f, []).append([x1, y1, x2, y2, index[cname]])
+            kept += 1
+    return ({f: np.array(v, np.float32) for f, v in frames.items()},
+            {"boxes": kept, "frames_with_boxes": len(frames), "unknown_classes": unknown,
+             "box_format": "x1,y1,x2,y2" if corner else "x,y,w,h"})
+
+
+def video_samples(video: Path, gt: dict, frames: list[int]):
+    """(image, gts) for the selected frame numbers (0-based), reading the video once."""
+    want = set(frames)
+    last = max(frames) if frames else -1
+    cap = cv2.VideoCapture(str(video))
+    if not cap.isOpened():
+        sys.exit(f"cannot open {video}")
+    idx = 0
+    while idx <= last:
+        ok, img = cap.read()
+        if not ok:
+            break
+        if idx in want:
+            yield img, gt.get(idx, np.zeros((0, 5), np.float32))
+        idx += 1
+    cap.release()
+
+
+def cmd_ref(args):
+    model = Path(args.model)
+    det = OnnxDetector(model, args.imgsz, args.cuda)
+    names = det.names or [f"class_{i}" for i in range(100)]
+    class_map = dict(kv.split("=", 1) for kv in args.class_map.split(",") if "=" in kv)
+    ref_names = args.ref_names.split(",") if args.ref_names else None
+    gt, info = load_reference_csv(Path(args.reference), names, class_map, ref_names)
+    print(f"reference: {info['boxes']} boxes on {info['frames_with_boxes']} frames "
+          f"({info['box_format']}); model {model.name}, input {det.imgsz}")
+    if info["unknown_classes"]:
+        print(f"  NOT counted (class not in the model's .names -- map with --class-map "
+              f"ref=model): {info['unknown_classes']}")
+    if not gt:
+        sys.exit("no usable reference boxes")
+
+    cap = cv2.VideoCapture(args.video)
+    n_video = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else 0
+    cap.release()
+    if n_video <= 0:
+        sys.exit(f"cannot open {args.video}")
+    if args.frames == "labeled":
+        frames = sorted(f for f in gt if f % args.every == 0)
+    else:   # every Nth frame of the whole video; frames without boxes = hard negatives
+        frames = list(range(0, n_video, args.every))
+    if args.max_frame is not None:
+        frames = [f for f in frames if f <= args.max_frame]
+    beyond = [f for f in gt if f >= n_video]
+    if beyond:
+        print(f"  WARNING: {len(beyond)} reference frames are beyond the video's "
+              f"{n_video} frames -- wrong video, or 1-based frame numbers?")
+    print(f"evaluating {len(frames)} frames ({args.frames}, every {args.every}) of "
+          f"{Path(args.video).name} ({n_video} frames)")
+    results = [evaluate(det, video_samples(Path(args.video), gt, frames), v.strip(), names)
+               for v in args.variants.split(",")]
+    report(args, model, det, results, f"{Path(args.video).name} + {Path(args.reference).name}",
+           len(frames))
 
 
 def main():
@@ -431,6 +559,27 @@ def main():
     v.add_argument("--min-gt", type=int, default=20,
                    help="classes with fewer labelled objects keep the global threshold")
     v.set_defaults(fn=cmd_eval)
+
+    r = sub.add_parser("ref", help="score the model on a raw video against a reference-box CSV")
+    r.add_argument("--model", required=True, help="the .onnx the cockpit uses (with its .names)")
+    r.add_argument("--video", required=True, help="the RAW flight video (no boxes drawn in)")
+    r.add_argument("--reference", required=True, help="CSV, one row per box: frame, class, box")
+    r.add_argument("--frames", choices=("labeled", "all"), default="labeled",
+                   help="labeled = only frames that have reference boxes (default); all = every "
+                        "Nth frame, frames without boxes count as hard negatives -- use only if "
+                        "the reference covers the WHOLE video")
+    r.add_argument("--every", type=int, default=5, help="use every Nth frame (default 5)")
+    r.add_argument("--max-frame", type=int, default=None)
+    r.add_argument("--class-map", default="", help="rename reference classes, e.g. truck=large_vehicle,bus=large_vehicle")
+    r.add_argument("--ref-names", default=None,
+                   help="comma list of class names for a numeric-only reference class column")
+    r.add_argument("--variants", default="base", help="comma list of base,deinterlace,flip,tiles")
+    r.add_argument("--imgsz", type=int, default=None)
+    r.add_argument("--cuda", action="store_true")
+    r.add_argument("--out", default=None)
+    r.add_argument("--write-thresholds", action="store_true")
+    r.add_argument("--min-gt", type=int, default=20)
+    r.set_defaults(fn=cmd_ref)
 
     args = p.parse_args()
     args.fn(args)
