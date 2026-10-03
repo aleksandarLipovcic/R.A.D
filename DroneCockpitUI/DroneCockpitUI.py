@@ -2260,7 +2260,15 @@ class DroneCockpitApp:
         snapshot.valid = bool(gps.position_usable)
         snapshot.latitude = gps.latitude
         snapshot.longitude = gps.longitude
-        snapshot.altitude_m = float(gps.altitude_m)
+        # Height ABOVE THE TAKE-OFF POINT, not GPS altitude: DetectionLink's
+        # ground-plane ranging needs height over the ground, and
+        # gps.altitude_m is above sea level (hundreds of meters here), which
+        # pushed every pin several times too far out. baro_altitude_cm is
+        # relative to the arming point on both links (USB: Betaflight's
+        # estimated altitude; radio: CRSF baro, or GPS altitude minus the
+        # home altitude when no baro arrives). Over flat terrain near the
+        # take-off point that is the height above ground.
+        snapshot.altitude_m = float(getattr(state, "baro_altitude_cm", 0)) / 100.0
         snapshot.heading_deg = float(state.yaw)
         snapshot.roll_deg = state.roll / 10.0
         snapshot.pitch_deg = state.pitch / 10.0

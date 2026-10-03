@@ -110,6 +110,15 @@ struct DetectionRecord {
     double distanceM = 0.0;       // 0 if not georeferenced
     double bearingDeg = 0.0;      // compass bearing from drone to object, 0 if not georeferenced
 
+    // Approximate radius, in meters, of the area the object is in (about
+    // 2 sigma): derived from the ranging method, altitude, viewing angle
+    // and heading uncertainty, and shrinking as sightings of the same
+    // object are fused (see "Object position fusion" in the .cpp). The map
+    // draws it as a circle; "coarse" fixes are typically 50-150 m.
+    double uncertaintyM = 0.0;
+    int sightings = 0;            // confirmed passes this object has been seen in so far
+    float bestConfidence = 0.0f;  // highest confidence over all those sightings
+
     std::string screenshotPath;   // empty if screenshot saving is disabled/failed
     TelemetrySnapshot telemetry;  // stored verbatim, for later re-derivation/debugging
 };
@@ -246,6 +255,18 @@ public:
     // when available for that class; if not available, ground-plane is
     // still used as a last resort rather than dropping the detection.
     void setMinGroundRayComponent(double v) { minGroundRayComponent_.store(v); }
+
+    // "Coarse" fallback georeference, used when no ranging method gives a
+    // fix but GPS + heading are valid (shallow camera angle, unknown
+    // altitude, radio-link telemetry...): the pin is put along the camera
+    // bearing at the ground-plane distance clamped to coarseMaxRangeM, or
+    // at coarseDefaultRangeM when even that is unknown, with an honest
+    // 50-150 m uncertainty radius. Good enough to send a search team to
+    // the right area. Defaults 60 m / 150 m; 0 disables the fallback.
+    void setCoarseRangeM(double defaultRangeM, double maxRangeM) {
+        coarseDefaultRangeM_.store(defaultRangeM);
+        coarseMaxRangeM_.store(maxRangeM);
+    }
 
     // ── Bearings-only triangulation (rangeByTriangulation()) ─────────
     //
@@ -436,7 +457,8 @@ private:
         double lat = 0.0, lon = 0.0;
         double distanceM = 0.0;
         double bearingDeg = 0.0;
-        std::string method;   // "ground_plane", "triangulated", or "object_size"
+        std::string method;   // "ground_plane", "triangulated", "object_size" or "coarse"
+        double uncertaintyM = 0.0;   // approx. 2-sigma radius of the fix, meters
     };
 
     // Least-squares intersection of this track's accumulated bearing
@@ -513,6 +535,7 @@ private:
         // has moved and there are 2+ sightings of the same track.
         bool rayValid = false;
         double rayUnitNorth = 0.0, rayUnitEast = 0.0;
+        double uncertaintyM = 0.0;   // see DetectionRecord::uncertaintyM
     };
     GeoCandidate computeGeoCandidate(const RawDetection& raw, int frameW, int frameH,
         const TelemetrySnapshot& telemetry, const std::vector<BearingObservation>* history) const;
@@ -546,6 +569,22 @@ private:
         // forward-flight sightings still accumulates useful parallax for
         // rangeByTriangulation() once the drone has moved enough.
         std::vector<BearingObservation> bearingHistory;
+
+        // Object position fusion: inverse-variance weighted mean of all
+        // georeferenced sightings, in meters relative to an anchor, with
+        // exponential forgetting (half-life kFusionHalfLifeS) so a moving
+        // object's pin follows it while a static one converges.
+        int sightings = 0;
+        float bestConfidence = 0.0f;
+        bool fusedValid = false;
+        double anchorLat = 0.0, anchorLon = 0.0;
+        double sumW = 0.0, sumN = 0.0, sumE = 0.0;   // weights = 1 / radius^2
+        double minRadiusM = 0.0;
+        bool bestIsCoarse = false;   // best fix so far is a "coarse" one (shared distance guess)
+        int64_t fusedAtMs = 0;
+        double fusedLat() const;
+        double fusedLon() const;
+        double fusedRadiusM() const;
     };
     struct ArchivedObject {
         ObjectState state;
@@ -573,6 +612,16 @@ private:
     // Record policy for a continuing object: moved far enough, refresh
     // interval elapsed, or georeferencing appeared/disappeared.
     bool shouldRecordAgain(const ObjectState& obj, const GeoCandidate& geo, int64_t nowMs) const;
+
+    // Adds one georeferenced sighting to the object's fused position.
+    static void fuseObjectPosition(ObjectState& obj, const GeoCandidate& geo, int64_t nowMs);
+
+    // ~2-sigma radius of a ground-plane fix (altitude, tilt, heading errors).
+    static double groundPlaneUncertaintyM(double altitudeM, double unitZ, double slantM);
+
+    // Bearing + rough distance fallback; see setCoarseRangeM().
+    RangeEstimate rangeCoarse(const TelemetrySnapshot& telemetry,
+        double unitX, double unitY, double unitZ) const;
 
     std::atomic<double> trackIouThreshold_{ 0.1 };
     std::atomic<int> trackMaxMissedPasses_{ 6 };
@@ -609,6 +658,8 @@ private:
     mutable std::mutex classThresholdsMutex_;
     std::unordered_map<std::string, float> classConfidenceThresholds_;
     std::atomic<double> minGroundRayComponent_{ 0.12 };
+    std::atomic<double> coarseDefaultRangeM_{ 60.0 };
+    std::atomic<double> coarseMaxRangeM_{ 150.0 };
     std::atomic<double> triangulationMinBaselineM_{ 5.0 };
     std::atomic<double> triangulationMinBearingSpreadDeg_{ 5.0 };
 

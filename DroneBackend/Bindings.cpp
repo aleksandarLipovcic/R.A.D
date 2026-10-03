@@ -914,6 +914,15 @@ PYBIND11_MODULE(DroneBackend, m) {
             "time, 0-360. 0 (== due north) when georeferenced is False -- "
             "always check georeferenced first, don't treat 0 as a real "
             "reading.")
+        .def_readonly("uncertainty_m", &DetectionRecord::uncertaintyM,
+            "Approximate radius (m, ~2 sigma) of the area the object is in. "
+            "Latitude/longitude are the FUSED position over all of the "
+            "object's sightings so far; the radius shrinks as they add up. "
+            "'coarse' fixes (bearing + rough distance) are 50-150 m.")
+        .def_readonly("sightings", &DetectionRecord::sightings,
+            "Confirmed detection passes this object (track_id) has been seen in so far.")
+        .def_readonly("best_confidence", &DetectionRecord::bestConfidence,
+            "Highest model confidence over all of this object's sightings.")
         .def_readonly("screenshot_path", &DetectionRecord::screenshotPath,
             "Empty string if screenshot saving is disabled or failed.")
         .def_readonly("telemetry", &DetectionRecord::telemetry,
@@ -1031,6 +1040,13 @@ PYBIND11_MODULE(DroneBackend, m) {
             "Removes every configured class width -- object-size ranging "
             "then falls back to unavailable for all classes until "
             "set_known_object_width() is called again.")
+        .def("set_coarse_range_m", &DetectionLink::setCoarseRangeM,
+            py::arg("default_range_m"), py::arg("max_range_m"),
+            "Coarse fallback georeference when no ranging method works (shallow "
+            "camera, no altitude, radio-link telemetry): pin along the camera "
+            "bearing at the clamped ground-plane distance, or default_range_m, "
+            "with a 50-150 m uncertainty radius. Defaults 60 / 150; "
+            "default_range_m = 0 disables it.")
         .def("set_min_ground_ray_component", &DetectionLink::setMinGroundRayComponent,
             py::arg("v"),
             "Ray-downward-component threshold (0-1, default 0.12) below "

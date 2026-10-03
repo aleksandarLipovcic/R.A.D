@@ -127,6 +127,9 @@
     <Compile Include="TestScripts\test_dual_layer.py">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="TestScripts\test_detection_map.py">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="TestScripts\sv_baud_probe.py">
       <SubType>Code</SubType>
     </Compile>

@@ -43,6 +43,15 @@ that" glance shouldn't require the detection list. The detection list
 remains the primary, trustworthy source of exact values (lat/lon,
 distance, bearing) for any single sighting.
 
+ONE ROW PER OBJECT: DetectionLink writes a record when an object is first
+confirmed, when it has moved, and as a periodic refresh -- a parked car
+watched for three minutes therefore produces many records. The list
+shows each object (track_id) once and updates that row in place: class,
+BEST confidence, number of sightings, last-seen time, fused position and
+its uncertainty radius ("± m"). Selecting the row shows the screenshot
+of the most confident sighting. The map draws the fused position with a
+circle of that radius -- the area to send a search team to.
+
 Records are grouped by track_id (see DetectionLink's tracker): only the
 newest sighting of a given track is drawn as the bright "current" pin;
 earlier sightings of that same track are drawn as a small fading trail
@@ -160,6 +169,9 @@ class DetectionMapWidget(tk.Toplevel):
         # object's repeated sightings draw as one pin + trail instead of
         # a pile of unrelated dots (see module docstring).
         self._track_positions = {}
+        # track key -> {"latest": rec, "best": rec, "count": n, "radius": m}
+        # (one Treeview row per object, see add_records / module docstring)
+        self._tracks = {}
         self._map_zoom = None      # zoom the map is currently drawn at (auto-fit or manual, see _follow_drone)
         self._map_center = None    # (lat, lon) the map is currently centered on
 
@@ -235,20 +247,22 @@ class DetectionMapWidget(tk.Toplevel):
         tk.Label(left, text="Detections", fg="#ffffff", bg="#1a1a1a",
                  font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=8, pady=(8, 2))
 
-        columns = ("track", "class", "conf", "time", "geo", "range")
+        columns = ("track", "class", "conf", "seen", "time", "geo", "acc")
         self._tree = ttk.Treeview(left, columns=columns, show="headings", selectmode="browse")
-        self._tree.heading("track", text="Track")
+        self._tree.heading("track", text="Obj.")
         self._tree.heading("class", text="Class")
-        self._tree.heading("conf", text="Conf.")
-        self._tree.heading("time", text="Time")
+        self._tree.heading("conf", text="Best")
+        self._tree.heading("seen", text="Seen")
+        self._tree.heading("time", text="Last seen")
         self._tree.heading("geo", text="Lat / Lon")
-        self._tree.heading("range", text="Range")
-        self._tree.column("track", width=50, anchor="center")
+        self._tree.heading("acc", text="± m")
+        self._tree.column("track", width=40, anchor="center")
         self._tree.column("class", width=80)
-        self._tree.column("conf", width=55, anchor="e")
-        self._tree.column("time", width=80, anchor="center")
-        self._tree.column("geo", width=150)
-        self._tree.column("range", width=90, anchor="e")
+        self._tree.column("conf", width=45, anchor="e")
+        self._tree.column("seen", width=45, anchor="e")
+        self._tree.column("time", width=70, anchor="center")
+        self._tree.column("geo", width=140)
+        self._tree.column("acc", width=50, anchor="e")
         self._tree.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self._tree.bind("<<TreeviewSelect>>", self._on_select)
 
@@ -472,23 +486,37 @@ class DetectionMapWidget(tk.Toplevel):
             return
         for rec in records:
             self._records.append(rec)
-            t = time.strftime("%H:%M:%S", time.localtime(rec.timestamp_ms / 1000.0))
-            geo = f"{rec.latitude:.5f}, {rec.longitude:.5f}" if rec.georeferenced else "n/a"
-            rng = f"{rec.distance_m:.0f}m" if rec.georeferenced else "n/a"
-            # track_id groups repeated sightings of the same physical
-            # object (see DetectionLink's tracker) -- getattr fallback in
-            # case an older DetectionLink build without the field is
-            # still in use, so this widget doesn't hard-crash on it.
             track_id = getattr(rec, "track_id", 0)
-            self._tree.insert("", "end", iid=str(rec.id),
-                               values=(track_id, rec.class_name, f"{rec.confidence:.2f}", t, geo, rng))
+            key = track_id if track_id else f"r{rec.id}"   # untracked (old build): one row per record
+            info = self._tracks.get(key)
+            if info is None:
+                info = {"latest": rec, "best": rec, "count": 0, "radius": 0.0}
+                self._tracks[key] = info
+            info["latest"] = rec
+            info["count"] += 1
+            if rec.confidence >= info["best"].confidence:
+                info["best"] = rec   # its screenshot is shown when the row is selected
+            best_conf = max(getattr(rec, "best_confidence", 0.0), info["best"].confidence)
+            seen = getattr(rec, "sightings", 0) or info["count"]
+            radius = getattr(rec, "uncertainty_m", 0.0) if rec.georeferenced else 0.0
+            info["radius"] = radius
+
+            t = time.strftime("%H:%M:%S", time.localtime(rec.timestamp_ms / 1000.0))
+            geo = f"{rec.latitude:.5f}, {rec.longitude:.5f}" if rec.georeferenced else "no GPS fix"
+            acc = f"±{radius:.0f}" if rec.georeferenced and radius > 0 else ("?" if rec.georeferenced else "-")
+            values = (track_id, rec.class_name, f"{best_conf:.2f}", seen, t, geo, acc)
+            iid = f"t{key}"
+            if self._tree.exists(iid):
+                self._tree.item(iid, values=values)
+            else:
+                self._tree.insert("", "end", iid=iid, values=values)
 
             if rec.georeferenced:
                 if self._map_origin is None:
                     self._map_origin = (rec.latitude, rec.longitude)
-                self._track_positions.setdefault(track_id, []).append((rec.latitude, rec.longitude))
+                self._track_positions.setdefault(key, []).append((rec.latitude, rec.longitude))
 
-            self._redraw_map()
+        self._redraw_map()
 
         # Keep the list scrolled to the newest detection.
         children = self._tree.get_children()
@@ -776,9 +804,7 @@ class DetectionMapWidget(tk.Toplevel):
         selected_track_id = None
         focus_iid = self._tree.focus()
         if focus_iid:
-            focused_rec = next((r for r in self._records if str(r.id) == focus_iid), None)
-            if focused_rec is not None:
-                selected_track_id = getattr(focused_rec, "track_id", 0)
+            selected_track_id = self._key_from_iid(focus_iid)
 
         if not self._track_positions:
             self._map_canvas.create_rectangle(8, 8, 210, 26, fill="#000000", stipple="gray50", outline="")
@@ -786,8 +812,22 @@ class DetectionMapWidget(tk.Toplevel):
                 14, 17, anchor="w", fill="#dddddd",
                 text="No georeferenced detections yet", font=("Segoe UI", 9))
 
+        meters_per_pixel = 156543.03392804097 * math.cos(math.radians(center_lat)) / (2 ** zoom)
+        px_per_m = (1.0 / meters_per_pixel) if meters_per_pixel > 0 else 0.0
+
         for track_id, positions in self._track_positions.items():
             is_selected = (track_id == selected_track_id)
+
+            # Uncertainty area of the object's (fused) position: where to
+            # search. Outline only, so the imagery underneath stays visible.
+            radius_m = self._tracks.get(track_id, {}).get("radius", 0.0)
+            if radius_m > 0 and px_per_m > 0 and positions:
+                cx, cy = to_canvas(*positions[-1])
+                rpx = max(4.0, radius_m * px_per_m)
+                self._map_canvas.create_oval(
+                    cx - rpx, cy - rpx, cx + rpx, cy + rpx,
+                    outline="#00e0ff" if is_selected else "#ffaa00",
+                    width=2 if is_selected else 1, dash=(4, 3))
 
             if len(positions) > 1:
                 coords = []
@@ -871,39 +911,46 @@ class DetectionMapWidget(tk.Toplevel):
     # Internals — detection list / preview
     # =====================================================================
 
+    def _key_from_iid(self, iid: str):
+        """Treeview row id 't<key>' -> self._tracks key (int track id or 'r<id>')."""
+        key = iid[1:] if iid.startswith("t") else iid
+        return int(key) if key.isdigit() else key
+
     def _on_select(self, _event) -> None:
         selection = self._tree.selection()
         if not selection:
             return
-        rec_id = int(selection[0])
-        rec = next((r for r in self._records if r.id == rec_id), None)
-        if rec is None:
+        info = self._tracks.get(self._key_from_iid(selection[0]))
+        if info is None:
             return
+        rec, best = info["latest"], info["best"]
 
         if rec.georeferenced:
-            range_line = (f"~{rec.distance_m:.0f}m at {rec.bearing_deg:.0f} deg "
-                          f"(via {rec.range_method})")
+            radius = getattr(rec, "uncertainty_m", 0.0)
+            range_line = (f"within ±{radius:.0f} m of the pin  ·  last fix ~{rec.distance_m:.0f} m "
+                          f"at {rec.bearing_deg:.0f}° (via {rec.range_method})")
         else:
-            range_line = "not georeferenced this pass (no valid telemetry / ray)"
+            range_line = "no position (no valid GPS / telemetry at the time)"
 
+        seen = getattr(rec, "sightings", 0) or info["count"]
         self._detail_lbl.config(
-            text=f"{rec.class_name}  ({rec.confidence:.2f})\n"
-                 f"heading {rec.telemetry.heading_deg:.0f} deg, "
-                 f"gimbal tilt {rec.telemetry.gimbal_tilt_deg:.0f} deg\n"
+            text=f"{rec.class_name}  ·  object {getattr(rec, 'track_id', 0)}  ·  seen {seen}x  ·  "
+                 f"best {best.confidence:.2f}\n"
                  f"{range_line}\n"
-                 f"{rec.screenshot_path or 'no screenshot saved'}"
+                 f"screenshot of the best sighting: {best.screenshot_path or 'none saved'}"
         )
 
-        # Swap the pane over to this detection's saved screenshot. The
+        # Swap the pane over to the BEST sighting's saved screenshot. The
         # live poll (_poll_live_frame) keeps running underneath -- it
         # just stops writing into _preview_label while _viewing_saved_id
         # is set, so "Back to live" is instant instead of a re-fetch.
-        self._viewing_saved_id = rec.id
-        self._preview_status_var.set(f"●  SAVED FRAME  (detection #{rec.id})")
+        self._viewing_saved_id = best.id
+        self._preview_status_var.set(f"●  SAVED FRAME  (object {getattr(rec, 'track_id', 0)}, "
+                                     f"best sighting #{best.id})")
         self._preview_status_lbl.config(fg="#ffaa00")
         self._show_back_to_live_button()
-        self._load_preview(rec.screenshot_path)
-        self._redraw_map()  # re-highlight this record's track on the map
+        self._load_preview(best.screenshot_path)
+        self._redraw_map()  # re-highlight this object's pin on the map
 
     def _return_to_live(self) -> None:
         """

@@ -81,6 +81,16 @@ namespace {
     // is exceeded.
     constexpr size_t kMaxBearingHistoryPerTrack = 12;
 
+    // Ground-plane ranging needs a real height above the take-off point
+    // and a ray that is not nearly level (see rangeByGroundPlane()).
+    constexpr double kMinGroundPlaneAltitudeM = 2.0;
+    constexpr double kMaxGroundPlaneRangeM = 400.0;
+
+    // Object position fusion (see ObjectState in the header): older
+    // sightings fade with this half-life, so a moving object's pin
+    // follows it and a static one keeps converging.
+    constexpr double kFusionHalfLifeS = 15.0;
+
     constexpr double kEarthRadiusM = 6378137.0;
 
     double degToRad(double d) { return d * M_PI / 180.0; }
@@ -580,7 +590,7 @@ void DetectionLink::inferenceLoop() {
                 const trk::TrackInfo* ti = tracker_.find(as.trackId);
                 if (geo.georeferenced && ti &&
                     reidentify(obj, ti->group, ti->hist, geo.lat, geo.lon, nowMs)) {
-                    shouldRecord = shouldRecordAgain(obj, geo, nowMs);
+                    shouldRecord = true;   // decided below, after fusion
                 }
                 else {
                     obj.trackId = nextTrackId_++;
@@ -588,13 +598,22 @@ void DetectionLink::inferenceLoop() {
                 }
             }
             else {
-                shouldRecord = shouldRecordAgain(obj, geo, nowMs);
+                shouldRecord = true;       // decided below, after fusion
             }
+            const bool firstRecord = !obj.recorded;
+            obj.sightings++;
+            obj.bestConfidence = std::max(obj.bestConfidence, candidates[i].confidence);
+            GeoCandidate fusedGeo = geo;
             if (geo.georeferenced) {
+                fuseObjectPosition(obj, geo, nowMs);
+                fusedGeo.lat = obj.fusedLat();
+                fusedGeo.lon = obj.fusedLon();
+                fusedGeo.uncertaintyM = obj.fusedRadiusM();
                 obj.seenGeo = true;
-                obj.seenLat = geo.lat;
-                obj.seenLon = geo.lon;
+                obj.seenLat = fusedGeo.lat;
+                obj.seenLon = fusedGeo.lon;
             }
+            shouldRecord = firstRecord || shouldRecordAgain(obj, fusedGeo, nowMs);
             if (!shouldRecord)
                 continue;   // same object as an already-recorded sighting, nothing new to log yet
 
@@ -605,10 +624,15 @@ void DetectionLink::inferenceLoop() {
             rec.bboxX = raw.x; rec.bboxY = raw.y; rec.bboxW = raw.w; rec.bboxH = raw.h;
             rec.telemetry = telemetry;
             rec.trackId = obj.trackId;
+            rec.sightings = obj.sightings;
+            rec.bestConfidence = obj.bestConfidence;
 
-            if (geo.georeferenced) {
-                rec.latitude = geo.lat;
-                rec.longitude = geo.lon;
+            if (fusedGeo.georeferenced) {
+                // Position = fusion of all this object's sightings so far;
+                // distance/bearing/method = this pass's own measurement.
+                rec.latitude = fusedGeo.lat;
+                rec.longitude = fusedGeo.lon;
+                rec.uncertaintyM = fusedGeo.uncertaintyM;
                 rec.distanceM = geo.distanceM;
                 rec.bearingDeg = geo.bearingDeg;
                 rec.rangeMethod = geo.method;
@@ -1016,12 +1040,20 @@ DetectionLink::GeoCandidate DetectionLink::computeGeoCandidate(const RawDetectio
     else if (triangulated.valid) chosen = &triangulated;
     else if (bySize.valid) chosen = &bySize;
 
+    RangeEstimate coarse;
+    if (!chosen && coarseDefaultRangeM_.load() > 0.0) {
+        coarse = rangeCoarse(telemetry, ux, uy, uz);
+        if (coarse.valid)
+            chosen = &coarse;
+    }
+
     if (chosen) {
         geo.lat = chosen->lat;
         geo.lon = chosen->lon;
         geo.distanceM = chosen->distanceM;
         geo.bearingDeg = chosen->bearingDeg;
         geo.method = chosen->method;
+        geo.uncertaintyM = chosen->uncertaintyM;
         geo.georeferenced = true;
     }
     return geo;
@@ -1101,6 +1133,59 @@ namespace {
     }
 }
 
+// ── Uncertainty model ─────────────────────────────────────────────────
+// All radii are ~2 sigma, meters. Error sources that matter at search-and-
+// rescue scale: altitude (baro / GPS-relative, a few meters), the camera
+// tilt angle (manually set until the gimbal reports it -- easily 3-5 deg
+// off), and heading (magnetometer / GPS course, ~5 deg).
+namespace {
+    constexpr double kAltSigmaBaseM = 3.0;      // + 5 % of altitude
+    constexpr double kTiltSigmaDeg = 4.0;
+    constexpr double kHeadingSigmaDeg = 5.0;
+}
+
+double DetectionLink::groundPlaneUncertaintyM(double altitudeM, double unitZ, double slantM) {
+    // Horizontal distance D = h / tan(d), d = depression angle of the ray.
+    const double dep = std::asin(std::min(1.0, std::max(1e-3, unitZ)));
+    const double D = altitudeM / std::tan(dep);
+    const double sigH = kAltSigmaBaseM + 0.05 * altitudeM;
+    const double sigDep = degToRad(kTiltSigmaDeg);
+    const double sD = std::hypot(D / altitudeM * sigH,                      // altitude error
+                                 altitudeM / (std::sin(dep) * std::sin(dep)) * sigDep);  // tilt error
+    const double sLat = slantM * degToRad(kHeadingSigmaDeg);               // heading error
+    return std::max(5.0, 2.0 * std::hypot(sD, sLat));
+}
+
+DetectionLink::RangeEstimate DetectionLink::rangeCoarse(const TelemetrySnapshot& telemetry,
+    double unitX, double unitY, double unitZ) const {
+    RangeEstimate est;
+    const double defRange = coarseDefaultRangeM_.load();
+    const double maxRange = std::max(defRange, coarseMaxRangeM_.load());
+    const double horiz = std::hypot(unitX, unitY);
+    double dist = defRange;
+    if (unitZ > 0.02 && telemetry.altitudeM >= kMinGroundPlaneAltitudeM)
+        dist = std::min(maxRange, telemetry.altitudeM / unitZ * horiz);   // clamped ground-plane distance
+    if (horiz < 0.15) {
+        // Looking (nearly) straight down: the object is below the drone.
+        est.lat = telemetry.latitude;
+        est.lon = telemetry.longitude;
+        est.bearingDeg = 0.0;
+        est.distanceM = std::max(0.0, telemetry.altitudeM);
+        est.uncertaintyM = std::max(30.0, telemetry.altitudeM);
+    }
+    else {
+        const double n = unitX / horiz * dist, e = unitY / horiz * dist;
+        offsetLatLon(telemetry.latitude, telemetry.longitude, n, e, est.lat, est.lon, est.bearingDeg);
+        est.distanceM = dist;
+        // Along the ray the distance is a guess (+-dist); across it the
+        // heading error. Never claim better than 50 m for a coarse fix.
+        est.uncertaintyM = std::max(50.0, std::max(dist, 2.0 * dist * degToRad(kHeadingSigmaDeg)));
+    }
+    est.method = "coarse";
+    est.valid = true;
+    return est;
+}
+
 DetectionLink::RangeEstimate DetectionLink::rangeByGroundPlane(const TelemetrySnapshot& telemetry,
     double unitX, double unitY, double unitZ) const {
     RangeEstimate est;
@@ -1116,13 +1201,22 @@ DetectionLink::RangeEstimate DetectionLink::rangeByGroundPlane(const TelemetrySn
     // meters. Flat-earth assumption -- fine at the few-km ranges this is
     // designed for; swap in a DEM lookup here later if slope error
     // matters for your use case.
+    // Altitude is height above the take-off point (see TelemetrySnapshot):
+    // below ~2 m (on the ground, just after take-off, no baro/GPS altitude)
+    // the intersection is meaningless -- it would put the object under
+    // the drone at distance 0.
+    if (telemetry.altitudeM < kMinGroundPlaneAltitudeM)
+        return est;
     double t = telemetry.altitudeM / unitZ;   // = slant range, since unit vector has length 1
     double northM = unitX * t;
     double eastM = unitY * t;
+    if (std::hypot(northM, eastM) > kMaxGroundPlaneRangeM)
+        return est;   // ray nearly level: a few degrees of error = hundreds of meters
 
     offsetLatLon(telemetry.latitude, telemetry.longitude, northM, eastM, est.lat, est.lon, est.bearingDeg);
     est.distanceM = t;
     est.method = "ground_plane";
+    est.uncertaintyM = groundPlaneUncertaintyM(telemetry.altitudeM, unitZ, t);
     est.valid = true;
     return est;
 }
@@ -1210,6 +1304,7 @@ DetectionLink::RangeEstimate DetectionLink::rangeByTriangulation(
     offsetLatLon(telemetry.latitude, telemetry.longitude, targetN, targetE, est.lat, est.lon, est.bearingDeg);
     est.distanceM = distanceM;
     est.method = "triangulated";
+    est.uncertaintyM = std::max(10.0, 0.2 * est.distanceM);
     est.valid = true;
     return est;
 }
@@ -1252,6 +1347,8 @@ DetectionLink::RangeEstimate DetectionLink::rangeByObjectSize(const RawDetection
     offsetLatLon(telemetry.latitude, telemetry.longitude, northM, eastM, est.lat, est.lon, est.bearingDeg);
     est.distanceM = slantRangeM;
     est.method = "object_size";
+    // Real width vs. assumed width and the viewing angle: ~35 %.
+    est.uncertaintyM = std::max(10.0, 0.35 * est.distanceM);
     est.valid = true;
     return est;
 }
@@ -1448,6 +1545,58 @@ bool DetectionLink::reidentify(ObjectState& obj, int group, const cv::Mat& hist,
         obj.bearingHistory.erase(obj.bearingHistory.begin());
     archive_.erase(archive_.begin() + best);
     return true;
+}
+
+void DetectionLink::fuseObjectPosition(ObjectState& obj, const GeoCandidate& geo, int64_t nowMs) {
+    const double r = std::max(5.0, geo.uncertaintyM);
+    const double w = 1.0 / (r * r);
+    if (!obj.fusedValid) {
+        obj.fusedValid = true;
+        obj.anchorLat = geo.lat;
+        obj.anchorLon = geo.lon;
+        obj.sumW = obj.sumN = obj.sumE = 0.0;
+        obj.minRadiusM = r;
+        obj.bestIsCoarse = geo.method == "coarse";
+        obj.fusedAtMs = nowMs;
+    }
+    // Fade older sightings (moving objects), then add this one.
+    const double dtS = std::max<int64_t>(0, nowMs - obj.fusedAtMs) / 1000.0;
+    const double decay = std::pow(0.5, dtS / kFusionHalfLifeS);
+    obj.sumW *= decay; obj.sumN *= decay; obj.sumE *= decay;
+    obj.minRadiusM /= std::max(decay, 1e-3);   // the old best fix fades too
+    if (r <= obj.minRadiusM) {
+        obj.minRadiusM = r;
+        obj.bestIsCoarse = geo.method == "coarse";
+    }
+    double n = 0.0, e = 0.0;
+    latLonToLocalMeters(obj.anchorLat, obj.anchorLon, geo.lat, geo.lon, n, e);
+    obj.sumW += w; obj.sumN += w * n; obj.sumE += w * e;
+    obj.fusedAtMs = nowMs;
+}
+
+double DetectionLink::ObjectState::fusedRadiusM() const {
+    if (!fusedValid || sumW <= 0.0)
+        return 0.0;
+    // Independent errors would shrink as 1/sqrt(sum w); mount/heading
+    // biases are shared between sightings, so never claim better than
+    // half the best single fix (and never under 5 m). Coarse fixes all
+    // share the same distance GUESS -- averaging them does not shrink it.
+    const double floorFactor = bestIsCoarse ? 1.0 : 0.5;
+    return std::max({ 5.0, 1.0 / std::sqrt(sumW), floorFactor * minRadiusM });
+}
+
+double DetectionLink::ObjectState::fusedLat() const {
+    double lat = anchorLat, lon = anchorLon, brg = 0.0;
+    if (fusedValid && sumW > 0.0)
+        offsetLatLon(anchorLat, anchorLon, sumN / sumW, sumE / sumW, lat, lon, brg);
+    return lat;
+}
+
+double DetectionLink::ObjectState::fusedLon() const {
+    double lat = anchorLat, lon = anchorLon, brg = 0.0;
+    if (fusedValid && sumW > 0.0)
+        offsetLatLon(anchorLat, anchorLon, sumN / sumW, sumE / sumW, lat, lon, brg);
+    return lon;
 }
 
 bool DetectionLink::shouldRecordAgain(const ObjectState& obj, const GeoCandidate& geo,

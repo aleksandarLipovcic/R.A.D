@@ -190,7 +190,7 @@ readonly, since Python code builds these to feed into
 
 `DroneBackend.DetectionRecord` — read-only mirror of the C++ struct (see
 [detectionlink.md](detectionlink.md#telemetrysnapshot-and-detectionrecord)):
-`id`, `timestamp_ms`, `class_name`, `confidence`, `track_id`, `bbox_x/y/w/h`,
+`id`, `timestamp_ms`, `class_name`, `confidence`, `track_id`, `sightings`, `best_confidence`, `uncertainty_m`, `bbox_x/y/w/h`,
 `latitude`, `longitude`, `georeferenced`, `range_method`, `distance_m`,
 `bearing_deg`, `screenshot_path`, `telemetry` (nested `TelemetrySnapshot`).
 

@@ -24,6 +24,28 @@ and displays them with ordinary Tk widgets (a `Treeview` list + a Canvas
 map). See [../modules/detectionlink.md](../modules/detectionlink.md) for
 what a `DetectionRecord` actually contains.
 
+## One row per object
+
+`DetectionLink` writes a record when an object is first confirmed, when it
+has moved, and as a periodic refresh, so a parked car watched for three
+minutes produces many records. The list shows each object (`track_id`)
+**once** and updates that row in place:
+
+| Column | Content |
+|---|---|
+| Obj. | track id |
+| Class | latest (voted) class |
+| Best | highest confidence over all sightings |
+| Seen | confirmed passes the object was seen in (`sightings`) |
+| Last seen | time of the newest record |
+| Lat / Lon | fused position, or "no GPS fix" |
+| ± m | uncertainty radius of that position |
+
+Selecting a row shows the screenshot of the object's **most confident**
+sighting, plus the radius and the last fix's method. The map draws each
+object's pin with a dashed circle of its radius: the area to search.
+Tests: `TestScripts/test_detection_map.py` (UT-DETMAP-001 … 004).
+
 ## Public API (called from `DroneCockpitApp`)
 
 | Method | Called when | Effect |

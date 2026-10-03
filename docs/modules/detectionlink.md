@@ -249,6 +249,54 @@ g++ -std=c++17 -O2 -I.. tracker_sim.cpp ../ObjectTracker.cpp $(pkg-config --cfla
 ./tracker_sim
 ```
 
+## Position estimate per object (search-and-rescue pin)
+
+The goal isn't survey precision. It's a pin and a radius small enough to
+send a search team: roughly 50–100 m is enough.
+
+**Altitude.** `TelemetrySnapshot.altitudeM` must be height above the
+ground. The cockpit fills it from `baro_altitude_cm`, which is relative to
+the arming point on both links: Betaflight's estimated altitude over USB,
+and CRSF baro over the radio, or GPS altitude minus the home altitude when
+no baro arrives. It used to come from `gps.altitude_m`, which is above
+*sea level* and pushed every ground-plane pin several times too far out.
+Ground-plane ranging also refuses altitudes below 2 m and ground distances
+over 400 m.
+
+**Uncertainty radius (`DetectionRecord.uncertaintyM`, ~2σ, m) per method:**
+
+| Method | Radius | When it's used |
+|---|---|---|
+| `ground_plane` | from altitude error (3 m + 5 %), camera-tilt error (4°) and heading error (5°). Grows quickly as the ray flattens | Camera pointing down enough, altitude ≥ 2 m |
+| `triangulated` | max(10 m, 20 % of distance) | The object was seen from positions far enough apart |
+| `object_size` | max(10 m, 35 % of distance) | A real-world width is configured for the class |
+| **`coarse`** (fallback) | ≥ 50 m, typically 60–150 m | **Whenever none of the above works but GPS and heading are valid**, e.g. a shallow camera angle, no altitude, or radio-link telemetry. The pin goes along the camera bearing at the ground-plane distance clamped to 150 m, or 60 m when even that is unknown (`setCoarseRangeM`). Straight down means at the drone |
+
+So with a GPS fix every confirmed object gets a pin, and the radius says
+how far to trust it.
+
+**Fusion over sightings.** Each object (track) keeps an inverse-variance
+weighted mean of all its georeferenced sightings, with a 15 s half-life so
+a moving object's pin follows it. The record's latitude/longitude are this
+**fused** position and `uncertaintyM` is its radius:
+- The radius shrinks with more sightings, but never below half the best
+  single fix, because mount and heading biases are shared between
+  sightings.
+- A coarse radius never shrinks, because every coarse fix uses the same
+  distance guess.
+- Distance, bearing and method in the record are the latest pass's own
+  measurement.
+
+Also new in each record: `sightings` (confirmed passes so far) and
+`bestConfidence`.
+
+**Radio vs. USB.** The estimate needs GPS position, heading (yaw), roll/
+pitch and the relative altitude. All of these arrive over CRSF too, just at
+lower rates (GPS about 1–5 Hz). A telemetry snapshot up to about a second
+old moves the pin by at most the drone's speed × that age, small compared
+with the 50–100 m target. Without a valid GPS fix there's no position at
+all, and the copilot list shows "no GPS fix".
+
 ## Georeferencing: three ranging strategies
 
 All three consume the same world-space ray, built once per raw detection:
