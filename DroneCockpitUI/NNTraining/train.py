@@ -1582,7 +1582,9 @@ def export_for_cpp(weights_path: Path):
     print(f"\nExporting {weights_path} to ONNX (end-to-end head, NMS inside "
           f"the model)...")
     model = YOLO(str(weights_path))
-    onnx_path = model.export(format="onnx", opset=17, simplify=True)
+    # end2end=True explicit: the default changed between Ultralytics
+    # versions (newer ones export the raw one-to-many head otherwise).
+    onnx_path = model.export(format="onnx", opset=17, simplify=True, end2end=True)
     onnx_path = Path(onnx_path)
 
     names_path = onnx_path.with_suffix(".names")

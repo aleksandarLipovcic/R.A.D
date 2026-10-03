@@ -60,7 +60,12 @@ def main():
     # per row, NMS inside the model. DetectionLink::runInference() reads
     # that layout, and also the raw [1, 4+numClasses, anchors] layout of an
     # end2end=False export (then it runs NMS itself).
-    exported_path = model.export(format="onnx", imgsz=EXPORT_IMGSZ, opset=12, simplify=True)
+    # end2end=True pinned explicitly: Ultralytics' default has changed
+    # between versions (8.4.116 -> (1, 300, 6) end-to-end, 8.4.170 -> raw
+    # (1, 4+nc, anchors) from the one-to-many head). DetectionLink reads
+    # both, but only end2end is the head the model was validated with.
+    exported_path = model.export(format="onnx", imgsz=EXPORT_IMGSZ, opset=12, simplify=True,
+                                 end2end=True)
 
     final_onnx = MODEL_DIR / "yolo26m_main.onnx"
     Path(exported_path).replace(final_onnx)
