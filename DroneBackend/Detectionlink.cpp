@@ -464,7 +464,7 @@ void DetectionLink::inferenceLoop() {
         TelemetrySnapshot telemetry = telemetryProvider_ ? telemetryProvider_() : TelemetrySnapshot{};
 
         auto dbgInferStart = std::chrono::steady_clock::now();
-        auto rawAll = runInference(frame);
+        auto rawAll = runDetection(frame);
         double dbgInferMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
             std::chrono::steady_clock::now() - dbgInferStart).count();
         dbgInferMsAccum += dbgInferMs;
@@ -844,6 +844,74 @@ std::vector<DetectionLink::RawDetection> DetectionLink::runInference(const cv::M
             results.push_back(d);
     }
     return results;
+}
+
+std::vector<DetectionLink::RawDetection> DetectionLink::runDetection(const cv::Mat& frame) {
+    std::vector<RawDetection> all = runInference(frame);
+    if (!tiling_.load() || frame.cols < 64 || frame.rows < 64)
+        return all;
+    const size_t nFull = all.size();   // [0, nFull) = full-frame boxes
+
+    // Four corner tiles, 60 % of the frame each (20 % overlap in the
+    // middle) -- the same layout fpv_eval.py's "tiles" variant measured.
+    const int tw = frame.cols * 6 / 10, th = frame.rows * 6 / 10;
+    const int xs[2] = { 0, frame.cols - tw }, ys[2] = { 0, frame.rows - th };
+    // A box ending within this margin of an INNER tile edge is cut off.
+    const int edgeX = std::max(4, tw / 50), edgeY = std::max(4, th / 50);
+    for (int y0 : ys) {
+        for (int x0 : xs) {
+            const cv::Rect roi(x0, y0, tw, th);
+            for (RawDetection d : runInference(frame(roi))) {
+                // The full frame (and the neighbouring tile) has this
+                // object whole -- a box cut by an inner tile edge would be
+                // a wrong, smaller duplicate.
+                const bool cutL = x0 > 0 && d.x < edgeX;
+                const bool cutT = y0 > 0 && d.y < edgeY;
+                const bool cutR = x0 + tw < frame.cols && d.x + d.w > tw - edgeX;
+                const bool cutB = y0 + th < frame.rows && d.y + d.h > th - edgeY;
+                if (cutL || cutT || cutR || cutB)
+                    continue;
+                d.x += x0;
+                d.y += y0;
+                // A fragment of a big object the full frame already has
+                // whole: mostly inside a larger same-class full-frame box.
+                const double area = static_cast<double>(d.w) * d.h;
+                bool fragment = false;
+                for (size_t i = 0; i < nFull && !fragment; ++i) {
+                    const RawDetection& f = all[i];
+                    if (f.classIndex != d.classIndex ||
+                        static_cast<double>(f.w) * f.h <= area)
+                        continue;
+                    const int ix = std::max(0, std::min(d.x + d.w, f.x + f.w) - std::max(d.x, f.x));
+                    const int iy = std::max(0, std::min(d.y + d.h, f.y + f.h) - std::max(d.y, f.y));
+                    fragment = area > 0 && static_cast<double>(ix) * iy >= 0.7 * area;
+                }
+                if (!fragment)
+                    all.push_back(d);
+            }
+        }
+    }
+
+    // One box per object: class-aware NMS over full-frame + tile boxes
+    // (each class shifted to its own region so classes never suppress
+    // each other), keeping the most confident.
+    std::vector<cv::Rect> rects;
+    std::vector<float> scores;
+    rects.reserve(all.size());
+    scores.reserve(all.size());
+    const int shift = std::max(frame.cols, frame.rows) * 2;
+    for (const auto& d : all) {
+        const int off = std::max(0, d.classIndex) * shift;
+        rects.emplace_back(d.x + off, d.y + off, d.w, d.h);
+        scores.push_back(d.confidence);
+    }
+    std::vector<int> keep;
+    cv::dnn::NMSBoxes(rects, scores, 0.0f, 0.5f, keep);
+    std::vector<RawDetection> merged;
+    merged.reserve(keep.size());
+    for (int k : keep)
+        merged.push_back(all[static_cast<size_t>(k)]);
+    return merged;
 }
 
 DetectionLink::GeoCandidate DetectionLink::computeGeoCandidate(const RawDetection& raw,

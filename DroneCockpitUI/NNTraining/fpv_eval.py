@@ -189,20 +189,35 @@ def run_variant(det: OnnxDetector, bgr, variant: str) -> np.ndarray:
             b[:, [0, 2]] = w - b[:, [2, 0]]
         return nms(np.vstack([a, b]), NMS_IOU)
     if variant == "tiles":
+        # Mirrors DetectionLink::runDetection() exactly (C++ side).
         h, w = bgr.shape[:2]
-        th, tw = int(h * 0.6), int(w * 0.6)          # 2x2 tiles, 20 % overlap
-        parts = [det.detect(bgr)]
+        th, tw = h * 6 // 10, w * 6 // 10            # 2x2 tiles, 20 % overlap
+        ex, ey = max(4, tw // 50), max(4, th // 50)   # inner-edge margin
+        full = det.detect(bgr)
+        parts = [full]
         for y0 in (0, h - th):
             for x0 in (0, w - tw):
                 d = det.detect(bgr[y0:y0 + th, x0:x0 + tw])
-                if len(d):
-                    # drop boxes cut by an inner tile edge (the full frame has them whole)
-                    cut = (((d[:, 0] < 2) & (x0 > 0)) | ((d[:, 2] > tw - 2) & (x0 + tw < w)) |
-                           ((d[:, 1] < 2) & (y0 > 0)) | ((d[:, 3] > th - 2) & (y0 + th < h)))
-                    d = d[~cut]
-                    d[:, [0, 2]] += x0
-                    d[:, [1, 3]] += y0
-                    parts.append(d)
+                if not len(d):
+                    continue
+                # drop boxes cut by an inner tile edge (the full frame has them whole)
+                cut = (((d[:, 0] < ex) & (x0 > 0)) | ((d[:, 2] > tw - ex) & (x0 + tw < w)) |
+                       ((d[:, 1] < ey) & (y0 > 0)) | ((d[:, 3] > th - ey) & (y0 + th < h)))
+                d = d[~cut]
+                d[:, [0, 2]] += x0
+                d[:, [1, 3]] += y0
+                if len(d) and len(full):
+                    # fragments: >= 70 % inside a larger same-class full-frame box
+                    area = (d[:, 2] - d[:, 0]) * (d[:, 3] - d[:, 1])
+                    farea = (full[:, 2] - full[:, 0]) * (full[:, 3] - full[:, 1])
+                    ix = np.clip(np.minimum(d[:, None, 2], full[None, :, 2]) -
+                                 np.maximum(d[:, None, 0], full[None, :, 0]), 0, None)
+                    iy = np.clip(np.minimum(d[:, None, 3], full[None, :, 3]) -
+                                 np.maximum(d[:, None, 1], full[None, :, 1]), 0, None)
+                    inside = ((ix * iy >= 0.7 * area[:, None]) &
+                              (d[:, None, 5] == full[None, :, 5]) & (farea[None, :] > area[:, None]))
+                    d = d[~inside.any(1)]
+                parts.append(d)
         return nms(np.vstack(parts), 0.5)
     raise ValueError(f"unknown variant {variant}")
 

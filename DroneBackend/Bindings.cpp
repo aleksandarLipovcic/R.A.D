@@ -1003,6 +1003,12 @@ PYBIND11_MODULE(DroneBackend, m) {
             "With CUDA, try half precision first (typically 1.5-2x faster "
             "on RTX GPUs). start() verifies it (no exception, no NaN/Inf) "
             "and falls back to FP32 CUDA. Default True.")
+        .def("set_tiling", &DetectionLink::setTiling, py::arg("enabled"),
+            "Tiled detection: full frame + 4 overlapping tiles per pass, "
+            "merged. Much better on small/distant objects (FPV part0: person "
+            "recall @0.4 0.32 -> 0.50), ~5x inference time per pass. Default "
+            "False; safe to toggle at runtime.")
+        .def("is_tiling", &DetectionLink::isTiling)
         .def("is_using_cuda_fp16", &DetectionLink::isUsingCudaFp16,
             "True if start() engaged the FP16 CUDA target.")
         .def("set_known_object_width", &DetectionLink::setKnownObjectWidth,

@@ -11,7 +11,7 @@
 //         $(pkg-config --cflags --libs opencv4) -lpthread -o detectionlink_run
 //   (case-sensitive file systems: ln -s Detectionlink.h ../DetectionLink.h)
 //
-//   ./detectionlink_run ../../DroneCockpitUI/models/yolo26m_main.onnx frame.jpg 960
+//   ./detectionlink_run ../../DroneCockpitUI/models/yolo26m_main.onnx frame.jpg 960 [tiles]
 //
 // Static image for ~2.5 s = ~50 passes: each object should appear ONCE
 // (one confirmed track, no repeated records).
@@ -21,13 +21,14 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <thread>
 
 cv::Mat VideoLink::getLatestFrame() { return {}; }   // link-only stub: frames come from setFrameSource
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        printf("usage: %s model.onnx image.jpg [input_size=640]\n", argv[0]);
+        printf("usage: %s model.onnx image.jpg [input_size=640] [tiles]\n", argv[0]);
         return 2;
     }
     cv::Mat img = cv::imread(argv[2]);
@@ -36,6 +37,7 @@ int main(int argc, char** argv) {
     dl.setModelPath(argv[1]);
     dl.setInputSize(argc > 3 ? std::atoi(argv[3]) : 640);
     dl.setConfidenceThreshold(0.25f);
+    dl.setTiling(argc > 4 && std::string(argv[4]) == "tiles");
     dl.setDetectionIntervalMs(50);
     dl.setFrameSource([img]() { return img.clone(); });
     if (!dl.start()) { printf("start failed (model not loadable?)\n"); return 1; }

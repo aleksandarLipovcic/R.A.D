@@ -304,6 +304,24 @@ DETECTION_USE_CUDA = True
 # after start() says which one ran ("CUDA FP16" / "CUDA" / "CPU").
 DETECTION_CUDA_FP16 = True
 
+# Minimum model confidence for a detection to start a track / become a
+# record (DetectionLink's own default is 0.4). Measured on our analog FPV
+# reference footage (NNTraining/fpv_eval.py, part0, IoU 0.3): at 0.40 the
+# model finds only ~32 % of people and ~71 % of vehicles per frame; at 0.25
+# it is ~46 % / ~86 % at 65 % / 94 % precision. The tracker's 2-hit
+# confirmation removes most single-frame false alarms, so 0.25 is the
+# better trade-off until the model is fine-tuned on FPV frames. Per-class
+# values from <model>.thresholds.json (below) override this.
+DETECTION_CONFIDENCE_THRESHOLD = 0.25
+
+# Tiled detection (DetectionLink.set_tiling): every pass also runs the
+# model on four overlapping 60 % tiles, so small/distant objects are seen
+# ~1.7x larger. Measured on the same footage at confidence 0.4: person
+# recall 0.32 -> 0.50, vehicles 0.72 -> 0.90. Costs ~5x inference per
+# pass -- the cockpit prints the real pass time ~20 s after start; if it
+# is far above DETECTION_INTERVAL_MS, set this to False.
+DETECTION_TILING = True
+
 # Per-class confidence thresholds tuned on our own FPV footage by
 # NNTraining/fpv_eval.py (eval --write-thresholds). Loaded if present next
 # to the model; classes not in it use DetectionLink's global threshold.
@@ -1663,6 +1681,12 @@ class DroneCockpitApp:
 
         self.detection_link.set_screenshot_dir(DETECTION_SCREENSHOT_DIR)
         self.detection_link.set_detection_interval_ms(DETECTION_INTERVAL_MS)
+        self.detection_link.set_confidence_threshold(DETECTION_CONFIDENCE_THRESHOLD)
+        if hasattr(self.detection_link, "set_tiling"):
+            self.detection_link.set_tiling(DETECTION_TILING)
+        elif DETECTION_TILING:
+            print("[DetectionLink] NOTE: this DroneBackend has no set_tiling() -- rebuild "
+                  "DroneBackend to get tiled detection. Running full-frame only.")
 
         # ── Georeferencing config -- was silently missing before ────────
         # Without these two calls, DetectionLink ran on its compiled-in
@@ -2344,6 +2368,7 @@ class DroneCockpitApp:
         """
         if self.detection_link.start():
             self._detection_engine_running = True
+            self.root.after(20000, self._report_detection_speed)
             self._detection_engine_detail = ""
             # Confirms which backend actually got engaged -- setUseCuda()
             # silently falls back to CPU if this build/machine's OpenCV
@@ -2510,6 +2535,23 @@ class DroneCockpitApp:
         win.geometry(f"{win_w}x{win_h}+{max(0, x)}+{max(0, y)}")
         win.lift()
         win.focus_force()
+
+    def _report_detection_speed(self) -> None:
+        """One console line with the real detection pass time, so the effect of
+        DETECTION_TILING / FP16 on this machine is visible without verbose logs."""
+        try:
+            ms = self.detection_link.get_last_pass_duration_ms()
+            tiling = getattr(self.detection_link, "is_tiling", lambda: False)()
+        except Exception:
+            return
+        if ms <= 0:
+            return
+        note = ""
+        if ms > 2 * DETECTION_INTERVAL_MS:
+            note = (f"  -- well above the {DETECTION_INTERVAL_MS} ms interval"
+                    + ("; consider DETECTION_TILING = False" if tiling else ""))
+        print(f"[DetectionLink] detection pass {ms:.0f} ms "
+              f"({'tiled' if tiling else 'full frame'}){note}")
 
     def _load_class_thresholds(self) -> None:
         """Per-class confidence thresholds from fpv_eval.py, if present."""

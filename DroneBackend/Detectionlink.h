@@ -179,6 +179,13 @@ public:
     void setClassConfidenceThreshold(const std::string& className, float threshold);
     void clearClassConfidenceThresholds();
 
+    // Tiled detection (see runDetection()): full frame + 4 overlapping
+    // tiles per pass, merged. Much better on small/distant objects, ~5x
+    // the inference time per pass -- check getLastPassDurationMs() against
+    // the detection interval. Off by default; safe to toggle at runtime.
+    void setTiling(bool enabled) { tiling_.store(enabled); }
+    bool isTiling() const { return tiling_.load(); }
+
     // Square input side the ONNX model expects (letterboxed). MUST match
     // whatever imgsz the .onnx was exported at -- this does NOT have to
     // match training imgsz (you can train at 960 and export/infer at a
@@ -383,6 +390,15 @@ private:
 
     std::vector<RawDetection> runInference(const cv::Mat& frame);
 
+    // runInference() on the full frame plus, when setTiling(true), on four
+    // overlapping tiles (each 60 % of the frame, one per corner), merged
+    // into frame coordinates. A tile is upscaled ~1.7x relative to the
+    // full frame, so small/distant objects get far higher confidence --
+    // measured on the part0 FPV reference (fpv_eval.py): person recall at
+    // confidence 0.4 went 0.32 -> 0.50, vehicles 0.72 -> 0.90, for ~5x
+    // the inference time.
+    std::vector<RawDetection> runDetection(const cv::Mat& frame);
+
     // A single pass's bearing to a tracked object, kept around across
     // passes so a LATER pass -- once the drone has moved -- can
     // triangulate against it. Deliberately minimal: just enough to
@@ -567,6 +583,7 @@ private:
     std::atomic<bool> useCuda_{ false };
     std::atomic<bool> usingCuda_{ false };
     std::atomic<bool> useCudaFp16_{ true };
+    std::atomic<bool> tiling_{ false };
     std::atomic<bool> usingCudaFp16_{ false };
     mutable std::mutex classThresholdsMutex_;
     std::unordered_map<std::string, float> classConfidenceThresholds_;

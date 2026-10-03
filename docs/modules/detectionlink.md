@@ -43,6 +43,7 @@ for why this is structured as callables rather than concrete dependencies.
 | `setClassConfidenceThreshold(name, t)` / `clearClassConfidenceThresholds()` | none | Per-class override of the threshold above. The cockpit loads tuned values from `<model>.thresholds.json`, written by `NNTraining/fpv_eval.py` |
 | `setInputSize(size)` | 640 | Square letterboxed input side. **Must match the ONNX export's `imgsz`**, not necessarily the training `imgsz` — mismatch silently scales every box wrong with no crash. `yolo_main_run` was trained at 960; if exported at 960, call `setInputSize(960)` |
 | `setUseCuda(enabled)` / `isUsingCuda()` | false | Opt into CUDA backend/target; needs an OpenCV build with CUDA support (stock pip/vcpkg wheels lack it). Falls back to CPU silently if unavailable — check `isUsingCuda()` after `start()` |
+| `setTiling(enabled)` / `isTiling()` | false (cockpit: on) | Each pass also runs the model on four overlapping 60 % tiles and merges the results (`runDetection()`). Small and distant objects are seen about 1.7× larger. On the FPV reference footage, recall at confidence 0.4 went from 0.32 to 0.50 for people and from 0.72 to 0.90 for vehicles. Costs about 5× inference per pass |
 | `setUseCudaFp16(enabled)` / `isUsingCudaFp16()` | true | With CUDA, try `DNN_TARGET_CUDA_FP16` first (typically 1.5–2× faster on RTX GPUs). `start()` verifies it with a dummy pass (no exception, no NaN/Inf in the output) and otherwise falls back to FP32 CUDA, then CPU |
 | `setKnownObjectWidth(class, meters)` / `clearKnownObjectWidths()` | none set | Real-world face-on width per class, enabling object-size ranging for that class (see below) |
 | `setMinGroundRayComponent(v)` | 0.12 (~7°) | Below this ray-downward-component, ground-plane ranging is distrusted in favor of object-size ranging (or used as a last resort if unavailable) |
@@ -57,6 +58,26 @@ for why this is structured as callables rather than concrete dependencies.
 | `setTrackCameraMotionCompensation(on)` | true | Compensate drone yaw/pan between passes |
 | `setTrackMoveThresholdM(m)` | 3.0 | Ground movement needed before a continuing track gets a fresh `DetectionRecord` |
 | `setTrackRefreshIntervalMs(ms)` | 10000 | Even a static, continuously-tracked object gets a periodic fresh record so it doesn't look stale |
+
+## Tiled detection (`runDetection()`)
+
+`inferenceLoop()` calls `runDetection()`, which runs `runInference()` on the
+full frame. With `setTiling(true)` it also runs on four corner tiles (60 %
+of the frame each, 20 % overlap) and merges everything in frame
+coordinates:
+
+1. A tile box ending within 2 % of an **inner** tile edge is dropped,
+   because the full frame or the neighbouring tile has that object whole.
+2. A tile box that lies ≥ 70 % inside a larger same-class full-frame box
+   is dropped as a fragment of a big object.
+3. Class-aware NMS (IoU 0.5) over all boxes keeps the most confident one
+   per object.
+
+`NNTraining/fpv_eval.py --variants tiles` implements exactly the same
+rules, so its measurements carry over to the cockpit. The cockpit prints
+the real pass time about 20 s after the engine starts (`detection pass
+… ms (tiled)`). If it's far above `DETECTION_INTERVAL_MS`, set
+`DETECTION_TILING = False` in `DroneCockpitUI.py`.
 
 ## Model output layouts
 
