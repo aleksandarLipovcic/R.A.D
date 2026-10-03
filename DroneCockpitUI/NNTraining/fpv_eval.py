@@ -16,8 +16,10 @@ COMMANDS  (extract / eval / ref)
   0. ref -- if a flight ALREADY has reference boxes (CSV: frame, class,
      box), skip labelling entirely and score the raw video against it:
        python fpv_eval.py ref --model ../models/yolo26m_main.onnx \\
-           --video ../datasets/test/rad_fpv_part0.mp4 --reference part0_reference_boxes.csv
-     (columns found by header name; --class-map renames classes).
+           --video rad_fpv_cropped_part0.mp4 --reference labels/part0
+     --reference is either a folder of per-frame YOLO txt files
+     (<name>_<frame>.txt, 0-based; empty file = checked empty frame) or a
+     CSV with one row per box (columns found by header name).
 
   1. extract -- frames from a flight video to label:
        python fpv_eval.py extract --video flight1.mp4 --out datasets/fpv_eval --every 15
@@ -478,6 +480,36 @@ def load_reference_csv(path: Path, names: list[str], class_map: dict, ref_names:
              "box_format": "x1,y1,x2,y2" if corner else "x,y,w,h"})
 
 
+def load_reference_dir(path: Path, frame_w: int, frame_h: int, n_classes: int, base: int = 0):
+    """A folder of per-frame YOLO txt files (<anything>_<frame>.txt, normalized
+    `cls xc yc w h`). Every file counts as a checked frame -- an EMPTY file is
+    a frame with nothing in it (hard negative). Returns ({frame: Nx5}, report)."""
+    import re
+    frames, bad_cls, n_boxes = {}, {}, 0
+    for t in sorted(path.glob("*.txt")):
+        m = re.search(r"(\d+)$", t.stem)
+        if not m:
+            continue
+        f = int(m.group(1)) - base
+        rows = []
+        for line in t.read_text().splitlines():
+            v = line.split()
+            if len(v) < 5:
+                continue
+            c = int(float(v[0]))
+            if not 0 <= c < n_classes:
+                bad_cls[c] = bad_cls.get(c, 0) + 1
+                continue
+            xc, yc, bw, bh = (float(x) for x in v[1:5])
+            rows.append([(xc - bw / 2) * frame_w, (yc - bh / 2) * frame_h,
+                         (xc + bw / 2) * frame_w, (yc + bh / 2) * frame_h, c])
+        frames[f] = np.array(rows, np.float32).reshape(-1, 5)
+        n_boxes += len(rows)
+    return frames, {"boxes": n_boxes, "frames_with_boxes": sum(1 for a in frames.values() if len(a)),
+                    "label_files": len(frames), "unknown_classes": bad_cls,
+                    "box_format": "YOLO txt per frame"}
+
+
 def video_samples(video: Path, gt: dict, frames: list[int]):
     """(image, gts) for the selected frame numbers (0-based), reading the video once."""
     want = set(frames)
@@ -502,20 +534,30 @@ def cmd_ref(args):
     names = det.names or [f"class_{i}" for i in range(100)]
     class_map = dict(kv.split("=", 1) for kv in args.class_map.split(",") if "=" in kv)
     ref_names = args.ref_names.split(",") if args.ref_names else None
-    gt, info = load_reference_csv(Path(args.reference), names, class_map, ref_names)
-    print(f"reference: {info['boxes']} boxes on {info['frames_with_boxes']} frames "
-          f"({info['box_format']}); model {model.name}, input {det.imgsz}")
+    cap = cv2.VideoCapture(args.video)
+    n_video = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else 0
+    vw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if cap.isOpened() else 0
+    vh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if cap.isOpened() else 0
+    cap.release()
+    if n_video <= 0:
+        sys.exit(f"cannot open {args.video}")
+
+    ref = Path(args.reference)
+    if ref.is_dir():
+        gt, info = load_reference_dir(ref, vw, vh, len(names), args.ref_frame_base)
+        print(f"reference: {info['label_files']} label files, {info['boxes']} boxes on "
+              f"{info['frames_with_boxes']} frames ({info['box_format']}, classes by index = "
+              f"{', '.join(names[:8])}{', ...' if len(names) > 8 else ''}); "
+              f"model {model.name}, input {det.imgsz}")
+    else:
+        gt, info = load_reference_csv(ref, names, class_map, ref_names)
+        print(f"reference: {info['boxes']} boxes on {info['frames_with_boxes']} frames "
+              f"({info['box_format']}); model {model.name}, input {det.imgsz}")
     if info["unknown_classes"]:
         print(f"  NOT counted (class not in the model's .names -- map with --class-map "
               f"ref=model): {info['unknown_classes']}")
     if not gt:
-        sys.exit("no usable reference boxes")
-
-    cap = cv2.VideoCapture(args.video)
-    n_video = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else 0
-    cap.release()
-    if n_video <= 0:
-        sys.exit(f"cannot open {args.video}")
+        sys.exit("no usable reference labels")
     if args.frames == "labeled":
         frames = sorted(f for f in gt if f % args.every == 0)
     else:   # every Nth frame of the whole video; frames without boxes = hard negatives
@@ -563,7 +605,11 @@ def main():
     r = sub.add_parser("ref", help="score the model on a raw video against a reference-box CSV")
     r.add_argument("--model", required=True, help="the .onnx the cockpit uses (with its .names)")
     r.add_argument("--video", required=True, help="the RAW flight video (no boxes drawn in)")
-    r.add_argument("--reference", required=True, help="CSV, one row per box: frame, class, box")
+    r.add_argument("--reference", required=True,
+                   help="a folder of per-frame YOLO txt labels (<name>_<frame>.txt) -- preferred, "
+                        "empty files count as checked empty frames -- or a CSV, one row per box")
+    r.add_argument("--ref-frame-base", type=int, default=0,
+                   help="frame number of the FIRST video frame in the label file names (0 or 1)")
     r.add_argument("--frames", choices=("labeled", "all"), default="labeled",
                    help="labeled = only frames that have reference boxes (default); all = every "
                         "Nth frame, frames without boxes count as hard negatives -- use only if "

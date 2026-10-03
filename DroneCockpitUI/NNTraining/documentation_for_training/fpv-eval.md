@@ -80,8 +80,20 @@ there is nothing to label. `ref` runs the model on the **raw** video and
 compares it frame by frame with the CSV:
 
 ```
-python fpv_eval.py ref --model ../models/yolo26m_main.onnx --video ../datasets/test/rad_fpv_part0.mp4 --reference part0_reference_boxes.csv --every 5
+python fpv_eval.py ref --model ../models/yolo26m_main.onnx --video rad_fpv_cropped_part0.mp4 --reference labels/part0 --every 5
 ```
+
+`--reference` can be either of two things:
+
+- **A folder of per-frame YOLO txt files** (preferred), e.g. the
+  `labels/part0/part0_NNNNNN.txt` files from the reference zips.
+  - Lines are normalized `cls xc yc w h`, with the class index taken from
+    the model's `.names`.
+  - The frame number is taken from the digits at the end of the file name:
+    0-based by default, or set `--ref-frame-base 1`.
+  - Every file counts as a checked frame. An empty file is a frame with
+    nothing in it, so detections there count as false alarms.
+- **A CSV with one row per box**, as described below.
 
 - **Use the raw video, not the `*_reference_labeled.mp4` copy.** That copy
   has the boxes drawn into the picture.
