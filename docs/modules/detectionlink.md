@@ -43,6 +43,8 @@ for why this is structured as callables rather than concrete dependencies.
 | `setClassConfidenceThreshold(name, t)` / `clearClassConfidenceThresholds()` | none | Per-class override of the threshold above. The cockpit loads tuned values from `<model>.thresholds.json`, written by `NNTraining/fpv_eval.py` |
 | `setInputSize(size)` | 640 | Square letterboxed input side. **Must match the ONNX export's `imgsz`**, not necessarily the training `imgsz` — mismatch silently scales every box wrong with no crash. `yolo_main_run` was trained at 960; if exported at 960, call `setInputSize(960)` |
 | `setUseCuda(enabled)` / `isUsingCuda()` | false | Opt into CUDA backend/target; needs an OpenCV build with CUDA support (stock pip/vcpkg wheels lack it). Falls back to CPU silently if unavailable — check `isUsingCuda()` after `start()` |
+| `setMaxDutyCycle(d)` | 0.66 | Max share of time the inference thread may be busy; it rests ≥ pass × (1/d − 1) after each pass |
+| `setTilingBudgetMs(ms)` / `isTilingActive()` | 0 = auto | Tiled pass time above which (3× in a row) tiling suspends itself; auto = max(500 ms, 2 × interval) |
 | `setTiling(enabled)` / `isTiling()` | false (cockpit: on) | Each pass also runs the model on four overlapping 60 % tiles and merges the results (`runDetection()`). Small and distant objects are seen about 1.7× larger. On the FPV reference footage, recall at confidence 0.4 went from 0.32 to 0.50 for people and from 0.72 to 0.90 for vehicles. Costs about 5× inference per pass |
 | `setUseCudaFp16(enabled)` / `isUsingCudaFp16()` | true | With CUDA, try `DNN_TARGET_CUDA_FP16` first (typically 1.5–2× faster on RTX GPUs). `start()` verifies it with a dummy pass (no exception, no NaN/Inf in the output) and otherwise falls back to FP32 CUDA, then CPU |
 | `setKnownObjectWidth(class, meters)` / `clearKnownObjectWidths()` | none set | Real-world face-on width per class, enabling object-size ranging for that class (see below) |
@@ -78,6 +80,21 @@ rules, so its measurements carry over to the cockpit. The cockpit prints
 the real pass time about 20 s after the engine starts (`detection pass
 … ms (tiled)`). If it's far above `DETECTION_INTERVAL_MS`, set
 `DETECTION_TILING = False` in `DroneCockpitUI.py`.
+
+## Protecting the live video
+
+The pilot's FPV view is `VideoLink`'s own capture/paint path: an
+`ABOVE_NORMAL` thread painting straight into a native window. Detection is
+only for spotting objects and estimating their position, so it must never
+slow that path down. These are the safeguards:
+
+| Where | Safeguard |
+|---|---|
+| Frame hand-off (`VideoLink::getLatestFrame()`) | Only the frame header is taken under the capture mutex; the 4 MB pixel copy happens after the lock is released. Every captured frame lives in a fresh buffer, so the capture thread never waits for a consumer's copy |
+| `inferenceLoop()` | `THREAD_PRIORITY_BELOW_NORMAL`. **Duty-cycle limit** (`setMaxDutyCycle`, default 0.66): after each pass the thread rests at least half the pass time, so a slow pass never runs back-to-back |
+| Tiling | Suspends itself (`isTilingActive()` becomes false) after 3 tiled passes in a row slower than `setTilingBudgetMs` (auto: max(500 ms, 2 × interval)), and full-frame detection continues |
+| `previewLoop()` | `BELOW_NORMAL`. It does no work at all unless the preview pane polled `get_latest_annotated_frame_jpeg()` within the last 2 s |
+| `get_latest_annotated_frame_jpeg` binding | Resize and JPEG encode run with the GIL released, so the Tk UI never waits on them |
 
 ## Model output layouts
 

@@ -210,7 +210,9 @@ readonly, since Python code builds these to feed into
 | `set_input_size(size)` | `setInputSize` |
 | `set_use_cuda(enabled)` / `is_using_cuda()` | `setUseCuda`/`isUsingCuda` |
 | `set_use_cuda_fp16(enabled)` / `is_using_cuda_fp16()` | `setUseCudaFp16`/`isUsingCudaFp16` |
-| `set_tiling(enabled)` / `is_tiling()` | `setTiling`/`isTiling` |
+| `set_tiling(enabled)` / `is_tiling()` / `is_tiling_active()` | `setTiling`/`isTiling`/`isTilingActive` |
+| `set_tiling_budget_ms(ms)` | `setTilingBudgetMs` |
+| `set_max_duty_cycle(d)` | `setMaxDutyCycle` |
 | `set_known_object_width(class_name, width_m)` | `setKnownObjectWidth` |
 | `clear_known_object_widths()` | `clearKnownObjectWidths` |
 | `set_min_ground_ray_component(v)` | `setMinGroundRayComponent` |

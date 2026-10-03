@@ -2280,8 +2280,19 @@ void VideoLink::captureLoop() {
 }
 
 cv::Mat VideoLink::getLatestFrame() {
-    std::lock_guard<std::mutex> lock(frameMutex);
-    return latestFrame.clone();
+    // Only the header is taken under frameMutex; the ~4 MB pixel copy
+    // happens AFTER the lock is released. captureLoop() publishes every
+    // frame into a fresh buffer (a new cv::Mat per read) by a header swap
+    // under this same mutex, so the capture thread -- which feeds the
+    // pilot's live view -- never waits for a consumer's copy. The
+    // published buffer is never written again, so copying it unlocked is
+    // safe; the refcount keeps it alive until the copy is done.
+    cv::Mat ref;
+    {
+        std::lock_guard<std::mutex> lock(frameMutex);
+        ref = latestFrame;
+    }
+    return ref.clone();
 }
 
 uint64_t VideoLink::getMsSinceLastFrame() const {

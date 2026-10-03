@@ -318,8 +318,11 @@ DETECTION_CONFIDENCE_THRESHOLD = 0.25
 # model on four overlapping 60 % tiles, so small/distant objects are seen
 # ~1.7x larger. Measured on the same footage at confidence 0.4: person
 # recall 0.32 -> 0.50, vehicles 0.72 -> 0.90. Costs ~5x inference per
-# pass -- the cockpit prints the real pass time ~20 s after start; if it
-# is far above DETECTION_INTERVAL_MS, set this to False.
+# pass. It can never slow the pilot's live video: detection runs at below-
+# normal priority, rests at least half a pass between passes, and tiling
+# switches itself off if tiled passes keep exceeding max(500 ms, 2 x
+# DETECTION_INTERVAL_MS). The cockpit prints the real pass time ~20 s
+# after start.
 DETECTION_TILING = True
 
 # Per-class confidence thresholds tuned on our own FPV footage by
@@ -2542,16 +2545,15 @@ class DroneCockpitApp:
         try:
             ms = self.detection_link.get_last_pass_duration_ms()
             tiling = getattr(self.detection_link, "is_tiling", lambda: False)()
+            active = getattr(self.detection_link, "is_tiling_active", lambda: tiling)()
         except Exception:
             return
         if ms <= 0:
             return
-        note = ""
-        if ms > 2 * DETECTION_INTERVAL_MS:
-            note = (f"  -- well above the {DETECTION_INTERVAL_MS} ms interval"
-                    + ("; consider DETECTION_TILING = False" if tiling else ""))
-        print(f"[DetectionLink] detection pass {ms:.0f} ms "
-              f"({'tiled' if tiling else 'full frame'}){note}")
+        mode = "tiled" if active else ("full frame -- tiling suspended, this machine "
+                                       "is too slow for it" if tiling else "full frame")
+        print(f"[DetectionLink] detection pass {ms:.0f} ms ({mode}); the inference "
+              f"thread rests >= half a pass between passes, the live video is not affected")
 
     def _load_class_thresholds(self) -> None:
         """Per-class confidence thresholds from fpv_eval.py, if present."""

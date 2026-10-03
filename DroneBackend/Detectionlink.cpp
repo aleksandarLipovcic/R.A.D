@@ -305,6 +305,12 @@ void DetectionLink::previewLoop() {
     // priority -- it's not the heavy CPU consumer, inferenceLoop is (see
     // that function's own THREAD_PRIORITY_BELOW_NORMAL).
     constexpr int kPreviewTickMs = 40;   // ~25fps ceiling for the live preview pane
+    constexpr int64_t kPreviewIdleAfterMs = 2000;   // nobody polled the preview -> idle
+#ifdef _WIN32
+    // Operator convenience only -- the pilot's view is VideoLink's own
+    // ABOVE_NORMAL capture/paint path. Below normal so it always yields.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
 
     // Draws `boxes` onto a clone of `frame` and publishes it as the live
     // preview.
@@ -348,6 +354,17 @@ void DetectionLink::previewLoop() {
 
     while (running_.load()) {
         auto tickStart = std::chrono::steady_clock::now();
+
+        // No frame copies / drawing while the preview pane is closed: a
+        // full-resolution clone 25x per second is pure load otherwise.
+        {
+            const int64_t wallNow = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            if (wallNow - lastPreviewRequestMs_.load() > kPreviewIdleAfterMs) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+        }
 
         auto dbgGrabStart = std::chrono::steady_clock::now();
         cv::Mat frame = frameSource_ ? frameSource_() : cv::Mat();
@@ -436,8 +453,17 @@ void DetectionLink::inferenceLoop() {
     double dbgInferMsAccum = 0.0, dbgPassMsAccum = 0.0;
     int dbgRecordsAccum = 0;
 
+    // Duty-cycle limit (setMaxDutyCycle): earliest start of the next pass.
+    auto restUntil = std::chrono::steady_clock::now();
+    int slowTiledPasses = 0;
+
     while (running_.load()) {
         auto now = std::chrono::steady_clock::now();
+        if (now < restUntil) {
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(restUntil - now).count();
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::min<int64_t>(std::max<int64_t>(left, 1), 20)));
+            continue;
+        }
         int64_t msSinceInference = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - lastInferenceAt).count();
         int intervalMs = detectionIntervalMs_.load();
@@ -622,6 +648,29 @@ void DetectionLink::inferenceLoop() {
             std::chrono::steady_clock::now() - passStart).count();
         lastPassDurationMs_.store(durationMs);
         lastPassTimestampMs_.store(nowMs);
+
+        // Never back-to-back: rest at least durationMs x (1/duty - 1).
+        {
+            const double duty = maxDutyCycle_.load();
+            restUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(
+                static_cast<int64_t>(durationMs * (1.0 / duty - 1.0)));
+        }
+        // Tiling costs ~5x per pass; if this machine can't afford it, drop
+        // back to full-frame detection rather than eat into the headroom
+        // the live video needs.
+        if (isTilingActive()) {
+            int budget = tilingBudgetMs_.load();
+            if (budget <= 0)
+                budget = std::max(500, 2 * intervalMs);
+            slowTiledPasses = durationMs > budget ? slowTiledPasses + 1 : 0;
+            if (slowTiledPasses >= 3) {
+                tilingSuspended_.store(true);
+                slowTiledPasses = 0;
+                fprintf(stderr, "[DetectionLink] tiled passes took %.0f ms (> %d ms budget) 3 times "
+                                "in a row -- tiling suspended, full-frame detection continues.\n",
+                        durationMs, budget);
+            }
+        }
         dbgPassMsAccum += durationMs;
 
         if (++dbgPassCounter >= kDebugPrintEveryPasses) {
@@ -848,7 +897,7 @@ std::vector<DetectionLink::RawDetection> DetectionLink::runInference(const cv::M
 
 std::vector<DetectionLink::RawDetection> DetectionLink::runDetection(const cv::Mat& frame) {
     std::vector<RawDetection> all = runInference(frame);
-    if (!tiling_.load() || frame.cols < 64 || frame.rows < 64)
+    if (!isTilingActive() || frame.cols < 64 || frame.rows < 64)
         return all;
     const size_t nFull = all.size();   // [0, nFull) = full-frame boxes
 
@@ -1236,6 +1285,9 @@ std::vector<uchar> DetectionLink::getLatestAnnotatedFrameJpeg() const {
     static std::atomic<int> dbgCallCounter{ 0 };
     constexpr int kDebugPrintEveryCalls = 25;
     auto dbgStart = std::chrono::steady_clock::now();
+
+    lastPreviewRequestMs_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
 
     std::vector<uchar> jpeg;
     cv::Mat frame;

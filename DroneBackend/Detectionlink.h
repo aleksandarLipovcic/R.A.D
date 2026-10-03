@@ -10,6 +10,7 @@
 #include <memory>
 #include <cstdint>
 #include <unordered_map>
+#include <algorithm>
 
 #include "ObjectTracker.h"
 
@@ -183,8 +184,22 @@ public:
     // tiles per pass, merged. Much better on small/distant objects, ~5x
     // the inference time per pass -- check getLastPassDurationMs() against
     // the detection interval. Off by default; safe to toggle at runtime.
-    void setTiling(bool enabled) { tiling_.store(enabled); }
+    void setTiling(bool enabled) { tiling_.store(enabled); tilingSuspended_.store(false); }
     bool isTiling() const { return tiling_.load(); }
+    // False if tiling was switched off automatically because tiled passes
+    // kept exceeding setTilingBudgetMs() (protects the machine's headroom
+    // for the live video; setTiling(true) re-arms it).
+    bool isTilingActive() const { return tiling_.load() && !tilingSuspended_.load(); }
+    // A tiled pass slower than this, 3 times in a row, suspends tiling.
+    // 0 = automatic: max(500 ms, 2 x detection interval).
+    void setTilingBudgetMs(int ms) { tilingBudgetMs_.store(ms); }
+
+    // Upper bound on the share of wall time the inference thread may be
+    // busy (0.1 .. 1.0, default 0.66). After every pass it rests at least
+    // pass_time x (1/duty - 1) -- 0.5 x pass time at the default -- so a
+    // slow pass (tiling, CPU fallback) can never run back-to-back and
+    // starve the capture/display threads of CPU or the GPU.
+    void setMaxDutyCycle(double d) { maxDutyCycle_.store(std::min(1.0, std::max(0.1, d))); }
 
     // Square input side the ONNX model expects (letterboxed). MUST match
     // whatever imgsz the .onnx was exported at -- this does NOT have to
@@ -584,6 +599,12 @@ private:
     std::atomic<bool> usingCuda_{ false };
     std::atomic<bool> useCudaFp16_{ true };
     std::atomic<bool> tiling_{ false };
+    std::atomic<bool> tilingSuspended_{ false };
+    std::atomic<int> tilingBudgetMs_{ 0 };
+    std::atomic<double> maxDutyCycle_{ 0.66 };
+    // Wall-clock ms of the last getLatestAnnotatedFrameJpeg() call: the
+    // preview thread only works while someone is actually looking.
+    mutable std::atomic<int64_t> lastPreviewRequestMs_{ 0 };
     std::atomic<bool> usingCudaFp16_{ false };
     mutable std::mutex classThresholdsMutex_;
     std::unordered_map<std::string, float> classConfidenceThresholds_;

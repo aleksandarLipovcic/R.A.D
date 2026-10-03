@@ -1009,6 +1009,15 @@ PYBIND11_MODULE(DroneBackend, m) {
             "recall @0.4 0.32 -> 0.50), ~5x inference time per pass. Default "
             "False; safe to toggle at runtime.")
         .def("is_tiling", &DetectionLink::isTiling)
+        .def("is_tiling_active", &DetectionLink::isTilingActive,
+            "False if tiling was suspended automatically (tiled passes over "
+            "the budget 3 times in a row).")
+        .def("set_tiling_budget_ms", &DetectionLink::setTilingBudgetMs, py::arg("ms"),
+            "Tiled pass time above which (3x in a row) tiling suspends itself. "
+            "0 = automatic: max(500 ms, 2 x detection interval).")
+        .def("set_max_duty_cycle", &DetectionLink::setMaxDutyCycle, py::arg("duty"),
+            "Max share of time the inference thread may be busy (0.1-1.0, "
+            "default 0.66): after each pass it rests >= pass x (1/duty - 1).")
         .def("is_using_cuda_fp16", &DetectionLink::isUsingCudaFp16,
             "True if start() engaged the FP16 CUDA target.")
         .def("set_known_object_width", &DetectionLink::setKnownObjectWidth,
@@ -1116,7 +1125,13 @@ PYBIND11_MODULE(DroneBackend, m) {
         .def("clear_records", &DetectionLink::clearRecords)
         .def("get_latest_annotated_frame_jpeg",
             [](const DetectionLink& self) -> py::bytes {
-                auto jpeg = self.getLatestAnnotatedFrameJpeg();
+                std::vector<uchar> jpeg;
+                {
+                    // Resize + JPEG encode run in C++ without holding the
+                    // GIL, so the Tk UI keeps running meanwhile.
+                    py::gil_scoped_release release;
+                    jpeg = self.getLatestAnnotatedFrameJpeg();
+                }
                 if (jpeg.empty())
                     return py::bytes();
                 return py::bytes(reinterpret_cast<const char*>(jpeg.data()), jpeg.size());
