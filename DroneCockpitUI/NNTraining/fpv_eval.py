@@ -74,7 +74,8 @@ NMS_IOU = 0.7              # Ultralytics predict default, same as the C++ side
 MAX_DET = 300
 SCORE_FLOOR = 0.01         # candidate floor for AP curves
 PRELABEL_CONF = 0.25
-F_BETA = {"person": 2.0}   # recall-weighted classes; others use F1
+F_BETA = {"person": 2.0}
+FIXED_THRESHOLDS = (0.15, 0.25, 0.40)   # tracker low floor / typical / DetectionLink default   # recall-weighted classes; others use F1
 
 
 # =============================================================================
@@ -263,6 +264,12 @@ def class_metrics(confs: np.ndarray, tps: np.ndarray, n_gt: int, beta: float) ->
     b2 = beta * beta
     f = (1 + b2) * precision * recall / np.maximum(b2 * precision + recall, 1e-9)
     k = int(np.argmax(f))
+    at = {}
+    for t in FIXED_THRESHOLDS:          # what the cockpit gets at a fixed setting
+        n = int(np.searchsorted(-confs, -t, side="right"))   # detections with conf >= t
+        at[f"{t:g}"] = {"P": round(float(precision[n - 1]), 3) if n else None,
+                        "R": round(float(recall[n - 1]), 3) if n else 0.0}
+    res["at_threshold"] = at
     res.update(ap50=round(ap_101(recall, precision), 4),
                best_threshold=round(float(confs[k]), 3),
                precision_at_best=round(float(precision[k]), 3),
@@ -405,16 +412,22 @@ def evaluate(det: OnnxDetector, samples, variant: str, names: list[str]) -> dict
 def report(args, model: Path, det: OnnxDetector, results: list, data_desc: str, n_frames: int):
     """Prints the tables, writes fpv_eval.json and (optionally) the thresholds file."""
     for r in results:
-        print(f"\n=== {r['variant']}: mAP50 {r['map50']}  |  {r['ms_per_frame']} ms/frame (CPU/cv2 "
+        print(f"\n=== {r['variant']}: mAP{round(IOU_MATCH * 100)} {r['map50']}  |  {r['ms_per_frame']} ms/frame (CPU/cv2 "
               f"unless --cuda)  |  false alarms on empty frames: {r['false_alarms_on_empty_frames_at_0.25']}")
         ap_col = f"AP{round(IOU_MATCH * 100)}"
-        print(f"  {'class':15s} {'GT':>5s} {ap_col:>6s} {'thr':>6s} {'P':>6s} {'R':>6s}")
+        fixed = "".join(f"  P/R@{t:g}".rjust(14) for t in FIXED_THRESHOLDS)
+        print(f"  {'class':15s} {'GT':>5s} {ap_col:>6s} {'thr':>6s} {'P':>6s} {'R':>6s}{fixed}")
         for name, m in r["classes"].items():
             if m["n_gt"] == 0:
                 continue   # no labelled objects: no recall/AP to show
             fmt = lambda k: f"{m[k]:6.3f}" if m.get(k) is not None else "     -"
+            pr = ""
+            for t in FIXED_THRESHOLDS:
+                v = (m.get("at_threshold") or {}).get(f"{t:g}")
+                pr += (f"{v['P'] if v['P'] is not None else 0:.2f}/{v['R']:.2f}".rjust(14)
+                       if v else "-".rjust(14))
             print(f"  {name:15s} {m['n_gt']:5d} {fmt('ap50')} {fmt('best_threshold')} "
-                  f"{fmt('precision_at_best')} {fmt('recall_at_best')}")
+                  f"{fmt('precision_at_best')} {fmt('recall_at_best')}{pr}")
 
     out = Path(args.out or f"runs/fpv_eval/{datetime.now():%Y%m%d_%H%M%S}")
     out.mkdir(parents=True, exist_ok=True)
