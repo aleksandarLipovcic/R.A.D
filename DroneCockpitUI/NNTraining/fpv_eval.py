@@ -343,8 +343,24 @@ def file_samples(items):
         yield img, load_labels(lbl_path, w, h)
 
 
+MERGE_VEHICLES = False     # --merge-vehicles: score every non-person class as one "vehicle"
+
+
+def merged_names(names: list[str]) -> tuple[list[str], np.ndarray]:
+    """(names, class-index remap) for --merge-vehicles: person stays, all other
+    classes become 'vehicle' -- the same grouping the cockpit's tracker uses."""
+    if "person" not in names:
+        return names, np.arange(len(names))
+    p = names.index("person")
+    remap = np.array([0 if i == p else 1 for i in range(len(names))])
+    return ["person", "vehicle"], remap
+
+
 def evaluate(det: OnnxDetector, samples, variant: str, names: list[str]) -> dict:
     """samples: iterable of (BGR image, Nx5 gts [x1,y1,x2,y2,cls] in pixels)."""
+    remap = None
+    if MERGE_VEHICLES:
+        names, remap = merged_names(names)
     per_class = {c: ([], [], 0) for c in range(len(names))}
     t_total = 0.0
     fp_on_empty = 0
@@ -354,6 +370,14 @@ def evaluate(det: OnnxDetector, samples, variant: str, names: list[str]) -> dict
         t0 = time.perf_counter()
         preds = run_variant(det, img, variant)
         t_total += time.perf_counter() - t0
+        if remap is not None:
+            if len(preds):
+                preds = preds.copy()
+                preds[:, 5] = remap[preds[:, 5].astype(int)]
+                preds = nms(preds, NMS_IOU)        # car + van boxes on one object -> one vehicle
+            if len(gts):
+                gts = gts.copy()
+                gts[:, 4] = remap[gts[:, 4].astype(int)]
         if len(gts) == 0:
             fp_on_empty += int((preds[:, 4] >= 0.25).sum()) if len(preds) else 0
         for c in per_class:
@@ -369,7 +393,8 @@ def evaluate(det: OnnxDetector, samples, variant: str, names: list[str]) -> dict
         tps = np.concatenate(tl) if tl else np.zeros(0, bool)
         classes[name] = class_metrics(confs, tps, ng, F_BETA.get(name, 1.0))
     aps = [m["ap50"] for m in classes.values() if m.get("ap50") is not None]
-    return {"variant": variant,
+    return {"variant": variant + (" (vehicles merged)" if remap is not None else "")
+                       + (f" @IoU{IOU_MATCH:g}" if IOU_MATCH != 0.5 else ""),
             "images": n_images,
             "ms_per_frame": round(1000 * t_total / max(1, n_images), 1),
             "map50": round(float(np.mean(aps)), 4) if aps else None,
@@ -382,7 +407,8 @@ def report(args, model: Path, det: OnnxDetector, results: list, data_desc: str, 
     for r in results:
         print(f"\n=== {r['variant']}: mAP50 {r['map50']}  |  {r['ms_per_frame']} ms/frame (CPU/cv2 "
               f"unless --cuda)  |  false alarms on empty frames: {r['false_alarms_on_empty_frames_at_0.25']}")
-        print(f"  {'class':15s} {'GT':>5s} {'AP50':>6s} {'thr':>6s} {'P':>6s} {'R':>6s}")
+        ap_col = f"AP{round(IOU_MATCH * 100)}"
+        print(f"  {'class':15s} {'GT':>5s} {ap_col:>6s} {'thr':>6s} {'P':>6s} {'R':>6s}")
         for name, m in r["classes"].items():
             if m["n_gt"] == 0:
                 continue   # no labelled objects: no recall/AP to show
@@ -604,6 +630,12 @@ def main():
     v.add_argument("--model", required=True, help="the .onnx the cockpit uses (with its .names)")
     v.add_argument("--data", default="datasets/fpv_eval")
     v.add_argument("--variants", default="base", help="comma list of base,deinterlace,flip,tiles")
+    v.add_argument("--iou", type=float, default=0.5,
+                   help="box overlap needed for a match (default 0.5 = AP50). A much higher score at "
+                        "0.3 means the objects ARE found but the boxes (model or reference) are imprecise")
+    v.add_argument("--merge-vehicles", action="store_true",
+                   help="score person vs. one 'vehicle' class (car/van/... confusions don't count), "
+                        "like the cockpit tracker's grouping")
     v.add_argument("--imgsz", type=int, default=None, help="default: read from the ONNX input")
     v.add_argument("--cuda", action="store_true", help="cv2 CUDA backend (needs a CUDA OpenCV build)")
     v.add_argument("--out", default=None)
@@ -631,6 +663,12 @@ def main():
     r.add_argument("--ref-names", default=None,
                    help="comma list of class names for a numeric-only reference class column")
     r.add_argument("--variants", default="base", help="comma list of base,deinterlace,flip,tiles")
+    r.add_argument("--iou", type=float, default=0.5,
+                   help="box overlap needed for a match (default 0.5 = AP50). A much higher score at "
+                        "0.3 means the objects ARE found but the boxes (model or reference) are imprecise")
+    r.add_argument("--merge-vehicles", action="store_true",
+                   help="score person vs. one 'vehicle' class (car/van/... confusions don't count), "
+                        "like the cockpit tracker's grouping")
     r.add_argument("--imgsz", type=int, default=None)
     r.add_argument("--cuda", action="store_true")
     r.add_argument("--out", default=None)
@@ -639,6 +677,11 @@ def main():
     r.set_defaults(fn=cmd_ref)
 
     args = p.parse_args()
+    global IOU_MATCH, MERGE_VEHICLES
+    IOU_MATCH = getattr(args, "iou", 0.5)
+    MERGE_VEHICLES = getattr(args, "merge_vehicles", False)
+    if MERGE_VEHICLES and getattr(args, "write_thresholds", False):
+        sys.exit("--write-thresholds needs the real classes -- run it without --merge-vehicles")
     args.fn(args)
 
 

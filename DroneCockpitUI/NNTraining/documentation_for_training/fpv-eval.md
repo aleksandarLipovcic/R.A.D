@@ -113,6 +113,17 @@ python fpv_eval.py ref --model ../models/yolo26m_main.onnx --video rad_fpv_cropp
   identical, so using all of them only costs time.
 - `--variants` and `--write-thresholds` work as in `eval`.
 
+## Diagnosing a weak class
+
+- **`--iou 0.3`** loosens the box-overlap rule from 0.5 to 0.3. If a class
+  scores much higher this way, the model *does* find the objects and only
+  the boxes are imprecise, in the model or the reference. That's typical
+  for 10–20 px pedestrians, where a 3 px shift already fails IoU 0.5.
+- **`--merge-vehicles`** scores person vs. a single `vehicle` class, the
+  same grouping the cockpit tracker uses. If vehicles jump up this way, the
+  remaining error is car ↔ van naming, not missed vehicles. It can't be
+  combined with `--write-thresholds`.
+
 ## Variants
 
 | Variant | What it tests | Cost |
