@@ -1,6 +1,6 @@
 """
 compare_detections.py -- Compare your NN's detections on the validation
-video against the reference detections from detect_video.py.
+video against the hand-made reference labels in labels/ (see README.md).
 
 INPUT: two directories of per-frame YOLO txt files, one line per box:
     cls xc yc w h [conf]        (unified class indices, normalized coords)
@@ -11,23 +11,28 @@ FRAME NUMBERING -- READ THIS: the reference labels are 0-based (first
 frame = 0). Ultralytics' own `predict(save_txt=True, save_conf=True)` on a
 video names its files <video>_<N>.txt with N 1-BASED. Set --pred-frame-base
 to match however your files were written (default 1 = Ultralytics
-convention). As a guard, the script also checks frame shifts of -3..+3
+convention; NNTraining/export_nn_boxes.py --txt-dir writes 0-based files,
+so use --pred-frame-base 0 for those). As a guard, the script also checks frame shifts of -3..+3
 and warns if a shift other than the one you picked fits much better.
 
 MATCHING: per frame, greedy one-to-one by IoU (highest first), boxes
-matched only at IoU >= --iou. Reported per class:
+matched only at IoU >= --iou. With --match-same-class (the rule used in
+the report's section 14), same-class pairs are matched first and only the
+leftovers are paired regardless of class. Reported per class:
   TP  = NN box matched to a reference box of the same class
   FP  = NN box with no matching reference box
   FN  = reference box the NN did not find
   class_confusion = boxes matched at IoU but with different classes
                     (counted as FP for the NN class and FN for the ref class)
-The reference is itself a model, not hand-labeled ground truth -- treat
-"precision/recall" here as AGREEMENT with the reference, and inspect the
-frames listed in mismatches.csv before drawing conclusions.
+The reference was made without any detection network: keyframes every
+30 frames labelled by eye, CSRT-tracked in between and reviewed in
+label_editor.py (see README.md). Small pedestrians' boxes are only
+accurate to a few pixels, so also check --iou 0.3 for person, and inspect
+the frames listed in mismatches.csv before drawing conclusions.
 
 USAGE:
     python compare_detections.py --ref labels/part0 --pred my_nn_labels/part0 \
-        --pred-frame-base 1 --out compare_part0
+        --pred-frame-base 1 --match-same-class --out compare_part0
 """
 import argparse, csv, re
 from collections import defaultdict
@@ -117,9 +122,8 @@ def main():
     a.add_argument("--out", default="compare_out")
     a.add_argument("--class-agnostic", action="store_true",
                    help="Ignore classes -- measures only whether the same objects were "
-                        "found and how well the boxes line up. Useful because the COCO "
-                        "reference tends to call vans 'car' while a VisDrone-trained NN "
-                        "calls them large_vehicle (van->large_vehicle in class_map).")
+                        "found and how well the boxes line up (the report's 'without "
+                        "class' comparison), separating wrong-class errors from misses.")
     a.add_argument("--match-same-class", action="store_true",
                    help="Pair same-class boxes first, then the rest regardless of class "
                         "(the report's section-14 rule). Without it, boxes are paired by IoU "
