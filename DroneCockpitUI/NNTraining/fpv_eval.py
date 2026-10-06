@@ -138,6 +138,13 @@ def parse_output(out: np.ndarray, input_size: int) -> np.ndarray:
         raise ValueError(f"unsupported output shape {out.shape}")
     if d2 == 6 and d1 >= 6:                                 # end-to-end
         rows = a[a[:, 4] >= 0.001]
+        rows = rows[np.argsort(-rows[:, 4], kind="stable")]
+        # The one-to-one head picks its top 300 over (anchor, class) pairs, so
+        # one anchor can come back twice with the same box -- e.g. car 0.55 and
+        # large_vehicle 0.40 on one car. Keep the best class per box (what
+        # agnostic_nms=True does in Ultralytics), same as DetectionLink.
+        _, first = np.unique(np.round(rows[:, :4], 2), axis=0, return_index=True)
+        rows = rows[np.sort(first)]
         return np.column_stack([rows[:, :5], np.round(rows[:, 5])]).astype(np.float32)
     if d1 > 4 and d2 > d1:                                  # raw [4+nc, anchors]
         a = a.T

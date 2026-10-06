@@ -850,7 +850,24 @@ std::vector<DetectionLink::RawDetection> DetectionLink::runInference(const cv::M
             const float* r = data + static_cast<size_t>(i) * 6;
             if (r[4] < 0.001f)   // padding rows; the real threshold is applied by the caller
                 continue;
-            boxes.push_back({ r[0], r[1], r[2], r[3], r[4], static_cast<int>(std::lround(r[5])) });
+            // The one-to-one head picks its top N over (anchor, class) pairs, so
+            // one anchor can come back twice with the identical box -- e.g. car
+            // 0.55 and large_vehicle 0.40 on one car (normally sorted by score).
+            // Keep only the best class per box, like Ultralytics' agnostic_nms.
+            bool sameBox = false;
+            for (auto& k : boxes) {
+                if (std::fabs(k.x1 - r[0]) < 0.01f && std::fabs(k.y1 - r[1]) < 0.01f &&
+                    std::fabs(k.x2 - r[2]) < 0.01f && std::fabs(k.y2 - r[3]) < 0.01f) {
+                    if (r[4] > k.conf) {           // not sorted after all: keep the better class
+                        k.conf = r[4];
+                        k.cls = static_cast<int>(std::lround(r[5]));
+                    }
+                    sameBox = true;
+                    break;
+                }
+            }
+            if (!sameBox)
+                boxes.push_back({ r[0], r[1], r[2], r[3], r[4], static_cast<int>(std::lround(r[5])) });
         }
     }
     else {
