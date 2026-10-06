@@ -95,19 +95,23 @@ struct DetectionRecord {
 
     double latitude = 0.0;
     double longitude = 0.0;
-    bool georeferenced = false;   // false if telemetry wasn't valid for this pass
+    bool georeferenced = false;   // false if no position could be estimated (telemetry not valid)
 
-    // How latitude/longitude above were derived, and how far away the
-    // object was judged to be (meters). "ground_plane": ray/ground-plane
-    // intersection using altitude + attitude + gimbal (accurate when the
-    // gimbal is steeply downward and altitude is trustworthy, unstable
-    // as the ray flattens toward the horizon). "object_size": apparent
-    // pixel size vs. a configured real-world size for the class (works
-    // at any elevation angle and doesn't need altitude at all, but is
-    // only as good as the assumed real-world size and viewing angle).
-    // Empty string if georeferenced is false.
+    // How THIS pass's distance/bearing were derived (latitude/longitude
+    // above are the fused position over all sightings), and how far away
+    // the object was judged to be (meters). "ground_plane": ray/ground-
+    // plane intersection using altitude + attitude + gimbal (accurate when
+    // the camera points steeply down and altitude is trustworthy).
+    // "triangulated": least-squares intersection of this object's bearings
+    // from different drone positions. "object_size": apparent pixel size
+    // vs. a configured real-world width for the class. "coarse": camera
+    // bearing + a rough distance guess (see setCoarseRangeM()). Empty
+    // string if georeferenced is false.
     std::string rangeMethod;
-    double distanceM = 0.0;       // 0 if not georeferenced
+    // 0 if not georeferenced. Slant range for "ground_plane" and
+    // "object_size", horizontal ground distance for "triangulated" and
+    // "coarse".
+    double distanceM = 0.0;
     double bearingDeg = 0.0;      // compass bearing from drone to object, 0 if not georeferenced
 
     // Approximate radius, in meters, of the area the object is in (about
@@ -152,12 +156,11 @@ public:
 
     // ── Configuration (call before start()) ───────────────────────────
 
-    // Path to an ONNX object-detection model. Tested against Ultralytics'
-    // end-to-end/NMS-baked export layout used by YOLO26 (output shape
-    // [1, maxDetections, 6] -- confidence/class already resolved, NMS
-    // already applied inside the graph). See runInference() in the .cpp
-    // for the exact column layout assumed and how to double check it
-    // against your own export. If a sibling text file with the same
+    // Path to an ONNX object-detection model. Both Ultralytics layouts are
+    // read: end-to-end [1, maxDetections, 6] (YOLO26 default, NMS inside
+    // the graph) and raw [1, 4 + classes, anchors] (class argmax + NMS done
+    // in runInference()). See runInference() in the .cpp for the exact
+    // column layouts. If a sibling text file with the same
     // stem and a ".names" extension exists (one class name per line), it
     // is loaded automatically; otherwise classes are labeled "class_N".
     void setModelPath(const std::string& path);
@@ -178,8 +181,10 @@ public:
     // change at runtime.
     void setDetectionIntervalMs(int ms) { detectionIntervalMs_.store(ms); }
 
-    // Raw model confidence below which a detection is discarded before
-    // it's ever turned into a DetectionRecord.
+    // Confidence a detection needs to START a track (and so ever become a
+    // DetectionRecord). Weaker detections, down to setTrackLowConfidence(),
+    // can only keep an already confirmed track alive -- see the tracking
+    // block below. Per-class overrides: setClassConfidenceThreshold().
     void setConfidenceThreshold(float t) { confidenceThreshold_.store(t); }
 
     // Per-class override of the confidence threshold above, by class name
@@ -216,8 +221,9 @@ public:
     // smaller size for speed), but it must match the export, or every
     // box coordinate coming out of runInference() will be silently wrong
     // (no crash -- just boxes and therefore georeferencing that are off
-    // by a scale factor). Default 640; yolom_main_run was trained at
-    // 960, so if you export at 960 call setInputSize(960) too.
+    // by a scale factor). Default 640; the cockpit model (yolo26m_main)
+    // is trained and exported at 960, so the cockpit calls
+    // setInputSize(960).
     void setInputSize(int size) { inputSize_.store(size > 0 ? size : 640); }
 
     // Opt into a CUDA backend/target for inference (needs an OpenCV
@@ -242,8 +248,8 @@ public:
     // side-on than head-on from above and width-across-frame is what the
     // bbox actually measures for most viewing angles). Only classes with
     // an entry here get object-size-based ranging; classes without one
-    // fall back to ground-plane-only (or go ungeoreferenced if the ray
-    // is too shallow for that either). Safe to call at runtime.
+    // use ground-plane / triangulation, or the coarse fallback when
+    // neither works. Safe to call at runtime.
     void setKnownObjectWidth(const std::string& className, double widthMeters);
     void clearKnownObjectWidths();
 
@@ -251,9 +257,10 @@ public:
     // intersection is considered too unreliable to trust on its own
     // (ray nearly parallel to the ground -- small altitude/attitude
     // errors turn into huge position errors). Default 0.12 (~7 degrees
-    // below horizontal). Below this, object-size ranging is preferred
-    // when available for that class; if not available, ground-plane is
-    // still used as a last resort rather than dropping the detection.
+    // below horizontal). Below this, ground-plane ranging is not used at
+    // all: triangulation, then object-size ranging, then the coarse
+    // fallback (which does use the ground-plane distance, clamped to
+    // coarseMaxRangeM) take over.
     void setMinGroundRayComponent(double v) { minGroundRayComponent_.store(v); }
 
     // "Coarse" fallback georeference, used when no ranging method gives a
@@ -270,10 +277,10 @@ public:
 
     // ── Bearings-only triangulation (rangeByTriangulation()) ─────────
     //
-    // Minimum straight-line distance, in meters, the drone must have
-    // moved between the OLDEST and the farthest-apart pair of bearing
-    // observations used for a triangulated fix on a given track, before
-    // that fix is trusted. Below this, the observations are too close
+    // Minimum straight-line distance, in meters, between the two
+    // farthest-apart drone positions among the bearing observations used
+    // for a triangulated fix on a given object, before that fix is
+    // trusted. Below this, the observations are too close
     // together in space to fix a distant object's range reliably --
     // small GPS/heading noise turns into a huge range error, the same
     // failure mode ground-plane has at a shallow ray, just caused by
@@ -404,14 +411,16 @@ public:
 
     // ── Live preview (opt-in exception to "no pixels in Python") ─────
 
-    // JPEG-encodes the most recent frame this link processed, with every
-    // detection from that pass drawn on it. Empty vector if no pass has
-    // completed yet. This is a deliberate, narrow exception to the "raw
-    // pixel data never crosses into Python" rule the rest of the app
-    // follows -- it exists only to feed an optional, low-rate (poll at
-    // ~1-3Hz, not per-tick) "live detections" preview pane, and is NOT
-    // the pilot's primary video path (that stays on VideoLink/FPVWidget
-    // exactly as before). Costs one JPEG encode per call.
+    // JPEG-encodes (at most 640 px wide) the latest captured frame with
+    // the most recent detection pass's boxes drawn on it (previewLoop()
+    // redraws it every kPreviewTickMs). Empty vector until previewLoop()
+    // has produced a frame; previewLoop() only works while this is called
+    // (idle after 2 s without a call). This is a deliberate, narrow
+    // exception to the "raw pixel data never crosses into Python" rule the
+    // rest of the app follows -- it exists only to feed the optional
+    // "live detections" preview pane, and is NOT the pilot's primary video
+    // path (that stays on VideoLink/FPVWidget). Costs one resize + JPEG
+    // encode per call.
     std::vector<uchar> getLatestAnnotatedFrameJpeg() const;
 
 private:

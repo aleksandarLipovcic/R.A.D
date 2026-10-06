@@ -71,8 +71,8 @@ namespace {
     // knowing.
     constexpr int kDefaultDetectionIntervalMs = 250;
 
-    // Cap on how many past BearingObservations a single Track carries
-    // (see Track::bearingHistory in the header). Triangulation only ever
+    // Cap on how many past BearingObservations a single object carries
+    // (see ObjectState::bearingHistory in the header). Triangulation only ever
     // needs a handful of well-spread observations -- keeping every
     // sighting for a track's whole lifetime would grow unbounded for a
     // long-dwelling object and cost more per-pass compute (every kept
@@ -311,9 +311,8 @@ void DetectionLink::previewLoop() {
     // clone/rectangle/putText, no model, no georeferencing, no mutex
     // contention beyond boxesMutex_/frameMutex_ which inferenceLoop only
     // holds briefly) so this thread can actually sustain kPreviewTickMs
-    // regardless of what inferenceLoop is doing. Left at default/NORMAL
-    // priority -- it's not the heavy CPU consumer, inferenceLoop is (see
-    // that function's own THREAD_PRIORITY_BELOW_NORMAL).
+    // regardless of what inferenceLoop is doing. Runs BELOW_NORMAL, like
+    // inferenceLoop, and idles entirely while nobody polls the preview.
     constexpr int kPreviewTickMs = 40;   // ~25fps ceiling for the live preview pane
     constexpr int64_t kPreviewIdleAfterMs = 2000;   // nobody polled the preview -> idle
 #ifdef _WIN32
@@ -647,12 +646,20 @@ void DetectionLink::inferenceLoop() {
             obj.lastLat = rec.latitude;
             obj.lastLon = rec.longitude;
 
+            // The screenshot (full-frame clone + JPEG write to disk) is
+            // saved OUTSIDE recordsMutex_, so a Python poll of
+            // getRecordsSince() -- which holds the GIL -- never waits on
+            // disk I/O. Only this thread assigns ids and appends, so the
+            // records stay in id order.
             {
                 std::lock_guard<std::mutex> lock(recordsMutex_);
                 rec.id = nextId_++;
-                if (!screenshotDir_.empty())
-                    rec.screenshotPath = saveScreenshot(frame, raw, rec.id);
-                records_.push_back(rec);
+            }
+            if (!screenshotDir_.empty())
+                rec.screenshotPath = saveScreenshot(frame, raw, rec.id);
+            {
+                std::lock_guard<std::mutex> lock(recordsMutex_);
+                records_.push_back(std::move(rec));
             }
             detectionCount_.fetch_add(1);
             recordsThisPass++;
@@ -1381,21 +1388,12 @@ void DetectionLink::clearKnownObjectWidths() {
 }
 
 std::vector<uchar> DetectionLink::getLatestAnnotatedFrameJpeg() const {
-    // ── TEMPORARY perf diagnostic ──────────────────────────────────────
-    // This function is called from Python (DetectionMapWidget's Tk-thread
-    // poll, ~25Hz) via pybind11, and runs SYNCHRONOUSLY on whichever
-    // thread calls it. If the pybind11 wrapper for this function does not
-    // release the GIL (py::gil_scoped_release) for the duration of the
-    // call, every millisecond spent inside this function -- lock, copy,
-    // AND imencode -- blocks the entire Python interpreter: the Tk
-    // mainloop, DetectionWorker's poll thread, everything. That would
-    // show up exactly as "the whole feed" bogging down, even though the
-    // native FPV window itself is painted independently by VideoLink.
-    // Check the Bindings.cpp entry for get_latest_annotated_frame_jpeg
-    // and add py::call_guard<py::gil_scoped_release>() (or an explicit
-    // py::gil_scoped_release inside the wrapper) if it's missing -- that
-    // alone can be the difference between this stalling everything else
-    // and running truly in parallel with it.
+    // Called from Python (DetectionMapWidget's Tk-thread poll, ~25 Hz) via
+    // pybind11, synchronously on the calling thread. The binding releases
+    // the GIL around this call (see Bindings.cpp), so the lock, resize and
+    // imencode below never block the Tk mainloop or the other Python
+    // threads. The timing counters are printed only with
+    // DETECTIONLINK_VERBOSE_LOGGING.
     static std::atomic<int> dbgCallCounter{ 0 };
     constexpr int kDebugPrintEveryCalls = 25;
     auto dbgStart = std::chrono::steady_clock::now();

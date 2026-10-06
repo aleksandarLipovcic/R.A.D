@@ -90,8 +90,8 @@ of the same physical object into one position history
 ## The live annotated-feed pane
 
 On by default, this pane polls
-`DetectionLink.get_latest_annotated_frame_jpeg()` at ~5–6 fps
-(`_poll_live_frame()`) — the same deliberate, narrow, clearly-labeled
+`DetectionLink.get_latest_annotated_frame_jpeg()` every 40 ms (~25 fps,
+the backend's own preview tick; `_poll_live_frame()`) — the same deliberate, narrow, clearly-labeled
 exception to the "no pixels in Python" rule documented in
 [../modules/detectionlink.md](../modules/detectionlink.md#live-preview-exception).
 This is what's shown whenever no detection row is selected. Clicking a
