@@ -75,7 +75,7 @@ Two kinds of search, both above the list:
   what was visible together. Matching passes less than ~1 s apart are
   merged into one scene (the rule from section 15.2). Selecting a scene
   limits the list and map to the objects in it; "Clear" removes it.
-  Quick buttons run the report's example queries.
+  Quick buttons: person, >= 2 persons, vehicle, >= 2 vehicles, no objects.
 
 The frame index needs a DroneBackend built with get_frame_index_since();
 with an older build the scene search says so and the object filter still
@@ -338,8 +338,29 @@ class DetectionMapWidget(tk.Toplevel):
 
         self._build_search_panel(left)
 
+        # Scene results above the object list, in a vertical PanedWindow:
+        # drag the sash between the two tables to give either more rows.
+        left_split = ttk.PanedWindow(left, orient="vertical")
+        left_split.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        scene_frame = tk.Frame(left_split, bg="#1a1a1a")
+        list_frame = tk.Frame(left_split, bg="#1a1a1a")
+        left_split.add(scene_frame, weight=1)
+        left_split.add(list_frame, weight=3)
+
+        self._scene_list = ttk.Treeview(scene_frame, columns=("when", "dur", "max", "objs"),
+                                        show="headings", height=3, selectmode="browse")
+        for col, text, width, anchor in (("when", "Scene", 120, "w"), ("dur", "Length", 60, "e"),
+                                         ("max", "Max at once", 75, "e"), ("objs", "Objects", 60, "e")):
+            self._scene_list.heading(col, text=text)
+            self._scene_list.column(col, width=width, anchor=anchor)
+        scene_scroll = ttk.Scrollbar(scene_frame, orient="vertical", command=self._scene_list.yview)
+        self._scene_list.configure(yscrollcommand=scene_scroll.set)
+        scene_scroll.pack(side="right", fill="y")
+        self._scene_list.pack(side="left", fill="both", expand=True)
+        self._scene_list.bind("<<TreeviewSelect>>", self._on_scene_select)
+
         columns = ("track", "class", "conf", "seen", "time", "geo", "acc")
-        self._tree = ttk.Treeview(left, columns=columns, show="headings", selectmode="browse")
+        self._tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="browse")
         self._tree.heading("track", text="Obj.")
         self._tree.heading("class", text="Class")
         self._tree.heading("conf", text="Best")
@@ -354,7 +375,10 @@ class DetectionMapWidget(tk.Toplevel):
         self._tree.column("time", width=70, anchor="center")
         self._tree.column("geo", width=140)
         self._tree.column("acc", width=50, anchor="e")
-        self._tree.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        tree_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self._tree.yview)
+        self._tree.configure(yscrollcommand=tree_scroll.set)
+        tree_scroll.pack(side="right", fill="y")
+        self._tree.pack(side="left", fill="both", expand=True)
         self._tree.bind("<<TreeviewSelect>>", self._on_select)
         for col in columns:
             self._tree.heading(col, command=lambda c=col: self._sort_by(c))
@@ -364,8 +388,16 @@ class DetectionMapWidget(tk.Toplevel):
         # ── Right: pin map + screenshot preview ───────────────────────
         right = tk.Frame(paned, bg="#1a1a1a")
         paned.add(right, weight=2)
+        # Map above the preview, in a vertical PanedWindow: drag the sash
+        # to give the map or the screenshot/live feed more height.
+        right_split = ttk.PanedWindow(right, orient="vertical")
+        right_split.pack(fill="both", expand=True)
+        map_frame = tk.Frame(right_split, bg="#1a1a1a")
+        preview_frame = tk.Frame(right_split, bg="#1a1a1a")
+        right_split.add(map_frame, weight=1)
+        right_split.add(preview_frame, weight=1)
 
-        map_header = tk.Frame(right, bg="#1a1a1a")
+        map_header = tk.Frame(map_frame, bg="#1a1a1a")
         map_header.pack(fill="x", padx=8, pady=(8, 0))
         tk.Label(map_header, text="Map", fg="#ffffff", bg="#1a1a1a",
                  font=("Segoe UI", 11, "bold")).pack(side="left")
@@ -413,8 +445,8 @@ class DetectionMapWidget(tk.Toplevel):
         )
         self._zoom_in_btn.pack(side="left", padx=(2, 0))
 
-        self._map_canvas = tk.Canvas(right, bg="#111a14", height=260, highlightthickness=0)
-        self._map_canvas.pack(fill="x", padx=8, pady=(4, 2))
+        self._map_canvas = tk.Canvas(map_frame, bg="#111a14", height=260, highlightthickness=0)
+        self._map_canvas.pack(fill="both", expand=True, padx=8, pady=(4, 2))
         self._map_canvas.bind("<Configure>", self._on_map_canvas_resize)
 
         # Look-around controls: drag to pan, wheel/scroll to zoom toward
@@ -429,7 +461,7 @@ class DetectionMapWidget(tk.Toplevel):
         self._map_canvas.bind("<Button-5>", self._on_mouse_wheel)    # Linux (X11) scroll down
 
         self._map_attribution_var = tk.StringVar(value="")
-        tk.Label(right, textvariable=self._map_attribution_var,
+        tk.Label(map_frame, textvariable=self._map_attribution_var,
                  fg="#888888", bg="#1a1a1a", font=("Segoe UI", 8)).pack(anchor="w", padx=8)
 
         # ── Live annotated feed (primary view for this pane) ──────────
@@ -443,7 +475,7 @@ class DetectionMapWidget(tk.Toplevel):
         # row); the live poll keeps running underneath the whole time
         # (see _poll_live_frame), so switching back is instant, not a
         # re-buffer.
-        live_row = tk.Frame(right, bg="#1a1a1a")
+        live_row = tk.Frame(preview_frame, bg="#1a1a1a")
         live_row.pack(fill="x", padx=8, pady=(4, 0))
         self._live_enabled = tk.BooleanVar(value=True)
         self._live_check = tk.Checkbutton(
@@ -469,10 +501,10 @@ class DetectionMapWidget(tk.Toplevel):
         )
         self._back_to_live_btn_visible = False
 
-        self._preview_label = tk.Label(right, bg="#000000")
+        self._preview_label = tk.Label(preview_frame, bg="#000000")
         self._preview_label.pack(fill="both", expand=True, padx=8, pady=8)
 
-        self._detail_lbl = tk.Label(right, text="Live feed -- click a detection for its saved screenshot",
+        self._detail_lbl = tk.Label(preview_frame, text="Live feed -- click a detection for its saved screenshot",
                                      fg="#cccccc", bg="#1a1a1a", font=("Segoe UI", 9), justify="left")
         self._detail_lbl.pack(anchor="w", padx=8, pady=(0, 8))
 
@@ -554,19 +586,10 @@ class DetectionMapWidget(tk.Toplevel):
         r4.pack(fill="x", pady=(3, 0))
         tk.Label(r4, text="Quick:", **lbl).pack(side="left")
         for text, q in (("Person", ("person", ">=", 1)), ("\u2265 2 persons", ("person", ">=", 2)),
-                        ("\u2265 5 vehicles", ("vehicle", ">=", 5)), ("No objects", ("any", "=", 0))):
+                        ("Vehicle", ("vehicle", ">=", 1)), ("\u2265 2 vehicles", ("vehicle", ">=", 2)),
+                        ("No objects", ("any", "=", 0))):
             tk.Button(r4, text=text, command=lambda q=q: self.run_scene_search(*q),
                       **btn).pack(side="left", padx=(4, 0))
-
-        # Scene results
-        self._scene_list = ttk.Treeview(box, columns=("when", "dur", "max", "objs"), show="headings",
-                                        height=3, selectmode="browse")
-        for col, text, width, anchor in (("when", "Scene", 120, "w"), ("dur", "Length", 60, "e"),
-                                         ("max", "Max at once", 75, "e"), ("objs", "Objects", 60, "e")):
-            self._scene_list.heading(col, text=text)
-            self._scene_list.column(col, width=width, anchor=anchor)
-        self._scene_list.pack(fill="x", pady=(4, 0))
-        self._scene_list.bind("<<TreeviewSelect>>", self._on_scene_select)
 
         self._search_status = tk.StringVar(value="")
         status_row = tk.Frame(box, bg="#1a1a1a")

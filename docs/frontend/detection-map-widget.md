@@ -70,7 +70,8 @@ Clicking a column heading sorts the list by it (again = reverse).
 **Scene search.** "Frames with ≥ / = N <class> at once" finds the time
 spans in which that many objects were in view together — e.g. two people
 at once, five or more vehicles, or frames with no objects at all. The
-quick buttons run the report's example queries. It runs on
+quick buttons run the common queries: *Person*, *≥ 2 persons*,
+*Vehicle*, *≥ 2 vehicles*, *No objects*. It runs on
 `DetectionLink`'s **frame index** (`get_frame_index_since()`: the
 confirmed objects of every detection pass), not on the records: a record
 is only written when an object is new, has moved or on a refresh, so the
@@ -81,6 +82,11 @@ each scene's time span, length, the most objects at once and how many
 different objects it contains. Selecting a scene limits the list and map
 to those objects; **Clear scene** removes that limit. The pure function
 behind it, `find_scenes(frames, wanted, op, n)`, is unit-tested on its own.
+
+**Resizing.** The scene table and the object list share the left column
+in a vertical split, and the map and the preview share the right column
+the same way: drag the bar between them up or down. The divider between
+the two columns resizes their width.
 
 With a `DroneBackend.pyd` built before the frame index, the scene search
 says it needs a rebuild; the object filter still works.
