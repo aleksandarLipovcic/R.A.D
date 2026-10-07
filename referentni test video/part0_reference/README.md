@@ -18,7 +18,7 @@ These labels were not produced by any detection network. Keyframes every 30 fram
     python label_editor.py --video rad_fpv_cropped_part0.mp4 --labels labels/part0
     # fix / draw / delete, press v on each checked frame, n jumps to the next unchecked one
     python render_labels.py --video rad_fpv_cropped_part0.mp4 --labels labels/part0 --out part0_reference_labeled.mp4
-    python compare_detections.py --ref labels/part0 --pred <your_nn_labels> --pred-frame-base 1 --out cmp_part0
+    python compare_detections.py --ref labels/part0 --pred <your_nn_labels> --pred-frame-base 1 --match-same-class --out cmp_part0
 
 Your NN run should use `save_txt=True, save_conf=True`. Ultralytics numbers video label files from 1, which is why the command uses `--pred-frame-base 1`.
 

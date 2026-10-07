@@ -720,8 +720,10 @@ PYBIND11_MODULE(DroneBackend, m) {
             "background thread on the Python side.")
         .def("connect", &VideoLink::connect, py::arg("device_index"),
             "Open a specific capture device by index (see enumerate_devices).")
-        .def("disconnect", &VideoLink::disconnect,
-            "Stop the capture thread and release the device.")
+        .def("disconnect", &VideoLink::disconnect, py::call_guard<py::gil_scoped_release>(),
+            "Stop the capture thread and release the device. Releases the GIL "
+            "while joining: the capture thread calls the Python OSD telemetry "
+            "provider, so holding it here could deadlock.")
         .def("is_connected", &VideoLink::isConnected)
         .def("get_latest_frame", [](VideoLink& v) { return matToNumpy(v.getLatestFrame()); },
             "Latest frame as an (H, W, 3) uint8 BGR numpy array. Empty "
@@ -832,7 +834,7 @@ PYBIND11_MODULE(DroneBackend, m) {
     py::class_<TelemetrySnapshot>(m, "TelemetrySnapshot")
         .def(py::init<>())
         .def_readwrite("valid", &TelemetrySnapshot::valid,
-            "Must be set True for DetectionLink::georeference() to run at "
+            "Must be set True for DetectionLink's georeferencing to run at "
             "all -- leave False (the default) whenever GPS/attitude aren't "
             "trustworthy yet.")
         .def_readwrite("latitude", &TelemetrySnapshot::latitude)
@@ -876,6 +878,16 @@ PYBIND11_MODULE(DroneBackend, m) {
     // DetectionMapWidget (see rec.class_name, rec.latitude/longitude,
     // rec.telemetry.heading_deg, etc. in that module).
     // =========================================================================
+    py::class_<FrameIndexEntry>(m, "FrameIndexEntry",
+        "One detection pass: the confirmed objects visible in that frame. "
+        "The frame-level index the copilot's detection search runs on.")
+        .def_readonly("timestamp_ms", &FrameIndexEntry::timestampMs,
+            "Wall-clock ms (epoch) of the pass, same clock as DetectionRecord.timestamp_ms.")
+        .def_readonly("track_ids", &FrameIndexEntry::trackIds,
+            "track_id of every confirmed object in the frame (index-parallel to class_names).")
+        .def_readonly("class_names", &FrameIndexEntry::classNames,
+            "Voted class of each object in track_ids.");
+
     py::class_<DetectionRecord>(m, "DetectionRecord")
         .def_readonly("id", &DetectionRecord::id)
         .def_readonly("timestamp_ms", &DetectionRecord::timestampMs,
@@ -900,15 +912,18 @@ PYBIND11_MODULE(DroneBackend, m) {
         .def_readonly("latitude", &DetectionRecord::latitude)
         .def_readonly("longitude", &DetectionRecord::longitude)
         .def_readonly("georeferenced", &DetectionRecord::georeferenced,
-            "False if telemetry wasn't valid for this pass -- lat/lon are "
+            "False if no position could be estimated for this pass "
+            "(telemetry not valid, i.e. no usable GPS fix) -- lat/lon are "
             "meaningless when this is False.")
         .def_readonly("range_method", &DetectionRecord::rangeMethod,
-            "'ground_plane' or 'object_size' -- which ranging method "
-            "produced latitude/longitude/distance_m/bearing_deg. Empty "
-            "string when georeferenced is False.")
+            "'ground_plane', 'triangulated', 'object_size' or 'coarse' -- "
+            "which ranging method produced THIS pass's distance_m/bearing_deg "
+            "(latitude/longitude are the fused position). Empty string when "
+            "georeferenced is False.")
         .def_readonly("distance_m", &DetectionRecord::distanceM,
-            "Estimated distance from the drone to the object, metres. "
-            "0 when georeferenced is False.")
+            "Estimated distance from the drone to the object, metres: "
+            "slant range for 'ground_plane'/'object_size', horizontal ground "
+            "distance for 'triangulated'/'coarse'. 0 when georeferenced is False.")
         .def_readonly("bearing_deg", &DetectionRecord::bearingDeg,
             "Compass bearing from the drone to the object at detection "
             "time, 0-360. 0 (== due north) when georeferenced is False -- "
@@ -1124,7 +1139,10 @@ PYBIND11_MODULE(DroneBackend, m) {
             "Loads the model and starts the worker thread. Returns False "
             "(and does not start the thread) if the model failed to load "
             "or no frame source has been set.")
-        .def("stop", &DetectionLink::stop)
+        // Releases the GIL: stop() joins the inference thread, which may be
+        // waiting for the GIL inside the Python telemetry provider -- holding
+        // it here would deadlock the shutdown.
+        .def("stop", &DetectionLink::stop, py::call_guard<py::gil_scoped_release>())
         .def("is_running", &DetectionLink::isRunning)
         .def("get_detection_count", &DetectionLink::getDetectionCount)
         .def("get_last_pass_duration_ms", &DetectionLink::getLastPassDurationMs)
@@ -1133,6 +1151,11 @@ PYBIND11_MODULE(DroneBackend, m) {
             "Full copy of every record collected since start() (or since "
             "clear_records()). Safe to call at UI refresh rate, not meant "
             "to be called every frame.")
+        .def("get_frame_index_since", &DetectionLink::getFrameIndexSince,
+            py::arg("since_ms"),
+            "Frame index: one FrameIndexEntry per detection pass with "
+            "timestamp_ms > since_ms, oldest first (the last ~3.5 h are kept). "
+            "Pass 0 to get everything still held.")
         .def("get_records_since", &DetectionLink::getRecordsSince,
             py::arg("since_id"),
             "Only records with id > since_id, so a poller can pull "
@@ -1152,14 +1175,15 @@ PYBIND11_MODULE(DroneBackend, m) {
                     return py::bytes();
                 return py::bytes(reinterpret_cast<const char*>(jpeg.data()), jpeg.size());
             },
-            "JPEG bytes of the most recent frame this link processed, "
-            "with that pass's detection boxes drawn on it. Empty bytes "
-            "if no pass has completed yet. A deliberate, narrow exception "
-            "to 'pixel data never crosses into Python' -- meant to feed "
-            "an OPTIONAL, low-rate (poll at ~1-3Hz, not per-tick) 'live "
-            "detections' preview pane, never the pilot's primary FPV "
-            "path (that stays on VideoLink.attach_to_window() exactly "
-            "as before). Costs one JPEG encode per call.");
+            "JPEG bytes (at most 640 px wide) of the latest captured frame "
+            "with the most recent detection pass's boxes drawn on it. Empty "
+            "bytes until the preview thread has produced a frame (it only "
+            "works while this is polled, idle after 2 s without a call). A "
+            "deliberate, narrow exception to 'pixel data never crosses into "
+            "Python' -- meant only for the OPTIONAL 'live detections' preview "
+            "pane, never the pilot's primary FPV path (that stays on "
+            "VideoLink.attach_to_window()). Costs one resize + JPEG encode per "
+            "call, without the GIL.");
 
     // =========================================================================
     // Free functions

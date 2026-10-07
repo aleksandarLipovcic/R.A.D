@@ -177,6 +177,8 @@ DetectionWorker(detection_link, poll_hz=4)
   .start() / .stop()
   .get_status() -> (detection_count, last_pass_duration_ms, last_pass_timestamp_ms)
   .get_new_records() -> list[DetectionRecord]   # returns and clears
+  .get_new_frame_index() -> [(timestamp_ms, ((track_id, class_name), ...)), ...]   # returns and clears
+  .frame_index_supported -> bool                # False on a DroneBackend without get_frame_index_since()
 ```
 
 Same "route heavy work through C++, poll cheap results from Python" split
@@ -195,3 +197,10 @@ record already delivered is never re-fetched. This worker never touches
 frames, never triggers inference, and never writes to disk — everything it
 reads is a small struct copy DetectionLink already produced on its own C++
 threads (see [../modules/detectionlink.md](../modules/detectionlink.md)).
+
+The frame index (`get_frame_index_since(self._last_frame_ms)`, newer
+builds only) is pulled the same incremental way and converted to plain
+tuples on the worker thread. It feeds the detection window's scene search
+(see [detection-map-widget.md](detection-map-widget.md#search-report-section-15)).
+While the window is closed the worker keeps at most the newest 50,000
+entries (~3.5 h at 4 Hz), the same cap `DetectionLink` uses.

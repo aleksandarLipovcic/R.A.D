@@ -367,10 +367,11 @@ DETECTION_CAMERA_FOV_DEG = 100.0
 # doesn't match any real class name fails silently (that class just
 # never gets object-size ranging), not with an error.
 DETECTION_KNOWN_OBJECT_WIDTHS_M = {
-    "person": 0.5,     # average shoulder width, face-on
-    "vehicle": 1.8,     # average car width, face-on -- rename/split this
-                        # key (e.g. "car"/"truck") if your .names file
-                        # doesn't use a single combined "vehicle" class
+    "person": 0.5,          # average shoulder width, face-on
+    "car": 1.8,             # average car width
+    "large_vehicle": 2.5,   # trucks, buses
+    "motorcycle": 0.8,
+    "other_vehicle": 2.0,   # vans, pickups (mostly)
 }
 
 # ── Camera mount angle (manual, NOT the SimpleBGC gimbal) ───────────────
@@ -1747,11 +1748,9 @@ class DroneCockpitApp:
             # names in your model's sibling .names file (one class name
             # per line, same stem as DETECTION_MODEL_PATH) -- a mismatch
             # doesn't error, it just silently never matches, and that
-            # class quietly falls back to ground-plane-only again. Open
-            # the .names file next to yolo26m_main.onnx and confirm the
-            # exact strings before relying on this; adjust the dict below
-            # to match if your classes are named differently (e.g. "car"/
-            # "truck" instead of a single "vehicle" class).
+            # class never gets object-size ranging. The keys match
+            # models/yolo26m_main.names (person, car, large_vehicle,
+            # motorcycle, other_vehicle); update them with the model.
             for class_name, width_m in DETECTION_KNOWN_OBJECT_WIDTHS_M.items():
                 self.detection_link.set_known_object_width(class_name, width_m)
         else:
@@ -1759,8 +1758,8 @@ class DroneCockpitApp:
                 "[DetectionLink] WARNING: this build of DroneBackend has no "
                 "set_known_object_width() -- rebuild DroneBackend from "
                 "current source to get it. Object-size ranging will stay "
-                "unavailable; only ground-plane ranging will ever produce "
-                "a lat/lon, and only when the ray is steep enough."
+                "unavailable; shallow-ray detections fall back to "
+                "triangulation or the coarse (50-150 m) estimate."
             )
 
         # Bearings-only triangulation (rangeByTriangulation() in
@@ -2306,11 +2305,9 @@ class DroneCockpitApp:
             anywhere the FC hasn't gotten a GPS lock yet -- which is
             exactly what was happening. Here `valid` means "do we have a
             live FC link", not "do we have a GPS fix".
-          - _get_detection_telemetry() also fills altitude_m from
-            gps.altitude_m (GPS altitude). The OSD should read the
-            barometer instead, same source BaroWidget already uses, so the
-            two on-screen altitude readouts agree and don't depend on GPS
-            at all.
+          - The OSD's altitude comes from the barometer, the same source
+            BaroWidget uses, so the two on-screen altitude readouts agree
+            and don't depend on GPS at all.
 
         Called directly from VideoLink's own capture/paint thread, once
         per painted frame (see drawOsdOverlay() in VideoLink.cpp) -- NOT
@@ -2619,6 +2616,8 @@ class DroneCockpitApp:
             "WM_DELETE_WINDOW", self._close_detection_window)
         self._detection_map_window.set_engine_status(
             self._detection_engine_running, self._detection_engine_detail)
+        self._detection_map_window.set_frame_index_supported(
+            getattr(self._detection_worker, "frame_index_supported", False))
 
         # Without this, DetectionMapWidget._link stays None and the live
         # annotated-feed pane (and its poll loop) never starts -- see
@@ -2764,6 +2763,12 @@ class DroneCockpitApp:
         records = self._detection_worker.get_new_records()
         if records:
             win.add_records(records)
+        # Frame index for the window's scene search (after the records, so
+        # "last seen" updates find the objects already listed).
+        if hasattr(self._detection_worker, "get_new_frame_index"):
+            frames = self._detection_worker.get_new_frame_index()
+            if frames:
+                win.add_frame_index(frames)
 
         telemetry_valid, telemetry_detail = self._get_telemetry_status_summary()
         win.set_telemetry_status(telemetry_valid, telemetry_detail)

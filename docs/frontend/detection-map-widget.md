@@ -46,6 +46,45 @@ sighting, plus the radius and the last fix's method. The map draws each
 object's pin with a dashed circle of its radius: the area to search.
 Tests: `TestScripts/test_detection_map.py` (UT-DETMAP-001 … 004).
 
+## Search (report, section 15)
+
+The panel above the list turns the detections into a searchable index,
+the way section 15 of the seminar report describes it. Everything is
+local to the window — nothing is sent back to `DetectionLink`.
+
+**Object filter.** It applies to the list **and** the map; hidden
+objects lose their pin and circle, and the status line says
+"Showing X of Y objects".
+
+| Control | Keeps objects that … |
+|---|---|
+| Class | have that class; `vehicle` = car, large_vehicle, motorcycle or other_vehicle |
+| Conf ≥ | have a best confidence at or above the value |
+| Seen ≥ | were seen in at least that many detection passes |
+| last N min | were in view during the last N minutes (re-checked every 5 s) |
+| on map only | have a map position |
+| Find | match the text: `12` / `#12` = object 12, otherwise part of the class name |
+
+Clicking a column heading sorts the list by it (again = reverse).
+
+**Scene search.** "Frames with ≥ / = N <class> at once" finds the time
+spans in which that many objects were in view together — e.g. two people
+at once, five or more vehicles, or frames with no objects at all. The
+quick buttons run the report's example queries. It runs on
+`DetectionLink`'s **frame index** (`get_frame_index_since()`: the
+confirmed objects of every detection pass), not on the records: a record
+is only written when an object is new, has moved or on a refresh, so the
+records alone cannot say what was visible together. Matching passes less
+than 1 s apart (or 3 detection intervals, if passes are slower) are
+merged into one scene, the rule from section 15.2. The result list shows
+each scene's time span, length, the most objects at once and how many
+different objects it contains. Selecting a scene limits the list and map
+to those objects; **Clear scene** removes that limit. The pure function
+behind it, `find_scenes(frames, wanted, op, n)`, is unit-tested on its own.
+
+With a `DroneBackend.pyd` built before the frame index, the scene search
+says it needs a rebuild; the object filter still works.
+
 ## Public API (called from `DroneCockpitApp`)
 
 | Method | Called when | Effect |
@@ -55,6 +94,8 @@ Tests: `TestScripts/test_detection_map.py` (UT-DETMAP-001 … 004).
 | `set_telemetry_status(valid, detail)` | Every poll tick | Updates a second, separate status line reflecting current GPS quality in near-real-time |
 | `set_detection_link(detection_link)` | Once, right after the window is created | Wires the live annotated-feed poll loop — **without this call the live feed pane never starts at all** |
 | `add_records(records)` | Whenever `DetectionWorker.get_new_records()` returns anything | Inserts a row for a new object or updates the existing row of a known `track_id` in place, updates track position history, triggers a map redraw |
+| `add_frame_index(entries)` | Whenever `DetectionWorker.get_new_frame_index()` returns anything | Stores the frame index for the scene search and keeps each object's "Last seen" current between records |
+| `set_frame_index_supported(bool)` | Once, when the window opens | Lets the scene search explain an old `DroneBackend` build instead of showing nothing |
 
 ### The `set_drone_telemetry()` fix
 
@@ -90,8 +131,8 @@ of the same physical object into one position history
 ## The live annotated-feed pane
 
 On by default, this pane polls
-`DetectionLink.get_latest_annotated_frame_jpeg()` at ~5–6 fps
-(`_poll_live_frame()`) — the same deliberate, narrow, clearly-labeled
+`DetectionLink.get_latest_annotated_frame_jpeg()` every 40 ms (~25 fps,
+the backend's own preview tick; `_poll_live_frame()`) — the same deliberate, narrow, clearly-labeled
 exception to the "no pixels in Python" rule documented in
 [../modules/detectionlink.md](../modules/detectionlink.md#live-preview-exception).
 This is what's shown whenever no detection row is selected. Clicking a

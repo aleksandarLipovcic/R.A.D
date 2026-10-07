@@ -47,5 +47,14 @@ int main(int argc, char** argv) {
     for (const auto& r : dl.getAllRecords())
         printf("%-14s %.3f  x1=%4d y1=%4d x2=%4d y2=%4d  track=%llu\n", r.className.c_str(), r.confidence,
                r.bboxX, r.bboxY, r.bboxX + r.bboxW, r.bboxY + r.bboxH, (unsigned long long)r.trackId);
+    // Frame index: the same objects should be listed in every pass once confirmed.
+    const auto frames = dl.getFrameIndexSince(0);
+    printf("frame index: %zu passes\n", frames.size());
+    for (const auto& f : frames) {
+        printf("  %lld:", (long long)f.timestampMs);
+        for (size_t i = 0; i < f.trackIds.size(); ++i)
+            printf(" %s#%llu", f.classNames[i].c_str(), (unsigned long long)f.trackIds[i]);
+        printf("\n");
+    }
     return 0;
 }

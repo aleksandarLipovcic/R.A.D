@@ -6,8 +6,8 @@ run, saved in machine-readable form (JSON + CSV) plus Ultralytics' own
 plots (confusion matrix, PR/F1/P/R curves) for each evaluated set.
 
 WHY THIS EXISTS: train.py runs the per-source evaluation only when a
-training run FINISHES. yolom_main_run was stopped by hand at epoch 65, so
-that step never ran, and the SARD/UAVDT/... test splits that
+training run FINISHES (yolom_main_run was first stopped by hand at epoch
+65, so that step didn't run then), and the SARD/UAVDT/... test splits that
 prepare_datasets.py remaps and holds out are never evaluated anywhere (the
 generated unified.yaml has train/val only). This script covers both.
 
@@ -26,9 +26,9 @@ USAGE (run from the folder that holds train.py / prepare_datasets.py):
     # 0. See what would be evaluated -- loads no model, takes a second:
     python eval_report.py --weights runs\\detect\\yolom_main_run\\weights\\best.pt --list
 
-    # 1. Real run. CPU because the GPU currently fails with the cuDNN
-    #    version mismatch; slow but reliable. Use --device 0 if that's fixed.
-    python eval_report.py --weights runs\\detect\\yolom_main_run\\weights\\best.pt --device cpu --out runs\\eval_final
+    # 1. Real run on the GPU (torch_dll_fix fixed the cuDNN mismatch; use
+    #    --device cpu if cudnn_check.py still reports a problem):
+    python eval_report.py --weights runs\\detect\\yolom_main_run\\weights\\best.pt --device 0 --out runs\\eval_final
 
     # Only UAVDT (per-source) + the held-out test set, ~10 min on CPU:
     python eval_report.py --weights ... --device cpu --out runs\\eval_plots --skip-blended --only UAVDT test

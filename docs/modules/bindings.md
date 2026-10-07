@@ -153,7 +153,7 @@ rssi-based value is used.
 | `VideoLink()` | `py::init<>()` | |
 | `connect_auto()` | `connectAuto` | |
 | `connect(device_index)` | `connect` | |
-| `disconnect()` | `disconnect` | |
+| `disconnect()` | `disconnect` | Releases the GIL: it joins the capture thread, which calls the Python OSD telemetry provider |
 | `is_connected()` | `isConnected` | |
 | `get_latest_frame()` | lambda: `matToNumpy(v.getLatestFrame())` | The one place a `cv::Mat` is converted to a numpy array for Python — used for anything **other** than the live feed itself (e.g. recording), since the live feed bypasses Python via `attach_to_window` |
 | `get_frame_count()` | `getFrameCount` | |
@@ -228,14 +228,15 @@ readonly, since Python code builds these to feed into
 | `set_track_camera_motion_compensation(on)` | `setTrackCameraMotionCompensation` |
 | `set_track_move_threshold_m(m)` | `setTrackMoveThresholdM` |
 | `set_track_refresh_interval_ms(ms)` | `setTrackRefreshIntervalMs` |
-| `start()` / `stop()` / `is_running()` | `start`/`stop`/`isRunning` |
+| `start()` / `stop()` / `is_running()` | `start`/`stop`/`isRunning` — `stop()` releases the GIL (it joins the inference thread, which calls the Python telemetry provider) |
 | `get_detection_count()` | `getDetectionCount` |
 | `get_last_pass_duration_ms()` | `getLastPassDurationMs` |
 | `get_last_pass_timestamp_ms()` | `getLastPassTimestampMs` |
 | `get_all_records()` | `getAllRecords` → `list[DetectionRecord]` |
 | `get_records_since(since_id)` | `getRecordsSince` → `list[DetectionRecord]` |
+| `get_frame_index_since(since_ms)` | `getFrameIndexSince` → `list[FrameIndexEntry]` (`timestamp_ms`, `track_ids`, `class_names`): confirmed objects per detection pass, for the scene search |
 | `clear_records()` | `clearRecords` |
-| `get_latest_annotated_frame_jpeg()` | lambda wrapping `getLatestAnnotatedFrameJpeg()` — returns raw JPEG bytes; see [detectionlink.md](detectionlink.md#live-preview-exception) for the polling-rate caveat |
+| `get_latest_annotated_frame_jpeg()` | lambda wrapping `getLatestAnnotatedFrameJpeg()` — returns raw JPEG bytes; releases the GIL; see [detectionlink.md](detectionlink.md#live-preview-exception) |
 
 ## Module-level free functions
 
