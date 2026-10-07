@@ -58,7 +58,7 @@
     },
     "test": {
       "geometry": "1536x793+-65+86",
-      "locked": false,
+      "locked": true,
       "panels": {
         "imu": {
           "x": 1185,
