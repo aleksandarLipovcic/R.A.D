@@ -234,6 +234,7 @@ readonly, since Python code builds these to feed into
 | `get_last_pass_timestamp_ms()` | `getLastPassTimestampMs` |
 | `get_all_records()` | `getAllRecords` → `list[DetectionRecord]` |
 | `get_records_since(since_id)` | `getRecordsSince` → `list[DetectionRecord]` |
+| `get_frame_index_since(since_ms)` | `getFrameIndexSince` → `list[FrameIndexEntry]` (`timestamp_ms`, `track_ids`, `class_names`): confirmed objects per detection pass, for the scene search |
 | `clear_records()` | `clearRecords` |
 | `get_latest_annotated_frame_jpeg()` | lambda wrapping `getLatestAnnotatedFrameJpeg()` — returns raw JPEG bytes; releases the GIL; see [detectionlink.md](detectionlink.md#live-preview-exception) |
 

@@ -424,5 +424,13 @@ this function is being polled (nothing in the last 2 s means idle).
   that mutex, so a poll never waits on disk I/O.
 - `getRecordsSince(sinceId)` — incremental poll (pass 0 for everything) so
   the UI doesn't have to re-render the whole pin list every tick.
+- `getFrameIndexSince(sinceMs)` — the **frame index**: one `FrameIndexEntry`
+  per detection pass (`timestampMs`, and the `trackIds`/`classNames` of the
+  confirmed objects in that frame), oldest first. Records are only written
+  when an object is new, moved or on a refresh, so they cannot tell which
+  objects were visible together; the frame index can, and the detection
+  window's scene search ("frames with ≥ 2 persons at once") runs on it.
+  The last 50,000 passes (~3.5 h at 4 Hz) are kept; `clearRecords()`
+  clears it too.
 - `getDetectionCount()`, `getLastPassDurationMs()`,
   `getLastPassTimestampMs()` — cheap atomics, safe to poll at UI rate.

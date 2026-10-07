@@ -10,6 +10,7 @@
 #include <memory>
 #include <cstdint>
 #include <unordered_map>
+#include <deque>
 #include <algorithm>
 
 #include "ObjectTracker.h"
@@ -125,6 +126,19 @@ struct DetectionRecord {
 
     std::string screenshotPath;   // empty if screenshot saving is disabled/failed
     TelemetrySnapshot telemetry;  // stored verbatim, for later re-derivation/debugging
+};
+
+// One entry per detection pass: which confirmed objects were in the frame.
+// This is the frame-level index the copilot's detection window searches
+// ("frames with >= 2 persons at once", "frames with no objects", ...):
+// DetectionRecords are only written when an object is new, has moved or
+// on a periodic refresh, so they cannot tell how many objects were visible
+// together in one frame. trackIds/classNames are index-parallel; the ids
+// are the same track_id values the records carry.
+struct FrameIndexEntry {
+    int64_t timestampMs = 0;               // wall clock ms (epoch), same clock as DetectionRecord
+    std::vector<uint64_t> trackIds;        // confirmed objects visible in this pass
+    std::vector<std::string> classNames;   // their (voted) class
 };
 
 class DetectionLink {
@@ -408,6 +422,11 @@ public:
     std::vector<DetectionRecord> getRecordsSince(uint64_t sinceId) const;
 
     void clearRecords();
+
+    // Frame index (see FrameIndexEntry): passes with timestampMs > sinceMs,
+    // oldest first. Kept for the last kMaxFrameIndexEntries passes (~3.5 h
+    // at 4 Hz). Pass 0 to get everything still held.
+    std::vector<FrameIndexEntry> getFrameIndexSince(int64_t sinceMs) const;
 
     // ── Live preview (opt-in exception to "no pixels in Python") ─────
 
@@ -710,6 +729,8 @@ private:
 
     mutable std::mutex recordsMutex_;
     std::vector<DetectionRecord> records_;
+    std::deque<FrameIndexEntry> frameIndex_;   // guarded by recordsMutex_
+    static constexpr size_t kMaxFrameIndexEntries = 50000;
     uint64_t nextId_ = 1;
 
     mutable std::mutex frameMutex_;

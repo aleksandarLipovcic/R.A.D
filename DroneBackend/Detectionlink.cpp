@@ -554,6 +554,8 @@ void DetectionLink::inferenceLoop() {
         // object's bearing history, so rangeByTriangulation() gets its
         // parallax -- both for the record policy and the record itself.
         std::vector<RawDetection> rawDetections;       // what the preview draws
+        FrameIndexEntry frameEntry;                    // confirmed objects in this frame
+        frameEntry.timestampMs = nowMs;
         int recordsThisPass = 0;
         for (size_t i = 0; i < candidates.size(); ++i) {
             const trk::Assignment& as = tracked.assignments[i];
@@ -599,6 +601,8 @@ void DetectionLink::inferenceLoop() {
             else {
                 shouldRecord = true;       // decided below, after fusion
             }
+            frameEntry.trackIds.push_back(obj.trackId);
+            frameEntry.classNames.push_back(classNameFor(raw.classIndex));
             const bool firstRecord = !obj.recorded;
             obj.sightings++;
             obj.bestConfidence = std::max(obj.bestConfidence, candidates[i].confidence);
@@ -665,6 +669,12 @@ void DetectionLink::inferenceLoop() {
             recordsThisPass++;
         }
         dbgRecordsAccum += recordsThisPass;
+        {
+            std::lock_guard<std::mutex> lock(recordsMutex_);
+            frameIndex_.push_back(std::move(frameEntry));
+            if (frameIndex_.size() > kMaxFrameIndexEntries)
+                frameIndex_.pop_front();
+        }
 
         // Hand off this pass's boxes to previewLoop -- the ONLY point of
         // contact between the two threads besides the (already-existing)
@@ -1652,4 +1662,14 @@ std::vector<DetectionRecord> DetectionLink::getRecordsSince(uint64_t sinceId) co
 void DetectionLink::clearRecords() {
     std::lock_guard<std::mutex> lock(recordsMutex_);
     records_.clear();
+    frameIndex_.clear();
+}
+
+std::vector<FrameIndexEntry> DetectionLink::getFrameIndexSince(int64_t sinceMs) const {
+    std::lock_guard<std::mutex> lock(recordsMutex_);
+    // Entries are appended in time order: scan back from the newest.
+    auto it = frameIndex_.end();
+    while (it != frameIndex_.begin() && std::prev(it)->timestampMs > sinceMs)
+        --it;
+    return std::vector<FrameIndexEntry>(it, frameIndex_.end());
 }

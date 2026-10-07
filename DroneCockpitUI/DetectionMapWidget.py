@@ -58,6 +58,29 @@ earlier sightings of that same track are drawn as a small fading trail
 so a single object logged 3 times over a minute of movement reads as
 one moving pin with a breadcrumb trail, not three unrelated dots.
 
+SEARCH (report, section 15: detections as an index over the video)
+-------------------------------------------------------------------
+Two kinds of search, both above the list:
+
+* Object filter -- class (or "vehicle" = any vehicle class), minimum best
+  confidence, minimum number of sightings, "last N minutes", only objects
+  with a map position, and free text (object number or class). The list
+  AND the map show only matching objects; "Showing X of Y" says how many
+  are hidden.
+* Scene search -- frames with "N or more" / "exactly N" objects of a class
+  at the same time (e.g. >= 2 persons, >= 5 vehicles, 0 objects). It runs
+  on DetectionLink's frame index (get_frame_index_since: the confirmed
+  objects of every detection pass), not on the records -- records are only
+  written when an object is new, moved or on a refresh, so they cannot say
+  what was visible together. Matching passes less than ~1 s apart are
+  merged into one scene (the rule from section 15.2). Selecting a scene
+  limits the list and map to the objects in it; "Clear" removes it.
+  Quick buttons run the report's example queries.
+
+The frame index needs a DroneBackend built with get_frame_index_since();
+with an older build the scene search says so and the object filter still
+works.
+
 VIEW STATE — auto-follow vs. manual look-around
 ------------------------------------------------
 By default the map is in "follow" mode (self._follow_drone = True): every
@@ -113,6 +136,64 @@ except ImportError:
 # it can still go up to a provider's real max_zoom.
 _AUTO_FIT_MAX_ZOOM = 17
 
+# Class choices for search. "vehicle" = any of VEHICLE_CLASSES (the
+# car <-> large_vehicle confusion makes the vehicle subclass unreliable on
+# the FPV camera, see the report's section 14).
+VEHICLE_CLASSES = ("car", "large_vehicle", "motorcycle", "other_vehicle")
+SEARCH_CLASSES = ("person",) + VEHICLE_CLASSES
+_TIME_WINDOWS = {"all time": None, "last 1 min": 60, "last 5 min": 300,
+                 "last 15 min": 900, "last 60 min": 3600}
+MAX_FRAME_INDEX = 50000     # same cap as DetectionLink::kMaxFrameIndexEntries
+
+
+def class_matches(class_name: str, wanted: str) -> bool:
+    """wanted: 'any', 'vehicle' or a class name."""
+    if wanted in ("any", "all", ""):
+        return True
+    if wanted == "vehicle":
+        return class_name in VEHICLE_CLASSES
+    return class_name == wanted
+
+
+def find_scenes(frames, wanted: str = "person", op: str = ">=", n: int = 1, gap_ms: int = None):
+    """
+    Scene search over the frame index (report, section 15.2).
+
+    frames: [(timestamp_ms, ((track_id, class_name), ...)), ...] in time order.
+    A frame matches when the number of objects of class `wanted` in it is
+    >= n (op ">=") or == n (op "="). Matching frames less than gap_ms apart
+    are merged into one scene (default: 1 s, or 3 detection intervals if
+    passes are slower than that).
+
+    Returns [{"start_ms", "end_ms", "frames", "max_count", "track_ids"}],
+    oldest first; track_ids are the objects of class `wanted` seen in the
+    scene (every object for "any").
+    """
+    if not frames:
+        return []
+    if gap_ms is None:
+        steps = sorted(b[0] - a[0] for a, b in zip(frames, frames[1:]))
+        median = steps[len(steps) // 2] if steps else 0
+        gap_ms = max(1000, 3 * median)
+    scenes = []
+    cur = None
+    for ts, objects in frames:
+        ids = [tid for tid, cls in objects if class_matches(cls, wanted)]
+        count = len(ids)
+        hit = count >= n if op == ">=" else count == n
+        if not hit:
+            continue
+        if cur is not None and ts - cur["end_ms"] <= gap_ms:
+            cur["end_ms"] = ts
+            cur["frames"] += 1
+            cur["max_count"] = max(cur["max_count"], count)
+            cur["track_ids"].update(ids)
+        else:
+            cur = {"start_ms": ts, "end_ms": ts, "frames": 1, "max_count": count,
+                   "track_ids": set(ids)}
+            scenes.append(cur)
+    return scenes
+
 
 def _mercator_pixel(lat, lon, zoom):
     """
@@ -151,7 +232,7 @@ class DetectionMapWidget(tk.Toplevel):
     def __init__(self, master, **kwargs):
         super().__init__(master, **kwargs)
         self.title("Detections & map")
-        self.geometry("900x560")
+        self.geometry("1100x760")   # room for the search panel above the list
         self.configure(bg="#1a1a1a")
 
         # In-memory record store. Kept here (not just in DetectionWorker)
@@ -172,6 +253,14 @@ class DetectionMapWidget(tk.Toplevel):
         # track key -> {"latest": rec, "best": rec, "count": n, "radius": m}
         # (one Treeview row per object, see add_records / module docstring)
         self._tracks = {}
+        self._track_order = {}       # key -> arrival index (list order is stable under filtering)
+        self._visible_keys = set()   # keys currently shown in the list (and on the map)
+        # Frame index from DetectionLink (see add_frame_index / find_scenes):
+        # [(timestamp_ms, ((track_id, class_name), ...)), ...]
+        self._frames = []
+        self._frame_index_supported = None   # None = unknown yet, set by set_frame_index_supported
+        self._scenes = []                    # result of the last scene search
+        self._scene_filter = None            # set of track ids of the selected scene, or None
         self._map_zoom = None      # zoom the map is currently drawn at (auto-fit or manual, see _follow_drone)
         self._map_center = None    # (lat, lon) the map is currently centered on
 
@@ -247,6 +336,8 @@ class DetectionMapWidget(tk.Toplevel):
         tk.Label(left, text="Detections", fg="#ffffff", bg="#1a1a1a",
                  font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=8, pady=(8, 2))
 
+        self._build_search_panel(left)
+
         columns = ("track", "class", "conf", "seen", "time", "geo", "acc")
         self._tree = ttk.Treeview(left, columns=columns, show="headings", selectmode="browse")
         self._tree.heading("track", text="Obj.")
@@ -265,6 +356,10 @@ class DetectionMapWidget(tk.Toplevel):
         self._tree.column("acc", width=50, anchor="e")
         self._tree.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self._tree.bind("<<TreeviewSelect>>", self._on_select)
+        for col in columns:
+            self._tree.heading(col, command=lambda c=col: self._sort_by(c))
+        self._sort_col = None
+        self._sort_desc = False
 
         # ── Right: pin map + screenshot preview ───────────────────────
         right = tk.Frame(paned, bg="#1a1a1a")
@@ -390,6 +485,314 @@ class DetectionMapWidget(tk.Toplevel):
         self._viewing_saved_id = None  # detection id currently shown in place of the live feed, or None
 
     # =====================================================================
+    # Search (see module docstring, "SEARCH")
+    # =====================================================================
+
+    def _build_search_panel(self, parent) -> None:
+        lbl = dict(fg="#cccccc", bg="#1a1a1a", font=("Segoe UI", 9))
+        spin = dict(width=5, bg="#2a2a2a", fg="#ffffff", insertbackground="#ffffff",
+                    buttonbackground="#2a2a2a", relief="flat", font=("Segoe UI", 9))
+        btn = dict(fg="#cccccc", bg="#2a2a2a", activebackground="#3a3a3a",
+                   activeforeground="#ffffff", relief="flat", padx=6, borderwidth=1,
+                   font=("Segoe UI", 9))
+        classes = ("all", "vehicle") + SEARCH_CLASSES
+
+        box = tk.Frame(parent, bg="#1a1a1a")
+        box.pack(fill="x", padx=8, pady=(0, 4))
+
+        # Row 1: object filter
+        r1 = tk.Frame(box, bg="#1a1a1a")
+        r1.pack(fill="x")
+        tk.Label(r1, text="Class", **lbl).pack(side="left")
+        self._flt_class = tk.StringVar(value="all")
+        ttk.Combobox(r1, textvariable=self._flt_class, values=classes, width=12,
+                     state="readonly").pack(side="left", padx=(2, 6))
+        tk.Label(r1, text="Conf \u2265", **lbl).pack(side="left")
+        self._flt_conf = tk.StringVar(value="0.00")
+        tk.Spinbox(r1, from_=0.0, to=1.0, increment=0.05, format="%.2f",
+                   textvariable=self._flt_conf, **spin).pack(side="left", padx=(2, 6))
+        tk.Label(r1, text="Seen \u2265", **lbl).pack(side="left")
+        self._flt_seen = tk.StringVar(value="0")
+        tk.Spinbox(r1, from_=0, to=100000, increment=1, textvariable=self._flt_seen,
+                   **spin).pack(side="left", padx=(2, 0))
+
+        # Row 2: time window, map-only, text
+        r2 = tk.Frame(box, bg="#1a1a1a")
+        r2.pack(fill="x", pady=(3, 0))
+        self._flt_window = tk.StringVar(value="all time")
+        ttk.Combobox(r2, textvariable=self._flt_window, values=tuple(_TIME_WINDOWS), width=11,
+                     state="readonly").pack(side="left")
+        self._flt_geo = tk.BooleanVar(value=False)
+        tk.Checkbutton(r2, text="on map only", variable=self._flt_geo, selectcolor="#1a1a1a",
+                       activebackground="#1a1a1a", activeforeground="#ffffff",
+                       **lbl).pack(side="left", padx=(6, 6))
+        tk.Label(r2, text="Find", **lbl).pack(side="left")
+        self._flt_text = tk.StringVar(value="")
+        tk.Entry(r2, textvariable=self._flt_text, width=10, bg="#2a2a2a", fg="#ffffff",
+                 insertbackground="#ffffff", relief="flat",
+                 font=("Segoe UI", 9)).pack(side="left", padx=(2, 6))
+        tk.Button(r2, text="Reset", command=self.reset_search, **btn).pack(side="left")
+
+        # Row 3: scene search over the frame index
+        r3 = tk.Frame(box, bg="#1a1a1a")
+        r3.pack(fill="x", pady=(5, 0))
+        tk.Label(r3, text="Frames with", **lbl).pack(side="left")
+        self._q_op = tk.StringVar(value=">=")
+        ttk.Combobox(r3, textvariable=self._q_op, values=(">=", "="), width=3,
+                     state="readonly").pack(side="left", padx=(2, 2))
+        self._q_n = tk.StringVar(value="1")
+        tk.Spinbox(r3, from_=0, to=100, increment=1, textvariable=self._q_n,
+                   **spin).pack(side="left", padx=(0, 2))
+        self._q_class = tk.StringVar(value="person")
+        ttk.Combobox(r3, textvariable=self._q_class, values=("any", "vehicle") + SEARCH_CLASSES,
+                     width=12, state="readonly").pack(side="left", padx=(0, 2))
+        tk.Label(r3, text="at once", **lbl).pack(side="left")
+        tk.Button(r3, text="Search", command=self.run_scene_search, **btn).pack(side="left", padx=(6, 0))
+
+        # Row 4: quick queries (the report's section 15.2 examples)
+        r4 = tk.Frame(box, bg="#1a1a1a")
+        r4.pack(fill="x", pady=(3, 0))
+        tk.Label(r4, text="Quick:", **lbl).pack(side="left")
+        for text, q in (("Person", ("person", ">=", 1)), ("\u2265 2 persons", ("person", ">=", 2)),
+                        ("\u2265 5 vehicles", ("vehicle", ">=", 5)), ("No objects", ("any", "=", 0))):
+            tk.Button(r4, text=text, command=lambda q=q: self.run_scene_search(*q),
+                      **btn).pack(side="left", padx=(4, 0))
+
+        # Scene results
+        self._scene_list = ttk.Treeview(box, columns=("when", "dur", "max", "objs"), show="headings",
+                                        height=3, selectmode="browse")
+        for col, text, width, anchor in (("when", "Scene", 120, "w"), ("dur", "Length", 60, "e"),
+                                         ("max", "Max at once", 75, "e"), ("objs", "Objects", 60, "e")):
+            self._scene_list.heading(col, text=text)
+            self._scene_list.column(col, width=width, anchor=anchor)
+        self._scene_list.pack(fill="x", pady=(4, 0))
+        self._scene_list.bind("<<TreeviewSelect>>", self._on_scene_select)
+
+        self._search_status = tk.StringVar(value="")
+        status_row = tk.Frame(box, bg="#1a1a1a")
+        status_row.pack(fill="x", pady=(2, 0))
+        tk.Label(status_row, textvariable=self._search_status, anchor="w", justify="left",
+                 fg="#e0d060", bg="#1a1a1a", font=("Segoe UI", 9)).pack(side="left", fill="x", expand=True)
+        self._clear_scene_btn = tk.Button(status_row, text="Clear scene", command=self.clear_scene, **btn)
+
+        for var in (self._flt_class, self._flt_conf, self._flt_seen, self._flt_window,
+                    self._flt_geo, self._flt_text):
+            var.trace_add("write", lambda *_: self._apply_filters())
+        self._window_refresh_job = None
+
+    def _int(self, var, default=0):
+        try:
+            return int(float(var.get()))
+        except (tk.TclError, ValueError):
+            return default
+
+    def _float(self, var, default=0.0):
+        try:
+            return float(var.get())
+        except (tk.TclError, ValueError):
+            return default
+
+    def _matches(self, key, info, now_ms) -> bool:
+        rec = info["latest"]
+        if not class_matches(rec.class_name, self._flt_class.get()):
+            return False
+        if info["best_conf"] < self._float(self._flt_conf) - 1e-9:
+            return False
+        if info["seen"] < self._int(self._flt_seen):
+            return False
+        window_s = _TIME_WINDOWS.get(self._flt_window.get())
+        if window_s is not None and info["last_ms"] < now_ms - window_s * 1000:
+            return False
+        if self._flt_geo.get() and not rec.georeferenced:
+            return False
+        text = self._flt_text.get().strip().lower()
+        if text:
+            tid = str(getattr(rec, "track_id", 0))
+            if text.lstrip("#").isdigit():
+                if text.lstrip("#") != tid:
+                    return False
+            elif text not in rec.class_name.lower():
+                return False
+        if self._scene_filter is not None and getattr(rec, "track_id", 0) not in self._scene_filter:
+            return False
+        return True
+
+    def _filters_active(self) -> bool:
+        return (self._flt_class.get() != "all" or self._float(self._flt_conf) > 0
+                or self._int(self._flt_seen) > 0 or _TIME_WINDOWS.get(self._flt_window.get())
+                or self._flt_geo.get() or bool(self._flt_text.get().strip())
+                or self._scene_filter is not None)
+
+    def _row_values(self, key, info):
+        rec = info["latest"]
+        radius = info["radius"]
+        t = time.strftime("%H:%M:%S", time.localtime(info["last_ms"] / 1000.0))
+        geo = f"{rec.latitude:.5f}, {rec.longitude:.5f}" if rec.georeferenced else "no GPS fix"
+        acc = f"±{radius:.0f}" if rec.georeferenced and radius > 0 else ("?" if rec.georeferenced else "-")
+        return (getattr(rec, "track_id", 0), rec.class_name, f"{info['best_conf']:.2f}",
+                info["seen"], t, geo, acc)
+
+    def _now_ms(self) -> int:
+        return int(time.time() * 1000)
+
+    def _sync_row(self, key, now_ms) -> None:
+        """Insert / update / remove one object's row according to the filters."""
+        info = self._tracks[key]
+        iid = f"t{key}"
+        if self._matches(key, info, now_ms):
+            values = self._row_values(key, info)
+            if self._tree.exists(iid):
+                self._tree.item(iid, values=values)
+            else:
+                order = self._track_order[key]
+                index = "end"
+                if self._sort_col is None:
+                    for pos, child in enumerate(self._tree.get_children()):
+                        if self._track_order.get(self._key_from_iid(child), -1) > order:
+                            index = pos
+                            break
+                self._tree.insert("", index, iid=iid, values=values)
+            self._visible_keys.add(key)
+        else:
+            if self._tree.exists(iid):
+                self._tree.delete(iid)
+            self._visible_keys.discard(key)
+
+    def _apply_filters(self) -> None:
+        """Re-evaluate every object against the filters (list + map)."""
+        now_ms = self._now_ms()
+        for key in sorted(self._tracks, key=lambda k: self._track_order[k]):
+            self._sync_row(key, now_ms)
+        if self._sort_col is not None:
+            self._resort()
+        self._update_search_status()
+        self._redraw_map()
+        # "last N min" drops objects as time passes: re-check periodically.
+        if self._window_refresh_job is not None:
+            self.after_cancel(self._window_refresh_job)
+            self._window_refresh_job = None
+        if _TIME_WINDOWS.get(self._flt_window.get()):
+            self._window_refresh_job = self.after(5000, self._apply_filters)
+
+    def _update_search_status(self) -> None:
+        total, shown = len(self._tracks), len(self._visible_keys)
+        parts = []
+        if self._filters_active():
+            parts.append(f"Showing {shown} of {total} objects")
+        if self._scene_filter is not None:
+            parts.append(self._scene_desc)
+        self._search_status.set("  ·  ".join(parts))
+        if self._scene_filter is not None:
+            self._clear_scene_btn.pack(side="right")
+        else:
+            self._clear_scene_btn.pack_forget()
+
+    def reset_search(self) -> None:
+        self._scene_filter = None
+        self._flt_class.set("all")
+        self._flt_conf.set("0.00")
+        self._flt_seen.set("0")
+        self._flt_window.set("all time")
+        self._flt_geo.set(False)
+        self._flt_text.set("")
+        self._apply_filters()
+
+    def _sort_by(self, col) -> None:
+        if self._sort_col == col:
+            self._sort_desc = not self._sort_desc
+        else:
+            self._sort_col, self._sort_desc = col, col in ("conf", "seen", "time")
+        self._resort()
+
+    def _resort(self) -> None:
+        cols = ("track", "class", "conf", "seen", "time", "geo", "acc")
+        idx = cols.index(self._sort_col)
+
+        def key(iid):
+            v = self._tree.item(iid, "values")[idx]
+            try:
+                return (0, float(str(v).lstrip("±")))
+            except ValueError:
+                return (1, str(v))
+        for pos, iid in enumerate(sorted(self._tree.get_children(), key=key, reverse=self._sort_desc)):
+            self._tree.move(iid, "", pos)
+
+    # ── Frame index / scenes ────────────────────────────────────────
+
+    def set_frame_index_supported(self, supported: bool) -> None:
+        """Called by the owning app: False if this DroneBackend has no frame index."""
+        self._frame_index_supported = supported
+
+    def add_frame_index(self, entries) -> None:
+        """
+        entries: [(timestamp_ms, ((track_id, class_name), ...)), ...] from
+        DetectionWorker.get_new_frame_index(). Also keeps each object's
+        "last seen" current between records.
+        """
+        if not entries:
+            return
+        self._frame_index_supported = True
+        self._frames.extend(entries)
+        if len(self._frames) > MAX_FRAME_INDEX:
+            del self._frames[:len(self._frames) - MAX_FRAME_INDEX]
+        now_ms = self._now_ms()
+        touched = set()
+        for ts, objects in entries:
+            for tid, _cls in objects:
+                info = self._tracks.get(tid)
+                if info is not None and ts > info["last_ms"]:
+                    info["last_ms"] = ts
+                    touched.add(tid)
+        for key in touched:
+            self._sync_row(key, now_ms)
+
+    def run_scene_search(self, wanted=None, op=None, n=None) -> list:
+        if wanted is not None:
+            self._q_class.set(wanted)
+            self._q_op.set(op)
+            self._q_n.set(str(n))
+        wanted, op, n = self._q_class.get(), self._q_op.get(), self._int(self._q_n, 1)
+        self._scene_list.delete(*self._scene_list.get_children())
+        if not self._frames:
+            self._scenes = []
+            self._search_status.set(
+                "Scene search needs a DroneBackend with get_frame_index_since() -- rebuild it"
+                if self._frame_index_supported is False else "No detection passes yet")
+            return []
+        self._scenes = find_scenes(self._frames, wanted, op, n)
+        for i, sc in enumerate(self._scenes):
+            t0 = time.strftime("%H:%M:%S", time.localtime(sc["start_ms"] / 1000.0))
+            t1 = time.strftime("%H:%M:%S", time.localtime(sc["end_ms"] / 1000.0))
+            dur = (sc["end_ms"] - sc["start_ms"]) / 1000.0
+            self._scene_list.insert("", "end", iid=f"s{i}",
+                                    values=(f"{t0} \u2013 {t1}" if t1 != t0 else t0, f"{dur:.1f} s",
+                                            sc["max_count"], len(sc["track_ids"])))
+        total_s = sum((sc["end_ms"] - sc["start_ms"]) / 1000.0 for sc in self._scenes)
+        span_s = (self._frames[-1][0] - self._frames[0][0]) / 1000.0
+        what = "objects" if wanted == "any" else (wanted + "s" if wanted != "person" else "persons")
+        self._search_status.set(
+            f"{len(self._scenes)} scene(s) with {op} {n} {what} at once  ·  "
+            f"{total_s:.0f} s of {span_s:.0f} s searched  ·  select a scene to show its objects")
+        return self._scenes
+
+    def _on_scene_select(self, _event) -> None:
+        sel = self._scene_list.selection()
+        if not sel:
+            return
+        sc = self._scenes[int(sel[0][1:])]
+        self._scene_filter = set(sc["track_ids"])
+        t0 = time.strftime("%H:%M:%S", time.localtime(sc["start_ms"] / 1000.0))
+        self._scene_desc = (f"Scene {t0} ({(sc['end_ms'] - sc['start_ms']) / 1000.0:.0f} s, "
+                            f"max {sc['max_count']} at once)")
+        self._apply_filters()
+
+    def clear_scene(self) -> None:
+        self._scene_filter = None
+        if self._scene_list.selection():
+            self._scene_list.selection_remove(self._scene_list.selection())
+        self._apply_filters()
+
+    # =====================================================================
     # Public API — called from the main app's poll loop
     # =====================================================================
 
@@ -484,43 +887,43 @@ class DetectionMapWidget(tk.Toplevel):
         """
         if not records:
             return
+        now_ms = self._now_ms()
+        changed = []
         for rec in records:
             self._records.append(rec)
             track_id = getattr(rec, "track_id", 0)
             key = track_id if track_id else f"r{rec.id}"   # untracked (old build): one row per record
             info = self._tracks.get(key)
             if info is None:
-                info = {"latest": rec, "best": rec, "count": 0, "radius": 0.0}
+                info = {"latest": rec, "best": rec, "count": 0, "radius": 0.0,
+                        "first_ms": rec.timestamp_ms, "last_ms": rec.timestamp_ms}
                 self._tracks[key] = info
+                self._track_order[key] = len(self._track_order)
             info["latest"] = rec
             info["count"] += 1
+            info["last_ms"] = max(info["last_ms"], rec.timestamp_ms)
             if rec.confidence >= info["best"].confidence:
                 info["best"] = rec   # its screenshot is shown when the row is selected
-            best_conf = max(getattr(rec, "best_confidence", 0.0), info["best"].confidence)
-            seen = getattr(rec, "sightings", 0) or info["count"]
-            radius = getattr(rec, "uncertainty_m", 0.0) if rec.georeferenced else 0.0
-            info["radius"] = radius
-
-            t = time.strftime("%H:%M:%S", time.localtime(rec.timestamp_ms / 1000.0))
-            geo = f"{rec.latitude:.5f}, {rec.longitude:.5f}" if rec.georeferenced else "no GPS fix"
-            acc = f"±{radius:.0f}" if rec.georeferenced and radius > 0 else ("?" if rec.georeferenced else "-")
-            values = (track_id, rec.class_name, f"{best_conf:.2f}", seen, t, geo, acc)
-            iid = f"t{key}"
-            if self._tree.exists(iid):
-                self._tree.item(iid, values=values)
-            else:
-                self._tree.insert("", "end", iid=iid, values=values)
+            info["best_conf"] = max(getattr(rec, "best_confidence", 0.0), info["best"].confidence)
+            info["seen"] = getattr(rec, "sightings", 0) or info["count"]
+            info["radius"] = getattr(rec, "uncertainty_m", 0.0) if rec.georeferenced else 0.0
+            changed.append(key)
 
             if rec.georeferenced:
                 if self._map_origin is None:
                     self._map_origin = (rec.latitude, rec.longitude)
                 self._track_positions.setdefault(key, []).append((rec.latitude, rec.longitude))
 
+        for key in dict.fromkeys(changed):
+            self._sync_row(key, now_ms)
+        if self._sort_col is not None:
+            self._resort()
+        self._update_search_status()
         self._redraw_map()
 
         # Keep the list scrolled to the newest detection.
         children = self._tree.get_children()
-        if children:
+        if children and self._sort_col is None:
             self._tree.see(children[-1])
 
     # =====================================================================
@@ -768,7 +1171,8 @@ class DetectionMapWidget(tk.Toplevel):
             # the drone's own current position if we have one -- a drone
             # that has flown well away from its one detection (or that
             # has zero detections at all) still needs to stay on screen.
-            all_points = [p for positions in self._track_positions.values() for p in positions]
+            all_points = [p for key, positions in self._track_positions.items()
+                          if key in self._visible_keys for p in positions]
             if self._drone_telemetry is not None:
                 all_points.append(self._drone_telemetry)
             if not all_points:
@@ -816,6 +1220,8 @@ class DetectionMapWidget(tk.Toplevel):
         px_per_m = (1.0 / meters_per_pixel) if meters_per_pixel > 0 else 0.0
 
         for track_id, positions in self._track_positions.items():
+            if track_id not in self._visible_keys:
+                continue                       # hidden by the search filter
             is_selected = (track_id == selected_track_id)
 
             # Uncertainty area of the object's (fused) position: where to
@@ -933,9 +1339,11 @@ class DetectionMapWidget(tk.Toplevel):
             range_line = "no position (no valid GPS / telemetry at the time)"
 
         seen = getattr(rec, "sightings", 0) or info["count"]
+        first = time.strftime("%H:%M:%S", time.localtime(info["first_ms"] / 1000.0))
+        last = time.strftime("%H:%M:%S", time.localtime(info["last_ms"] / 1000.0))
         self._detail_lbl.config(
             text=f"{rec.class_name}  ·  object {getattr(rec, 'track_id', 0)}  ·  seen {seen}x  ·  "
-                 f"best {best.confidence:.2f}\n"
+                 f"best {best.confidence:.2f}  ·  in view {first} \u2013 {last}\n"
                  f"{range_line}\n"
                  f"screenshot of the best sighting: {best.screenshot_path or 'none saved'}"
         )

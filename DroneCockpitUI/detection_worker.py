@@ -33,6 +33,12 @@ class DetectionWorker:
         self._last_pass_timestamp_ms = 0
         self._last_seen_id = 0
         self._new_records = []   # records pulled since the last get_new_records() call
+        # Frame index (DetectionLink.get_frame_index_since, newer builds
+        # only): per detection pass, the confirmed objects in the frame --
+        # what the detection window's scene search runs on.
+        self._frame_index_supported = hasattr(detection_link, "get_frame_index_since")
+        self._last_frame_ms = 0
+        self._new_frames = []    # [(timestamp_ms, ((track_id, class_name), ...)), ...]
 
     def start(self):
         self._running = True
@@ -55,6 +61,10 @@ class DetectionWorker:
             # structs (a few floats/strings), not frames, so pulling this
             # every poll tick is fine at 4-10Hz.
             fresh = self._link.get_records_since(self._last_seen_id)
+            frames = []
+            if self._frame_index_supported:
+                for e in self._link.get_frame_index_since(self._last_frame_ms):
+                    frames.append((e.timestamp_ms, tuple(zip(e.track_ids, e.class_names))))
 
             with self._lock:
                 self._detection_count = count
@@ -63,6 +73,13 @@ class DetectionWorker:
                 if fresh:
                     self._new_records.extend(fresh)
                     self._last_seen_id = fresh[-1].id
+                if frames:
+                    self._new_frames.extend(frames)
+                    self._last_frame_ms = frames[-1][0]
+                    # Window closed for hours: keep the newest ~3.5 h only
+                    # (same cap as DetectionLink's own frame index).
+                    if len(self._new_frames) > 50000:
+                        del self._new_frames[:len(self._new_frames) - 50000]
 
             time.sleep(self._interval)
 
@@ -80,3 +97,18 @@ class DetectionWorker:
         with self._lock:
             records, self._new_records = self._new_records, []
             return records
+
+    @property
+    def frame_index_supported(self) -> bool:
+        """False if this DroneBackend build has no get_frame_index_since()."""
+        return self._frame_index_supported
+
+    def get_new_frame_index(self):
+        """
+        Non-blocking. Returns and clears the frame-index entries collected
+        since the last call: [(timestamp_ms, ((track_id, class_name), ...)), ...].
+        """
+        with self._lock:
+            frames = self._new_frames
+            self._new_frames = []
+        return frames

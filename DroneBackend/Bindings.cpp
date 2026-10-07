@@ -878,6 +878,16 @@ PYBIND11_MODULE(DroneBackend, m) {
     // DetectionMapWidget (see rec.class_name, rec.latitude/longitude,
     // rec.telemetry.heading_deg, etc. in that module).
     // =========================================================================
+    py::class_<FrameIndexEntry>(m, "FrameIndexEntry",
+        "One detection pass: the confirmed objects visible in that frame. "
+        "The frame-level index the copilot's detection search runs on.")
+        .def_readonly("timestamp_ms", &FrameIndexEntry::timestampMs,
+            "Wall-clock ms (epoch) of the pass, same clock as DetectionRecord.timestamp_ms.")
+        .def_readonly("track_ids", &FrameIndexEntry::trackIds,
+            "track_id of every confirmed object in the frame (index-parallel to class_names).")
+        .def_readonly("class_names", &FrameIndexEntry::classNames,
+            "Voted class of each object in track_ids.");
+
     py::class_<DetectionRecord>(m, "DetectionRecord")
         .def_readonly("id", &DetectionRecord::id)
         .def_readonly("timestamp_ms", &DetectionRecord::timestampMs,
@@ -1141,6 +1151,11 @@ PYBIND11_MODULE(DroneBackend, m) {
             "Full copy of every record collected since start() (or since "
             "clear_records()). Safe to call at UI refresh rate, not meant "
             "to be called every frame.")
+        .def("get_frame_index_since", &DetectionLink::getFrameIndexSince,
+            py::arg("since_ms"),
+            "Frame index: one FrameIndexEntry per detection pass with "
+            "timestamp_ms > since_ms, oldest first (the last ~3.5 h are kept). "
+            "Pass 0 to get everything still held.")
         .def("get_records_since", &DetectionLink::getRecordsSince,
             py::arg("since_id"),
             "Only records with id > since_id, so a poller can pull "
