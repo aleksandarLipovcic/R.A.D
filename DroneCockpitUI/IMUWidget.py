@@ -18,6 +18,21 @@ class IMUWidget(tk.Frame):
 
     All three states keep the numeric value fully legible at all times.
 
+    YAW alerting (two separate conditions, deliberately kept apart):
+      • YAW ANGLE cell — coloured by how FAST the heading is changing (yaw
+        rate, same hold logic as the ROT column: WARN held 2 s, CRIT held
+        4 s). Goes amber/red on a rapid yaw and returns to green by itself
+        once the drone settles. A heading value on its own is never an
+        alarm. (Previously this cell was coloured by Δ HDG, a persistent
+        sensor-disagreement condition, so it stayed red until the pilot
+        pressed ADJUST HEADING.)
+      • Δ HDG label + ADJUST HEADING flash — FC yaw vs magnetometer
+        disagreement. Only becomes CRIT once the disagreement has stayed
+        above DRIFT_CRIT_DEG for DRIFT_CONFIRM_SEC while the drone is NOT
+        rotating, because during a fast yaw the mag heading lags the gyro
+        and produces a false spike. Clears by itself as soon as the two
+        sensors agree again.
+
     Link-aware (see link_mode.py):
       USB   — every cell live, as above.
       RADIO — the ELRS link carries attitude only. Rotation and G-force
@@ -57,6 +72,10 @@ class IMUWidget(tk.Frame):
     ACC_VERT_HI_CR = 1.36
     DRIFT_WARN_DEG = 15.0
     DRIFT_CRIT_DEG = 30.0
+    # Δ HDG must stay above DRIFT_CRIT_DEG this long, with the drone not
+    # rotating (|yaw rate| < GYRO_WARN_DPS), before it is treated as a real
+    # heading disagreement. Filters the mag-lag spike during a fast yaw.
+    DRIFT_CONFIRM_SEC = 3.0
 
     # ── Layout pixel budgets ──────────────────────────────────────────────────
     _HDR_H    = 28
@@ -128,6 +147,10 @@ class IMUWidget(tk.Frame):
         self._last_mag_heading = 0.0
         self._mag_valid        = False
         self._last_data        = {}
+
+        # Monotonic time Δ HDG first exceeded DRIFT_CRIT_DEG while the drone
+        # was settled; None while below threshold or rotating.
+        self._drift_since      = None
 
         self._radio         = False   # True while the ELRS link feeds us
         # Latency / link footer (RTT, one-way, FC cycle — or attitude age /
@@ -561,6 +584,8 @@ class IMUWidget(tk.Frame):
             return
         if self._on_adjust_heading:
             self._on_adjust_heading()
+        # Trim just changed -- restart the drift confirmation from scratch.
+        self._drift_since = None
 
     def _start_flash(self):
         if self._flashing:
@@ -675,11 +700,28 @@ class IMUWidget(tk.Frame):
         drift     = (fc_yaw_trimmed - mag_heading + 540) % 360 - 180 if mag_valid else 0.0
         abs_drift = abs(drift)
 
+        # ── Δ HDG confirmation ────────────────────────────────────────────────
+        # Δ HDG is only meaningful while the drone is NOT rotating: during a
+        # fast yaw the magnetometer heading lags the gyro-integrated FC yaw
+        # and produces a large but false disagreement. A CRIT drift therefore
+        # has to persist for DRIFT_CONFIRM_SEC while settled before it is
+        # treated as real. Any frame below threshold, or any rotation,
+        # restarts the timer -- so the alarm also clears by itself as soon
+        # as the sensors agree again.
+        settled = (not raw_imu) or abs(gz) < self.GYRO_WARN_DPS
+        if mag_valid and settled and abs_drift >= self.DRIFT_CRIT_DEG:
+            if self._drift_since is None:
+                self._drift_since = now
+            drift_confirmed = (now - self._drift_since) >= self.DRIFT_CONFIRM_SEC
+        else:
+            self._drift_since = None
+            drift_confirmed = False
+
         # ── Drift label ───────────────────────────────────────────────────────
         drift_lbl = self._tier_widgets.get("drift_lbl")
         if drift_lbl:
             if mag_valid:
-                clr = (self.C_CRIT_BG_A if abs_drift >= self.DRIFT_CRIT_DEG else
+                clr = (self.C_CRIT_BG_A if drift_confirmed else
                        self.C_WARN_BG    if abs_drift >= self.DRIFT_WARN_DEG else
                        self.C_SAFE_FG)
                 drift_lbl.config(text=f"{drift:>+6.1f}°", fg=clr)
@@ -696,7 +738,7 @@ class IMUWidget(tk.Frame):
             src_lbl.config(text=txt, fg=clr)
 
         # ── Heading-button flash ──────────────────────────────────────────────
-        if mag_valid and abs_drift >= self.DRIFT_CRIT_DEG:
+        if drift_confirmed:
             self._start_flash()
         else:
             self._stop_flash()
@@ -706,7 +748,8 @@ class IMUWidget(tk.Frame):
         if summary:
             rc = self._angle_state(roll)
             pc = self._angle_state(pitch)
-            yc = self._drift_state(abs_drift) if mag_valid else "safe"
+            # Yaw: rate-based with hold (see class docstring), not Δ HDG.
+            yc = self._gyro_state_label("yaw", abs(gz), now) if raw_imu else "safe"
             worst = self._worst_state(rc, pc, yc)
             fg = {
                 "crit": self.C_CRIT_FG,
@@ -741,10 +784,14 @@ class IMUWidget(tk.Frame):
                 continue
 
             if is_yaw:
-                # A heading is not a tilt: without a mag reference there is
-                # nothing to alarm on (the old code ran it through the
-                # roll/pitch limits, so any heading past 30° flashed red).
-                ang_state = self._drift_state(abs_drift) if mag_valid else "safe"
+                # A heading value is not an alarm in itself. Colour the yaw
+                # cell by how FAST the heading is changing, using the same
+                # hold logic as the ROT column: amber/red on a rapid yaw,
+                # back to green on its own once the drone settles.
+                # (Heading disagreement with the magnetometer is a separate,
+                # persistent condition -- shown by Δ HDG and the button.)
+                ang_state = (self._gyro_state_label("yaw", abs(rot_val), now)
+                             if raw_imu else "safe")
             else:
                 ang_state = self._angle_state(ang_val)
             if att_old:
@@ -811,6 +858,10 @@ class IMUWidget(tk.Frame):
                            disabledforeground=link_mode.C_NA_FG)
             else:
                 btn.config(state="normal")
+        if self._radio:
+            # No independent mag on the radio link -- drop any pending
+            # drift confirmation.
+            self._drift_since = None
         if self._radio and self.is_calibrating:
             # No raw gyro on the radio link — abandon a running calibration.
             self.is_calibrating = False
