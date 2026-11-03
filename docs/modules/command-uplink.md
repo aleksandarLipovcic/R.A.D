@@ -49,8 +49,8 @@ laptop ──USB-VCP (mode "LUA")──► Pocket Lua script ──► mixer out
   outputs them as **mix sources**. EdgeTX mixes put those on free AUX
   channels: gimbal pan/tilt, and a "laptop requests RTH" channel.
 - Betaflight then treats them like any other switch or channel:
-  - **Gimbal:** AUX channel → servo output, or the SimpleBGC controller's
-    own RC input.
+  - **Gimbal:** AUX channel → the flight controller's servo outputs M5
+    and M6, which drive the gimbal's two MG90S servos.
   - **RTH:** an AUX range in the Modes tab mapped to GPS RESCUE.
 - **Authority (R4):** in the EdgeTX mixer, the laptop's channels are only
   used while a Pocket switch ("LAPTOP CTRL") is on, and the pilot's
@@ -84,9 +84,8 @@ through the Pocket's ELRS module to Betaflight.
 
 ### C. Separate link for the gimbal
 
-Drive the SimpleBGC gimbal from its own link, for example a second
-receiver channel or the controller's serial API through a companion
-radio. This keeps the flight link untouched, but adds hardware. It's only
+Drive the gimbal servos from their own link, for example a second
+receiver channel instead of the flight controller's M5/M6 outputs. This keeps the flight link untouched, but adds hardware. It's only
 worth doing if A can't provide the gimbal channels.
 
 ## Safety rules (apply to any design)

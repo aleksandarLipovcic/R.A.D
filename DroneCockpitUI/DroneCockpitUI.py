@@ -330,10 +330,12 @@ DETECTION_KNOWN_OBJECT_WIDTHS_M = {
                         # doesn't use a single combined "vehicle" class
 }
 
-# ── Camera mount angle (manual, NOT the SimpleBGC gimbal) ───────────────
-# The SimpleBGC gimbal hardware is physically installed but not
-# electrically wired (missing step-down modules) -- there is no live
-# pan/tilt readback yet. In the meantime the camera is mounted at a
+# ── Camera mount angle (manual, NOT the servo gimbal) ───────────────────
+# The camera gimbal is a 2-axis mount driven by two MG90S metal-gear
+# servos, controlled directly by the flight controller from its M5 and M6
+# outputs and powered from a separate 5 V step-down module. It is
+# physically installed but not wired up yet -- there is no live pan/tilt
+# angle yet. In the meantime the camera is mounted at a
 # FIXED angle chosen by hand before each flight (anywhere from 0 deg
 # forward-level, through 90 deg straight down, to 180 deg backward-level,
 # or negative for facing upward -- a single tilt hinge, no pan -- though
@@ -351,9 +353,9 @@ DETECTION_KNOWN_OBJECT_WIDTHS_M = {
 # geometry is -- editing these two constants and restarting no longer
 # has any effect once a profile with its own "camera_angle" exists.
 #
-# Wire snapshot.gimbal_pan_deg/gimbal_tilt_deg to a real SimpleBGC
-# readback in _get_camera_mount_angle() once the gimbal is actually
-# powered ("auto" mode already exists as a placeholder for exactly that,
+# Wire snapshot.gimbal_pan_deg/gimbal_tilt_deg to the commanded servo
+# angles in _get_camera_mount_angle() once the flight controller drives
+# the gimbal servos ("auto" mode already exists as a placeholder for exactly that,
 # and its choice persists across restarts the same as Manual's values
 # do); until then, georeferenced pins will drift off if the toolbar's
 # Manual value doesn't match how the camera is actually physically
@@ -1495,9 +1497,9 @@ class DroneCockpitApp:
         self._camera_angle_win = None
         # "manual" or "auto" -- overwritten below by _apply_layout() with
         # whatever was last saved, if anything was. Genuinely should
-        # default to "auto" once the SimpleBGC gimbal is electrically
-        # wired and its IMU-based attitude readback exists -- there is no
-        # such readback yet (see _get_camera_mount_angle()'s TODO below),
+        # default to "auto" once the servo gimbal is wired to the flight
+        # controller (M5/M6) and its commanded angles are read back --
+        # there is no such readback yet (see _get_camera_mount_angle()'s TODO below),
         # so "auto" would silently do nothing useful right now (it still
         # falls back to whatever the Manual tilt/pan were last set to).
         # "manual" is the correct fallback for THIS moment, not the
@@ -1662,8 +1664,8 @@ class DroneCockpitApp:
         # available, leaving ONLY ground-plane ranging -- which itself
         # needs a ray steeper than ~7 deg below horizontal
         # (minGroundRayComponent_, see setMinGroundRayComponent() in the
-        # header) to be trusted. The camera's SimpleBGC gimbal isn't
-        # electrically wired yet (see CAMERA_MOUNT_PAN_DEG/
+        # header) to be trusted. The camera's servo gimbal isn't
+        # wired up yet (see CAMERA_MOUNT_PAN_DEG/
         # CAMERA_MOUNT_TILT_DEG and _get_detection_telemetry() above), so
         # unless you've physically angled the camera down for this
         # flight, that 7-degree bar is rarely cleared in level forward
@@ -1876,9 +1878,9 @@ class DroneCockpitApp:
         label -- lock-protected plain state, no Tk widgets touched here.
         Returns (tilt_deg, pan_deg).
 
-        TODO once the SimpleBGC gimbal is electrically wired: in "auto"
-        mode, read its real IMU-based pan/tilt readback here instead of
-        falling back to the manual values. There is no such readback yet,
+        TODO once the servo gimbal is wired to the flight controller
+        (M5/M6): in "auto" mode, read the commanded servo pan/tilt angles
+        here instead of falling back to the manual values. There is no such readback yet,
         so "auto" is currently indistinguishable from "manual" except for
         the one-time warning shown when switching into it (see
         _set_camera_angle_mode()) -- it's wired up this way now so turning
@@ -1901,11 +1903,11 @@ class DroneCockpitApp:
         if mode == "auto":
             messagebox.showinfo(
                 "Camera Angle — Auto",
-                "Auto mode has no real gimbal feedback to read yet -- the "
-                "SimpleBGC gimbal isn't electrically wired (missing "
-                "step-down modules). Auto will keep using the last Manual "
-                "tilt/pan values until real stepper-position readback is "
-                "wired into DroneLink. Switch back to Manual any time to "
+                "Auto mode has no gimbal angle to read yet -- the servo "
+                "gimbal (2x MG90S on flight controller outputs M5/M6) "
+                "isn't wired up yet. Auto will keep using the last Manual "
+                "tilt/pan values until the commanded servo angles are "
+                "read into DroneLink. Switch back to Manual any time to "
                 "set them directly.",
             )
         with self._camera_angle_lock:
@@ -2195,14 +2197,14 @@ class DroneCockpitApp:
 
         NOTE: gimbal_pan_deg / gimbal_tilt_deg come from
         _get_camera_mount_angle() below, NOT from live gimbal telemetry --
-        the SimpleBGC gimbal hardware is physically installed but not
-        electrically wired yet (missing step-down modules), so there's no
-        readback to use. That getter's "manual" mode is a live,
+        the servo gimbal (2x MG90S, driven from flight controller outputs
+        M5/M6) is physically installed but not wired up yet, so there's no
+        gimbal angle to use. That getter's "manual" mode is a live,
         toolbar-editable stand-in (see the "📐 Camera Angle" button) for
         however the camera is actually physically angled right now --
         keep it in sync with reality, there's no sensor to do that for
-        you yet. Its "auto" mode is a placeholder for real SimpleBGC
-        readback once the gimbal is powered.
+        you yet. Its "auto" mode is a placeholder for the commanded servo
+        angles once the gimbal is wired up.
         """
         snapshot = DroneBackend.TelemetrySnapshot()
 
@@ -3101,8 +3103,8 @@ class DroneCockpitApp:
         self._camera_angle_btn = self._mk_icon_btn(
             toolbar, "📐", self._show_camera_angle_dialog,
             "Camera Angle — set how the FPV camera is physically mounted "
-            "(Manual), or hand off to real gimbal feedback once the "
-            "SimpleBGC gimbal is wired (Auto). Used for detection "
+            "(Manual), or hand off to the gimbal servo angles once the "
+            "servo gimbal is wired (Auto). Used for detection "
             "georeferencing. Saved with the active layout profile, so it "
             "persists across restarts.",
             label="Camera Angle",
