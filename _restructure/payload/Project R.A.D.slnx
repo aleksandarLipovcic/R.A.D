@@ -1,0 +1,72 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Folder Name="/Solution Items/">
+    <File Path=".gitattributes" />
+    <File Path=".gitignore" />
+    <File Path="README.md" />
+  </Folder>
+  <Folder Name="/YOLO26M model/">
+    <File Path="YOLO26M model/best.pt" />
+  </Folder>
+  <Folder Name="/docs/">
+    <File Path="docs/ARCHITECTURE.md" />
+    <File Path="docs/FRONTEND.md" />
+    <File Path="docs/README.md" />
+  </Folder>
+  <Folder Name="/docs/modules/">
+    <File Path="docs/modules/bindings.md" />
+    <File Path="docs/modules/command-uplink.md" />
+    <File Path="docs/modules/command-uplink-uputstvo.md" />
+    <File Path="docs/modules/crsf-protocol.md" />
+    <File Path="docs/modules/crsflink.md" />
+    <File Path="docs/modules/detectionlink.md" />
+    <File Path="docs/modules/dronelink.md" />
+    <File Path="docs/modules/sensors.md" />
+    <File Path="docs/modules/serial-port-scan.md" />
+    <File Path="docs/modules/videolink.md" />
+  </Folder>
+  <Folder Name="/docs/frontend/">
+    <File Path="docs/frontend/app-shell.md" />
+    <File Path="docs/frontend/arming-widget.md" />
+    <File Path="docs/frontend/baro-widget.md" />
+    <File Path="docs/frontend/detection-map-widget.md" />
+    <File Path="docs/frontend/drone3d-view.md" />
+    <File Path="docs/frontend/dual-layer.md" />
+    <File Path="docs/frontend/fc-status-widget.md" />
+    <File Path="docs/frontend/fpv-widget.md" />
+    <File Path="docs/frontend/gps-widget.md" />
+    <File Path="docs/frontend/imu-widget.md" />
+    <File Path="docs/frontend/link-mode.md" />
+    <File Path="docs/frontend/mag-widget.md" />
+    <File Path="docs/frontend/map-tiles.md" />
+    <File Path="docs/frontend/osd-overlay-controls.md" />
+    <File Path="docs/frontend/radio-link-indicator.md" />
+    <File Path="docs/frontend/setup-tools.md" />
+    <File Path="docs/frontend/ui-performance.md" />
+    <File Path="docs/frontend/workers.md" />
+  </Folder>
+  <Folder Name="/docs/doxygen/">
+    <File Path="docs/doxygen/commFilter.py" />
+    <File Path="docs/doxygen/Configuration.txt" />
+  </Folder>
+  <Folder Name="/Firmware/">
+    <File Path="Firmware/README.md" />
+  </Folder>
+  <Folder Name="/Firmware/pocket/">
+    <File Path="Firmware/pocket/SCRIPTS/MIXES/radcmd.lua" />
+  </Folder>
+  <Folder Name="/Firmware/betaflight/">
+    <File Path="Firmware/betaflight/LISTIC_BF4.5.3_backup_20261103.txt" />
+    <File Path="Firmware/betaflight/LISTIC_BF4.5.5_servo_mag_20261103.txt" />
+  </Folder>
+  <Project Path="DroneBackend/DroneBackend.vcxproj" Id="9baff06c-9db1-499e-80eb-7d2681e22b08" />
+  <Project Path="DroneCockpitUI/DroneCockpitUI.pyproj" Type="888888a0-9f3d-457c-b088-3a5042f75d52" Id="f88caf8a-b9ee-4054-861c-8666670e9e5f">
+    <Platform Project="AnyCPU" />
+    <Build Project="false" />
+  </Project>
+  <Project Path="IMUTests/IMUTests.vcxproj" Id="3351c50c-11f2-4dec-b422-243d53ae1f0f" />
+</Solution>
