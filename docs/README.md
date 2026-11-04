@@ -61,7 +61,7 @@ compiled via pybind11) and the Python/Tkinter cockpit UI
 | `MagQMC5883L`  | `MagQMC5883L.h/.cpp`                  | Heading computation, MSP checksum helper         | (used internally by `DroneLink::parseDebug`) |
 | `BaroBMP280`   | `BaroBMP280.h/.cpp`                   | `MSP_ALTITUDE` parsing + unit scaling             | (used internally by `DroneLink::parseBaro`) |
 | `VideoLink`    | `VideoLink.h/.cpp`                    | Capture thread, native render window, OSD overlay | `DroneBackend.VideoLink`     |
-| `DetectionLink`| `Detectionlink.h/.cpp`                | Preview + inference threads, tracker, georeferencing | `DroneBackend.DetectionLink` |
+| `DetectionLink`| `DetectionLink.h/.cpp`                | Preview + inference threads, tracker, georeferencing | `DroneBackend.DetectionLink` |
 | —              | `Bindings.cpp`                        | pybind11 module definition (`PYBIND11_MODULE(DroneBackend, m)`) | — |
 
 ### Python frontend
@@ -91,12 +91,12 @@ One file per module/widget under [`frontend/`](FRONTEND.md) — see
 
 ## Screenshots
 
-UI screenshots live in [`../Software_progress/`](../Software_progress/)
+UI screenshots live in [`../docs/screenshots/`](../docs/screenshots/)
 (e.g. `MainView.png`, `GPS_sensor.png`, `Detection_and_mapping.png`,
 `FPV_with_osd.png`), and hardware build photos and drawings live in
-[`../Hardware_progress/`](../Hardware_progress/). Reference them from the
+[`../docs/hardware/`](../docs/hardware/). Reference them from the
 relevant page with a relative path, e.g.
-`![Main view](../../Software_progress/MainView.png)` from a page under
+`![Main view](../../docs/screenshots/MainView.png)` from a page under
 `frontend/`. There is no screenshot of the radio-link indicator yet.
 
 ## Conventions used throughout this documentation

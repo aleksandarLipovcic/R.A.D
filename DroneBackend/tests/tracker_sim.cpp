@@ -13,7 +13,7 @@
 //   FP records   records created by false alarms
 //
 // Build (Linux, OpenCV 4):
-//   g++ -std=c++17 -O2 -I.. tracker_sim.cpp ../ObjectTracker.cpp \
+//   g++ -std=c++17 -O2 -I../src/detection tracker_sim.cpp ../src/detection/ObjectTracker.cpp \
 //       $(pkg-config --cflags --libs opencv4) -o tracker_sim && ./tracker_sim
 // Exit code 0 only if the new tracker is at least as good as the old one on
 // every scenario and within the per-scenario limits.

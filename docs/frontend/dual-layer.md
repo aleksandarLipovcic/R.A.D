@@ -3,7 +3,7 @@
 **Files:** `dual_layer.py` (`DualLayerPanel`, `LayerSwitch`),
 `radio_panels.py` (`RadioAttitudePanel`, `RadioFlightPanel`), wiring in `DroneCockpitUI.py`
 (`_setup_ui`, `_update_link_status`, `_switch_link_layer`)
-**Tests:** `TestScripts/test_dual_layer.py` (UT-LAYER-001 … 009)
+**Tests:** `tests/unit/test_dual_layer.py` (UT-LAYER-001 … 009)
 
 ## What it does
 

@@ -1,6 +1,6 @@
 # `DetectionLink` — YOLO detection, tracking & georeferencing
 
-**Files:** `Detectionlink.h`, `Detectionlink.cpp`, `ObjectTracker.h`, `ObjectTracker.cpp`
+**Files:** `DetectionLink.h`, `DetectionLink.cpp`, `ObjectTracker.h`, `ObjectTracker.cpp`
 **Tests:** `tests/tracker_sim.cpp` (tracker simulation, old vs new),
 `tests/detectionlink_run.cpp` (the real `DetectionLink` on an image, optional
 `tiles`), `NNTraining/fpv_eval.py` (accuracy on our own FPV footage)
@@ -137,7 +137,7 @@ reads either ONNX layout, told apart by the output shape:
 | Raw (`end2end=False`) | `[1, 4+classes, anchors]` | `[cx, cy, w, h, score…]`, channel-major, sigmoid applied | class argmax, class-aware NMS (IoU 0.7, max 300; Ultralytics' `predict()` defaults) |
 
 Any other shape is reported once on stderr and the pass is skipped. Tested
-by running this `Detectionlink.cpp` against `yolo26n` exported both ways and
+by running this `DetectionLink.cpp` against `yolo26n` exported both ways and
 comparing with Ultralytics' `predict()`.
 
 ## Dual-thread design

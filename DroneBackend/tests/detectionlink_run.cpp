@@ -7,9 +7,9 @@
 // Ultralytics' predict() on the same image.
 //
 //   Linux (OpenCV >= 4.10 with dnn; videoio not needed):
-//     g++ -std=c++17 -O2 -I.. detectionlink_run.cpp ../Detectionlink.cpp ../ObjectTracker.cpp \
+//     g++ -std=c++17 -O2 -I../src/detection -I../src/video detectionlink_run.cpp \
+//         ../src/detection/DetectionLink.cpp ../src/detection/ObjectTracker.cpp \
 //         $(pkg-config --cflags --libs opencv4) -lpthread -o detectionlink_run
-//   (case-sensitive file systems: ln -s Detectionlink.h ../DetectionLink.h)
 //
 //   ./detectionlink_run ../../DroneCockpitUI/models/yolo26m_main.onnx frame.jpg 960 [tiles]
 //

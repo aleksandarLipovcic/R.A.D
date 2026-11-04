@@ -3,7 +3,7 @@
 **Files:** `link_mode.py` (shared helper) and every instrument widget that
 imports it: `IMUWidget.py`, `MagWidget.py`, `Drone3DView.py`,
 `BaroWidget.py`, `GPSWidget.py`, `FCStatusWidget.py`, `ArmingWidget.py`
-**Tests:** `TestScripts/test_link_mode.py` (UT-LINK-001 … 009)
+**Tests:** `tests/unit/test_link_mode.py` (UT-LINK-001 … 009)
 
 ## Why
 
@@ -79,4 +79,4 @@ neutral, the same as the widget's TINY layout already did.
   `TelemetryWorker._build_ui_data()` and `to_dict()` in `Bindings.cpp`,
   instead of special-casing `"ELRS"` in the widget.
 - Add a UT-LINK test with `_frame("ELRS", …)` from
-  `TestScripts/test_link_mode.py`.
+  `tests/unit/test_link_mode.py`.

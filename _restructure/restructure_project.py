@@ -6,6 +6,7 @@ with Visual Studio CLOSED:
 
     python _restructure\\restructure_project.py --dry-run   # show the plan, change nothing
     python _restructure\\restructure_project.py             # do it
+    python _restructure\\restructure_project.py --resume    # finish a run that stopped
     python _restructure\\restructure_project.py --undo      # put everything back
 
 What it does
@@ -69,6 +70,19 @@ def ignored(rel):
     return git("check-ignore", "-q", "--", rel, check=False).returncode == 0
 
 
+def git_add(rel):
+    """git add, except for files a .gitignore excludes (e.g. IMUTests/)."""
+    if ignored(rel):
+        return
+    r = git("add", "--", rel, check=False)
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout).strip()
+        if "ignored" in msg:
+            print(f"  note: {rel} is git-ignored, written but not added to git")
+            return
+        raise RuntimeError(f"git add -- {rel}: {msg}")
+
+
 def load_plan():
     with open(os.path.join(HERE, "moves.json"), encoding="utf-8") as f:
         plan = json.load(f)
@@ -91,6 +105,16 @@ def load_plan():
         for fn in files:
             payload.append(os.path.relpath(os.path.join(r, fn), PAYLOAD).replace(os.sep, "/"))
     return moves, sorted(payload), hashes, plan["remove_empty_dirs"]
+
+
+def load_plan_for_resume(journal):
+    """Plan of the interrupted run: its recorded moves first (the source
+    folders of the photo/screenshot moves may be gone already), then any
+    move of the original plan that was not reached."""
+    moves, payload, hashes, remove_dirs = load_plan()
+    recorded = [(s, d) for s, d, _ in journal["moves"]]
+    done = {d for _, d in recorded}
+    return recorded + [m for m in moves if m[1] not in done], payload, hashes, remove_dirs
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -119,8 +143,12 @@ def check(moves, payload, hashes, use_git, force):
     return problems
 
 
-def run(moves, payload, hashes, remove_dirs, use_git):
-    journal = {"moves": [], "created": [], "backed_up": [], "git": use_git}
+def run(moves, payload, hashes, remove_dirs, use_git, journal=None):
+    resume = journal is not None
+    if journal is None:
+        journal = {"moves": [], "created": [], "backed_up": [], "git": use_git}
+    done_moves = {m[1] for m in journal["moves"]}
+    done_writes = set(journal["created"]) | set(journal["backed_up"])
 
     def save():
         with open(JOURNAL, "w", encoding="utf-8") as f:
@@ -128,6 +156,8 @@ def run(moves, payload, hashes, remove_dirs, use_git):
 
     # 1. moves
     for s, d in moves:
+        if d in done_moves:
+            continue
         os.makedirs(os.path.dirname(p(d)), exist_ok=True)
         via_git = use_git and tracked(s)
         if via_git:
@@ -140,6 +170,8 @@ def run(moves, payload, hashes, remove_dirs, use_git):
 
     # 2. payload (new and changed files)
     for rel in payload:
+        if rel in done_writes:
+            continue
         dst = p(rel)
         if os.path.exists(dst):
             bk = os.path.join(BACKUP, *rel.split("/"))
@@ -151,8 +183,8 @@ def run(moves, payload, hashes, remove_dirs, use_git):
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copyfile(os.path.join(PAYLOAD, *rel.split("/")), dst)
         save()
-        if use_git and not ignored(rel):
-            git("add", "--", rel)
+        if use_git:
+            git_add(rel)
         print(f"  write   {rel}")
 
     # 3. clean-up of emptied folders
@@ -165,6 +197,8 @@ def run(moves, payload, hashes, remove_dirs, use_git):
                 dirs.remove(d)
     for rel in remove_dirs:
         remove_empty_tree(p(rel))
+    journal["complete"] = True
+    save()
     print("\nDone. Nothing is committed yet. Next:")
     print("  1. git status                      -- review")
     print("  2. Visual Studio: open the solution, Rebuild DroneBackend (Release x64)")
@@ -204,8 +238,8 @@ def undo():
             print(f"  delete  {rel}")
     for rel in reversed(j["backed_up"]):
         shutil.copy2(os.path.join(BACKUP, *rel.split("/")), p(rel))
-        if use_git and not ignored(rel) and tracked(rel):
-            git("add", "--", rel)
+        if use_git and tracked(rel):
+            git_add(rel)
         print(f"  restore {rel}")
     for s, d, via_git in reversed(j["moves"]):
         os.makedirs(os.path.dirname(p(s)), exist_ok=True)
@@ -231,13 +265,26 @@ def main():
     ap.add_argument("--undo", action="store_true", help="revert a previous run")
     ap.add_argument("--yes", action="store_true", help="don't ask for confirmation")
     ap.add_argument("--force", action="store_true", help="skip the clean-working-tree check")
+    ap.add_argument("--resume", action="store_true", help="finish a run that stopped half-way")
     a = ap.parse_args()
 
     if a.undo:
         undo()
         return
+    if a.resume:
+        if not os.path.exists(JOURNAL):
+            sys.exit("Nothing to resume (no journal.json).")
+        with open(JOURNAL, encoding="utf-8") as f:
+            journal = json.load(f)
+        if journal.get("complete"):
+            sys.exit("The previous run already finished.")
+        moves, payload, hashes, remove_dirs = load_plan_for_resume(journal)
+        print(f"Resuming: {len(journal['moves'])}/{len(moves)} moves and "
+              f"{len(journal['created']) + len(journal['backed_up'])}/{len(payload)} files already done.")
+        run(moves, payload, hashes, remove_dirs, journal.get("git", False), journal)
+        return
     if os.path.exists(JOURNAL):
-        sys.exit("Already run (journal.json exists). Use --undo first to run again.")
+        sys.exit("Already run (journal.json exists). Use --resume to finish it or --undo to revert.")
 
     use_git = have_git()
     if not use_git:

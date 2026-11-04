@@ -93,6 +93,7 @@
       <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir)src\core;$(ProjectDir)src\sensors;$(ProjectDir)src\radio;$(ProjectDir)src\video;$(ProjectDir)src\detection;$(ProjectDir)src\bindings;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -108,6 +109,7 @@
       <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir)src\core;$(ProjectDir)src\sensors;$(ProjectDir)src\radio;$(ProjectDir)src\video;$(ProjectDir)src\detection;$(ProjectDir)src\bindings;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -121,7 +123,7 @@
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>C:\openCVBuild\build\install\include;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\Include;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\pybind11\include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src\core;$(ProjectDir)src\sensors;$(ProjectDir)src\radio;$(ProjectDir)src\video;$(ProjectDir)src\detection;$(ProjectDir)src\bindings;C:\openCVBuild\build\install\include;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\Include;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\pybind11\include</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -139,7 +141,7 @@
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>C:\openCVBuild\build\install\include;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\Include;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\pybind11\include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src\core;$(ProjectDir)src\sensors;$(ProjectDir)src\radio;$(ProjectDir)src\video;$(ProjectDir)src\detection;$(ProjectDir)src\bindings;C:\openCVBuild\build\install\include;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\Include;C:\Users\TheSilent\AppData\Local\Python\pythoncore-3.14-64\Lib\site-packages\pybind11\include</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -149,33 +151,44 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="BaroBMP280.h" />
-    <ClInclude Include="CrsfLink.h" />
-    <ClInclude Include="CrsfProtocol.h" />
-    <ClInclude Include="CrsfStateMapper.h" />
-    <ClInclude Include="DetectionLink.h" />
-    <ClInclude Include="DroneLink.h" />
-    <ClInclude Include="GPSneoM10.h" />
-    <ClInclude Include="IMUSensor.h" />
-    <ClInclude Include="MagQMC5883L.h" />
-    <ClInclude Include="ObjectTracker.h" />
-    <ClInclude Include="SerialPortScan.h" />
-    <ClInclude Include="VideoLink.h" />
+    <ClInclude Include="src\core\DroneLink.h" />
+    <ClInclude Include="src\core\SerialPortScan.h" />
+    <ClInclude Include="src\sensors\IMUSensor.h" />
+    <ClInclude Include="src\sensors\BaroBMP280.h" />
+    <ClInclude Include="src\sensors\MagQMC5883L.h" />
+    <ClInclude Include="src\sensors\GPSneoM10.h" />
+    <ClInclude Include="src\radio\CrsfProtocol.h" />
+    <ClInclude Include="src\radio\CrsfStateMapper.h" />
+    <ClInclude Include="src\radio\CrsfLink.h" />
+    <ClInclude Include="src\radio\UplinkProtocol.h" />
+    <ClInclude Include="src\radio\CommandLink.h" />
+    <ClInclude Include="src\video\VideoLink.h" />
+    <ClInclude Include="src\detection\DetectionLink.h" />
+    <ClInclude Include="src\detection\ObjectTracker.h" />
+    <ClInclude Include="src\bindings\UplinkBindings.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="CrsfLink.cpp" />
-    <ClCompile Include="CrsfProtocol.cpp" />
-    <ClCompile Include="CrsfStateMapper.cpp" />
-    <ClCompile Include="DetectionLink.cpp" />
-    <ClCompile Include="DroneLink.cpp" />
-    <ClCompile Include="GPSneoM10.cpp" />
-    <ClCompile Include="IMUSensor.cpp" />
-    <ClCompile Include="Bindings.cpp" />
-    <ClCompile Include="BaroBMP280.cpp" />
-    <ClCompile Include="MagQMC5883L.cpp" />
-    <ClCompile Include="ObjectTracker.cpp" />
-    <ClCompile Include="SerialPortScan.cpp" />
-    <ClCompile Include="VideoLink.cpp" />
+    <ClCompile Include="src\core\DroneLink.cpp" />
+    <ClCompile Include="src\core\SerialPortScan.cpp" />
+    <ClCompile Include="src\sensors\IMUSensor.cpp" />
+    <ClCompile Include="src\sensors\BaroBMP280.cpp" />
+    <ClCompile Include="src\sensors\MagQMC5883L.cpp" />
+    <ClCompile Include="src\sensors\GPSneoM10.cpp" />
+    <ClCompile Include="src\radio\CrsfProtocol.cpp" />
+    <ClCompile Include="src\radio\CrsfStateMapper.cpp" />
+    <ClCompile Include="src\radio\CrsfLink.cpp" />
+    <ClCompile Include="src\radio\UplinkProtocol.cpp" />
+    <ClCompile Include="src\radio\CommandLink.cpp" />
+    <ClCompile Include="src\video\VideoLink.cpp" />
+    <ClCompile Include="src\detection\DetectionLink.cpp" />
+    <ClCompile Include="src\detection\ObjectTracker.cpp" />
+    <ClCompile Include="src\bindings\Bindings.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="tests\detectionlink_run.cpp" />
+    <None Include="tests\tracker_sim.cpp" />
+    <None Include="tests\test_uplink.cpp" />
+    <None Include="scripts\sync_pyd.bat" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

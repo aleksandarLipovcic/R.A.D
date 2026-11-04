@@ -123,7 +123,7 @@ other's concrete types. Instead:
 `TelemetrySnapshot` itself (the struct) is shared between `VideoLink`'s OSD
 and `DetectionLink`'s georeferencing on purpose — there's no second
 "telemetry type" invented for the OSD (see the comment on
-`TelemetrySnapshot` in `Detectionlink.h`). It also means `DetectionLink` can
+`TelemetrySnapshot` in `DetectionLink.h`). It also means `DetectionLink` can
 run against a recorded video file during post-flight replay by calling
 `setFrameSource(std::function<cv::Mat()>)` instead of
 `setVideoLinkSource()`, with zero code changes elsewhere.
@@ -283,46 +283,56 @@ trampolines are documented in [FRONTEND.md](FRONTEND.md).
 ```
 Project R.A.D/
 ├── README.md                    # project overview → links into docs/
+├── Project R.A.D.slnx           # Visual Studio solution
 ├── docs/                        # this documentation set
 │   ├── README.md                # documentation index / reading order
 │   ├── ARCHITECTURE.md
 │   ├── FRONTEND.md              # index of frontend/ pages
-│   ├── modules/                 # one page per C++ unit
-│   └── frontend/                # one page per Python module
-├── Project R.A.D.slnx           # Visual Studio solution
-├── DroneBackend/                # C++ → DroneBackend.pyd (pybind11), flat
-│   ├── Bindings.cpp
-│   ├── DroneLink.h/.cpp         # MSP over USB + DroneState / RadioLinkStats
-│   ├── CrsfLink.h/.cpp          # ELRS telemetry link (Win32 serial, thread)
-│   ├── CrsfProtocol.h/.cpp      # CRSF framing + decoders (pure)
-│   ├── CrsfStateMapper.h/.cpp   # CRSF frames → DroneState (pure)
-│   ├── SerialPortScan.h/.cpp    # COM enumeration, MSP-verified FC detection
-│   ├── GPSneoM10.h/.cpp, IMUSensor.h/.cpp, MagQMC5883L.h/.cpp, BaroBMP280.h/.cpp
-│   ├── VideoLink.h/.cpp
-│   ├── Detectionlink.h/.cpp
-│   └── sync_pyd.bat             # copies the built .pyd next to the UI
-├── DroneCockpitUI/              # Python/Tk cockpit, flat
+│   ├── modules/                 # one page per C++ unit (+ command uplink)
+│   ├── frontend/                # one page per Python module
+│   ├── doxygen/                 # Doxygen configuration + comment filter
+│   ├── hardware/                # build photos, mechanical drawings (PDF)
+│   └── screenshots/             # UI screenshots
+├── DroneBackend/                # C++ → DroneBackend.pyd (pybind11)
+│   ├── src/core/                # DroneLink (MSP, DroneState), SerialPortScan
+│   ├── src/sensors/             # IMUSensor, BaroBMP280, MagQMC5883L, GPSneoM10
+│   ├── src/radio/               # CrsfProtocol, CrsfStateMapper, CrsfLink,
+│   │                            #   UplinkProtocol, CommandLink (laptop → drone)
+│   ├── src/video/               # VideoLink
+│   ├── src/detection/           # DetectionLink, ObjectTracker
+│   ├── src/bindings/            # Bindings.cpp, UplinkBindings.h
+│   ├── tests/                   # stand-alone C++ test programs
+│   └── scripts/sync_pyd.bat     # copies the built .pyd next to the UI
+├── DroneCockpitUI/              # Python/Tk cockpit (run DroneCockpitUI.py)
 │   ├── DroneCockpitUI.py        # entry point, DroneCockpitApp
-│   ├── telemetry_worker.py, video_worker.py, detection_worker.py
-│   ├── radio_link_indicator.py  # ELRS toolbar traffic light
-│   ├── *Widget.py, Drone3DView.py, MapTiles.py, prefetch_tiles.py, osd_overlay_controls.py
-│   ├── cockpit_layouts.json, osd_layout.json   # persisted UI state
+│   ├── widgets/                 # *Widget.py, Drone3DView, radio panels,
+│   │                            #   OSD controls, command_panel (Laptop Control)
+│   ├── workers/                 # telemetry / video / detection workers, uplink_controller
+│   ├── core/                    # link_mode, dual_layer, MapTiles, ui_perf
+│   ├── control/                 # altitude_hold (laptop-side altitude regulator)
+│   ├── config/                  # cockpit_layouts.json, osd_layout.json (UI state)
+│   ├── tools/                   # Setup_Project, check_backend, export_model,
+│   │                            #   prefetch_tiles, bench tools (msp_probe,
+│   │                            #   radio_sniff, uplink_bench, ...)
+│   ├── tests/unit/              # pytest, no hardware (default `pytest`)
+│   ├── tests/integration/       # IT-* suites, FC on USB
+│   ├── tests/system/            # SAT-* suites, FC on USB
 │   ├── models/                  # YOLO class names (weights are git-ignored)
-│   ├── NNTraining/              # dataset + training pipeline (own docs inside)
-│   ├── TestScripts/, it_tests/, sat_imu/        # pytest suites & bench tools
-│   └── Setup_Project.py, DroneTest.py, export_model.py
-├── IMUTests/                    # GoogleTest project for the C++ IMU parser
-├── Doxygen_conf/                # Doxyfile + comment filter
-├── Hardware_progress/           # build photos, mechanical drawings (PDF)
-└── Software_progress/           # UI screenshots
+│   └── NNTraining/              # dataset + training pipeline (own docs inside)
+├── Firmware/                    # radio + flight controller side
+│   ├── pocket/SCRIPTS/MIXES/radcmd.lua   # EdgeTX command bridge
+│   └── betaflight/              # CLI backups (diff all)
+├── IMUTests/                    # GoogleTest project for the C++ IMU parser (local)
+└── YOLO26M model/               # released detection model (best.pt)
 ```
 
-C++ and Python sources are kept flat inside their project folders on
-purpose: the Visual Studio projects (`DroneBackend.vcxproj`,
-`DroneCockpitUI.pyproj`) and the Python imports rely on it. If the tree is
-ever split (e.g. `link/`, `sensors/`, `vision/`, `widgets/`), update both
-project files, the imports, and the module map in
-[README.md](README.md).
+Each project folder is split by responsibility. Python modules are imported
+by package from the app root (`from widgets.IMUWidget import IMUWidget`);
+DroneCockpitUI.py, pytest (`tests/conftest.py`, `pytest.ini`) and the tools
+put DroneCockpitUI/ on `sys.path`. The C++ project adds every `src/`
+subfolder to the include path, so `#include "DroneLink.h"` works from any
+unit. When adding a file, put it in the matching folder and add it to the
+project (Visual Studio does this on *Add → Existing Item*).
 
 > **Note on `DroneTest.py`:** it calls `drone.getBatteryVoltage()` and
 > `drone.getAttitude()`, which do not match the current bindings surface
