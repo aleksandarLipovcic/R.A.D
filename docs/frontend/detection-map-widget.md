@@ -44,7 +44,7 @@ minutes produces many records. The list shows each object (`track_id`)
 Selecting a row shows the screenshot of the object's **most confident**
 sighting, plus the radius and the last fix's method. The map draws each
 object's pin with a dashed circle of its radius: the area to search.
-Tests: `TestScripts/test_detection_map.py` (UT-DETMAP-001 … 004).
+Tests: `tests/unit/test_detection_map.py` (UT-DETMAP-001 … 004).
 
 ## Search (report, section 15)
 

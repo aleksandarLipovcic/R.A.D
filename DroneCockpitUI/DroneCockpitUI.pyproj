@@ -23,137 +23,72 @@
     <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="ArmingWidget.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="BaroWidget.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="DetectionMapWidget.py" />
-    <Compile Include="detection_worker.py" />
     <Compile Include="DroneCockpitUI.py" />
-    <Compile Include="DroneTest.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="FCStatusWidget.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="GPSWidget.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="IMUWidget.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="Drone3DView.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="it_tests\conftest.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="MagWidget.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="FPVWidget.py" />
-    <Compile Include="export_model.py" />
-    <Compile Include="MapTiles.py" />
-    <Compile Include="check_backend.py" />
+    <Compile Include="NNTraining\benchmark_speed.py" />
+    <Compile Include="NNTraining\check_split_leakage.py" />
+    <Compile Include="NNTraining\eval_report.py" />
     <Compile Include="NNTraining\export_nn_boxes.py" />
-    <Compile Include="radio_link_indicator.py" />
-    <Compile Include="link_mode.py" />
-    <Compile Include="dual_layer.py" />
-    <Compile Include="ui_perf.py" />
-    <Compile Include="radio_panels.py" />
-    <Compile Include="osd_overlay_controls.py" />
-    <Compile Include="prefetch_tiles.py" />
-    <Compile Include="NNTraining\class_map.py" />
-    <Compile Include="NNTraining\cross_reference_gaps.py" />
-    <Compile Include="NNTraining\check_label_gaps.py" />
-    <Compile Include="NNTraining\generate_pseudo_labels.py" />
-    <Compile Include="NNTraining\finetune_and_resolve_queue.py" />
-    <Compile Include="NNTraining\dedupe_real_labels.py" />
-    <Compile Include="NNTraining\review_batch_assigner.py" />
-    <Compile Include="NNTraining\resolve_cross_class_conflicts.py" />
-    <Compile Include="NNTraining\review_labels.py" />
-    <Compile Include="NNTraining\verify_pipeline_assumptions.py" />
-    <Compile Include="NNTraining\predict_test.py" />
     <Compile Include="NNTraining\fpv_eval.py" />
-    <Compile Include="NNTraining\torch_dll_fix.py" />
-    <Compile Include="NNTraining\cudnn_check.py" />
-    <Compile Include="NNTraining\mosaic_guard.py" />
-    <Compile Include="NNTraining\vram_diagnostic.py" />
-    <Compile Include="NNTraining\prepare_datasets.py" />
+    <Compile Include="NNTraining\predict_test.py" />
     <Compile Include="NNTraining\setup.py" />
     <Compile Include="NNTraining\train.py" />
-    <Compile Include="video_worker.py" />
-    <Compile Include="sat_imu\conftest.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="sat_imu\test_SAT_IMU_001.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="sat_imu\test_SAT_IMU_002.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="sat_imu\test_SAT_IMU_003.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="sat_imu\test_SAT_IMU_004.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="sat_imu\test_SAT_IMU_005.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="telemetry_worker.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="TestScripts\conftest.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="TestScripts\gps_sv_reader.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="TestScripts\mag_calibration_tool.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="TestScripts\msp_probe.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="TestScripts\radio_sniff.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="TestScripts\test_link_mode.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="TestScripts\test_dual_layer.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="TestScripts\test_detection_map.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="TestScripts\sv_baud_probe.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="TestScripts\sv_passthrough_test.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="Setup_Project.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="TestScripts\test_imu_widget.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="it_tests\test_IT_IMU_001.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="it_tests\test_IT_IMU_002.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="it_tests\test_IT_IMU_003.py">
-      <SubType>Code</SubType>
-    </Compile>
-    <Compile Include="it_tests\test_IT_IMU_004.py">
-      <SubType>Code</SubType>
-    </Compile>
+    <Compile Include="control\__init__.py" />
+    <Compile Include="control\altitude_hold.py" />
+    <Compile Include="core\MapTiles.py" />
+    <Compile Include="core\__init__.py" />
+    <Compile Include="core\dual_layer.py" />
+    <Compile Include="core\link_mode.py" />
+    <Compile Include="core\ui_perf.py" />
+    <Compile Include="tests\conftest.py" />
+    <Compile Include="tests\integration\conftest.py" />
+    <Compile Include="tests\integration\test_IT_IMU_001.py" />
+    <Compile Include="tests\integration\test_IT_IMU_002.py" />
+    <Compile Include="tests\integration\test_IT_IMU_003.py" />
+    <Compile Include="tests\integration\test_IT_IMU_004.py" />
+    <Compile Include="tests\system\conftest.py" />
+    <Compile Include="tests\system\test_SAT_IMU_001.py" />
+    <Compile Include="tests\system\test_SAT_IMU_002.py" />
+    <Compile Include="tests\system\test_SAT_IMU_003.py" />
+    <Compile Include="tests\system\test_SAT_IMU_004.py" />
+    <Compile Include="tests\system\test_SAT_IMU_005.py" />
+    <Compile Include="tests\unit\conftest.py" />
+    <Compile Include="tests\unit\test_detection_map.py" />
+    <Compile Include="tests\unit\test_dual_layer.py" />
+    <Compile Include="tests\unit\test_imu_widget.py" />
+    <Compile Include="tests\unit\test_link_mode.py" />
+    <Compile Include="tests\unit\test_lua_bridge.py" />
+    <Compile Include="tests\unit\test_uplink_python.py" />
+    <Compile Include="tools\DroneTest.py" />
+    <Compile Include="tools\Setup_Project.py" />
+    <Compile Include="tools\check_backend.py" />
+    <Compile Include="tools\export_model.py" />
+    <Compile Include="tools\gps_sv_reader.py" />
+    <Compile Include="tools\mag_calibration_tool.py" />
+    <Compile Include="tools\msp_probe.py" />
+    <Compile Include="tools\prefetch_tiles.py" />
+    <Compile Include="tools\radio_sniff.py" />
+    <Compile Include="tools\sv_baud_probe.py" />
+    <Compile Include="tools\sv_passthrough_test.py" />
+    <Compile Include="tools\uplink_bench.py" />
+    <Compile Include="widgets\ArmingWidget.py" />
+    <Compile Include="widgets\BaroWidget.py" />
+    <Compile Include="widgets\DetectionMapWidget.py" />
+    <Compile Include="widgets\Drone3DView.py" />
+    <Compile Include="widgets\FCStatusWidget.py" />
+    <Compile Include="widgets\FPVWidget.py" />
+    <Compile Include="widgets\GPSWidget.py" />
+    <Compile Include="widgets\IMUWidget.py" />
+    <Compile Include="widgets\MagWidget.py" />
+    <Compile Include="widgets\__init__.py" />
+    <Compile Include="widgets\command_panel.py" />
+    <Compile Include="widgets\osd_overlay_controls.py" />
+    <Compile Include="widgets\radio_link_indicator.py" />
+    <Compile Include="widgets\radio_panels.py" />
+    <Compile Include="workers\__init__.py" />
+    <Compile Include="workers\detection_worker.py" />
+    <Compile Include="workers\telemetry_worker.py" />
+    <Compile Include="workers\uplink_controller.py" />
+    <Compile Include="workers\video_worker.py" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\DroneBackend\DroneBackend.vcxproj">
@@ -163,19 +98,30 @@
     </ProjectReference>
   </ItemGroup>
   <ItemGroup>
-    <Folder Include="it_tests\" />
+    <Folder Include="config\" />
+    <Folder Include="control\" />
+    <Folder Include="core\" />
     <Folder Include="NNTraining\" />
-    <Folder Include="sat_imu\" />
-    <Folder Include="TestScripts\" />
+    <Folder Include="NNTraining\documentation_for_training\" />
+    <Folder Include="tests\" />
+    <Folder Include="tests\integration\" />
+    <Folder Include="tests\system\" />
+    <Folder Include="tests\unit\" />
+    <Folder Include="tools\" />
+    <Folder Include="widgets\" />
+    <Folder Include="workers\" />
   </ItemGroup>
   <ItemGroup>
-    <Content Include="sat_imu\Readme.md">
-      <SubType>Code</SubType>
-    </Content>
-    <Content Include="TestScripts\pytest.ini">
-      <SubType>Code</SubType>
-    </Content>
-    <Content Include="it_tests\Readme.md" />
+    <Content Include="pytest.ini" />
+    <Content Include="NNTraining\documentation_for_training\ML_PIPELINE.md" />
+    <Content Include="NNTraining\documentation_for_training\README.md" />
+    <Content Include="NNTraining\documentation_for_training\fpv-eval.md" />
+    <Content Include="NNTraining\documentation_for_training\setup.md" />
+    <Content Include="config\cockpit_layout.json" />
+    <Content Include="config\cockpit_layouts.json" />
+    <Content Include="config\osd_layout.json" />
+    <Content Include="tests\integration\Readme.md" />
+    <Content Include="tests\system\Readme.md" />
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
   <!-- Uncomment the CoreCompile target to enable the Build command in

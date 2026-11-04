@@ -120,24 +120,26 @@ from typing import Optional
 import tkinter as tk
 from tkinter import simpledialog, messagebox
 
-from telemetry_worker import TelemetryWorker
-from radio_link_indicator import RadioLinkIndicator
-import link_mode
-from dual_layer import DualLayerPanel, LayerSwitch
-import ui_perf
-from radio_panels import RadioAttitudePanel, RadioFlightPanel
-from video_worker      import VideoWorker
-from detection_worker  import DetectionWorker
+from workers.telemetry_worker import TelemetryWorker
+from widgets.radio_link_indicator import RadioLinkIndicator
+from core import link_mode
+from core.dual_layer import DualLayerPanel, LayerSwitch
+from core import ui_perf
+from widgets.radio_panels import RadioAttitudePanel, RadioFlightPanel
+from workers.uplink_controller import UplinkController
+from widgets.command_panel import CommandPanel
+from workers.video_worker      import VideoWorker
+from workers.detection_worker  import DetectionWorker
 
-from IMUWidget           import IMUWidget
-from Drone3DView         import Drone3DView
-from BaroWidget          import BaroWidget
-from MagWidget           import MagWidget
-from GPSWidget           import GPSWidget
-from FCStatusWidget      import FCStatusWidget
-from ArmingWidget        import ArmingWidget
-from FPVWidget           import FPVWidget
-from DetectionMapWidget  import DetectionMapWidget
+from widgets.IMUWidget           import IMUWidget
+from widgets.Drone3DView         import Drone3DView
+from widgets.BaroWidget          import BaroWidget
+from widgets.MagWidget           import MagWidget
+from widgets.GPSWidget           import GPSWidget
+from widgets.FCStatusWidget      import FCStatusWidget
+from widgets.ArmingWidget        import ArmingWidget
+from widgets.FPVWidget           import FPVWidget
+from widgets.DetectionMapWidget  import DetectionMapWidget
 
 # ── Path configuration ────────────────────────────────────────────────────────
 script_dir   = os.path.dirname(os.path.abspath(__file__))
@@ -212,7 +214,7 @@ except Exception:
     pass
 
 # ── Verbose diagnostic logging ──────────────────────────────────────────────
-# Same convention as DETECTIONLINK_VERBOSE_LOGGING in Detectionlink.cpp:
+# Same convention as DETECTIONLINK_VERBOSE_LOGGING in DetectionLink.cpp:
 # routine/diagnostic console output (LayoutStore load/save confirmations,
 # viewport-clamp notices, which inference backend got engaged) is off by
 # default now that the CUDA build is confirmed working and this app has
@@ -302,7 +304,7 @@ DETECTION_POLL_HZ = 4
 # actually got. Confirmed working on this rig's RTX 3060 6GB (laptop) --
 # inference currently runs at DNN_TARGET_CUDA (FP32); avg_inference sits
 # around 70-85ms at 960x960/YOLO26m on this card, which is on the slow
-# side for FP32 CUDA via cv::dnn -- see the perf notes in Detectionlink.cpp
+# side for FP32 CUDA via cv::dnn -- see the perf notes in DetectionLink.cpp
 # (DNN_TARGET_CUDA_FP16 / a TensorRT export are the next lever if this
 # interval ever needs to come down).
 DETECTION_USE_CUDA = True
@@ -343,8 +345,8 @@ DETECTION_THRESHOLDS_PATH = os.path.splitext(DETECTION_MODEL_PATH)[0] + ".thresh
 # Horizontal FOV of the actual camera in degrees, used for every
 # pixel-offset -> ray-angle calculation in georeferencing (see
 # DetectionLink::setHorizontalFovDeg() / computeWorldRay() in
-# Detectionlink.cpp). This MUST match the physical camera, not a guess --
-# Detectionlink.h's compiled-in default (90 deg) was never actually
+# DetectionLink.cpp). This MUST match the physical camera, not a guess --
+# DetectionLink.h's compiled-in default (90 deg) was never actually
 # correct for this rig and was silently never overridden until now.
 # Sourced from the E5-FPV night-vision module's own datasheet: "FOV: 100
 # deg". Update this if the camera is ever swapped for a different
@@ -354,7 +356,7 @@ DETECTION_CAMERA_FOV_DEG = 100.0
 
 # Known face-on real-world widths (meters) for object-size ranging (see
 # DetectionLink::setKnownObjectWidth() / rangeByObjectSize() in
-# Detectionlink.cpp) -- this is the ranging method that still works when
+# DetectionLink.cpp) -- this is the ranging method that still works when
 # ground-plane ranging can't (shallow ray -- see the georeferencing note
 # in the DetectionLink setup code below for why that's the common case
 # on this rigidly forward-facing, non-gimbaled camera). Without entries
@@ -408,14 +410,14 @@ DETECTION_KNOWN_OBJECT_WIDTHS_M = {
 # Tilting toward 90 (straight down) during search sweeps is the single
 # biggest improvement available to ground-plane ranging accuracy -- see
 # the DetectionLink setup code below and rangeByGroundPlane()'s doc
-# comment in Detectionlink.cpp for why a steep ray matters so much more
+# comment in DetectionLink.cpp for why a steep ray matters so much more
 # than which ranging method is technically "preferred".
 CAMERA_MOUNT_PAN_DEG = 0.0     # startup default only -- see toolbar control
 CAMERA_MOUNT_TILT_DEG = 0.0    # 0=forward-level, 90=down, 180=backward-level, negative=up
 
 # ── Bearings-only triangulation tuning ───────────────────────────────
 # See DetectionLink::setTriangulationMinBaselineM() /
-# setTriangulationMinBearingSpreadDeg() in Detectionlink.h for the full
+# setTriangulationMinBearingSpreadDeg() in DetectionLink.h for the full
 # rationale -- both exist to reject a triangulated fix computed from
 # observations with too little real parallax between them (e.g. the
 # drone flew straight at the object with no lateral offset), which would
@@ -447,8 +449,8 @@ GUIDE_DASH     = (4, 3)
 #   new file doesn't exist yet but the old one does, it's migrated
 #   automatically into a profile called "Default" the first time the app
 #   runs after this update, so no existing layout is lost.
-_LAYOUTS_FILE         = Path(script_dir) / "cockpit_layouts.json"
-_LEGACY_LAYOUT_FILE   = Path(script_dir) / "cockpit_layout.json"
+_LAYOUTS_FILE         = Path(script_dir) / "config" / "cockpit_layouts.json"
+_LEGACY_LAYOUT_FILE   = Path(script_dir) / "config" / "cockpit_layout.json"
 _DEFAULT_PROFILE_NAME = "Default"
 
 # ── Per-widget throttle divisors (frames between updates) ────────────────────
@@ -1565,6 +1567,19 @@ class DroneCockpitApp:
         if self.radio is None:
             print("[CrsfLink] not in this DroneBackend build -- radio telemetry disabled")
 
+        # ── Laptop -> drone commands (Pocket USB-VCP = LUA, radcmd.lua) ──────
+        # CommandLink owns no port: CrsfLink writes its frames on the Pocket's
+        # port, and only after the Lua bridge has identified itself with a
+        # RAD_STATUS frame. With the Pocket in Telem Mirror mode nothing is
+        # ever written. The pilot's switch on the Pocket gates everything.
+        self.cmd_link = None
+        self.uplink = None
+        self._command_panel = None
+        if self.radio is not None and hasattr(DroneBackend, "CommandLink"):
+            self.cmd_link = DroneBackend.CommandLink()
+            self.radio.set_uplink(self.cmd_link)
+            self.uplink = UplinkController(self.cmd_link, self.radio, backend=DroneBackend)
+
         # USB auto-connect runs on a background thread (auto_detect_fc sends
         # an MSP probe to each port, which takes a few hundred ms per port --
         # too long for the Tk thread now that the UI must stay live while
@@ -1672,14 +1687,14 @@ class DroneCockpitApp:
 
         # set_input_size() is only present in DroneBackend once
         # Bindings.cpp has been recompiled after the binding was added --
-        # editing Bindings.cpp/Detectionlink.cpp source does NOT change
+        # editing Bindings.cpp/DetectionLink.cpp source does NOT change
         # the already-built DroneBackend.pyd Python actually imports.
         # `import DroneBackend` failing here would take the *entire*
         # cockpit down over a detection-only config mismatch, so warn
         # loudly and keep going instead -- DetectionLink just falls back
         # to its compiled-in default inputSize_ (640), which only matters
         # if that also doesn't match your .onnx export (see
-        # DETECTION_INPUT_SIZE / Detectionlink.h's setInputSize() docs).
+        # DETECTION_INPUT_SIZE / DetectionLink.h's setInputSize() docs).
         if hasattr(self.detection_link, "set_input_size"):
             self.detection_link.set_input_size(DETECTION_INPUT_SIZE)
         else:
@@ -1690,7 +1705,7 @@ class DroneCockpitApp:
                 "extension (.pyd) from the current source and replace the "
                 "one this app is importing. Continuing with whatever "
                 f"default input size is compiled in (see inputSize_ in "
-                f"Detectionlink.h) -- detection will misbehave if that "
+                f"DetectionLink.h) -- detection will misbehave if that "
                 f"doesn't match the {DETECTION_INPUT_SIZE}x{DETECTION_INPUT_SIZE} "
                 "the current model was exported at."
             )
@@ -1706,11 +1721,11 @@ class DroneCockpitApp:
 
         # ── Georeferencing config -- was silently missing before ────────
         # Without these two calls, DetectionLink ran on its compiled-in
-        # header defaults: horizontalFovDeg_=90 (Detectionlink.h) and NO
+        # header defaults: horizontalFovDeg_=90 (DetectionLink.h) and NO
         # known object widths at all. On this rig specifically that meant
         # (a) every ray-angle/bearing calculation was wrong by however far
         # 90 deg differs from the camera's real FOV, and (b) object-size
-        # ranging (rangeByObjectSize() in Detectionlink.cpp) was never
+        # ranging (rangeByObjectSize() in DetectionLink.cpp) was never
         # available, leaving ONLY ground-plane ranging -- which itself
         # needs a ray steeper than ~7 deg below horizontal
         # (minGroundRayComponent_, see setMinGroundRayComponent() in the
@@ -1742,7 +1757,7 @@ class DroneCockpitApp:
             # common case whenever the camera is mounted forward-level
             # rather than angled down -- see CAMERA_MOUNT_TILT_DEG
             # above). Values are face-on width in meters -- see
-            # setKnownObjectWidth()'s doc comment in Detectionlink.h for
+            # setKnownObjectWidth()'s doc comment in DetectionLink.h for
             # why width (not length/height) is what the bbox actually
             # measures at most viewing angles.
             #
@@ -1765,13 +1780,13 @@ class DroneCockpitApp:
             )
 
         # Bearings-only triangulation (rangeByTriangulation() in
-        # Detectionlink.cpp) -- a third ranging method that needs neither
+        # DetectionLink.cpp) -- a third ranging method that needs neither
         # a steep ray nor an assumed object size, using instead a
         # tracked object's accumulated bearing history plus however far
         # the drone has moved between sightings. These two thresholds
         # guard against trusting a fix built from too little real
         # parallax (see setTriangulationMinBaselineM/
-        # setTriangulationMinBearingSpreadDeg in Detectionlink.h) --
+        # setTriangulationMinBearingSpreadDeg in DetectionLink.h) --
         # overriding them here is optional, the compiled-in defaults
         # (5.0m / 5.0deg) match these constants already, but they're
         # exposed as named constants above so they're easy to tune
@@ -1839,6 +1854,8 @@ class DroneCockpitApp:
             if hasattr(self.radio, "set_cell_count"):
                 self.radio.set_cell_count(RADIO_BATTERY_CELLS)
             self.radio.start_auto()      # non-blocking, auto-reconnects forever
+        if self.uplink is not None:
+            self.uplink.start()          # 25 Hz; sends nothing until enabled
         self._worker.start()
         self._schedule_update()
         self._auto_connect()             # USB probe on a background thread
@@ -3215,6 +3232,16 @@ class DroneCockpitApp:
         )
         self._camera_angle_btn.pack(side="left", padx=(0, 8))
 
+        self._command_btn = self._mk_icon_btn(
+            toolbar, "🕹", self._open_command_panel,
+            "Laptop Control — move the drone (ANGLE mode, small stick offsets), "
+            "hold altitude and aim the gimbal through the RadioMaster Pocket. "
+            "Needs the Pocket's USB-VCP set to LUA with radcmd.lua running; "
+            "the pilot's switch on the Pocket must be ON for anything but the gimbal.",
+            label="Laptop Control",
+        )
+        self._command_btn.pack(side="left", padx=(0, 8))
+
         self._camera_angle_lbl = tk.Label(
             toolbar, text="",
             fg="#66aadd", bg="#13203a",
@@ -3594,6 +3621,27 @@ class DroneCockpitApp:
         self._reschedule_update(t0)
 
     # =========================================================================
+    # Laptop control window (command uplink)
+    # =========================================================================
+
+    def _open_command_panel(self) -> None:
+        if self.uplink is None:
+            messagebox.showinfo(
+                "Laptop Control",
+                "This DroneBackend build has no CommandLink (or no CrsfLink).\n"
+                "Rebuild DroneBackend.pyd with CommandLink.cpp / UplinkProtocol.cpp.")
+            return
+        if self._command_panel is not None and self._command_panel.winfo_exists():
+            self._command_panel.lift()
+            self._command_panel.focus_force()
+            return
+        self._command_panel = CommandPanel(self.root, self.uplink,
+                                           on_close=self._on_command_panel_closed)
+
+    def _on_command_panel_closed(self) -> None:
+        self._command_panel = None
+
+    # =========================================================================
     # Clean shutdown
     # =========================================================================
 
@@ -3605,7 +3653,11 @@ class DroneCockpitApp:
             self.root.after_cancel(self._detection_pump_job)
         self._worker.stop()
         self.hub.disconnect()
+        if self.uplink is not None:
+            self.uplink.stop()           # neutral + disabled ...
+            time.sleep(0.1)              # ... and let a few such frames go out
         if self.radio is not None:
+            self.radio.set_uplink(None)
             self.radio.disconnect()
         self._video_worker.stop()
         self.fpv_view.detach()
@@ -3618,6 +3670,11 @@ class DroneCockpitApp:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Real time: several Python threads share the GIL (Tk, telemetry, the
+    # 25 Hz uplink controller). The default 5 ms switch interval lets a busy
+    # Tk redraw delay the controller by 100+ ms; 2 ms keeps it near 40 ms.
+    # Video, detection and the radio port run in C++ threads without the GIL.
+    sys.setswitchinterval(0.002)
     root = tk.Tk()
     app  = DroneCockpitApp(root)
     root.protocol("WM_DELETE_WINDOW", app.shutdown)

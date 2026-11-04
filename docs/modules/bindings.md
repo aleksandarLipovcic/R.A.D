@@ -255,3 +255,13 @@ identical (`DroneState`, `GPSReading`, `VideoLink`, …). When adding a new
 `DroneState`/`DetectionRecord`/etc. field in C++, mirror it here with the
 same `snake_case` transliteration so the convention holds across the whole
 module.
+
+## CommandLink (command uplink)
+
+Registered by `RegisterUplinkBindings(m)` from
+[`src/bindings/UplinkBindings.h`](../../DroneBackend/src/bindings/UplinkBindings.h),
+called before `CrsfLink` so that `CrsfLink.set_uplink(command_link)` can take
+it. Classes: `CommandValues`, `CommandLimits`, `BridgeStatus`,
+`CommandLinkStatus`, `CommandLink` (`set_enabled`, `set_command`,
+`set_gimbal_tilt_pct`, `neutral`, `get_status`, `set_limits`). Design and
+safety rules: [command-uplink.md](command-uplink.md).

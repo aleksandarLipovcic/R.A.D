@@ -46,6 +46,15 @@ runs/
 # without hardcoding anyone's Desktop path.
 DroneCockpitUI/tile_cache/
 DroneCockpitUI/detections/
+DroneCockpitUI/logs/
+
+# Local build of the C++ uplink test
+DroneBackend/tests/test_uplink
+DroneBackend/tests/*.exe
+DroneBackend/tests/*.obj
+
+# One-time reorganisation helper (delete after committing)
+_restructure/
 
 # VRAM diagnostics / profiling artifacts
 *vram_snapshot.pickle
