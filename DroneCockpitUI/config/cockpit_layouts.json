@@ -1,5 +1,5 @@
 {
-  "active_profile": "test",
+  "active_profile": "VideoLoad",
   "profiles": {
     "Default": {
       "geometry": "1536x793+-11+31",
@@ -103,11 +103,11 @@
           "visible": true
         },
         "arming": {
-          "x": 88,
-          "y": 205,
-          "w": 440,
-          "h": 300,
-          "visible": false
+          "x": 513,
+          "y": 180,
+          "w": 759,
+          "h": 495,
+          "visible": true
         },
         "fpv": {
           "x": 385,
@@ -119,13 +119,13 @@
       },
       "camera_angle": {
         "mode": "manual",
-        "tilt_deg": 0.0,
-        "pan_deg": 0.0
+        "tilt_deg": -14.0,
+        "pan_deg": 94.0
       }
     },
     "VideoLoad": {
       "geometry": "1536x793+-47+42",
-      "locked": true,
+      "locked": false,
       "panels": {
         "imu": {
           "x": 1185,
@@ -183,6 +183,11 @@
           "h": 546,
           "visible": true
         }
+      },
+      "camera_angle": {
+        "mode": "manual",
+        "tilt_deg": 0.0,
+        "pan_deg": 0.0
       }
     },
     "test 1": {

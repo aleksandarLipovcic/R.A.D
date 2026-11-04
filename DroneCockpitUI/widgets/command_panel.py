@@ -191,6 +191,7 @@ class CommandPanel(tk.Toplevel):
         self._push_move()
 
     def _push_move(self):
+        self.ctrl.ui_heartbeat()
         self.ctrl.set_move(self._held.get("fwd", 0), self._held.get("right", 0),
                            self._held.get("yaw", 0))
         self._paint_buttons()
@@ -285,6 +286,9 @@ class CommandPanel(tk.Toplevel):
 
     # ── refresh ────────────────────────────────────────────────────────────
     def _refresh(self):
+        # Heartbeat: if this Tk thread freezes, the controller stops honouring
+        # held movement keys after UI_TIMEOUT_S (see uplink_controller.py).
+        self.ctrl.ui_heartbeat()
         s = self.ctrl.get_status()
         state = s.get("state", "NO_BRIDGE")
         self.state_lbl.configure(text=f"{state}  RTT {s.get('rtt_ms', -1):.0f} ms",
@@ -322,7 +326,8 @@ class CommandPanel(tk.Toplevel):
         self.radio_lbl.configure(text=(
             "radio out  " + "  ".join(f"CH{i + 1} {v:.0f}" for i, v in enumerate(ch[:8]))
             if ch else "radio out  --") + f"\nLua period {s.get('script_period_ms', 0)} ms,"
-            f" frames {s.get('frames_sent', 0)}, write errors {s.get('write_errors', 0)}")
+            f" frames {s.get('frames_sent', 0)}, write errors {s.get('write_errors', 0)},"
+            f" laptop loop max {s.get('loop_max_ms', 0):.0f} ms")
         self._job = self.after(100, self._refresh)
 
     def close(self):

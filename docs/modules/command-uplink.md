@@ -1,103 +1,131 @@
-# Command uplink (laptop → drone)
+# Command uplink (laptop → drone) — design proposal
 
-> **Status: implemented (design A, Lua bridge), NOT yet tested on hardware.**
-> Verified off-hardware only: C++ unit tests (`DroneBackend/tests/test_uplink.cpp`),
-> `radcmd.lua` under Lua 5.2 with a mocked EdgeTX API cross-checked against
-> the C++ decoders (`DroneCockpitUI/tests/unit/test_lua_bridge.py`), and the Python controller
-> and altitude hold against a vertical model (`DroneCockpitUI/tests/unit/test_uplink_python.py`).
-> Setup, bench tests and flight procedure: [command-uplink-uputstvo.md](command-uplink-uputstvo.md) (Serbian).
+> **Status: not implemented.** This page records the requirements, the
+> candidate designs and the bench tests that decide between them. Build
+> it after the drone → laptop telemetry path has been verified on the real
+> hardware (see [crsflink.md](crsflink.md)).
 
 ## Requirements
 
-| # | Requirement | Status |
+| # | Requirement | Priority |
 |---|---|---|
-| R1 | Gimbal tilt from the laptop | implemented (CH8 / AUX4 → Betaflight servo 0) |
-| R2 | Emergency actions (RTH / land) from the laptop | **not implemented** — stays on the pilot's switches |
-| R3 | Movement: forward/back/left/right/yaw, altitude hold | implemented (stick offsets in ANGLE mode, laptop-side baro altitude hold) |
-| R4 | Pilot keeps final authority | radio-side gate switch, ADD mixing, bounded throttle delta |
-| R5 | Losing the laptop never affects flight | radio watchdog 500 ms, laptop lease 300 ms |
-| R6 | Telemetry keeps working | the Lua script re-encodes the same CRSF frames Telem Mirror produced |
+| R1 | Gimbal pan/tilt from the laptop (camera aiming for detection) | high |
+| R2 | Emergency actions from the laptop: trigger GPS Rescue (RTH), and a failsafe/land action | high |
+| R3 | Simple movement commands ("move forward/left/…", "hold") | later |
+| R4 | The pilot's RadioMaster Pocket keeps **final authority** at all times | mandatory |
+| R5 | Losing the laptop (crash, USB unplug, app hang) must never affect flight | mandatory |
+| R6 | Telemetry to the laptop (the existing `CrsfLink` path) keeps working | mandatory |
 
-## Data path
+## The constraint that shapes everything
+
+Today the Pocket's USB port runs in EdgeTX **USB-VCP = Telem Mirror**
+mode. It is **output-only**: EdgeTX copies received telemetry to the
+laptop and ignores anything the laptop writes. The laptop has no path to
+the drone at all. Any uplink design therefore changes how the laptop is
+connected to the Pocket, the drone, or both.
+
+All data to the drone has to travel over the ELRS link the Pocket already
+flies with. That link carries:
+
+- **RC channels** at the full packet rate. This is how stick and switch
+  positions reach Betaflight.
+- **Low-rate "MSP over CRSF"**: CRSF frame types `0x7A` MSP_REQ, `0x7B`
+  MSP_RESP and `0x7C` MSP_WRITE. Betaflight uses these for its TX Lua
+  scripts (PID and VTX settings from the radio). They are only a few
+  frames per second and not suitable for continuous control.
+
+## Candidate designs
+
+### A. EdgeTX Lua bridge on the Pocket → extra RC channels (recommended to test first)
 
 ```
-UplinkController (Python, 25 Hz) ─set_command()─► CommandLink (C++, no port)
-CrsfLink worker ─nextFrame()/WriteFile─► Pocket USB-VCP "LUA" ─► radcmd.lua
-radcmd.lua ─mixer outputs─► CH1–4 (ADD, gated) + CH8 gimbal ══ELRS══► Betaflight
-radcmd.lua ─CRSF telemetry + RC_CHANNELS 0x16 + RAD_STATUS 0x7E─► CrsfLink
+laptop ──USB-VCP (mode "LUA")──► Pocket Lua script ──► mixer outputs on AUX channels ══ELRS══► RP4TD ──► Betaflight
+                                        │
+                                        └──► telemetry back to the laptop (re-encoded by the script)
 ```
 
-- **One port owner.** `CrsfLink` keeps owning the Pocket's COM port (auto-detect,
-  auto-reconnect unchanged). A `CommandLink` attached with `set_uplink()` is
-  serviced from the same worker thread.
-- **Write only to a proven bridge.** `CommandLink::frameDue()` stays false until
-  a valid `RAD_STATUS` frame arrived within `bridgeTimeoutMs` (1.5 s). A port in
-  Telem Mirror mode, a CLI or a flight controller is never written to.
-- **Telemetry unchanged.** `CrsfStateMapper` ignores the two new frame types
-  (default branch); `TelemetryWorker` and all widgets work as before.
+- Set the Pocket's USB-VCP to the Lua serial mode. A Lua script reads
+  command packets from the laptop (`serialRead`), and a mixer script
+  outputs them as **mix sources**. EdgeTX mixes put those on free AUX
+  channels: gimbal pan/tilt, and a "laptop requests RTH" channel.
+- Betaflight then treats them like any other switch or channel:
+  - **Gimbal:** AUX channel → the flight controller's servo outputs M5
+    and M6, which drive the gimbal's two MG90S servos.
+  - **RTH:** an AUX range in the Modes tab mapped to GPS RESCUE.
+- **Authority (R4):** in the EdgeTX mixer, the laptop's channels are only
+  used while a Pocket switch ("LAPTOP CTRL") is on, and the pilot's
+  switches override them. Turning the switch off returns full control
+  instantly, on the radio, without any software involved.
+- **Watchdog (R5):** the Lua script falls back to neutral (gimbal centre,
+  RTH request off) if no packet has arrived for ~500 ms.
+- **Cost:** the VCP can run one mode at a time. Leaving Telem Mirror means
+  the script must also send telemetry to the laptop, and `CrsfLink` then
+  needs to accept that stream as a second input format.
 
-## Command frame (laptop → Pocket)
+**Unknowns (bench tests):** UT-UPL-A1 through A4 below. They cover whether
+serial Lua is available in mixer scripts on the Pocket's EdgeTX version,
+the script cycle time, and how much telemetry a Lua script can read and
+forward.
 
-Standard CRSF `RC_CHANNELS_PACKED` (0x16, address 0xC8, CRC-8/DVB-S2), so the
-same bytes also fit EdgeTX's proposed "CRSF Trainer over USB-VCP" mode.
+### B. MSP over CRSF for one-shot commands
 
-| Channel | Meaning |
-|---|---|
-| 1 / 2 / 4 | roll / pitch / yaw **offset** (−100…100 %) |
-| 3 | throttle target, absolute µs |
-| 5 | gimbal tilt (−100…100 %) |
-| 6 / 7 | sticks enable / throttle enable (1811 on, 172 off) |
-| 8 | alive counter, changes every frame (a frozen sender is not "fresh") |
+The Lua script (or a future EdgeTX feature) sends `MSP_WRITE` frames
+through the Pocket's ELRS module to Betaflight.
 
-## RAD_STATUS (0x7E, Pocket → laptop, USB only, never over RF)
+- Good for **rare, discrete** commands, such as changing a setting or
+  selecting a PID profile.
+- Not suitable for continuous gimbal or movement control: the rate is too
+  low and delivery isn't guaranteed.
+- Betaflight's **MSP override** (`msp_override_channels_mask` plus the
+  MSP OVERRIDE mode on a switch) lets `MSP_SET_RAW_RC` replace selected
+  channels while the pilot holds that switch. In principle this is a path
+  for R3 (movement), still under the pilot's switch. It needs a bench test
+  with Betaflight 4.5 on the F405 (UT-UPL-B1).
 
-22 bytes, big-endian: version, flags (fresh, gate, sticks active, throttle
-active, telemetry live), echoed alive value (round-trip time), command frames
-received, CRC errors, command age, pilot throttle stick, applied throttle
-delta, script period, applied roll/pitch/yaw/tilt outputs.
+### C. Separate link for the gimbal
 
-## Safety model
+Drive the gimbal servos from their own link, for example a second
+receiver channel instead of the flight controller's M5/M6 outputs. This keeps the flight link untouched, but adds hardware. It's only
+worth doing if A can't provide the gimbal channels.
 
-| Layer | Where | Rule |
-|---|---|---|
-| Gate switch | radio (Lua + logical switch L01) | Pilot switch off → roll/pitch/yaw/throttle outputs 0 |
-| Watchdog | radio | No new alive counter for 500 ms → neutral, gimbal holds |
-| Authority | radio mixer | Laptop offsets are ADDed to the pilot's sticks |
-| Throttle | radio | Delta to the pilot's stick, ±THR_BAND (≈100 µs), only with stick > ≈1200 µs |
-| Limits | laptop | roll/pitch ≤ 25 %, yaw ≤ 30 %, throttle 1150–1750 µs, slew-limited |
-| Lease | laptop | Command older than 300 ms → sticks/throttle disabled |
-| Flight state | laptop | Commands only when ELRS telemetry is live, armed, ANGLE (bench override: `COCKPIT_UPLINK_BENCH=1`) |
-| Log | laptop | Every command change → `logs/uplink_*.csv` |
+## Safety rules (apply to any design)
 
-**Change to the original rule "never command throttle":** replaced by the
-bounded delta above. The laptop can only move throttle within ±100 µs of
-where the pilot holds the stick; releasing the gate returns throttle to the
-stick with a jump of at most that band. Altitude hold engages bumplessly
-from the throttle the radio is transmitting (RC_CHANNELS echo).
+1. **Never command throttle** from the laptop. Movement (R3) goes through
+   Betaflight flight modes and small attitude offsets, never raw stick
+   injection with throttle.
+2. **Emergency = Betaflight's own modes.** RTH means GPS RESCUE and "land"
+   means the configured failsafe. The laptop only *requests* them, and the
+   requests use the same Modes-tab switches the pilot has.
+3. **Pilot switch gates everything.** With the switch off, laptop input is
+   ignored in the radio itself, not in the laptop software.
+4. **Watchdog to neutral** within ≤ 500 ms of lost laptop packets.
+5. **Visible state.** The cockpit shows whether laptop control is
+   enabled, which is only known from telemetry (for example, the flight
+   mode), and it logs every command sent.
+6. **Rate-limit and range-check** every command before it leaves the
+   laptop.
 
-Arming, flight modes, failsafe and GPS Rescue are never touched by the
-laptop.
+## Proposed software shape (once a design is chosen)
 
-## Bench tests
+- **`CommandLink` (C++, next to `CrsfLink`)** owns the VCP when it is in
+  Lua mode. It sends framed command packets (sequence number, command id,
+  value, CRC) at a fixed rate and receives the telemetry stream for
+  `CrsfLink`'s parser, so there is one port owner and two logical
+  directions.
+- **Python API:** `set_gimbal(pan_deg, tilt_deg)`, `request_rth()`,
+  `cancel_request()`, `heartbeat()`. Every command is state ("what the
+  laptop wants now"), resent periodically, never a one-shot, so a lost
+  packet heals on its own.
+- **UI:** a "Laptop control" panel. It is disabled on the USB cable link
+  and while the pilot switch is off. RTH is a two-step confirm button.
+
+## Bench tests that decide the design
 
 | Test | Question | Pass criterion |
 |---|---|---|
-| UT-UPL-A1 | Bridge runs: serial in/out from a mix script, binary with zero bytes | `RAD_STATUS` arrives, telemetry CRC errors 0 |
-| UT-UPL-A2 | Offsets reach Betaflight only with the gate on | Receiver tab follows `--sweep` only with the switch on |
-| UT-UPL-A3 | Latency laptop → Betaflight channel | median < 100 ms (`uplink_bench.py --latency`) |
-| UT-UPL-A4 | Telemetry from re-encoded sensors | attitude ≥ 5 Hz, GPS/battery ≥ 1 Hz, units match USB |
-| UT-UPL-A5 | Gimbal | follows `--tilt`, also with the gate off |
-| UT-UPL-S1..S3 | Gate off / USB unplugged / app killed mid-sweep | channels back to the sticks within 500 ms |
-| UT-UPL-S4 | Script CPU budget | no "Script killed" in 10 min |
-| ALT-1..3, MOV-1 | Rod rig: bumpless engage, step response, battery sag, movement | see command-uplink-uputstvo.md §6 |
-
-UT-UPL-B1 (MSP override over CRSF) is no longer needed for R3.
-
-## Not done / next
-
-- R2 (RTH/land request from the laptop): would be one more Lua output on a
-  free AUX channel mapped in the Modes tab, behind a two-step confirm.
-- Position hold: needs a laptop GPS position loop on top of the movement
-  offsets (drift with wind is not corrected today).
-- If EdgeTX ships CRSF Trainer over USB-VCP with telemetry back on the same
-  port, the laptop side stays the same and only the radio mixing changes.
+| UT-UPL-A1 | Does the Pocket's EdgeTX expose a Lua serial mode on USB-VCP, and can a script read laptop bytes? | Echo test: laptop → script → laptop |
+| UT-UPL-A2 | Can a mixer script output values used as mix sources on AUX channels? | AUX value visible in Betaflight Receiver tab |
+| UT-UPL-A3 | End-to-end latency, laptop command → Betaflight channel | < 100 ms |
+| UT-UPL-A4 | Can the script forward the telemetry `CrsfLink` needs (attitude, GPS, battery, mode, LQ) at usable rates? | Attitude ≥ 5 Hz, GPS/battery ≥ 1 Hz |
+| UT-UPL-B1 | Does MSP override work over CRSF on the F405 with Betaflight 4.5? | Overridden AUX follows `MSP_SET_RAW_RC` only while the switch is on |
+| UT-UPL-S1 | Pilot switch off, or laptop unplugged mid-command | Channels back to pilot/neutral within 500 ms |

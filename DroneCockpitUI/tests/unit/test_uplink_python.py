@@ -158,6 +158,7 @@ def make():
 
 def test_controller():
     c, cmd, radio = make()
+    c.ui_heartbeat(0.0)
     c._tick(0.04, 0.0)
     check(not cmd.sent and cmd.tilt == 0.0, "disabled: only gimbal, no command")
     check("laptop control off" in c.get_status()["blockers"], "blocker listed")
@@ -165,22 +166,26 @@ def test_controller():
     c.set_enabled(True)
     c.set_speed(10)
     c.set_move(1, -1, 0)
+    c.ui_heartbeat(0.04)
     c._tick(0.04, 0.04)
     cv = cmd.sent[-1]
     check(cv.sticks_enabled and cv.pitch_pct == 10 and cv.roll_pct == -10, "forward-left 10 %")
 
     radio.s.flight_mode_name = "HORIZON"
+    c.ui_heartbeat(0.08)
     c._tick(0.04, 0.08)
     cv = cmd.sent[-1]
     check(not cv.sticks_enabled and cv.pitch_pct == 0, "not ANGLE -> neutral")
     radio.s.flight_mode_name = "ANGLE"
 
     radio.s.armed = False
+    c.ui_heartbeat(0.12)
     c._tick(0.04, 0.12)
     check(not cmd.sent[-1].sticks_enabled, "disarmed -> neutral")
     radio.s.armed = True
 
     radio.s.radio.status_str = "TELEMETRY_LOST"
+    c.ui_heartbeat(0.16)
     c._tick(0.04, 0.16)
     check(not cmd.sent[-1].sticks_enabled, "telemetry lost -> neutral")
     radio.s.radio.status_str = "TELEMETRY_OK"
@@ -188,17 +193,20 @@ def test_controller():
     # altitude hold: bumpless engage from the radio's CH3
     c.stop_move()
     c.request_altitude_hold(True)
+    c.ui_heartbeat(0.20)
     c._tick(0.04, 0.20)
     cv = cmd.sent[-1]
     check(c.hold.engaged and cv.throttle_enabled, "hold engaged")
     check(abs(cv.throttle_us - 1470.0) < 1.0, f"bumpless: starts at radio CH3 ({cv.throttle_us})")
     c.nudge_altitude(1.0)
     for i in range(10):
+        c.ui_heartbeat(0.24 + i * 0.04)
         c._tick(0.04, 0.24 + i * 0.04)
     check(cmd.sent[-1].throttle_us > 1470.0, "climb request raises throttle")
 
     # pilot switch off -> hold dropped
     cmd.gate = False
+    c.ui_heartbeat(1.0)
     c._tick(0.04, 1.0)
     check(not c.hold.engaged and not cmd.sent[-1].throttle_enabled, "gate off drops the hold")
     check("pilot switch" in c.get_status()["hold_reason"], "reason shown")
@@ -207,6 +215,7 @@ def test_controller():
     # hold refused without baro
     radio.s.baro_valid = False
     c.request_altitude_hold(True)
+    c.ui_heartbeat(1.04)
     c._tick(0.04, 1.04)
     check(not c.hold.engaged and c.get_status()["hold_reason"] == "no baro altitude",
           "no baro -> no hold")
@@ -214,11 +223,14 @@ def test_controller():
 
     # baro lost while holding -> dropped after 1.5 s
     c.request_altitude_hold(True)
+    c.ui_heartbeat(2.0)
     c._tick(0.04, 2.0)
     check(c.hold.engaged, "hold engaged again")
     radio.s.radio.baro_age_ms = 5000
+    c.ui_heartbeat(2.04)
     c._tick(0.04, 2.04)
     check(c.hold.engaged, "still holding right after baro loss")
+    c.ui_heartbeat(3.7)
     c._tick(0.04, 3.7)
     check(not c.hold.engaged, "hold dropped after baro loss")
     radio.s.radio.baro_age_ms = 100
@@ -234,13 +246,74 @@ def test_controller():
     radiob.s.flight_mode_name = "ACRO"
     cb.set_enabled(True)
     cb.set_move(1, 0, 0)
+    cb.ui_heartbeat(0.0)
     cb._tick(0.04, 0.0)
     check(cmdb.sent[-1].sticks_enabled, "bench mode")
     _assert_clean()
 
 
+def test_ui_freeze_stops_movement():
+    """Tk thread freezes while W is held: movement must stop within
+    UI_TIMEOUT_S, altitude hold must keep regulating."""
+    from workers.uplink_controller import UI_TIMEOUT_S
+    c, cmd, radio = make()
+    c.set_enabled(True)
+    c.set_speed(20)
+    c.request_altitude_hold(True)
+    c.set_move(1, 0, 0)                      # W held
+    t = 0.0
+    c.ui_heartbeat(t)
+    c._tick(0.04, t)
+    check(cmd.sent[-1].pitch_pct == 20 and c.hold.engaged, "moving forward, hold on")
+    check(c.get_status()["ui_alive"], "ui alive")
+    # UI frozen from here on: no more heartbeats, the key is still "held"
+    while t < UI_TIMEOUT_S - 0.05:
+        t += 0.04
+        c._tick(0.04, t)
+    check(cmd.sent[-1].pitch_pct == 20, "short hiccup (< timeout) tolerated")
+    t = UI_TIMEOUT_S + 0.01
+    c._tick(0.04, t)
+    cv = cmd.sent[-1]
+    check(cv.pitch_pct == 0 and cv.roll_pct == 0 and cv.yaw_pct == 0, "frozen UI -> neutral sticks")
+    check(c.hold.engaged and cv.throttle_enabled, "altitude hold keeps running")
+    check(not c.get_status()["ui_alive"], "status shows ui stalled")
+    # UI recovers -> held key works again (no stale latch)
+    c.ui_heartbeat(t + 0.04)
+    c._tick(0.04, t + 0.04)
+    check(cmd.sent[-1].pitch_pct == 20, "UI back -> movement resumes")
+    _assert_clean()
+
+
+def test_controller_thread_never_blocks_on_ui():
+    """Real 25 Hz thread against a 'UI' that hammers set_move/get_status:
+    every tick must finish quickly and the loop period must hold."""
+    import threading, time as _t
+    c, cmd, radio = make()
+    c.set_enabled(True)
+    stop = threading.Event()
+
+    def ui():
+        i = 0
+        while not stop.is_set():
+            c.ui_heartbeat()
+            c.set_move((i % 3) - 1, 0, 0)
+            c.get_status()
+            i += 1
+    th = threading.Thread(target=ui, daemon=True)
+    th.start()
+    c.start()
+    _t.sleep(1.0)
+    stop.set()
+    th.join(1.0)
+    c.stop()
+    n = len(cmd.sent)
+    check(18 <= n <= 30, f"~25 commands in 1 s under UI load ({n})")
+    _assert_clean()
+
+
 if __name__ == "__main__":
-    for fn in (test_altitude_hold, test_controller):
+    for fn in (test_altitude_hold, test_controller, test_ui_freeze_stops_movement,
+               test_controller_thread_never_blocks_on_ui):
         try:
             fn()
         except AssertionError:

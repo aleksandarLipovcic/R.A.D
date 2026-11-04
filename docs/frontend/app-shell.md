@@ -132,7 +132,7 @@ Toolbar actions built in `_setup_ui()`:
 | 🗂 Layouts ▾ | Opens `LayoutManagerDialog` |
 | 🧩 Panels ▾ | Per-panel show/hide checkboxes |
 | 🎯 Detections | Opens the detection/map window |
-| 📐 Camera Angle | Manual (or future SimpleBGC-auto) camera mount angle, used for detection georeferencing, persisted with the active layout |
+| 📐 Camera Angle | Manual (or future gimbal-auto) camera mount angle, used for detection georeferencing, persisted with the active layout |
 | ↺ Revert to Saved | Discards unsaved panel-position changes |
 | 🏭 Factory Default | Resets all panels to built-in default positions (does not touch any saved profile) |
 | 🔓 Save & Lock Layout | Saves the current layout and disables drag/resize |
@@ -155,8 +155,8 @@ and merging them breaks the OSD:
 | Wired to | `DetectionLink.set_telemetry_provider()` | `VideoLink.set_telemetry_provider()` |
 | Called from | `DetectionLink`'s own C++ inference thread, once per pass | `VideoLink`'s own C++ capture/paint thread, once per painted frame |
 | `valid` means | GPS fix usable (`gps.position_usable`) — no fix ⇒ skip georeferencing | FC link is up at all — altitude/horizon/compass need no GPS fix |
-| `altitude_m` source | **barometer** (`state.baro_altitude_cm`): height above the take-off point, which ground-plane ranging needs. `gps.altitude_m` is above sea level and pushed every pin several times too far out | **barometer** (`state.baro_altitude_cm`, converted) — keeps the OSD altitude in agreement with `BaroWidget` instead of silently depending on GPS |
-| `gimbal_pan/tilt_deg` | `_get_camera_mount_angle()` — a manual, toolbar-editable stand-in; the SimpleBGC gimbal is physically installed but not electrically wired yet, so there's no live readback to use | not read by the OSD |
+| `altitude_m` source | `gps.altitude_m` | **barometer** (`state.baro_altitude_cm`, converted) — keeps the OSD altitude in agreement with `BaroWidget` instead of silently depending on GPS |
+| `gimbal_pan/tilt_deg` | `_get_camera_mount_angle()` — a manual, toolbar-editable stand-in; the servo gimbal (2× MG90S on flight controller outputs M5/M6) is physically installed but not wired up yet, so there's no gimbal angle to use | not read by the OSD |
 
 Both are safe to call from a non-Tk thread: `get_active_state()` only
 takes mutex-protected snapshot copies from `DroneLink` / `CrsfLink` (see

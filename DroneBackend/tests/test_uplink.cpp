@@ -4,7 +4,8 @@
 // Build (any OS, no Win32), from DroneBackend/tests:
 //   g++ -std=c++17 -Wall -Wextra -I../src/radio test_uplink.cpp
 //       ../src/radio/UplinkProtocol.cpp ../src/radio/CommandLink.cpp
-//       ../src/radio/CrsfProtocol.cpp -o test_uplink
+//       ../src/radio/CrsfProtocol.cpp -o test_uplink -pthread
+//   Race check (Linux/WSL): add -fsanitize=thread -g
 //   (MSVC: cl /std:c++17 /EHsc /I..\src\radio test_uplink.cpp
 //          ..\src\radio\UplinkProtocol.cpp ..\src\radio\CommandLink.cpp
 //          ..\src\radio\CrsfProtocol.cpp)
@@ -21,6 +22,9 @@
 #include <fstream>
 #include <iterator>
 #include <random>
+#include <atomic>
+#include <chrono>
+#include <thread>
 
 static int g_fail = 0, g_pass = 0;
 #define CHECK(cond) do { if (cond) ++g_pass; else { ++g_fail; \
@@ -280,11 +284,110 @@ static int cmdDecode(const char* path) {
     return 0;
 }
 
+// -----------------------------------------------------------------------------
+// Concurrency: the cockpit calls CommandLink from three threads at once
+// (UplinkController 25 Hz, Tk status 10 Hz, CrsfLink worker ~33 Hz + every
+// received frame). Run them for real, faster than in the app, and check that
+//   - no call ever waits noticeably (all locks are short, none nested),
+//   - every frame on the wire is valid and inside the limits,
+//   - when the commanding thread stops, the lease drops to neutral in time.
+// Build with -fsanitize=thread to also prove there are no data races.
+// -----------------------------------------------------------------------------
+static void testConcurrency() {
+    using clk = std::chrono::steady_clock;
+    CommandLink cl;
+    std::atomic<bool> stopCmd{false}, stopAll{false};
+    std::atomic<int64_t> worstUs{0};
+    auto timed = [&](auto&& fn) {
+        const auto a = clk::now();
+        fn();
+        const int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(clk::now() - a).count();
+        int64_t prev = worstUs.load();
+        while (us > prev && !worstUs.compare_exchange_weak(prev, us)) {}
+    };
+
+    cl.onFrame(statusFrame(0x01, 1500), CommandLink::nowMs());
+    cl.setEnabled(true);
+
+    std::atomic<int> badFrames{0}, outOfLimits{0}, frames{0};
+    std::thread worker([&] {                       // CrsfLink worker
+        while (!stopAll) {
+            const int64_t now = CommandLink::nowMs();
+            timed([&] { cl.onFrame(statusFrame(0x01, 1500), now); });
+            bool due = false;
+            timed([&] { due = cl.frameDue(now); });
+            if (due) {
+                std::vector<uint8_t> f;
+                timed([&] { f = cl.nextFrame(now); });
+                if (!f.empty()) {
+                    ++frames;
+                    if (parseAll(f).size() != 1) ++badFrames;
+                    const auto v = sentOf(f);
+                    if (std::fabs(v.rollPct) > 25.3f || std::fabs(v.pitchPct) > 25.3f ||
+                        std::fabs(v.yawPct) > 30.3f ||
+                        (v.throttleEnabled && (v.throttleUs < 1149 || v.throttleUs > 1751)))
+                        ++outOfLimits;
+                    timed([&] { cl.onWriteResult(true); });
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    });
+    std::thread commander([&] {                    // UplinkController (fast)
+        std::mt19937 rng(7);
+        std::uniform_real_distribution<float> u(-100.f, 100.f);
+        int i = 0;
+        while (!stopCmd) {
+            Uplink::CommandValues c;
+            c.sticksEnabled = true; c.throttleEnabled = (i / 50) % 2 == 0;
+            c.rollPct = u(rng); c.pitchPct = u(rng); c.yawPct = u(rng);
+            c.throttleUs = 1450.f + u(rng) * 5.f;  // also out of range on purpose
+            c.gimbalTiltPct = u(rng);
+            timed([&] { cl.setCommand(c); });
+            if (i % 97 == 0) timed([&] { cl.neutral(); });
+            ++i;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    });
+    std::thread ui([&] {                           // Tk status + gimbal slider
+        int i = 0;
+        while (!stopAll) {
+            timed([&] { (void)cl.getStatus(); });
+            if (i++ % 10 == 0) timed([&] { cl.setGimbalTiltPct(static_cast<float>(i % 100)); });
+            std::this_thread::sleep_for(std::chrono::milliseconds(3));
+        }
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    stopCmd = true;                                // controller thread "hangs"
+    commander.join();
+    const int64_t stoppedAt = CommandLink::nowMs();
+    bool neutralSeen = false;
+    while (CommandLink::nowMs() - stoppedAt < 1000) {
+        if (!cl.getStatus().leaseValid) { neutralSeen = true; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const int64_t dropMs = CommandLink::nowMs() - stoppedAt;
+    stopAll = true;
+    worker.join();
+    ui.join();
+
+    std::printf("  concurrency: %d frames, worst call %lld us, lease dropped after %lld ms\n",
+                frames.load(), static_cast<long long>(worstUs.load()),
+                static_cast<long long>(dropMs));
+    CHECK(frames > 20);
+    CHECK(badFrames == 0);
+    CHECK(outOfLimits == 0);
+    CHECK(neutralSeen && dropMs <= 300 + 50);
+    CHECK(worstUs < 20000);                        // generous: CI/sanitizer scheduling
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "encode") == 0) return cmdEncode(argv[2]);
     if (argc == 3 && std::strcmp(argv[1], "decode") == 0) return cmdDecode(argv[2]);
     testProtocol();
     testCommandLink();
+    testConcurrency();
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

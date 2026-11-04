@@ -25,10 +25,30 @@ Set COCKPIT_UPLINK_BENCH=1 to drop the armed/ANGLE gates for bench tests
 with the propellers OFF -- the panel shows a red BENCH label.
 
 Every command change is written to logs/uplink_<date>.csv.
+
+Threads and real time (nothing here can stall video or telemetry)
+-----------------------------------------------------------------
+  Tk thread           CommandPanel: key/button events, 10 Hz status display.
+                      Only sets intents under a short lock; never waits.
+  UplinkController    this thread, 25 Hz: reads telemetry snapshots, runs
+                      AltitudeHold, calls CommandLink.set_command(). Never
+                      touches Tk, never blocks on I/O except a buffered log.
+  CrsfLink worker     C++, owns the Pocket's COM port: reads telemetry,
+                      writes command frames. Needs no GIL.
+  VideoLink, DetectionLink, TelemetryWorker run on their own threads and
+  share nothing with this path except mutex-protected snapshots.
+
+Each thread is guarded against the one before it stalling:
+  * Tk thread frozen (heavy redraw, dialog): the panel's heartbeat stops,
+    movement intents expire after UI_TIMEOUT_S -> sticks to neutral, even
+    if a key was held when it froze. Altitude hold keeps regulating.
+  * this thread stalled: CommandLink's lease (300 ms) -> neutral.
+  * CrsfLink worker or the USB link stalled: radcmd.lua watchdog (500 ms).
 """
 
 import csv
 import os
+import collections
 import threading
 import time
 from typing import Optional
@@ -39,6 +59,8 @@ UPLINK_HZ = 25
 RADIO_LIVE = ("TELEMETRY_OK", "DEGRADED")
 BENCH_MODE = os.environ.get("COCKPIT_UPLINK_BENCH", "0") == "1"
 ALT_HOLD_DROP_STALE_S = 1.5        # baro missing this long -> hold dropped
+UI_TIMEOUT_S = 0.5                 # no panel heartbeat this long -> movement neutral
+LOG_FLUSH_S = 1.0                  # command log is flushed at most this often
 THROTTLE_CH = 2                     # CH3 (0-based) in the radio channel echo
 
 # DroneCockpitUI/logs (this file lives in DroneCockpitUI/workers/)
@@ -63,6 +85,9 @@ class UplinkController:
         self._yaw_pct = 15.0
         self._tilt_pct = 0.0
         self._hold_requested = False
+        self._ui_beat = float("-inf")                  # last CommandPanel heartbeat
+        self._last_flush = 0.0
+        self._gaps = collections.deque()             # (t, dt) of the last 2 s
 
         self.hold = AltitudeHold(hold_cfg)
         self._stale_since: Optional[float] = None
@@ -110,6 +135,12 @@ class UplinkController:
         with self._lock:
             self._fwd, self._right, self._yaw = clamp(forward), clamp(right), clamp(yaw)
 
+    def ui_heartbeat(self, t: Optional[float] = None) -> None:
+        """Called by the Tk thread (panel refresh + every key event). Movement
+        intents are only honoured while these keep coming, so a frozen UI
+        can never leave a held key driving the drone."""
+        self._ui_beat = time.monotonic() if t is None else t
+
     def stop_move(self) -> None:
         self.set_move(0, 0, 0)
 
@@ -143,6 +174,9 @@ class UplinkController:
             now = time.monotonic()
             dt = now - last
             last = now
+            self._gaps.append((now, dt))
+            while self._gaps and now - self._gaps[0][0] > 2.0:
+                self._gaps.popleft()
             try:
                 self._tick(dt, now)
             except Exception as exc:            # never let the loop die silently
@@ -163,6 +197,12 @@ class UplinkController:
             fwd, right, yaw = self._fwd, self._right, self._yaw
             speed, yaw_speed, tilt = self._speed_pct, self._yaw_pct, self._tilt_pct
             hold_req = self._hold_requested
+        # UI heartbeat: a frozen Tk thread must not leave a held key driving
+        # the drone. Only movement is cancelled; altitude hold and gimbal keep
+        # running, they don't depend on a key being held.
+        ui_alive = (now - self._ui_beat) <= UI_TIMEOUT_S
+        if not ui_alive:
+            fwd = right = yaw = 0.0
 
         st = self._cmd.get_status()
         rs = self._radio.get_latest_state() if self._radio is not None else None
@@ -248,6 +288,10 @@ class UplinkController:
 
         self._status = {
             "enabled": enabled,
+            "ui_alive": ui_alive,
+            # loop timing over the last 2 s (25 Hz -> 40 ms); the lease is
+            # 300 ms, so anything well below that is harmless
+            "loop_max_ms": max((g for _, g in list(self._gaps)), default=0.0) * 1000.0,
             "bench": self.bench,
             "state": st.state,
             "blockers": blockers,
@@ -304,7 +348,9 @@ class UplinkController:
             s = self._status
             self._log.writerow([time.strftime("%H:%M:%S") + f".{int(now * 1000) % 1000:03d}",
                                 *row, s.get("altitude_m"), round(self.hold.target_m, 2)])
-            self._log_file.flush()
+            if now - self._last_flush >= LOG_FLUSH_S:   # disk I/O at most 1 Hz
+                self._log_file.flush()
+                self._last_flush = now
         except OSError:
             pass                               # logging must never stop control
         self._last_logged = row
