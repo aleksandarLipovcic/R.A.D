@@ -173,7 +173,7 @@ getters — `is_connected()`, `get_measured_fps()`, `get_device_name()` — at
 **Consumed by:** `DetectionMapWidget` (via `DroneCockpitApp._pump_detection_records()`)
 
 ```
-DetectionWorker(detection_link, poll_hz=4)
+DetectionWorker(detection_link, poll_hz=4, report_writer=None)
   .start() / .stop()
   .get_status() -> (detection_count, last_pass_duration_ms, last_pass_timestamp_ms)
   .get_new_records() -> list[DetectionRecord]   # returns and clears
@@ -197,6 +197,12 @@ record already delivered is never re-fetched. This worker never touches
 frames, never triggers inference, and never writes to disk — everything it
 reads is a small struct copy DetectionLink already produced on its own C++
 threads (see [../modules/detectionlink.md](../modules/detectionlink.md)).
+
+If a `report_writer` (`DetectionReportWriter`) is given, every new batch is
+also handed to it with `submit()` — a deque append; the collage, JSON and
+CSV are written on the writer's own thread (see
+[detection-reports.md](detection-reports.md)). This happens whether or not
+the Detections window is open.
 
 The frame index (`get_frame_index_since(self._last_frame_ms)`, newer
 builds only) is pulled the same incremental way and converted to plain

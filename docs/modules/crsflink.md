@@ -21,10 +21,13 @@ Betaflight ──CRSF telemetry──► RP4TD (ELRS RX) ══ELRS 2.4 GHz═�
 ```
 
 EdgeTX copies every telemetry frame it receives from the ELRS module to its
-USB virtual COM port unchanged. That port is output-only, so
-**`CrsfLink` only listens.** Nothing is ever written to the Pocket's port,
-and nothing can reach the drone this way. Sending commands to the drone is a
-separate design proposal: [command-uplink.md](command-uplink.md).
+USB virtual COM port unchanged. In "Telem Mirror" mode that port is
+output-only and `CrsfLink` only listens. In "LUA" mode `radcmd.lua`
+re-encodes the same telemetry frames and also accepts commands; a
+`CommandLink` attached with `set_uplink()` is then serviced from this
+worker (`serviceUplink()`), and nothing is written until the bridge's
+`RAD_STATUS` frame has been seen on the port. See
+[command-uplink.md](command-uplink.md).
 
 It is built the same way as `DroneLink`: it owns its own worker thread and
 its own lifecycle, and it publishes a thread-safe `DroneState` snapshot.

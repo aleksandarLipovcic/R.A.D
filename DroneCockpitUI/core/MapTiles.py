@@ -122,28 +122,46 @@ class TileCache:
         threading.Thread(target=self._download, args=key, daemon=True).start()
 
     def _download(self, provider, z, x, y):
-        cfg = PROVIDERS[provider]
-        url = cfg["url_template"].format(z=z, x=x, y=y)
-        dest = self.tile_path(provider, z, x, y)
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                data = resp.read()
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            # Write to a temp file and rename into place so a half-written
-            # tile (killed app, dropped connection mid-write) never gets
-            # read back as "cached" by get_cached()'s os.path.exists check.
-            tmp = dest + ".part"
-            with open(tmp, "wb") as f:
-                f.write(data)
-            os.replace(tmp, dest)
-            self.ready_queue.put((provider, z, x, y))
-        except Exception:
             # Offline, rate-limited, tile doesn't exist at this z/x/y, etc.
-            # Fail quiet -- the widget keeps showing its flat-color
-            # placeholder for this cell and will naturally retry the next
-            # time this tile is needed (e.g. pan/zoom, or app restart).
-            pass
+            # all come back False. Fail quiet -- the widget keeps showing
+            # its flat-color placeholder for this cell and will naturally
+            # retry the next time this tile is needed (e.g. pan/zoom, or
+            # app restart).
+            if download_tile(provider, z, x, y):
+                self.ready_queue.put((provider, z, x, y))
         finally:
             with self._pending_lock:
                 self._pending.discard((provider, z, x, y))
+
+
+def download_tile(provider, z, x, y, timeout=6.0):
+    """
+    Blocking download of one tile into the shared on-disk cache. Returns
+    True if the tile is now on disk, False on any failure (never raises).
+
+    Used by TileCache's background threads and, directly, by
+    detection_report.py's writer thread -- which builds detection collages
+    off the Tk thread and simply waits for the few tiles it needs instead
+    of polling ready_queue.
+    """
+    cfg = PROVIDERS[provider]
+    url = cfg["url_template"].format(z=z, x=x, y=y)
+    dest = TileCache.tile_path(provider, z, x, y)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        # Write to a temp file and rename into place so a half-written
+        # tile (killed app, dropped connection mid-write) never gets
+        # read back as "cached" by get_cached()'s os.path.exists check.
+        # Thread id in the temp name: TileCache and the report writer may
+        # fetch the same tile at the same moment.
+        tmp = f"{dest}.{threading.get_ident()}.part"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, dest)
+        return True
+    except Exception:
+        return False

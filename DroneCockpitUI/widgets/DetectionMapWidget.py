@@ -50,7 +50,10 @@ shows each object (track_id) once and updates that row in place: class,
 BEST confidence, number of sightings, last-seen time, fused position and
 its uncertainty radius ("± m"). Selecting the row shows the screenshot
 of the most confident sighting. The map draws the fused position with a
-circle of that radius -- the area to send a search team to.
+circle of that radius -- the area to send a search team to. "Open report"
+opens that sighting's report collage (frame + satellite map + position,
+time and confidence, written by core/detection_report.py) -- the
+permanent, self-contained copy that outlives this window.
 
 Records are grouped by track_id (see DetectionLink's tracker): only the
 newest sighting of a given track is drawn as the bright "current" pin;
@@ -112,12 +115,16 @@ flat placeholder if not).
 """
 
 import math
+import os
 import queue
+import subprocess
+import sys
 import time
 import tkinter as tk
 from tkinter import ttk
 
 from core import MapTiles
+from core import detection_report
 
 try:
     from PIL import Image, ImageTk
@@ -500,6 +507,18 @@ class DetectionMapWidget(tk.Toplevel):
             fg="#000000", bg="#00e0ff", relief="flat", padx=6,
         )
         self._back_to_live_btn_visible = False
+
+        # Opens the selected object's report collage (camera frame +
+        # satellite map + coordinates, see core/detection_report.py) in the
+        # system image viewer. Only packed while a saved frame is shown and
+        # the app has told us where reports live (set_report_dir).
+        self._open_report_btn = tk.Button(
+            live_row, text="Open report", command=self._open_report,
+            fg="#000000", bg="#ffaa00", relief="flat", padx=6,
+        )
+        self._open_report_btn_visible = False
+        self._report_dir = None
+        self._report_rec = None     # record whose report the button opens
 
         self._preview_label = tk.Label(preview_frame, bg="#000000")
         self._preview_label.pack(fill="both", expand=True, padx=8, pady=8)
@@ -1380,6 +1399,10 @@ class DetectionMapWidget(tk.Toplevel):
                                      f"best sighting #{best.id})")
         self._preview_status_lbl.config(fg="#ffaa00")
         self._show_back_to_live_button()
+        self._report_rec = best
+        if self._report_dir and not self._open_report_btn_visible:
+            self._open_report_btn.pack(side="right", padx=(0, 4))
+            self._open_report_btn_visible = True
         self._load_preview(best.screenshot_path)
         self._redraw_map()  # re-highlight this object's pin on the map
 
@@ -1394,6 +1417,10 @@ class DetectionMapWidget(tk.Toplevel):
         if self._tree.selection():
             self._tree.selection_remove(self._tree.selection())
         self._hide_back_to_live_button()
+        self._report_rec = None
+        if self._open_report_btn_visible:
+            self._open_report_btn.pack_forget()
+            self._open_report_btn_visible = False
 
         if self._live_enabled.get():
             self._preview_status_var.set("●  LIVE")
@@ -1411,6 +1438,33 @@ class DetectionMapWidget(tk.Toplevel):
 
         self._detail_lbl.config(text="Live feed -- click a detection for its saved screenshot")
         self._redraw_map()  # clear the track highlight tied to the deselected row
+
+    def set_report_dir(self, report_dir: str) -> None:
+        """Where DetectionReportWriter puts the collages; enables 'Open report'."""
+        self._report_dir = report_dir
+
+    def report_path_for(self, rec):
+        """Collage path of a record's report, or None if not written (yet)."""
+        if not self._report_dir or rec is None:
+            return None
+        jpg, _json = detection_report.report_paths(rec, self._report_dir)
+        return jpg if os.path.exists(jpg) else None
+
+    def _open_report(self) -> None:
+        path = self.report_path_for(self._report_rec)
+        if path is None:
+            # Written by a background thread a moment after the record
+            # arrives -- or Pillow/disk trouble, see the console.
+            self._detail_lbl.config(text=self._detail_lbl.cget("text").split("\n[report")[0]
+                                    + "\n[report not written yet -- try again in a second]")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)              # default image viewer
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except OSError as exc:
+            self._detail_lbl.config(text=f"Could not open report: {exc}\n{path}")
 
     def _show_back_to_live_button(self) -> None:
         if not self._back_to_live_btn_visible:

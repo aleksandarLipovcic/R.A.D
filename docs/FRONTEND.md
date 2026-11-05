@@ -39,6 +39,7 @@ small tightly-related group of files) in detail.
 | Page | Covers |
 |---|---|
 | [frontend/detection-map-widget.md](frontend/detection-map-widget.md) | `DetectionMapWidget.py` — the separate detection/map `Toplevel` window |
+| [frontend/detection-reports.md](frontend/detection-reports.md) | `detection_report.py` — per-detection report: collage (frame + satellite map + position/time/confidence), JSON sidecar, daily `index.csv` |
 | [frontend/map-tiles.md](frontend/map-tiles.md) | `MapTiles.py` (disk tile cache) + `prefetch_tiles.py` (offline pre-download CLI) |
 
 ## OSD

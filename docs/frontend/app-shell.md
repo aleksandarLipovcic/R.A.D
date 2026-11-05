@@ -155,7 +155,7 @@ and merging them breaks the OSD:
 | Wired to | `DetectionLink.set_telemetry_provider()` | `VideoLink.set_telemetry_provider()` |
 | Called from | `DetectionLink`'s own C++ inference thread, once per pass | `VideoLink`'s own C++ capture/paint thread, once per painted frame |
 | `valid` means | GPS fix usable (`gps.position_usable`) — no fix ⇒ skip georeferencing | FC link is up at all — altitude/horizon/compass need no GPS fix |
-| `altitude_m` source | `gps.altitude_m` | **barometer** (`state.baro_altitude_cm`, converted) — keeps the OSD altitude in agreement with `BaroWidget` instead of silently depending on GPS |
+| `altitude_m` source | **barometer** (`state.baro_altitude_cm`, height above the arming point; GPS altitude is above sea level and pushed every pin too far out) | **barometer** (`state.baro_altitude_cm`, converted) — keeps the OSD altitude in agreement with `BaroWidget` instead of silently depending on GPS |
 | `gimbal_pan/tilt_deg` | `_get_camera_mount_angle()` — a manual, toolbar-editable stand-in; the servo gimbal (2× MG90S on flight controller outputs M5/M6) is physically installed but not wired up yet, so there's no gimbal angle to use | not read by the OSD |
 
 Both are safe to call from a non-Tk thread: `get_active_state()` only

@@ -535,7 +535,12 @@ private:
     RangeEstimate rangeByObjectSize(const RawDetection& raw, int frameW,
         const TelemetrySnapshot& telemetry, double unitX, double unitY, double unitZ) const;
 
-    std::string saveScreenshot(const cv::Mat& frame, const RawDetection& raw, uint64_t id) const;
+    // File name: det_<YYYYMMDD>_<HHMMSS>_<id>_<classIndex>.jpg (local time
+    // of timestampMs). The date/time part keeps frames from different
+    // sessions apart -- id restarts at 1 every run, so det_<id>_<class>
+    // alone silently overwrote earlier flights' frames.
+    std::string saveScreenshot(const cv::Mat& frame, const RawDetection& raw, uint64_t id,
+        int64_t timestampMs) const;
     std::string classNameFor(int classIndex) const;
 
     // Bundles the outcome of running both ranging methods for one raw

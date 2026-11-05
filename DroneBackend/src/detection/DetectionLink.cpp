@@ -28,6 +28,8 @@
 #include <iostream>
 #include <cctype>
 #include <map>
+#include <ctime>
+#include <iomanip>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -660,7 +662,7 @@ void DetectionLink::inferenceLoop() {
                 rec.id = nextId_++;
             }
             if (!screenshotDir_.empty())
-                rec.screenshotPath = saveScreenshot(frame, raw, rec.id);
+                rec.screenshotPath = saveScreenshot(frame, raw, rec.id, rec.timestampMs);
             {
                 std::lock_guard<std::mutex> lock(recordsMutex_);
                 records_.push_back(std::move(rec));
@@ -1463,9 +1465,21 @@ std::vector<uchar> DetectionLink::getLatestAnnotatedFrameJpeg() const {
     return jpeg;
 }
 
-std::string DetectionLink::saveScreenshot(const cv::Mat& frame, const RawDetection& raw, uint64_t id) const {
+std::string DetectionLink::saveScreenshot(const cv::Mat& frame, const RawDetection& raw, uint64_t id,
+    int64_t timestampMs) const {
+    // Local wall-clock time of the detection in the name: ids restart at 1
+    // every session, so without it a new flight overwrote the previous
+    // flight's frames (and the reports pointing at them).
+    std::time_t secs = static_cast<std::time_t>(timestampMs / 1000);
+    std::tm local{};
+#ifdef _WIN32
+    localtime_s(&local, &secs);
+#else
+    localtime_r(&secs, &local);
+#endif
     std::ostringstream name;
-    name << "det_" << id << "_" << raw.classIndex << ".jpg";
+    name << "det_" << std::put_time(&local, "%Y%m%d_%H%M%S") << "_" << id
+         << "_" << raw.classIndex << ".jpg";
     std::filesystem::path outPath = std::filesystem::path(screenshotDir_) / name.str();
 
     // Full frame saved, not just the crop -- a crop alone loses the

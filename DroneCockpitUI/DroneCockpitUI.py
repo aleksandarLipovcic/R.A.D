@@ -130,6 +130,7 @@ from workers.uplink_controller import UplinkController
 from widgets.command_panel import CommandPanel
 from workers.video_worker      import VideoWorker
 from workers.detection_worker  import DetectionWorker
+from core.detection_report     import DetectionReportWriter
 
 from widgets.IMUWidget           import IMUWidget
 from widgets.Drone3DView         import Drone3DView
@@ -281,6 +282,14 @@ DETECTION_INPUT_SIZE = 960
 # first use). Leave as "" to disable screenshot saving -- detections are
 # still recorded and georeferenced, just without an image to inspect.
 DETECTION_SCREENSHOT_DIR = os.path.join(script_dir, "detections")
+
+# Self-contained detection reports (core/detection_report.py): for every
+# DetectionRecord, one collage JPEG -- camera frame + satellite map with the
+# object, its ± radius and the dron + all position/telemetry data -- plus a
+# JSON sidecar and a per-day index.csv, under <dir>/<YYYY-MM-DD>/. This is
+# what the copilot reviews after the flight; the raw frames above are only
+# its input. Leave as "" to disable.
+DETECTION_REPORT_DIR = os.path.join(DETECTION_SCREENSHOT_DIR, "reports")
 
 # How often DetectionLink runs a detection pass, independent of both the
 # 100 Hz telemetry loop and the 30fps FPV capture loop -- see
@@ -1827,7 +1836,19 @@ class DroneCockpitApp:
         # never frames, never inference, never disk I/O -- so it's safe to
         # start polling immediately regardless of whether the model
         # actually loaded below.
-        self._detection_worker = DetectionWorker(self.detection_link, poll_hz=DETECTION_POLL_HZ)
+        # Report writer first, so not a single record reaches the worker
+        # before there is somewhere to send it. Own thread; see
+        # core/detection_report.py.
+        self._report_writer = None
+        if DETECTION_REPORT_DIR:
+            self._report_writer = DetectionReportWriter(DETECTION_REPORT_DIR)
+            if self._report_writer.available:
+                self._report_writer.start()
+            else:
+                print("[DetectionReport] Pillow not installed -- detection reports disabled.")
+                self._report_writer = None
+        self._detection_worker = DetectionWorker(self.detection_link, poll_hz=DETECTION_POLL_HZ,
+                                                 report_writer=self._report_writer)
         self._detection_worker.start()
 
         # DetectionMapWidget is intentionally NOT created here -- like the
@@ -2644,6 +2665,8 @@ class DroneCockpitApp:
         # the one call missing between DetectionLink starting up above and
         # the window actually being able to show anything live.
         self._detection_map_window.set_detection_link(self.detection_link)
+        if self._report_writer is not None:
+            self._detection_map_window.set_report_dir(DETECTION_REPORT_DIR)
 
         # Center over the main window and force it to the front. A bare
         # Toplevel with no explicit position can land off in a corner or
@@ -3663,6 +3686,10 @@ class DroneCockpitApp:
         self.fpv_view.detach()
         self.video_link.disconnect()
         self._detection_worker.stop()
+        if self._report_writer is not None:
+            # Finish the reports already queued (a few at most) so the last
+            # detections of the flight are not lost on close.
+            self._report_writer.stop(flush_timeout_s=5.0)
         self.detection_link.stop()
         self.root.destroy()
 

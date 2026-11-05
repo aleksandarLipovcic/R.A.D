@@ -48,8 +48,12 @@ mirrors the polling style already used elsewhere in the app (see
 `DetectionMapWidget._poll_live_frame`) rather than calling back into Tk
 from a worker thread directly, which Tk does not support safely.
 
-Downloads (`_download`) write to a `.part` temp file first and
-`os.replace()` into place atomically — a half-written tile (app killed,
+Downloads go through the module-level `download_tile(provider, z, x, y,
+timeout=6.0) -> bool` (blocking, never raises), which `TileCache._download`
+runs on its background threads and `detection_report.py`'s writer thread
+calls directly. It writes to a `.part` temp file (thread id in the name, as
+both may fetch the same tile at once) and `os.replace()`s it into place
+atomically — a half-written tile (app killed,
 connection dropped mid-write) can never be read back as "cached" by
 `get_cached()`'s `os.path.exists` check. Failures (offline, rate-limited,
 tile doesn't exist at that z/x/y) fail quiet: the widget keeps showing its

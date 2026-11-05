@@ -44,7 +44,11 @@ minutes produces many records. The list shows each object (`track_id`)
 Selecting a row shows the screenshot of the object's **most confident**
 sighting, plus the radius and the last fix's method. The map draws each
 object's pin with a dashed circle of its radius: the area to search.
-Tests: `tests/unit/test_detection_map.py` (UT-DETMAP-001 … 004).
+"Open report" (shown while a saved frame is displayed, if the app called
+`set_report_dir()`) opens that sighting's report collage in the system image
+viewer — see [detection-reports.md](detection-reports.md).
+Tests: `tests/unit/test_detection_map.py` (UT-DETMAP-001 … 004),
+`tests/unit/test_detection_report.py` (UT-DETREP-007).
 
 ## Search (report, section 15)
 

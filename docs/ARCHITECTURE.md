@@ -192,8 +192,10 @@ heading & home, flight & ELRS link). All three swap in place about 1 s
 after the source changes, without moving any panel. See
 [frontend/dual-layer.md](frontend/dual-layer.md).
 
-The link is **drone → laptop only** today. Commands from the laptop to
-the drone (gimbal, emergency RTH, movement) are a design proposal in
+With the Pocket's USB-VCP in "LUA" mode, `radcmd.lua` also carries
+commands from the laptop to the drone (movement offsets, bounded throttle
+for altitude hold, gimbal tilt) over the same port. `CrsfLink` stays the
+only port owner and services `CommandLink` from its worker thread. See
 [modules/command-uplink.md](modules/command-uplink.md).
 
 ## 4. Data flow: one detection, end to end

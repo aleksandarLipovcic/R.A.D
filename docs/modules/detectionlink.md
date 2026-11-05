@@ -393,7 +393,11 @@ one struct instead of inventing a second telemetry type.
 - **Position:** the **fused** lat/lon, the `georeferenced` flag and the
   `uncertaintyM` radius, plus this pass's own `rangeMethod`, `distanceM`
   (slant or horizontal, see "Fusion over sightings") and `bearingDeg`.
-- **An optional `screenshotPath`.**
+- **An optional `screenshotPath`**: the annotated full frame,
+  `det_<YYYYMMDD>_<HHMMSS>_<id>_<classIndex>.jpg` (local time; ids restart
+  every session, the date/time keeps flights apart). The cockpit turns it
+  into a report collage with map and position, see
+  [../frontend/detection-reports.md](../frontend/detection-reports.md).
 - **The full `telemetry` snapshot**, stored verbatim for later
   re-derivation or debugging.
 

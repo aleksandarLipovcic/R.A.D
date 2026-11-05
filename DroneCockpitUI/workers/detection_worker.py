@@ -9,7 +9,10 @@ DetectionRecords incrementally so DetectionMapWidget never has to
 re-render its whole pin list every tick.
 
 Deliberately does NOT touch frames, does NOT call anything that runs
-inference, and does NOT write to disk. Every call this worker makes into
+inference, and does NOT write to disk. New records are also handed to an
+optional DetectionReportWriter (core/detection_report.py), which builds
+the georeferenced collage + JSON for each one on its OWN thread -- the
+hand-off here is just a deque append. Every call this worker makes into
 DetectionLink is a fast, mutex-protected read of already-computed data
 -- the same "route heavy work through C++, poll cheap results from
 Python" split as VideoWorker/VideoLink.
@@ -20,8 +23,9 @@ import time
 
 
 class DetectionWorker:
-    def __init__(self, detection_link, poll_hz: int = 4):
+    def __init__(self, detection_link, poll_hz: int = 4, report_writer=None):
         self._link = detection_link
+        self._report_writer = report_writer   # DetectionReportWriter or None
         self._interval = 1.0 / poll_hz
         self._lock = threading.Lock()
 
@@ -61,6 +65,10 @@ class DetectionWorker:
             # structs (a few floats/strings), not frames, so pulling this
             # every poll tick is fine at 4-10Hz.
             fresh = self._link.get_records_since(self._last_seen_id)
+            if fresh and self._report_writer is not None:
+                # Every record, whether or not the Detections window is
+                # open -- the report is the permanent copy.
+                self._report_writer.submit(fresh)
             frames = []
             if self._frame_index_supported:
                 for e in self._link.get_frame_index_since(self._last_frame_ms):

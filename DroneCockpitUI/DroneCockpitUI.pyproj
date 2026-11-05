@@ -35,6 +35,7 @@
     <Compile Include="control\__init__.py" />
     <Compile Include="control\altitude_hold.py" />
     <Compile Include="core\MapTiles.py" />
+    <Compile Include="core\detection_report.py" />
     <Compile Include="core\__init__.py" />
     <Compile Include="core\dual_layer.py" />
     <Compile Include="core\link_mode.py" />
@@ -53,6 +54,7 @@
     <Compile Include="tests\system\test_SAT_IMU_005.py" />
     <Compile Include="tests\unit\conftest.py" />
     <Compile Include="tests\unit\test_detection_map.py" />
+    <Compile Include="tests\unit\test_detection_report.py" />
     <Compile Include="tests\unit\test_dual_layer.py" />
     <Compile Include="tests\unit\test_imu_widget.py" />
     <Compile Include="tests\unit\test_link_mode.py" />
