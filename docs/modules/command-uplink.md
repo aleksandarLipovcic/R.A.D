@@ -11,7 +11,7 @@
 
 | # | Requirement | Status |
 |---|---|---|
-| R1 | Gimbal tilt from the laptop | implemented (CH8 / AUX4 → Betaflight servo 0) |
+| R1 | Gimbal pan + tilt from the laptop, angles for georeferencing | implemented (CH8 tilt → servo 0 on M5, CH9 pan → servo 1 on M6; `control/gimbal.py`) |
 | R2 | Emergency actions (RTH / land) from the laptop | **not implemented** — stays on the pilot's switches |
 | R3 | Movement: forward/back/left/right/yaw, altitude hold | implemented (stick offsets in ANGLE mode, laptop-side baro altitude hold) |
 | R4 | Pilot keeps final authority | radio-side gate switch, ADD mixing, bounded throttle delta |
@@ -23,7 +23,7 @@
 ```
 UplinkController (Python, 25 Hz) ─set_command()─► CommandLink (C++, no port)
 CrsfLink worker ─nextFrame()/WriteFile─► Pocket USB-VCP "LUA" ─► radcmd.lua
-radcmd.lua ─mixer outputs─► CH1–4 (ADD, gated) + CH8 gimbal ══ELRS══► Betaflight
+radcmd.lua ─mixer outputs─► CH1–4 (ADD, gated) + CH8/CH9 gimbal ══ELRS══► Betaflight
 radcmd.lua ─CRSF telemetry + RC_CHANNELS 0x16 + RAD_STATUS 0x7E─► CrsfLink
 ```
 
@@ -48,19 +48,22 @@ same bytes also fit EdgeTX's proposed "CRSF Trainer over USB-VCP" mode.
 | 5 | gimbal tilt (−100…100 %) |
 | 6 / 7 | sticks enable / throttle enable (1811 on, 172 off) |
 | 8 | alive counter, changes every frame (a frozen sender is not "fresh") |
+| 9 | gimbal pan (−100…100 %) |
 
 ## RAD_STATUS (0x7E, Pocket → laptop, USB only, never over RF)
 
-22 bytes, big-endian: version, flags (fresh, gate, sticks active, throttle
-active, telemetry live), echoed alive value (round-trip time), command frames
-received, CRC errors, command age, pilot throttle stick, applied throttle
-delta, script period, applied roll/pitch/yaw/tilt outputs.
+24 bytes (version 2), big-endian: version, flags (fresh, gate, sticks
+active, throttle active, telemetry live), echoed alive value (round-trip
+time), command frames received, CRC errors, command age, pilot throttle
+stick, applied throttle delta, script period, applied roll/pitch/yaw/tilt
+outputs, applied pan output. Version 1 bridges (22 bytes, no pan) are still
+accepted (`BridgeStatus.hasPan = false`).
 
 ## Safety model
 
 | Layer | Where | Rule |
 |---|---|---|
-| Gate switch | radio (Lua + logical switch L01) | Pilot switch off → roll/pitch/yaw/throttle outputs 0 |
+| Gate switch | radio (Lua + switch condition SD on the CH1–4 mixer lines) | Pilot switch off → roll/pitch/yaw/throttle outputs 0 |
 | Watchdog | radio | No new alive counter for 500 ms → neutral, gimbal holds |
 | Authority | radio mixer | Laptop offsets are ADDed to the pilot's sticks |
 | Throttle | radio | Delta to the pilot's stick, ±THR_BAND (≈100 µs), only with stick > ≈1200 µs |
@@ -78,6 +81,37 @@ from the throttle the radio is transmitting (RC_CHANNELS echo).
 
 Arming, flight modes, failsafe and GPS Rescue are never touched by the
 laptop.
+
+## Gimbal
+
+Two MG90S servos on flight controller outputs M5/M6, 5 V from a separate
+step-down. Betaflight `feature SERVO_TILT` with "forward from channel":
+servo 0 (GIMBAL_PITCH, M5) ← CH8 = tilt, servo 1 (GIMBAL_ROLL, M6) ← CH9 =
+pan. Betaflight copies the forwarded channel straight to the servo pulse
+(then clamps to the servo's min/max), so 1 % of channel = 5.12 µs and the
+servo **Rate does not reverse a forwarded channel** (it only scales CAMSTAB
+stabilisation); direction is set in the cockpit calibration.
+
+The R.A.D. mount has its base plate vertical at the nose, so the pan servo
+turns about the drone's forward axis (`GIMBAL_MOUNT_AXIS = "roll"`):
+`TelemetrySnapshot.gimbalRollDeg`, outermost in the gimbal chain
+(roll → pan → tilt). Positive = a downward-looking camera swings right.
+
+`control/gimbal.py` (`GimbalModel`):
+- commands in degrees → pulse via per-axis calibration (`center_us`,
+  `us_per_deg`, `direction`, soft limits) → channel %;
+- angles for georeferencing from the best feedback: MSP_SERVO (USB,
+  `DroneState.servoValues`, polled every 50 ms) > radio channel echo (CH8/CH9
+  from the bridge) > command, passed through a servo model (300 °/s, 80 ms
+  dead time);
+- `gimbalMoving` while the model is still moving: DetectionLink then keeps
+  each object's last fused position instead of fusing rays from a moving
+  camera (record `range_method = "held (gimbal moving)"`).
+
+With normal ±100 % radio limits Betaflight sees ~988–2012 µs, about 100° of
+MG90S travel per axis (not the bracket's 180°). The horns are placed so this
+window covers tilt 0–90° and pan ±45°; calibration in
+[command-uplink-uputstvo.md](command-uplink-uputstvo.md) §4–5.
 
 ## Threads and real time
 
@@ -129,7 +163,8 @@ Tests: `test_uplink.cpp::testConcurrency` (three real threads hammering
 | UT-UPL-A2 | Offsets reach Betaflight only with the gate on | Receiver tab follows `--sweep` only with the switch on |
 | UT-UPL-A3 | Latency laptop → Betaflight channel | median < 100 ms (`uplink_bench.py --latency`) |
 | UT-UPL-A4 | Telemetry from re-encoded sensors | attitude ≥ 5 Hz, GPS/battery ≥ 1 Hz, units match USB |
-| UT-UPL-A5 | Gimbal | follows `--tilt`, also with the gate off |
+| UT-UPL-A5 | Gimbal | follows `--tilt` / `--pan`, also with the gate off |
+| UT-GMB-1..4 | Gimbal calibration, direction, limits, georeferencing angles | see command-uplink-uputstvo.md §5 |
 | UT-UPL-S1..S3 | Gate off / USB unplugged / app killed mid-sweep | channels back to the sticks within 500 ms |
 | UT-UPL-S4 | Script CPU budget | no "Script killed" in 10 min |
 | ALT-1..3, MOV-1 | Rod rig: bumpless engage, step response, battery sag, movement | see command-uplink-uputstvo.md §6 |

@@ -38,9 +38,9 @@ static std::vector<Crsf::Frame> parseAll(const std::vector<uint8_t>& bytes) {
     return out;
 }
 
-static Crsf::Frame statusFrame(uint8_t flags, int echo) {
-    std::vector<uint8_t> p(22, 0);
-    p[0] = Uplink::RAD_STATUS_VERSION;
+static Crsf::Frame statusFrame(uint8_t flags, int echo, uint8_t version = Uplink::RAD_STATUS_VERSION) {
+    std::vector<uint8_t> p(version >= 2 ? 24 : 22, 0);
+    p[0] = version;
     p[1] = flags;
     const uint16_t e = echo < 0 ? 0xFFFF : static_cast<uint16_t>(echo);
     p[2] = e >> 8; p[3] = e & 0xFF;
@@ -60,6 +60,7 @@ static Uplink::CommandValues sentOf(const std::vector<uint8_t>& frame) {
     c.throttleUs = Uplink::crsfToUs(ch[2]);
     c.yawPct = Uplink::crsfToPct(ch[3]);
     c.gimbalTiltPct = Uplink::crsfToPct(ch[4]);
+    c.gimbalPanPct = Uplink::crsfToPct(ch[8]);
     c.sticksEnabled = ch[5] > 1500;
     c.throttleEnabled = ch[6] > 1500;
     return c;
@@ -91,6 +92,7 @@ static void testProtocol() {
     Uplink::CommandValues c;
     c.rollPct = 10; c.pitchPct = -20; c.yawPct = 5; c.throttleUs = 1420;
     c.sticksEnabled = true; c.throttleEnabled = false; c.gimbalTiltPct = -50;
+    c.gimbalPanPct = 35;
     auto fr = parseAll(Uplink::buildCommandFrame(c, 41));
     CHECK(fr.size() == 1);
     CHECK(fr[0].type == Crsf::Type::RC_CHANNELS);
@@ -101,7 +103,9 @@ static void testProtocol() {
     CHECK(ch[Uplink::Ch::THROTTLE_EN] == 172);
     CHECK(ch[Uplink::Ch::ALIVE] == Uplink::aliveValue(41));
     CHECK(Uplink::aliveValue(41) != Uplink::aliveValue(42));
-    for (int i = 8; i < 16; ++i) CHECK(ch[i] == 992);
+    NEAR(Uplink::crsfToPct(ch[Uplink::Ch::TILT]), -50.0f, 0.15f);
+    NEAR(Uplink::crsfToPct(ch[Uplink::Ch::PAN]), 35.0f, 0.15f);
+    for (int i = 9; i < 16; ++i) CHECK(ch[i] == 992);
 
     // status decode
     auto sf = statusFrame(0x1F, 777);
@@ -115,6 +119,13 @@ static void testProtocol() {
     CHECK(b.throttleStick == -200);
     auto none = statusFrame(0, -1);
     CHECK(Uplink::decodeBridgeStatus(none, b) && b.echoAlive == -1 && !b.fresh);
+
+    // v2 carries the applied pan output; v1 (22 bytes) still decodes, no pan
+    auto v2 = statusFrame(0x01, 5);
+    v2.payload[22] = 0xFE; v2.payload[23] = 0x0C;          // -500
+    CHECK(Uplink::decodeBridgeStatus(v2, b) && b.hasPan && b.outPan == -500);
+    auto v1 = statusFrame(0x01, 5, 1);
+    CHECK(Uplink::decodeBridgeStatus(v1, b) && !b.hasPan && b.outPan == 0);
 }
 
 static void testCommandLink() {
@@ -132,12 +143,13 @@ static void testCommandLink() {
     Uplink::CommandValues want;
     want.rollPct = 50; want.pitchPct = -10; want.yawPct = 80;
     want.sticksEnabled = true; want.throttleEnabled = true; want.throttleUs = 1450;
-    want.gimbalTiltPct = 30;
+    want.gimbalTiltPct = 30; want.gimbalPanPct = -45;
     cl.setCommandAt(want, t);
     auto s = sentOf(cl.nextFrame(t));
     CHECK(!s.sticksEnabled && !s.throttleEnabled);
     NEAR(s.rollPct, 0.0f, 0.2f);
     NEAR(s.gimbalTiltPct, 30.0f, 0.2f);          // gimbal works without enable
+    NEAR(s.gimbalPanPct, -45.0f, 0.2f);
     CHECK(cl.getStatusAt(t).state == "STANDBY");
 
     // The bridge answers every frame, as radcmd.lua does on the radio.
@@ -219,17 +231,36 @@ static void testCommandLink() {
     CHECK(sn.getStatusAt(100).state == "GATE_ON");
     sn.onFrame(statusFrame(0x07, -1), 110);
     CHECK(sn.getStatusAt(110).state == "ACTIVE");
+
+    // 11. Gimbal: setGimbalPct without enable, kept by neutral(), clamped,
+    //     and an old v1 bridge is still accepted
+    CommandLink gb;
+    gb.onFrame(statusFrame(0x01, -1, 1), 200);
+    CHECK(gb.getStatusAt(200).bridgeDetected);
+    gb.setGimbalPct(60.0f, -20.0f);
+    auto g = sentOf(gb.nextFrame(200));
+    NEAR(g.gimbalPanPct, 60.0f, 0.2f);
+    NEAR(g.gimbalTiltPct, -20.0f, 0.2f);
+    gb.neutral();
+    gb.setGimbalPanPct(150.0f);
+    g = sentOf(gb.nextFrame(240));
+    NEAR(g.gimbalPanPct, 100.0f, 0.2f);
+    NEAR(g.gimbalTiltPct, -20.0f, 0.2f);
+    CommandLink old;
+    Crsf::Frame bad = statusFrame(0x01, -1, 9);   // unknown future version
+    old.onFrame(bad, 300);
+    CHECK(!old.getStatusAt(300).bridgeDetected);
 }
 
 // ── CLI helpers for the Lua cross-check ─────────────────────────────────────
 static int cmdEncode(const char* path) {
     // Fixed scenario read by test_lua_bridge.py (keep both in sync):
-    //   frame k: roll 20, pitch -15, yaw 40, thr 1450, tilt -60, sticks on,
-    //            throttle on, sequence k
+    //   frame k: roll 20, pitch -15, yaw 40, thr 1450, tilt -60, pan 45,
+    //            sticks on, throttle on, sequence k
     std::ofstream f(path, std::ios::binary);
     Uplink::CommandValues c;
     c.rollPct = 20; c.pitchPct = -15; c.yawPct = 40; c.throttleUs = 1450;
-    c.gimbalTiltPct = -60; c.sticksEnabled = true; c.throttleEnabled = true;
+    c.gimbalTiltPct = -60; c.gimbalPanPct = 45; c.sticksEnabled = true; c.throttleEnabled = true;
     for (uint32_t k = 0; k < 3; ++k) {
         auto fr = Uplink::buildCommandFrame(c, k);
         f.write(reinterpret_cast<const char*>(fr.data()), static_cast<std::streamsize>(fr.size()));
@@ -269,10 +300,12 @@ static int cmdDecode(const char* path) {
         else if (Uplink::decodeBridgeStatus(fr, bs))
             std::printf(", \"fresh\": %d, \"gate\": %d, \"stk\": %d, \"thr\": %d, \"live\": %d, \"echo\": %d,"
                         " \"rx\": %u, \"thr_stick\": %d, \"thr_delta\": %d, \"out_roll\": %d,"
-                        " \"out_pitch\": %d, \"out_yaw\": %d, \"out_tilt\": %d, \"age_ms\": %d",
+                        " \"out_pitch\": %d, \"out_yaw\": %d, \"out_tilt\": %d, \"age_ms\": %d,"
+                        " \"version\": %d, \"has_pan\": %d, \"out_pan\": %d",
                         bs.fresh, bs.gateOn, bs.sticksActive, bs.throttleActive, bs.telemetryLive,
                         bs.echoAlive, bs.rxFrames, bs.throttleStick, bs.throttleDelta, bs.outRoll,
-                        bs.outPitch, bs.outYaw, bs.outTilt, bs.cmdAgeMs);
+                        bs.outPitch, bs.outYaw, bs.outTilt, bs.cmdAgeMs,
+                        bs.version, bs.hasPan, bs.outPan);
         else if (fr.type == Crsf::Type::RC_CHANNELS && Uplink::unpackChannels(fr.payload, ch)) {
             std::printf(", \"us\": [");
             for (int k = 0; k < 16; ++k) std::printf("%s%.1f", k ? ", " : "", Uplink::crsfToUs(ch[k]));

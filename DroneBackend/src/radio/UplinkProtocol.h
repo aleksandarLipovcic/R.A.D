@@ -20,7 +20,14 @@
 //   ch1 roll offset   ch2 pitch offset   ch3 throttle target (absolute, µs)
 //   ch4 yaw offset    ch5 gimbal tilt    ch6 sticks enable (1811 on / 172 off)
 //   ch7 throttle enable                  ch8 alive counter (changes every frame)
-//   ch9–16 centre (reserved)
+//   ch9 gimbal pan (outer gimbal axis)   ch10–16 centre (reserved)
+//
+// The two gimbal values are what the radio puts on its gimbal channels
+// (CH8 tilt, CH9 pan in the Pocket mixer); Betaflight forwards those
+// channels unchanged to the servo outputs M5/M6 (feature SERVO_TILT,
+// "forward from channel"). Converting degrees to percent is the cockpit's
+// job (DroneCockpitUI/control/gimbal.py), because it needs the per-servo
+// calibration.
 //
 // Units on the radio side: EdgeTX mixer value v ∈ [−1024, 1024],
 //   CRSF = 992 + v·4/5,   µs ≈ 1500 + v/2,   so CRSF = 992 + (µs − 1500)·1.6.
@@ -38,11 +45,12 @@ constexpr uint16_t CRSF_MIN = 172, CRSF_MID = 992, CRSF_MAX = 1811;
 // Frame type of the bridge status frame written by radcmd.lua. Never sent
 // over RF: it only exists on the Pocket ↔ laptop USB link.
 constexpr uint8_t TYPE_RAD_STATUS = 0x7E;
-constexpr uint8_t RAD_STATUS_VERSION = 1;
+constexpr uint8_t RAD_STATUS_VERSION = 2;       // 2: + applied gimbal pan
+constexpr uint8_t RAD_STATUS_MIN_VERSION = 1;   // v1 bridges still work (no pan)
 
 namespace Ch {                                  // 0-based indices
     constexpr int ROLL = 0, PITCH = 1, THROTTLE = 2, YAW = 3, TILT = 4,
-                  STICKS_EN = 5, THROTTLE_EN = 6, ALIVE = 7;
+                  STICKS_EN = 5, THROTTLE_EN = 6, ALIVE = 7, PAN = 8;
 }
 
 // ── Unit conversions ────────────────────────────────────────────────────────
@@ -64,7 +72,8 @@ struct CommandValues {
     bool  sticksEnabled = false;
     float throttleUs = 1000.0f;  // absolute target; the radio clamps it to
     bool  throttleEnabled = false;   // ± THR_BAND around the pilot's stick
-    float gimbalTiltPct = 0.0f;  // −100..100 % of the gimbal channel
+    float gimbalTiltPct = 0.0f;  // −100..100 % of the gimbal tilt channel (CH8)
+    float gimbalPanPct = 0.0f;   // −100..100 % of the gimbal pan channel (CH9)
 };
 
 std::array<uint16_t, NUM_CHANNELS> commandToChannels(const CommandValues& c,
@@ -88,6 +97,8 @@ struct BridgeStatus {
     int16_t  throttleDelta = 0;      // applied throttle delta, mixer units
     int      scriptPeriodMs = 0;     // time between two script runs
     int16_t  outRoll = 0, outPitch = 0, outYaw = 0, outTilt = 0;   // mixer units
+    int16_t  outPan = 0;             // mixer units (version ≥ 2, else 0)
+    bool     hasPan = false;         // the bridge reports the pan output
 };
 bool decodeBridgeStatus(const Crsf::Frame& f, BridgeStatus& out);
 

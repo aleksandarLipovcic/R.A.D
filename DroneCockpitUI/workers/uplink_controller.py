@@ -15,7 +15,11 @@ What the laptop can do
     mode so an offset means a lean angle, not a rotation rate;
   * altitude hold: throttle from AltitudeHold around the hover throttle the
     radio was sending when it was engaged;
-  * gimbal tilt (always, also without the pilot switch).
+  * camera gimbal pan + tilt in degrees (always, also without the pilot
+    switch and without "laptop control" enabled) -- see control/gimbal.py.
+    The same thread feeds the gimbal model with the best servo feedback
+    (MSP_SERVO over USB, else the radio's channel echo), and the cockpit
+    reads the resulting angles for georeferencing.
 What it can never do: arm, disarm, change flight mode, trigger failsafe.
 
 Gates, checked every tick (any failing gate -> neutral, hold dropped):
@@ -51,9 +55,10 @@ import os
 import collections
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional, Sequence
 
 from control.altitude_hold import AltitudeHold, AltitudeHoldConfig
+from control.gimbal import GimbalModel
 
 UPLINK_HZ = 25
 RADIO_LIVE = ("TELEMETRY_OK", "DEGRADED")
@@ -69,7 +74,13 @@ _LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 
 class UplinkController:
     def __init__(self, command_link, radio, hold_cfg: Optional[AltitudeHoldConfig] = None,
-                 backend=None, log_dir: str = _LOG_DIR, bench: bool = BENCH_MODE) -> None:
+                 backend=None, log_dir: str = _LOG_DIR, bench: bool = BENCH_MODE,
+                 gimbal: Optional[GimbalModel] = None,
+                 servo_feedback: Optional[Callable[[], Optional[Sequence[float]]]] = None) -> None:
+        # servo_feedback: returns Betaflight's servo outputs in us (MSP_SERVO
+        # over USB) or None when USB is not connected/healthy. Called from
+        # this thread at 25 Hz, so it must be quick and thread-safe
+        # (DroneLink.get_latest_state() is).
         self._cmd = command_link
         self._radio = radio
         self._backend = backend         # DroneBackend module (for CommandValues)
@@ -83,7 +94,9 @@ class UplinkController:
         self._fwd = self._right = self._yaw = 0.0      # -1..1
         self._speed_pct = 10.0                         # stick % at full intent
         self._yaw_pct = 15.0
-        self._tilt_pct = 0.0
+        self.gimbal = gimbal if gimbal is not None else GimbalModel()
+        self._servo_feedback = servo_feedback
+        self._pan_supported = True        # False with an old .pyd (no gimbal_pan_pct)
         self._hold_requested = False
         self._ui_beat = float("-inf")                  # last CommandPanel heartbeat
         self._last_flush = 0.0
@@ -150,9 +163,12 @@ class UplinkController:
             if yaw_pct is not None:
                 self._yaw_pct = max(0.0, min(100.0, float(yaw_pct)))
 
-    def set_gimbal_tilt(self, pct: float) -> None:
-        with self._lock:
-            self._tilt_pct = max(-100.0, min(100.0, float(pct)))
+    # gimbal (degrees; the model converts with the servo calibration)
+    def set_gimbal(self, pan_deg: Optional[float] = None, tilt_deg: Optional[float] = None) -> None:
+        self.gimbal.set_target(pan_deg, tilt_deg)
+
+    def nudge_gimbal(self, d_pan: float = 0.0, d_tilt: float = 0.0) -> None:
+        self.gimbal.nudge(d_pan, d_tilt)
 
     def request_altitude_hold(self, on: bool) -> None:
         with self._lock:
@@ -195,7 +211,7 @@ class UplinkController:
         with self._lock:
             enabled = self._enabled
             fwd, right, yaw = self._fwd, self._right, self._yaw
-            speed, yaw_speed, tilt = self._speed_pct, self._yaw_pct, self._tilt_pct
+            speed, yaw_speed = self._speed_pct, self._yaw_pct
             hold_req = self._hold_requested
         # UI heartbeat: a frozen Tk thread must not leave a held key driving
         # the drone. Only movement is cancelled; altitude hold and gimbal keep
@@ -206,6 +222,18 @@ class UplinkController:
 
         st = self._cmd.get_status()
         rs = self._radio.get_latest_state() if self._radio is not None else None
+
+        # ── gimbal: feedback into the servo model, command out ──────────────
+        servo_us = None
+        if self._servo_feedback is not None:
+            try:
+                servo_us = self._servo_feedback()
+            except Exception:
+                servo_us = None
+        radio_us = list(st.radio_channels_us) if st.radio_channels_valid else None
+        self.gimbal.update(now, servo_us, radio_us)
+        pan_pct, tilt_pct = self.gimbal.command_pct()
+        gimbal_angles = self.gimbal.angles(now)
 
         # ── gates ──────────────────────────────────────────────────────────
         blockers = []
@@ -274,7 +302,12 @@ class UplinkController:
 
         # ── command ────────────────────────────────────────────────────────
         cv = self._values()
-        cv.gimbal_tilt_pct = tilt
+        cv.gimbal_tilt_pct = tilt_pct
+        if self._pan_supported:
+            try:
+                cv.gimbal_pan_pct = pan_pct
+            except AttributeError:          # DroneBackend.pyd older than the pan channel
+                self._pan_supported = False
         cv.sticks_enabled = sticks_ok
         cv.roll_pct = right * speed if sticks_ok else 0.0
         cv.pitch_pct = fwd * speed if sticks_ok else 0.0
@@ -283,8 +316,10 @@ class UplinkController:
         cv.throttle_us = thr_us
         if enabled:
             self._cmd.set_command(cv)        # renews the lease
+        elif self._pan_supported and hasattr(self._cmd, "set_gimbal_pct"):
+            self._cmd.set_gimbal_pct(pan_pct, tilt_pct)
         else:
-            self._cmd.set_gimbal_tilt_pct(tilt)
+            self._cmd.set_gimbal_tilt_pct(tilt_pct)
 
         self._status = {
             "enabled": enabled,
@@ -310,7 +345,14 @@ class UplinkController:
             "altitude_m": alt_m,
             "altitude_age_ms": alt_age,
             "cmd_roll_pct": cv.roll_pct, "cmd_pitch_pct": cv.pitch_pct,
-            "cmd_yaw_pct": cv.yaw_pct, "cmd_tilt_pct": tilt,
+            "cmd_yaw_pct": cv.yaw_pct, "cmd_tilt_pct": tilt_pct, "cmd_pan_pct": pan_pct,
+            "gimbal": {
+                "pan_deg": gimbal_angles.pan_deg, "tilt_deg": gimbal_angles.tilt_deg,
+                "target_pan_deg": gimbal_angles.target_pan_deg,
+                "target_tilt_deg": gimbal_angles.target_tilt_deg,
+                "moving": gimbal_angles.moving, "source": gimbal_angles.source,
+                "limits": self.gimbal.limits(), "pan_supported": self._pan_supported,
+            },
             "rtt_ms": float(st.rtt_avg_ms),
             "script_period_ms": int(st.bridge.script_period_ms),
             "lua_sticks_active": bool(st.bridge.sticks_active),
@@ -333,7 +375,7 @@ class UplinkController:
     def _write_log(self, now: float, cv, state: str) -> None:
         row = (state, round(cv.roll_pct, 1), round(cv.pitch_pct, 1), round(cv.yaw_pct, 1),
                bool(cv.sticks_enabled), bool(cv.throttle_enabled), round(cv.throttle_us),
-               round(cv.gimbal_tilt_pct, 1))
+               round(cv.gimbal_tilt_pct, 1), round(self._status.get("cmd_pan_pct", 0.0), 1))
         if row == self._last_logged and now - self._last_log_t < 1.0:
             return
         try:
@@ -343,7 +385,7 @@ class UplinkController:
                 self._log_file = open(os.path.join(self._log_dir, name), "w", newline="")
                 self._log = csv.writer(self._log_file)
                 self._log.writerow(["time", "state", "roll_pct", "pitch_pct", "yaw_pct",
-                                    "sticks_en", "thr_en", "thr_us", "tilt_pct",
+                                    "sticks_en", "thr_en", "thr_us", "tilt_pct", "pan_pct",
                                     "alt_m", "target_m"])
             s = self._status
             self._log.writerow([time.strftime("%H:%M:%S") + f".{int(now * 1000) % 1000:03d}",

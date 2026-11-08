@@ -3,6 +3,9 @@
 # Servos, VTX. Restores the LISTIC configuration of 2026-11-03 plus the
 # gimbal servos on M5 (A01, TIM5) / M6 (A08, TIM1) and the compass alignment.
 # Paste the whole file into the CLI. Lines starting with # are comments.
+# Gimbal channel forwarding (servo 0 <- AUX4/CH8 tilt, servo 1 <- AUX5/CH9
+# pan, min/max) is set in the Configurator's Servos tab, see
+# docs/modules/command-uplink-uputstvo.md section 4.2. Do NOT assign CAMSTAB.
 batch start
 defaults nosave
 board_name OMNIBUSF4SD

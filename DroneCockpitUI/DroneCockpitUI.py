@@ -127,6 +127,7 @@ from core.dual_layer import DualLayerPanel, LayerSwitch
 from core import ui_perf
 from widgets.radio_panels import RadioAttitudePanel, RadioFlightPanel
 from workers.uplink_controller import UplinkController
+from control.gimbal import GimbalAxisConfig, GimbalModel, ServoModelConfig
 from widgets.command_panel import CommandPanel
 from workers.video_worker      import VideoWorker
 from workers.detection_worker  import DetectionWorker
@@ -385,36 +386,46 @@ DETECTION_KNOWN_OBJECT_WIDTHS_M = {
     "other_vehicle": 2.0,   # vans, pickups (mostly)
 }
 
-# ── Camera mount angle (manual, NOT the servo gimbal) ───────────────────
-# The camera gimbal is a 2-axis mount driven by two MG90S metal-gear
-# servos, controlled directly by the flight controller from its M5 and M6
-# outputs and powered from a separate 5 V step-down module. It is
-# physically installed but not wired up yet -- there is no live pan/tilt
-# angle yet. In the meantime the camera is mounted at a
-# FIXED angle chosen by hand before each flight (anywhere from 0 deg
-# forward-level, through 90 deg straight down, to 180 deg backward-level,
-# or negative for facing upward -- a single tilt hinge, no pan -- though
-# the controls below expose a pan value too, ready for the day the
-# gimbal's second axis is wired in).
+# ── Camera gimbal (2x MG90S on flight controller outputs M5/M6) ─────────
+# Two MG90S servos, powered from a separate 5 V step-down, driven by
+# Betaflight (feature SERVO_TILT, "forward from channel"):
+#   M5 -> servo 0 (GIMBAL_PITCH) -> TILT, radio CH8 (Pocket output "Tlt")
+#   M6 -> servo 1 (GIMBAL_ROLL)  -> PAN,  radio CH9 (Pocket output "Pan")
+# The bracket's base plate is mounted VERTICALLY at the nose, so the "pan"
+# servo turns about the drone's FORWARD axis (90 deg each way seen from the
+# front): GIMBAL_MOUNT_AXIS = "roll". Use "yaw" for a flat pan/tilt mount.
+# Commands are in degrees (🕹 Laptop Control window, arrow keys); the model
+# in control/gimbal.py converts them with the calibration below and turns
+# the servo feedback (MSP_SERVO over USB, else the radio's channel echo)
+# into the angles used for georeferencing ("📐 Camera Angle" = Auto).
 #
-# These two constants are now only the FALLBACK defaults -- used to seed
-# the very first layout profile, and to fill in a saved profile that
+# CALIBRATE before trusting pins (manual: command-uplink-uputstvo.md,
+# gimbal chapter): measure the angle at two pulse widths per servo and set
+# center_us / us_per_deg / direction. min_deg/max_deg must stay inside the
+# bracket's mechanical stops -- a servo pushing against a stop overheats.
+# With normal +-100 % radio limits Betaflight only sees ~988..2012 us, about
+# 100 deg of MG90S travel per axis; place the horns so that window covers
+# tilt 0..90 and pan +-45 (the defaults below assume exactly that).
+GIMBAL_MOUNT_AXIS = "roll"
+GIMBAL_PAN_CAL = GimbalAxisConfig("pan", center_us=1500.0, us_per_deg=10.0, direction=1,
+                                  min_deg=-45.0, max_deg=45.0, servo_index=1, channel_index=8)
+GIMBAL_TILT_CAL = GimbalAxisConfig("tilt", center_us=1050.0, us_per_deg=10.0, direction=1,
+                                   min_deg=0.0, max_deg=90.0, servo_index=0, channel_index=7)
+GIMBAL_SERVO_MODEL = ServoModelConfig(rate_dps=300.0, dead_time_s=0.08, settle_deg=1.5)
+
+# ── Camera mount angle: Manual fallback ─────────────────────────────────
+# "📐 Camera Angle" has two modes. AUTO (default) takes the angles from the
+# gimbal model above. MANUAL is for flying with the gimbal unpowered or the
+# camera fixed by hand: the tilt/pan set in the dialog are used as-is
+# (0 = forward-level, 90 = straight down, 180 = backward-level, negative =
+# up; pan along GIMBAL_MOUNT_AXIS).
+#
+# These two constants are only the FALLBACK defaults for Manual -- used to
+# seed the very first layout profile, and to fill in a saved profile that
 # predates this field or has a missing/malformed "camera_angle" entry
 # (see LayoutStore's on-disk format and DroneCockpitApp._apply_layout()).
-# Once the app has run once, the mode/tilt/pan you set from the
-# "📐 Camera Angle" toolbar button is saved into the active layout
-# profile (on dialog close, and again at shutdown as a safety net) and
-# restored from there on every future launch, the same way panel
-# geometry is -- editing these two constants and restarting no longer
-# has any effect once a profile with its own "camera_angle" exists.
-#
-# Wire snapshot.gimbal_pan_deg/gimbal_tilt_deg to the commanded servo
-# angles in _get_camera_mount_angle() once the flight controller drives
-# the gimbal servos ("auto" mode already exists as a placeholder for exactly that,
-# and its choice persists across restarts the same as Manual's values
-# do); until then, georeferenced pins will drift off if the toolbar's
-# Manual value doesn't match how the camera is actually physically
-# angled right now.
+# Once the app has run once, the mode/tilt/pan from the dialog are saved
+# into the active layout profile and restored from there.
 #
 # Tilting toward 90 (straight down) during search sweeps is the single
 # biggest improvement available to ground-plane ranging accuracy -- see
@@ -1550,17 +1561,9 @@ class DroneCockpitApp:
         # Handle to the single open "Camera Angle" Toplevel, or None when
         # closed -- see _show_camera_angle_dialog() for why this exists.
         self._camera_angle_win = None
-        # "manual" or "auto" -- overwritten below by _apply_layout() with
-        # whatever was last saved, if anything was. Genuinely should
-        # default to "auto" once the servo gimbal is wired to the flight
-        # controller (M5/M6) and its commanded angles are read back --
-        # there is no such readback yet (see _get_camera_mount_angle()'s TODO below),
-        # so "auto" would silently do nothing useful right now (it still
-        # falls back to whatever the Manual tilt/pan were last set to).
-        # "manual" is the correct fallback for THIS moment, not the
-        # long-term intent -- flip CAMERA_MOUNT_* mode handling over to
-        # defaulting "auto" once real feedback is wired in.
-        self._camera_angle_mode = "manual"
+        # "auto" (gimbal model) or "manual" -- overwritten below by
+        # _apply_layout() with whatever was last saved, if anything was.
+        self._camera_angle_mode = "auto"
         self._camera_tilt_deg = CAMERA_MOUNT_TILT_DEG
         self._camera_pan_deg = CAMERA_MOUNT_PAN_DEG
 
@@ -1584,10 +1587,17 @@ class DroneCockpitApp:
         self.cmd_link = None
         self.uplink = None
         self._command_panel = None
+        # The gimbal model exists even without CommandLink (old .pyd / no
+        # radio), so Auto camera angles still follow the servo feedback
+        # over USB; it just cannot be commanded then.
+        self.gimbal = GimbalModel(GIMBAL_PAN_CAL, GIMBAL_TILT_CAL, GIMBAL_SERVO_MODEL,
+                                  axis=GIMBAL_MOUNT_AXIS)
         if self.radio is not None and hasattr(DroneBackend, "CommandLink"):
             self.cmd_link = DroneBackend.CommandLink()
             self.radio.set_uplink(self.cmd_link)
-            self.uplink = UplinkController(self.cmd_link, self.radio, backend=DroneBackend)
+            self.uplink = UplinkController(self.cmd_link, self.radio, backend=DroneBackend,
+                                           gimbal=self.gimbal,
+                                           servo_feedback=self._usb_servo_feedback)
 
         # USB auto-connect runs on a background thread (auto_detect_fc sends
         # an MSP probe to each port, which takes a few hundred ms per port --
@@ -1963,22 +1973,50 @@ class DroneCockpitApp:
 
     def _get_camera_mount_angle(self) -> tuple:
         """
-        Thread-safe. Called from _get_detection_telemetry() (DetectionLink's
-        C++ worker thread) AND from the Tk-thread dialog's live status
-        label -- lock-protected plain state, no Tk widgets touched here.
-        Returns (tilt_deg, pan_deg).
-
-        TODO once the servo gimbal is wired to the flight controller
-        (M5/M6): in "auto" mode, read the commanded servo pan/tilt angles
-        here instead of falling back to the manual values. There is no such readback yet,
-        so "auto" is currently indistinguishable from "manual" except for
-        the one-time warning shown when switching into it (see
-        _set_camera_angle_mode()) -- it's wired up this way now so turning
-        on real auto-tracking later is a one-line change in this function,
-        not a UI rework.
+        Thread-safe. The MANUAL tilt/pan from the "📐 Camera Angle" dialog,
+        (tilt_deg, pan_deg). Read by _camera_snapshot_angles() (DetectionLink's
+        C++ worker thread) in Manual mode and by the dialog's labels (Tk
+        thread) -- lock-protected plain state, no Tk widgets touched here.
         """
         with self._camera_angle_lock:
             return self._camera_tilt_deg, self._camera_pan_deg
+
+    def _usb_servo_feedback(self):
+        """Betaflight's servo outputs in us (MSP_SERVO) while the USB link is
+        up and healthy, else None. Called at 25 Hz from UplinkController's
+        thread (and from DetectionLink's when there is no controller);
+        DroneLink.get_latest_state() is a mutex-protected copy."""
+        try:
+            if not self.hub.is_connected():
+                return None
+            st = self.hub.get_latest_state()
+            if not getattr(st, "link_healthy", False) or not getattr(st, "servo_valid", False):
+                return None
+            return list(st.servo_values)
+        except Exception:
+            return None
+
+    def _camera_snapshot_angles(self) -> dict:
+        """
+        Thread-safe. Gimbal fields for a TelemetrySnapshot, in the mode
+        chosen in the "📐 Camera Angle" dialog:
+          auto   -- the gimbal model's estimate of the real servo angles
+                    (control/gimbal.py), incl. gimbal_moving while it moves;
+          manual -- the dialog's fixed tilt/pan, never "moving".
+        Keys: gimbal_tilt_deg, gimbal_pan_deg, gimbal_roll_deg, gimbal_moving.
+        """
+        with self._camera_angle_lock:
+            mode = self._camera_angle_mode
+        if mode == "auto":
+            now = time.monotonic()
+            if self.uplink is None:          # nobody else feeds the model
+                self.gimbal.update(now, self._usb_servo_feedback(), None)
+            return self.gimbal.angles(now).snapshot_fields()
+        tilt_deg, pan_deg = self._get_camera_mount_angle()
+        roll = pan_deg if GIMBAL_MOUNT_AXIS == "roll" else 0.0
+        pan = pan_deg if GIMBAL_MOUNT_AXIS == "yaw" else 0.0
+        return {"gimbal_tilt_deg": tilt_deg, "gimbal_pan_deg": pan,
+                "gimbal_roll_deg": roll, "gimbal_moving": False}
 
     def _set_camera_mount_angle(self, tilt_deg: float = None, pan_deg: float = None) -> None:
         """Thread-safe setter, called from the Tk-thread dialog only."""
@@ -1990,16 +2028,6 @@ class DroneCockpitApp:
 
     def _set_camera_angle_mode(self, mode: str) -> None:
         """Thread-safe mode switch, called from the Tk-thread dialog only."""
-        if mode == "auto":
-            messagebox.showinfo(
-                "Camera Angle — Auto",
-                "Auto mode has no gimbal angle to read yet -- the servo "
-                "gimbal (2x MG90S on flight controller outputs M5/M6) "
-                "isn't wired up yet. Auto will keep using the last Manual "
-                "tilt/pan values until the commanded servo angles are "
-                "read into DroneLink. Switch back to Manual any time to "
-                "set them directly.",
-            )
         with self._camera_angle_lock:
             self._camera_angle_mode = mode
         self._refresh_camera_angle_label()
@@ -2011,11 +2039,13 @@ class DroneCockpitApp:
         tilt_deg, pan_deg = self._get_camera_mount_angle()
         mode = self._camera_angle_mode
         if mode == "auto":
-            text = "📐 Auto (unwired)"
+            a = self.gimbal.angles(time.monotonic())
+            text = (f"📐 Auto: {a.tilt_deg:.0f}° tilt, {a.pan_deg:+.0f}° pan"
+                    + (" …" if a.moving else ""))
         else:
             text = f"📐 Manual: {tilt_deg:+.0f}° tilt, {pan_deg:+.0f}° pan"
         lbl = getattr(self, "_camera_angle_lbl", None)
-        if lbl is not None:
+        if lbl is not None and lbl.cget("text") != text:
             lbl.config(text=text)
 
     def _show_camera_angle_dialog(self) -> None:
@@ -2072,8 +2102,8 @@ class DroneCockpitApp:
         tk.Label(
             win,
             text="Used for detection georeferencing (DetectionLink).\n"
-                 "Auto has no real gimbal feedback yet -- see the info "
-                 "shown when you switch to it.",
+                 "Auto: live gimbal angles (servo feedback + model; aim it in\n"
+                 "Laptop Control). Manual: camera fixed at the angles below.",
             fg="#8098c0", bg="#0f1428", font=("Consolas", 8),
             justify="left",
         ).pack(anchor="w", padx=14, pady=(2, 8))
@@ -2285,16 +2315,12 @@ class DroneCockpitApp:
         mutex-protected snapshot (see Bindings.cpp), so it's safe to call
         straight from here.
 
-        NOTE: gimbal_pan_deg / gimbal_tilt_deg come from
-        _get_camera_mount_angle() below, NOT from live gimbal telemetry --
-        the servo gimbal (2x MG90S, driven from flight controller outputs
-        M5/M6) is physically installed but not wired up yet, so there's no
-        gimbal angle to use. That getter's "manual" mode is a live,
-        toolbar-editable stand-in (see the "📐 Camera Angle" button) for
-        however the camera is actually physically angled right now --
-        keep it in sync with reality, there's no sensor to do that for
-        you yet. Its "auto" mode is a placeholder for the commanded servo
-        angles once the gimbal is wired up.
+        Gimbal fields come from _camera_snapshot_angles(): in Auto mode
+        the gimbal model's estimate of the real servo angles (MSP_SERVO
+        over USB, else the radio's CH8/CH9 echo, else the command, passed
+        through a servo-speed model) plus gimbal_moving, during which
+        DetectionLink holds each object's last position; in Manual mode
+        the fixed angles from the "📐 Camera Angle" dialog.
         """
         snapshot = DroneBackend.TelemetrySnapshot()
 
@@ -2321,9 +2347,10 @@ class DroneCockpitApp:
         snapshot.heading_deg = float(state.yaw)
         snapshot.roll_deg = state.roll / 10.0
         snapshot.pitch_deg = state.pitch / 10.0
-        tilt_deg, pan_deg = self._get_camera_mount_angle()
-        snapshot.gimbal_tilt_deg = tilt_deg
-        snapshot.gimbal_pan_deg = pan_deg
+        for name, value in self._camera_snapshot_angles().items():
+            # gimbal_roll_deg / gimbal_moving only exist in a rebuilt .pyd
+            if hasattr(snapshot, name):
+                setattr(snapshot, name, value)
         return snapshot
 
     def _get_osd_telemetry(self) -> "DroneBackend.TelemetrySnapshot":
@@ -2900,9 +2927,9 @@ class DroneCockpitApp:
         # saved before this field existed, or with a missing/malformed
         # entry, so old layout files keep loading instead of erroring.
         cam = layout.get("camera_angle") or {}
-        mode = cam.get("mode", "manual")
+        mode = cam.get("mode", "auto")
         if mode not in ("manual", "auto"):
-            mode = "manual"
+            mode = "auto"
         tilt_deg = cam.get("tilt_deg", CAMERA_MOUNT_TILT_DEG)
         pan_deg = cam.get("pan_deg", CAMERA_MOUNT_PAN_DEG)
         with self._camera_angle_lock:
@@ -3246,9 +3273,9 @@ class DroneCockpitApp:
 
         self._camera_angle_btn = self._mk_icon_btn(
             toolbar, "📐", self._show_camera_angle_dialog,
-            "Camera Angle — set how the FPV camera is physically mounted "
-            "(Manual), or hand off to the gimbal servo angles once the "
-            "servo gimbal is wired (Auto). Used for detection "
+            "Camera Angle — Auto uses the live gimbal angles (M5/M6 servos, "
+            "aimed from Laptop Control); Manual sets how the camera is fixed "
+            "when the gimbal is not powered. Used for detection "
             "georeferencing. Saved with the active layout profile, so it "
             "persists across restarts.",
             label="Camera Angle",
@@ -3569,6 +3596,8 @@ class DroneCockpitApp:
             self._frame_counters["fpv"] = 0
             connected, fps, device_name = self._video_worker.get_status()
             self.fpv_view.update_status(connected, fps, device_name)
+            if self._camera_angle_mode == "auto":
+                self._refresh_camera_angle_label()     # live gimbal angles, 10 Hz
         self._frame_counters["fpv"] += 1
 
         # ── Link status: USB label + ELRS radio indicator ─────────────────────

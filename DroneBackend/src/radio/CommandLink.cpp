@@ -50,16 +50,32 @@ void CommandLink::setCommandAt(const Uplink::CommandValues& c, int64_t now) {
     leaseT_ = now;
 }
 
+namespace {
+    float clampPct(float v) { return (std::min)((std::max)(v, -100.0f), 100.0f); }
+}
+
 void CommandLink::setGimbalTiltPct(float pct) {
     std::lock_guard<std::mutex> lk(m_);
-    target_.gimbalTiltPct = (std::min)((std::max)(pct, -100.0f), 100.0f);
+    target_.gimbalTiltPct = clampPct(pct);
+}
+
+void CommandLink::setGimbalPanPct(float pct) {
+    std::lock_guard<std::mutex> lk(m_);
+    target_.gimbalPanPct = clampPct(pct);
+}
+
+void CommandLink::setGimbalPct(float panPct, float tiltPct) {
+    std::lock_guard<std::mutex> lk(m_);
+    target_.gimbalPanPct = clampPct(panPct);
+    target_.gimbalTiltPct = clampPct(tiltPct);
 }
 
 void CommandLink::neutral() {
     std::lock_guard<std::mutex> lk(m_);
-    const float tilt = target_.gimbalTiltPct;
+    const float tilt = target_.gimbalTiltPct, pan = target_.gimbalPanPct;
     target_ = Uplink::CommandValues{};
     target_.gimbalTiltPct = tilt;
+    target_.gimbalPanPct = pan;
     leaseT_ = -1;
 }
 
@@ -87,7 +103,8 @@ std::vector<uint8_t> CommandLink::nextFrame(int64_t now) {
     const bool thrOn = lease && target_.throttleEnabled;
 
     Uplink::CommandValues out = sent_;
-    out.gimbalTiltPct = (std::min)((std::max)(target_.gimbalTiltPct, -100.0f), 100.0f);
+    out.gimbalTiltPct = clampPct(target_.gimbalTiltPct);
+    out.gimbalPanPct = clampPct(target_.gimbalPanPct);
 
     // Sticks: slew toward the clamped target; drop to zero at once when off.
     if (sticksOn) {
@@ -131,7 +148,8 @@ void CommandLink::onWriteResult(bool ok) {
 void CommandLink::onFrame(const Crsf::Frame& f, int64_t now) {
     if (f.type == Uplink::TYPE_RAD_STATUS) {
         Uplink::BridgeStatus b;
-        if (!Uplink::decodeBridgeStatus(f, b) || b.version != Uplink::RAD_STATUS_VERSION) return;
+        if (!Uplink::decodeBridgeStatus(f, b) || b.version < Uplink::RAD_STATUS_MIN_VERSION
+            || b.version > Uplink::RAD_STATUS_VERSION) return;
         std::lock_guard<std::mutex> lk(m_);
         bridge_ = b;
         statusT_ = now;

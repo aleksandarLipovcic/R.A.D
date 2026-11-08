@@ -74,8 +74,11 @@ public:
     bool isEnabled() const;
     // Full command; renews the lease. The gimbal value in it is used too.
     void setCommand(const Uplink::CommandValues& c);
-    // Gimbal only (no lease: the radio holds the last tilt anyway).
+    // Gimbal only (no lease: the radio holds the last gimbal values anyway,
+    // and gimbal commands work without the master enable).
     void setGimbalTiltPct(float pct);
+    void setGimbalPanPct(float pct);
+    void setGimbalPct(float panPct, float tiltPct);
     // Sticks to zero and throttle hold off immediately (keeps gimbal).
     void neutral();
     Status getStatus() const;

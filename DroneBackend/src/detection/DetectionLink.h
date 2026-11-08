@@ -40,6 +40,14 @@ class VideoLink;
 //   pitchDeg      : positive = nose up
 //   gimbalPanDeg  : relative to body forward, positive = pan right
 //   gimbalTiltDeg : 0 = forward/level, +90 = straight down
+//   gimbalRollDeg : outer gimbal axis along the body's forward axis
+//                   (R.A.D. mount: base plate vertical at the nose), positive
+//                   = a downward-looking camera swings toward the right side
+//
+// Gimbal chain, body → camera: roll (outermost, fixed to the frame), then
+// pan, then tilt (innermost, carries the camera). A classic pan/tilt mount
+// uses pan + tilt and leaves roll at 0; the R.A.D. mount uses roll + tilt
+// and leaves pan at 0. At 0/0/0 the camera looks straight forward.
 struct TelemetrySnapshot {
     bool valid = false;
     double latitude = 0.0;
@@ -50,6 +58,12 @@ struct TelemetrySnapshot {
     double pitchDeg = 0.0;
     double gimbalPanDeg = 0.0;
     double gimbalTiltDeg = 0.0;
+    double gimbalRollDeg = 0.0;
+    // True while the gimbal is still moving toward a new command (the
+    // cockpit's servo model). Rays from a moving camera are unreliable, so
+    // such passes keep each object's last fused position instead of adding
+    // a new observation (see inferenceLoop()).
+    bool gimbalMoving = false;
 
     // --- Added for the software OSD's battery/RSSI/GPS/home-distance
     // readouts (VideoLink::drawOsdBattery/Rssi/Gps/HomeDistance). Nothing
@@ -746,4 +760,4 @@ private:
     // files that never touch inference directly.
     struct InferenceImpl;
     std::unique_ptr<InferenceImpl> impl_;
-};
+};

@@ -8,7 +8,10 @@ UPUTSTVO.md can be run before the cockpit integration is built.
     pip install pyserial
     python uplink_bench.py --list
     python uplink_bench.py --port COM7                 # UT-UPL-A1 / A4: monitor
-    python uplink_bench.py --port COM7 --tilt -50      # gimbal only
+    python uplink_bench.py --port COM7 --tilt -50      # gimbal only (percent)
+    python uplink_bench.py --port COM7 --tilt-us 1300 --pan-us 1700 --msp COM5
+                                                       # gimbal calibration: pulse
+                                                       # widths in us, MSP_SERVO readback
     python uplink_bench.py --port COM7 --sweep         # UT-UPL-A2 (PROPS OFF)
     python uplink_bench.py --port COM7 --latency --msp COM5   # UT-UPL-A3 (PROPS OFF)
 
@@ -80,10 +83,11 @@ def alive(seq):
     return 200 + seq % 1600
 
 
-def command_frame(seq, roll=0.0, pitch=0.0, yaw=0.0, thr_us=1000.0, tilt=0.0,
+def command_frame(seq, roll=0.0, pitch=0.0, yaw=0.0, thr_us=1000.0, tilt=0.0, pan=0.0,
                   sticks=False, throttle=False):
     ch = [992] * 16
     ch[0], ch[1], ch[2], ch[3], ch[4] = pct(roll), pct(pitch), us(thr_us), pct(yaw), pct(tilt)
+    ch[8] = pct(pan)                                   # CH9 gimbal pan
     ch[5] = 1811 if sticks else 172
     ch[6] = 1811 if throttle else 172
     ch[7] = alive(seq)
@@ -127,7 +131,8 @@ def decode_status(p):
             "crc_err": struct.unpack(">H", p[6:8])[0], "age_ms": p[8] * 10,
             "thr_stick_us": 1500 + s16(9) / 2, "thr_delta_us": s16(11) / 2,
             "period_ms": p[13] * 10, "out_roll": s16(14), "out_pitch": s16(16),
-            "out_yaw": s16(18), "out_tilt": s16(20)}
+            "out_yaw": s16(18), "out_tilt": s16(20),
+            "out_pan": s16(22) if p[0] >= 2 and len(p) >= 24 else None}
 
 
 # ── MSP (Betaflight over USB) for the latency test ──────────────────────────
@@ -144,6 +149,23 @@ def msp_rc(port):
             if len(buf) >= i + 6 + size:
                 data = bytes(buf[i + 5:i + 5 + size])
                 return [struct.unpack("<H", data[k:k + 2])[0] for k in range(0, size, 2)]
+    return None
+
+
+def msp_servo(port):
+    """Betaflight servo outputs in us (MSP_SERVO 103): [0] = M5 tilt, [1] = M6 pan."""
+    port.reset_input_buffer()
+    port.write(b"$M<\x00\x67\x67")                     # MSP_SERVO (103), size 0
+    t0 = time.perf_counter()
+    buf = bytearray()
+    while time.perf_counter() - t0 < 0.05:
+        buf += port.read(port.in_waiting or 1)
+        i = buf.find(b"$M>")
+        if i >= 0 and len(buf) >= i + 5:
+            size = buf[i + 3]
+            if len(buf) >= i + 6 + size:
+                data = bytes(buf[i + 5:i + 5 + size])
+                return [struct.unpack("<H", data[k:k + 2])[0] for k in range(0, size - 1, 2)]
     return None
 
 
@@ -197,15 +219,20 @@ class Bench:
             print(f"  bridge: fresh={st['fresh']} gate={st['gate']} sticks={st['sticks']}"
                   f" thr={st['throttle']} tlm_live={st['tlm_live']} script period {st['period_ms']} ms"
                   f"  cmd rx {st['rx']} crc {st['crc_err']}  {rtt}")
+            pan_txt = "" if st["out_pan"] is None else f" pan {st['out_pan']}"
             print(f"  outputs: roll {st['out_roll']} pitch {st['out_pitch']} yaw {st['out_yaw']}"
-                  f" tilt {st['out_tilt']}  thr stick {st['thr_stick_us']:.0f} us"
+                  f" tilt {st['out_tilt']}{pan_txt}  thr stick {st['thr_stick_us']:.0f} us"
                   f" delta {st['thr_delta_us']:+.0f} us")
         else:
             print("  no RAD_STATUS yet: is USB-VCP = LUA and radcmd.lua enabled on this model?")
         if 0x16 in self.last:
             ch = unpack11(self.last[0x16])
             print("  radio out: " + "  ".join(f"CH{i + 1} {1500 + (c - 992) * 0.625:.0f}"
-                                              for i, c in enumerate(ch[:8])))
+                                              for i, c in enumerate(ch[:9])))
+        if getattr(self, "msp", None) is not None:
+            sv = msp_servo(self.msp)
+            print("  Betaflight servo out: " + (f"M5 (tilt) {sv[0]} us   M6 (pan) {sv[1]} us"
+                                                 if sv and len(sv) >= 2 else "-- (no MSP_SERVO reply)"))
         if 0x1E in self.last:
             p = self.last[0x1E]
             pi, ro, ya = (struct.unpack(">h", p[i:i + 2])[0] / 10000 * 57.2958 for i in (0, 2, 4))
@@ -227,7 +254,7 @@ class Bench:
 def run_monitor(b, args):
     t_sum = time.perf_counter()
     while True:
-        b.send(tilt=args.tilt)
+        b.send(tilt=args.tilt, pan=args.pan)
         b.poll()
         time.sleep(0.03)
         if time.perf_counter() - t_sum >= 1.0:
@@ -241,7 +268,7 @@ def run_sweep(b, args):
     while True:
         t = time.perf_counter() - t0
         b.send(roll=20 * math.sin(2 * math.pi * 0.2 * t), pitch=20 * math.cos(2 * math.pi * 0.2 * t),
-               tilt=args.tilt, sticks=True)
+               tilt=args.tilt, pan=args.pan, sticks=True)
         b.poll()
         time.sleep(0.03)
         if time.perf_counter() - t_sum >= 1.0:
@@ -287,12 +314,20 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--port", help="Pocket COM port (default: auto by USB name)")
-    ap.add_argument("--tilt", type=float, default=0.0, help="gimbal tilt %% (-100..100)")
+    ap.add_argument("--tilt", type=float, default=0.0, help="gimbal tilt %% (-100..100), CH8")
+    ap.add_argument("--pan", type=float, default=0.0, help="gimbal pan %% (-100..100), CH9")
+    ap.add_argument("--tilt-us", type=float, help="gimbal tilt as pulse width in us (calibration)")
+    ap.add_argument("--pan-us", type=float, help="gimbal pan as pulse width in us (calibration)")
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--latency", action="store_true")
     ap.add_argument("--msp", help="flight controller COM port for --latency")
     ap.add_argument("--steps", type=int, default=10)
     args = ap.parse_args()
+    # 1 % of channel = 5.12 us on the servo (Betaflight forwards the channel)
+    if args.tilt_us is not None:
+        args.tilt = (args.tilt_us - 1500.0) / 5.12
+    if args.pan_us is not None:
+        args.pan = (args.pan_us - 1500.0) / 5.12
 
     if args.list:
         for p in list_ports.comports():
@@ -302,6 +337,9 @@ def main():
     if not port:
         sys.exit("Pocket not found, use --port")
     b = Bench(port)
+    b.msp = None
+    if args.msp and not args.latency:
+        b.msp = serial.Serial(args.msp, 115200, timeout=0)   # servo readback in the monitor
     print(f"Pocket on {port}. Ctrl+C to stop.")
     try:
         if args.latency:
@@ -314,7 +352,7 @@ def main():
             run_monitor(b, args)
     except KeyboardInterrupt:
         for _ in range(20):
-            b.send(tilt=args.tilt)
+            b.send(tilt=args.tilt, pan=args.pan)
             time.sleep(0.03)
         print("\nstopped, sent neutral frames")
 

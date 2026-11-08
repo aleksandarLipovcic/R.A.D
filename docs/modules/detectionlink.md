@@ -335,8 +335,8 @@ all, and the copilot list shows "no GPS fix".
 All of them consume the same world-space ray, built once per detection:
 
 `computeWorldRay(raw, frameW, frameH, telemetry, ...)` composes the pixel
-offset + horizontal FOV into a camera-space ray, then applies gimbal
-pan/tilt, then body roll/pitch/heading — shared by every ranging method so
+offset + horizontal FOV into a camera-space ray, then applies the gimbal
+(tilt, then pan, then the outer roll axis), then body roll/pitch/heading — shared by every ranging method so
 they always agree on *direction* and only differ on how far along that
 direction the object actually is. Angle conventions (documented explicitly
 because getting one wrong offsets every pin consistently and
@@ -348,6 +348,15 @@ easy-to-miss, the same class of bug as `MagQMC5883L`'s historical
 - `pitchDeg` — positive = nose up
 - `gimbalPanDeg` — relative to body forward, positive = pan right
 - `gimbalTiltDeg` — 0 = forward/level, +90° = straight down
+- `gimbalRollDeg` — outer gimbal axis along the body's forward axis (R.A.D.
+  mount: base plate vertical at the nose), positive = a downward-looking
+  camera swings to the right. Gimbal chain body → camera: roll, pan, tilt.
+- `gimbalMoving` — set by the cockpit's servo model while the gimbal is
+  still moving; such passes add no bearing and no position fix, objects
+  keep their last fused position (`range_method = "held (gimbal moving)"`)
+
+The cockpit fills these from `control/gimbal.py` ("📐 Camera Angle" =
+Auto), or from the fixed Manual angles.
 
 | Strategy | Method | Needs | Strength | Weakness |
 |---|---|---|---|---|

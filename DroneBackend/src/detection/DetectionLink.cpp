@@ -571,8 +571,16 @@ void DetectionLink::inferenceLoop() {
                 continue;                               // tentative: not a record (yet)
 
             ObjectState& obj = objects_[as.trackId];
-            const GeoCandidate geo = computeGeoCandidate(raw, frame.cols, frame.rows, telemetry,
-                                                         &obj.bearingHistory);
+            // While the gimbal is still moving the camera angle is only an
+            // estimate, so this pass adds no bearing and no position fix;
+            // the object keeps its last fused position (below).
+            const bool gimbalSteady = !telemetry.gimbalMoving;
+            GeoCandidate geo = computeGeoCandidate(raw, frame.cols, frame.rows, telemetry,
+                                                   &obj.bearingHistory);
+            if (!gimbalSteady) {
+                geo.rayValid = false;
+                geo.georeferenced = false;
+            }
             if (geo.rayValid) {
                 BearingObservation obs;
                 obs.timestampMs = nowMs;
@@ -609,7 +617,15 @@ void DetectionLink::inferenceLoop() {
             obj.sightings++;
             obj.bestConfidence = std::max(obj.bestConfidence, candidates[i].confidence);
             GeoCandidate fusedGeo = geo;
-            if (geo.georeferenced) {
+            if (!gimbalSteady && obj.seenGeo) {
+                // Hold the last fused position while the camera moves, so a
+                // gimbal sweep neither moves the pin nor "loses" it.
+                fusedGeo.georeferenced = true;
+                fusedGeo.lat = obj.fusedLat();
+                fusedGeo.lon = obj.fusedLon();
+                fusedGeo.uncertaintyM = obj.fusedRadiusM();
+            }
+            else if (geo.georeferenced) {
                 fuseObjectPosition(obj, geo, nowMs);
                 fusedGeo.lat = obj.fusedLat();
                 fusedGeo.lon = obj.fusedLon();
@@ -640,7 +656,7 @@ void DetectionLink::inferenceLoop() {
                 rec.uncertaintyM = fusedGeo.uncertaintyM;
                 rec.distanceM = geo.distanceM;
                 rec.bearingDeg = geo.bearingDeg;
-                rec.rangeMethod = geo.method;
+                rec.rangeMethod = gimbalSteady ? geo.method : std::string("held (gimbal moving)");
                 rec.georeferenced = true;
             }
 
@@ -1122,7 +1138,11 @@ bool DetectionLink::computeWorldRay(const RawDetection& raw, int frameW, int fra
     // shot.
     Mat3 gimbalTilt = rotY(-telemetry.gimbalTiltDeg);   // negative: tilt-down rotates +X toward +Z
     Mat3 gimbalPan = rotZ(telemetry.gimbalPanDeg);
-    Vec3 rayBody = matVec(matMul(gimbalPan, gimbalTilt), rayCam);
+    // Outer roll axis (body forward). Negative: rotX(+) turns the body's
+    // down axis toward the LEFT, and positive gimbal roll is defined as the
+    // downward-looking camera swinging to the RIGHT.
+    Mat3 gimbalRoll = rotX(-telemetry.gimbalRollDeg);
+    Vec3 rayBody = matVec(matMul(gimbalRoll, matMul(gimbalPan, gimbalTilt)), rayCam);
 
     // Body to world (NED): apply roll, then pitch, then yaw/heading.
     Mat3 attitude = matMul(rotZ(telemetry.headingDeg),
@@ -1686,4 +1706,4 @@ std::vector<FrameIndexEntry> DetectionLink::getFrameIndexSince(int64_t sinceMs) 
     while (it != frameIndex_.begin() && std::prev(it)->timestampMs > sinceMs)
         --it;
     return std::vector<FrameIndexEntry>(it, frameIndex_.end());
-}
+}

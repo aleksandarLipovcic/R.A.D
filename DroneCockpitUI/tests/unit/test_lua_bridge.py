@@ -162,6 +162,7 @@ def py_encode():
         ch = [992] * 16
         ch[0], ch[1], ch[2], ch[3], ch[4] = _pct(20), _pct(-15), _us(1450), _pct(40), _pct(-60)
         ch[5], ch[6], ch[7] = 1811, 1811, 200 + k % 1600
+        ch[8] = _pct(45)                       # gimbal pan
         out += rc_frame(ch)
     return out
 
@@ -240,7 +241,9 @@ def py_decode(data):
                      echo=-1 if echo == 0xFFFF else echo, rx=_u16(p, 4),
                      thr_stick=_s16(p, 9), thr_delta=_s16(p, 11), out_roll=_s16(p, 14),
                      out_pitch=_s16(p, 16), out_yaw=_s16(p, 18), out_tilt=_s16(p, 20),
-                     age_ms=p[8] * 10)
+                     age_ms=p[8] * 10, version=p[0])
+            has_pan = p[0] >= 2 and len(p) >= 24
+            d.update(has_pan=int(has_pan), out_pan=_s16(p, 22) if has_pan else 0)
         elif t == 0x16 and len(p) >= 22:
             acc = bits = 0
             ch = []
@@ -301,22 +304,21 @@ def main():
     m = EdgeTxMock()
     m.values.update({"sd": -1024, "thr": 0, "RQly": 0})
 
-    # --- no laptop: neutral, Lnk -1024 -------------------------------------
+    # --- no laptop: everything neutral -------------------------------------
     out = m.run()
-    check(out == (0, 0, 0, 0, 0, -1024), f"idle outputs {out}")
+    check(out == (0, 0, 0, 0, 0, 0), f"idle outputs {out}")
 
     # --- fresh command, gate OFF: nothing applied except gimbal ------------
     m.rx += f0
-    rol, pit, thr, yaw, tlt, lnk = m.run()
+    rol, pit, thr, yaw, tlt, pan = m.run()
     check((rol, pit, thr, yaw) == (0, 0, 0, 0), "gate off -> sticks/throttle zero")
-    check(lnk == 0, f"gate off, fresh -> Lnk 0 (got {lnk})")
-    near(tlt, -0.60 * 1024, 2, "gimbal follows laptop without gate")
+    near(tlt, -0.60 * 1024, 2, "gimbal tilt follows laptop without gate")
+    near(pan, 0.45 * 1024, 2, "gimbal pan follows laptop without gate")
 
     # --- gate ON: offsets applied and clamped ------------------------------
     m.values["sd"] = 1024
     m.rx += f1
-    rol, pit, thr, yaw, tlt, lnk = m.run()
-    check(lnk == 1024, "gate on -> Lnk 1024")
+    rol, pit, thr, yaw, tlt, pan = m.run()
     near(rol, 0.20 * 1024, 2, "roll offset 20 %")
     near(pit, -0.15 * 1024, 2, "pitch offset -15 %")
     check(yaw == 300, f"yaw 40 % clamped to MAX_STICK 300 (got {yaw})")
@@ -335,26 +337,28 @@ def main():
     m.tick += 60                   # 600 ms
     m.rx += f1                     # replay: same counter as before
     out = m.run(0)
-    check(out[:4] == (0, 0, 0, 0) and out[5] == -1024, f"replayed frame is stale {out}")
+    check(out[:4] == (0, 0, 0, 0), f"replayed frame is stale {out}")
     near(out[4], -0.60 * 1024, 2, "gimbal holds last tilt when stale")
+    near(out[5], 0.45 * 1024, 2, "gimbal holds last pan when stale")
 
     # --- new counter -> fresh again; then watchdog after 500 ms ------------
     m.rx += f2
     out = m.run()
-    check(out[5] == 1024 and out[0] != 0, "new counter -> active again")
+    check(out[0] != 0, "new counter -> active again")
     m.tick += 49
     out = m.run(0)
-    check(out[5] == 1024, "still fresh at 490 ms")
+    check(out[0] != 0, "still fresh at 490 ms")
     m.tick += 2
     out = m.run(0)
-    check(out[:4] == (0, 0, 0, 0) and out[5] == -1024, "watchdog neutral after 510 ms")
+    check(out[:4] == (0, 0, 0, 0), "watchdog neutral after 510 ms")
+    near(out[5], 0.45 * 1024, 2, "gimbal pan held after watchdog")
 
     # --- corrupted frame is rejected ---------------------------------------
     bad = bytearray(f0)
     bad[10] ^= 0x55
     m.rx += bad
     out = m.run()
-    check(out[5] == -1024, "corrupted frame ignored")
+    check(out[:4] == (0, 0, 0, 0), "corrupted frame ignored")
 
     # --- '\n' inside binary frames (serialRead stops there) ----------------
     # ch1 = 0x30A puts a 0x0A byte at the start of the payload.
@@ -362,8 +366,7 @@ def main():
     check(0x0A in nl[3:], "test frame contains 0x0A")
     m.rx += nl + nl[:5]            # plus a partial frame
     out = m.run()
-    near(out[0], (0x30A - 992) * 1.25, 1, "frame with 0x0A parsed (roll)")
-    check(out[5] == 1024, "frame with 0x0A counts as fresh")
+    near(out[0], (0x30A - 992) * 1.25, 1, "frame with 0x0A parsed (roll), counts as fresh")
 
     # --- telemetry re-encoding ---------------------------------------------
     m.values.update({
@@ -411,6 +414,8 @@ def main():
     st = by[0x7E][-1]
     check(st["echo"] == 202, f"status echoes alive counter of seq 2 (got {st['echo']})")
     check(st["live"] == 1 and st["gate"] == 1, "status flags")
+    check(st["version"] == 2 and st["has_pan"] == 1, f"status v2 with pan ({st['version']})")
+    near(st["out_pan"], 0.45 * 1024, 2, "status reports applied pan")
 
     # attitude dominates the schedule
     per_run = len(dec["frames"]) / 30      # baro slot writes BARO + VARIO

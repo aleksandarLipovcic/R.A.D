@@ -6,9 +6,10 @@
 -- directions:
 --
 --   laptop --CRSF RC frame (0x16)--> serialRead --> mixer outputs Rol/Pit/Thr/
---                                                   Yaw/Tlt/Lnk --> mixes on
---                                                   CH1-4 + gimbal channel
+--                                                   Yaw/Tlt/Pan --> mixes on
+--                                                   CH1-4 + gimbal CH8/CH9
 --                                                   ==ELRS==> Betaflight
+--                                                   (servos on M5/M6)
 --   laptop <--CRSF telemetry frames-- serialWrite <-- EdgeTX telemetry sensors
 --
 -- Telemetry is re-encoded from the EdgeTX sensors into the SAME CRSF frames
@@ -27,8 +28,15 @@
 --     where the pilot holds the stick, and switching the gate off returns
 --     throttle to the stick with a jump of at most THR_BAND.
 --   * Arming, flight modes and failsafe are NOT touched by this script.
---   * Gimbal tilt (Tlt) follows the laptop while commands are fresh and
---     holds its last value when they stop. It is not gated by the switch.
+--   * Gimbal tilt (Tlt) and pan (Pan) follow the laptop while commands are
+--     fresh and hold their last value when they stop. They are not gated by
+--     the switch.
+--
+-- EdgeTX allows at most 6 outputs per mixer script. Version 2 uses the 6th
+-- output for the gimbal pan axis; the former "Lnk" output is gone. The
+-- mixer lines on CH1-4 are now conditioned on the gate switch itself (SD),
+-- which is equivalent: every laptop output is already 0 here unless the
+-- switch is ON and commands are fresh.
 --
 -- Install: /SCRIPTS/MIXES/radcmd.lua (file name max 6 characters), then
 -- MODEL -> Custom scripts -> radcmd. Setup and bench tests: UPUTSTVO.md.
@@ -69,7 +77,7 @@ local floor = math.floor
 local SYNC_FC = 0xC8
 local T_GPS, T_VARIO, T_BATT, T_BARO = 0x02, 0x07, 0x08, 0x09
 local T_LINK, T_RC, T_ATT, T_FM, T_STATUS = 0x14, 0x16, 0x1E, 0x21, 0x7E
-local STATUS_VERSION = 1
+local STATUS_VERSION = 2          -- 2: + applied gimbal pan output
 
 -- CRC-8/DVB-S2 (poly 0xD5), precomputed: building it in init() would cost
 -- ~16k Lua instructions and risk the script being killed.
@@ -121,10 +129,10 @@ end
 local function s16(v) return clamp(rnd(v), 32767) end
 
 -- ---- State ------------------------------------------------------------------
-local cmd = { roll = 0, pitch = 0, thr = 0, yaw = 0, tilt = 0,
+local cmd = { roll = 0, pitch = 0, thr = 0, yaw = 0, tilt = 0, pan = 0,
               stk = false, thrOn = false }
 local st = { ctr = -1, freshT = -10000, rxFrames = 0, crcErr = 0, lastRun = 0 }
-local out = { rol = 0, pit = 0, thr = 0, yaw = 0, tlt = 0, lnk = -1024 }
+local out = { rol = 0, pit = 0, thr = 0, yaw = 0, tlt = 0, pan = 0 }
 local flags = { fresh = false, gate = false, stk = false, thr = false, live = false }
 local thrStick = -1024
 local rxbuf = ""
@@ -136,6 +144,7 @@ local tlmStep = 0
 --   1 roll offset   2 pitch offset   3 throttle target (absolute)
 --   4 yaw offset    5 gimbal tilt    6 sticks enable (>1500 = on)
 --   7 throttle enable (>1500 = on)   8 alive counter (must change)
+--   9 gimbal pan
 local function toMix(c) return (c - 992) * 5 / 4 end
 
 local function unpack11(b, off, dst)
@@ -154,6 +163,7 @@ local function handleFrame(b, len)          -- b = {type, payload..., crc}
   cmd.roll  = toMix(chIn[1]); cmd.pitch = toMix(chIn[2])
   cmd.thr   = toMix(chIn[3]); cmd.yaw   = toMix(chIn[4])
   cmd.tilt  = toMix(chIn[5])
+  cmd.pan   = toMix(chIn[9])
   cmd.stk   = chIn[6] > 1500
   cmd.thrOn = chIn[7] > 1500
   st.rxFrames = (st.rxFrames + 1) % 65536
@@ -306,6 +316,7 @@ local function sendStatus(now)
   if dt > 255 or dt < 0 then dt = 255 end
   u8(p, dt)
   u16(p, s16(out.rol)); u16(p, s16(out.pit)); u16(p, s16(out.yaw)); u16(p, s16(out.tlt))
+  u16(p, s16(out.pan))
   send(T_STATUS, p)
 end
 
@@ -351,11 +362,9 @@ local function run()
   thrStick    = num("thr")
 
   out.rol, out.pit, out.yaw, out.thr = 0, 0, 0, 0
-  out.lnk = flags.fresh and 0 or -1024
   flags.stk, flags.thr = false, false
 
   if flags.fresh and flags.gate then
-    out.lnk = 1024
     if cmd.stk then
       out.rol = clamp(cmd.roll, CFG.MAX_STICK)
       out.pit = clamp(cmd.pitch, CFG.MAX_STICK)
@@ -367,17 +376,20 @@ local function run()
       flags.thr = true
     end
   end
-  if flags.fresh then out.tlt = clamp(cmd.tilt, 1024) end   -- else hold
+  if flags.fresh then                                       -- else hold
+    out.tlt = clamp(cmd.tilt, 1024)
+    out.pan = clamp(cmd.pan, 1024)
+  end
 
   -- 3. Telemetry back to the laptop.
   if serialWrite then sendTelemetry(now) end
   st.lastRun = now
 
-  return out.rol, out.pit, out.thr, out.yaw, out.tlt, out.lnk
+  return out.rol, out.pit, out.thr, out.yaw, out.tlt, out.pan
 end
 
 return {
-  output = { "Rol", "Pit", "Thr", "Yaw", "Tlt", "Lnk" },
+  output = { "Rol", "Pit", "Thr", "Yaw", "Tlt", "Pan" },
   init = init,
   run = run,
 }

@@ -71,6 +71,7 @@ std::array<uint16_t, NUM_CHANNELS> commandToChannels(const CommandValues& c, uin
     ch[Ch::THROTTLE]    = usToCrsf(c.throttleUs);
     ch[Ch::YAW]         = pctToCrsf(c.yawPct);
     ch[Ch::TILT]        = pctToCrsf(c.gimbalTiltPct);
+    ch[Ch::PAN]         = pctToCrsf(c.gimbalPanPct);
     ch[Ch::STICKS_EN]   = c.sticksEnabled ? CRSF_MAX : CRSF_MIN;
     ch[Ch::THROTTLE_EN] = c.throttleEnabled ? CRSF_MAX : CRSF_MIN;
     ch[Ch::ALIVE]       = aliveValue(seq);
@@ -104,6 +105,8 @@ bool decodeBridgeStatus(const Crsf::Frame& f, BridgeStatus& o) {
     o.outPitch       = be16s(p + 16);
     o.outYaw         = be16s(p + 18);
     o.outTilt        = be16s(p + 20);
+    o.hasPan         = o.version >= 2 && f.payload.size() >= 24;
+    o.outPan         = o.hasPan ? be16s(p + 22) : 0;
     return true;
 }
 

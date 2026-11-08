@@ -34,6 +34,7 @@
     <Compile Include="NNTraining\train.py" />
     <Compile Include="control\__init__.py" />
     <Compile Include="control\altitude_hold.py" />
+    <Compile Include="control\gimbal.py" />
     <Compile Include="core\MapTiles.py" />
     <Compile Include="core\detection_report.py" />
     <Compile Include="core\__init__.py" />
@@ -59,6 +60,7 @@
     <Compile Include="tests\unit\test_imu_widget.py" />
     <Compile Include="tests\unit\test_link_mode.py" />
     <Compile Include="tests\unit\test_lua_bridge.py" />
+    <Compile Include="tests\unit\test_gimbal.py" />
     <Compile Include="tests\unit\test_uplink_python.py" />
     <Compile Include="tools\DroneTest.py" />
     <Compile Include="tools\Setup_Project.py" />
@@ -134,4 +136,4 @@
   </Target>
   <Target Name="AfterBuild">
   </Target>
-</Project>
+</Project>

@@ -20,6 +20,8 @@ DroneLink::DroneLink()
     , accCalRequested(false)
     , svPollTickCounter_(0)
     , slowPollTickCounter_(0)
+    , servoPollTickCounter_(0)
+    , servoFailCount_(0)
     , magCalActive_(false)
     , accCalActive_(false)
 {
@@ -237,6 +239,20 @@ void DroneLink::communicationLoop() {
             svPollTickCounter_ = SV_POLL_TICKS;
         }
         --svPollTickCounter_;
+
+        // ── Gimbal servos — MSP_SERVO (103), every ~50 ms ────────────────────
+        if (servoPollTickCounter_ <= 0) {
+            auto buf = sendMSP(MSP::SERVO);
+            if (parseServos(buf, pending)) {
+                servoFailCount_ = 0;
+                servoPollTickCounter_ = SERVO_POLL_TICKS;
+            } else {
+                ++servoFailCount_;
+                servoPollTickCounter_ = servoFailCount_ >= 3 ? SERVO_BACKOFF_TICKS
+                                                             : SERVO_POLL_TICKS;
+            }
+        }
+        --servoPollTickCounter_;
 
         // ── Battery detail — MSP_BATTERY_STATE (242), every ~500 ms ──────────
         if (slowPollTickCounter_ <= 0) {
@@ -912,6 +928,26 @@ bool DroneLink::parseMotors(const std::vector<uint8_t>& buf, DroneState& s) {
 }
 
 // -----------------------------------------------------------------------------
+// parseServos() — MSP_SERVO (103)
+//
+// 8 × uint16 servo pulse widths (µs), Betaflight's servo[] array after
+// channel forwarding and per-servo min/max. Firmware built without servos
+// answers with an error/empty frame: the parse fails and servoValid stays
+// false, so the cockpit falls back to the commanded gimbal angles.
+// Min frame: header(5) + payload(16) + checksum(1) = 22 bytes
+// -----------------------------------------------------------------------------
+
+bool DroneLink::parseServos(const std::vector<uint8_t>& buf, DroneState& s) {
+    if (buf.size() < 22 || buf[4] != MSP::SERVO || buf[3] < 2 * MAX_SERVOS) return false;
+    for (int i = 0; i < MAX_SERVOS; ++i) {
+        s.servoValues[i] = static_cast<uint16_t>(buf[5 + i * 2]) |
+            (static_cast<uint16_t>(buf[6 + i * 2]) << 8);
+    }
+    s.servoValid = true;
+    return true;
+}
+
+// -----------------------------------------------------------------------------
 // parseRCChannels() — MSP_RC (105)
 //
 // N × uint16 RC channel values (1000-2000 µs).
@@ -1060,4 +1096,4 @@ std::string AutoDetectF405() {
         }
     }
     return "NOT_FOUND";
-}
+}

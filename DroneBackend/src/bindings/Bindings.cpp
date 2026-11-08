@@ -312,6 +312,14 @@ PYBIND11_MODULE(DroneBackend, m) {
             })
         .def_readonly("motor_count", &DroneState::motorCount)
 
+        // ── Servo outputs (MSP_SERVO, USB only) ───────────────────────────────
+        .def_property_readonly("servo_values",
+            [](const DroneState& s) {
+                return std::vector<uint16_t>(
+                    s.servoValues, s.servoValues + MAX_SERVOS);
+            })
+        .def_readonly("servo_valid", &DroneState::servoValid)
+
         // ── RC channel inputs ─────────────────────────────────────────────────
         .def_property_readonly("rc_channels",
             [](const DroneState& s) {
@@ -529,6 +537,13 @@ PYBIND11_MODULE(DroneBackend, m) {
         d["available_raw_imu"] = usb;
         d["available_raw_mag"] = usb;
         d["available_motors"] = usb;
+        d["available_servos"] = usb && s.servoValid;
+        {
+            py::list servo_vals;
+            for (int i = 0; i < MAX_SERVOS; ++i)
+                servo_vals.append(s.servoValues[i]);
+            d["servo_values"] = servo_vals;
+        }
         d["available_rc_channels"] = usb;
         d["available_sat_list"] = usb;
         d["available_hdop"] = usb;
@@ -852,6 +867,10 @@ PYBIND11_MODULE(DroneBackend, m) {
             "Relative to body forward, positive = pan right.")
         .def_readwrite("gimbal_tilt_deg", &TelemetrySnapshot::gimbalTiltDeg,
             "0 = forward/level, +90 = straight down.")
+        .def_readwrite("gimbal_roll_deg", &TelemetrySnapshot::gimbalRollDeg,
+            "Outer axis along the body's forward axis, positive = a downward-looking camera swings right.")
+        .def_readwrite("gimbal_moving", &TelemetrySnapshot::gimbalMoving,
+            "True while the gimbal is still moving; such passes add no new position fix.")
         .def_readwrite("battery_voltage", &TelemetrySnapshot::batteryVoltage,
             "Volts. For the OSD battery readout -- same source as "
             "DroneState.battery_voltage.")
@@ -1263,4 +1282,4 @@ PYBIND11_MODULE(DroneBackend, m) {
 
     m.def("auto_detect_f405", &AutoDetectF405,
         "Scan COM1-COM29 and return the first port that opens, or 'NOT_FOUND'.");
-}
+}

@@ -15,6 +15,7 @@
 namespace MSP {
     constexpr uint8_t STATUS = 101;
     constexpr uint8_t RAW_IMU = 102;
+    constexpr uint8_t SERVO = 103;   // MSP_SERVO         — servo outputs (gimbal on M5/M6)
     constexpr uint8_t MOTOR = 104;   // MSP_MOTOR         — motor throttle outputs
     constexpr uint8_t RC = 105;   // MSP_RC            — RC channel inputs
     constexpr uint8_t RAW_GPS = 106;
@@ -100,12 +101,21 @@ static constexpr int ACC_CAL_DURATION_S = 5;
 // =============================================================================
 static constexpr int SV_POLL_TICKS = 100;   // ~1 s at 100 Hz
 static constexpr int SLOW_POLL_TICKS = 50;   // ~500 ms at 100 Hz
+// SERVO_POLL_TICKS — gimbal servo outputs via MSP_SERVO (103).
+//   5 ticks = ~50 ms (20 Hz): fast enough to follow an MG90S (~0.1 s/60°)
+//   for georeferencing, without a 14th request in every tick.
+static constexpr int SERVO_POLL_TICKS = 5;
+// After 3 failed MSP_SERVO polls in a row (firmware without servos answers
+// with an MSP error, which costs sendMSP()'s full 80 ms timeout), back off
+// to one attempt every ~5 s so the 100 Hz loop is not slowed down.
+static constexpr int SERVO_BACKOFF_TICKS = 500;
 
 // =============================================================================
 // Motor / RC channel array sizes
 // =============================================================================
 static constexpr int MAX_MOTORS = 8;    // Betaflight supports up to 8 motors
 static constexpr int MAX_RC_CH = 18;   // up to 18 CRSF/ELRS channels
+static constexpr int MAX_SERVOS = 8;   // Betaflight MAX_SUPPORTED_SERVOS
 
 // =============================================================================
 // BatteryState — MSP_BATTERY_STATE buf[13]
@@ -324,6 +334,16 @@ struct DroneState {
     uint16_t rcChannels[MAX_RC_CH] = {};
     uint8_t  rcChannelCount = 0;
 
+    // ── Servo outputs — MSP_SERVO (103), every SERVO_POLL_TICKS (~50 ms) ────
+    // Pulse widths in µs that Betaflight is driving right now. With
+    // feature SERVO_TILT: [0] = gimbal pitch servo (resource SERVO 1 = M5),
+    // [1] = gimbal roll servo (resource SERVO 2 = M6). This is the real
+    // output after channel forwarding and min/max limits, so the cockpit
+    // turns it into the gimbal angles used for georeferencing.
+    // USB only; over ELRS the cockpit uses the radio's channel echo instead.
+    uint16_t servoValues[MAX_SERVOS] = {};
+    bool     servoValid = false;      // at least one MSP_SERVO reply parsed
+
     // ── GPS — NEO-M10 via MSP_RAW_GPS (106) + MSP_COMP_GPS (107) ─────────────
     GPSReading gps;
 
@@ -433,6 +453,8 @@ private:
     // slowPollTickCounter_ : battery state,  fires every SLOW_POLL_TICKS (~500 ms)
     int svPollTickCounter_ = 0;
     int slowPollTickCounter_ = 0;
+    int servoPollTickCounter_ = 0;      // servo outputs, every SERVO_POLL_TICKS (~50 ms)
+    int servoFailCount_ = 0;            // consecutive MSP_SERVO failures (back-off)
 
     // Calibration countdown state (worker-thread only, committed via commitState)
     bool                                  magCalActive_;
@@ -477,6 +499,7 @@ private:
     bool parseBatteryState(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseMotors(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseRCChannels(const std::vector<uint8_t>& buf, DroneState& s);
+    bool parseServos(const std::vector<uint8_t>& buf, DroneState& s);
 
     // ── Decode helpers (static — no hardware access) ──────────────────────────
     // decodeFlightMode: translates flightModeFlags bitmask → display string.
@@ -493,4 +516,4 @@ private:
 // =============================================================================
 // AutoDetectF405() — scans COM1–COM29, returns first port that opens
 // =============================================================================
-std::string AutoDetectF405();
+std::string AutoDetectF405();

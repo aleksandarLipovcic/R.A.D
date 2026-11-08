@@ -29,7 +29,8 @@ inline void RegisterUplinkBindings(pybind11::module_& m) {
         .def_readwrite("sticks_enabled", &Uplink::CommandValues::sticksEnabled)
         .def_readwrite("throttle_us", &Uplink::CommandValues::throttleUs)
         .def_readwrite("throttle_enabled", &Uplink::CommandValues::throttleEnabled)
-        .def_readwrite("gimbal_tilt_pct", &Uplink::CommandValues::gimbalTiltPct);
+        .def_readwrite("gimbal_tilt_pct", &Uplink::CommandValues::gimbalTiltPct)
+        .def_readwrite("gimbal_pan_pct", &Uplink::CommandValues::gimbalPanPct);
 
     py::class_<Uplink::BridgeStatus>(m, "BridgeStatus")
         .def_readonly("version", &Uplink::BridgeStatus::version)
@@ -48,7 +49,9 @@ inline void RegisterUplinkBindings(pybind11::module_& m) {
         .def_readonly("out_roll", &Uplink::BridgeStatus::outRoll)
         .def_readonly("out_pitch", &Uplink::BridgeStatus::outPitch)
         .def_readonly("out_yaw", &Uplink::BridgeStatus::outYaw)
-        .def_readonly("out_tilt", &Uplink::BridgeStatus::outTilt);
+        .def_readonly("out_tilt", &Uplink::BridgeStatus::outTilt)
+        .def_readonly("out_pan", &Uplink::BridgeStatus::outPan)
+        .def_readonly("has_pan", &Uplink::BridgeStatus::hasPan);
 
     py::class_<CommandLink::Limits>(m, "CommandLimits")
         .def(py::init<>())
@@ -87,6 +90,9 @@ inline void RegisterUplinkBindings(pybind11::module_& m) {
         .def("set_command", &CommandLink::setCommand,
              "Full command; renews the lease (call at least every lease_ms).")
         .def("set_gimbal_tilt_pct", &CommandLink::setGimbalTiltPct)
+        .def("set_gimbal_pan_pct", &CommandLink::setGimbalPanPct)
+        .def("set_gimbal_pct", &CommandLink::setGimbalPct, py::arg("pan_pct"), py::arg("tilt_pct"),
+             "Both gimbal channels at once (no lease, works without set_enabled).")
         .def("neutral", &CommandLink::neutral)
         .def("get_status", &CommandLink::getStatus);
 }

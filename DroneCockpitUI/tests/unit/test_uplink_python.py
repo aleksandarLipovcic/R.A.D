@@ -112,6 +112,7 @@ class FakeValues:
         self.sticks_enabled = self.throttle_enabled = False
         self.throttle_us = 1000.0
         self.gimbal_tilt_pct = 0.0
+        self.gimbal_pan_pct = 0.0
 
 
 class FakeCmd:
@@ -119,6 +120,7 @@ class FakeCmd:
         self.enabled = False
         self.sent = []
         self.tilt = None
+        self.pan = None
         self.neutral_calls = 0
         self.gate = True
         self.bridge = True
@@ -129,6 +131,7 @@ class FakeCmd:
     def neutral(self): self.neutral_calls += 1
     def set_command(self, cv): self.sent.append(cv)
     def set_gimbal_tilt_pct(self, p): self.tilt = p
+    def set_gimbal_pct(self, pan, tilt): self.pan, self.tilt = pan, tilt
 
     def get_status(self):
         b = types.SimpleNamespace(gate_on=self.gate, script_period_ms=30, sticks_active=self.gate,
@@ -160,7 +163,9 @@ def test_controller():
     c, cmd, radio = make()
     c.ui_heartbeat(0.0)
     c._tick(0.04, 0.0)
-    check(not cmd.sent and cmd.tilt == 0.0, "disabled: only gimbal, no command")
+    pan_pct, tilt_pct = c.gimbal.command_pct()
+    check(not cmd.sent and cmd.tilt == tilt_pct and cmd.pan == pan_pct,
+          "disabled: only gimbal, no command")
     check("laptop control off" in c.get_status()["blockers"], "blocker listed")
 
     c.set_enabled(True)

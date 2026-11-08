@@ -9,6 +9,11 @@ Keys (this window must have keyboard focus -- see the "Keyboard" line):
     Q / E      yaw left / right          Space   stop all movement
     R / F      altitude target +0.5 / -0.5 m (while holding)
     H          altitude hold on / off
+    Up / Down  gimbal tilt -5 / +5 deg   (0 = forward, 90 = straight down)
+    Left/Right gimbal pan  -5 / +5 deg   C  centre the pan
+Gimbal commands work without "Laptop control" and without the pilot
+switch; the angles shown are the servo model's estimate that also goes to
+georeferencing (source usb / radio / cmd, see control/gimbal.py).
 Movement is press-and-hold: releasing the key returns that axis to zero.
 Losing keyboard focus (clicking another window) stops all movement.
 
@@ -38,6 +43,7 @@ _KEYS = {"w": ("fwd", 1), "s": ("fwd", -1), "d": ("right", 1), "a": ("right", -1
 _PAD = [("Q  yaw <", 1, 0, "yaw", -1), ("W  fwd", 1, 1, "fwd", 1), ("yaw >  E", 1, 2, "yaw", 1),
         ("A  left", 2, 0, "right", -1), ("STOP", 2, 1, None, 0), ("right  D", 2, 2, "right", 1),
         ("S  back", 3, 1, "fwd", -1)]
+GIMBAL_STEP_DEG = 5.0
 _AXIS_WORDS = {("fwd", 1): "forward", ("fwd", -1): "back", ("right", 1): "right",
                ("right", -1): "left", ("yaw", 1): "yaw right", ("yaw", -1): "yaw left"}
 
@@ -70,6 +76,11 @@ class CommandPanel(tk.Toplevel):
             self.bind(f"<KeyPress-{key}>", lambda e, d=delta: self._nudge(d))
         self.bind("<KeyPress-h>", lambda e: self._toggle_hold(from_key=True))
         self.bind("<KeyPress-H>", lambda e: self._toggle_hold(from_key=True))
+        for key, dp, dt in (("Up", 0, -GIMBAL_STEP_DEG), ("Down", 0, GIMBAL_STEP_DEG),
+                            ("Left", -GIMBAL_STEP_DEG, 0), ("Right", GIMBAL_STEP_DEG, 0)):
+            self.bind(f"<KeyPress-{key}>", lambda e, a=dp, b=dt: self._gimbal_step(a, b))
+        for key in ("c", "C"):
+            self.bind(f"<KeyPress-{key}>", lambda e: self._gimbal_preset(pan=0.0, text="pan centred"))
         self.bind("<FocusIn>", lambda e: self.after_idle(self._check_focus))
         self.bind("<FocusOut>", lambda e: self.after(50, self._check_focus))
         # A click anywhere in the window gives the keyboard back to it.
@@ -111,6 +122,7 @@ class CommandPanel(tk.Toplevel):
         self.kb_lbl.pack(fill="x")
         self._lbl(kb, "W/S fwd-back  A/D left-right  Q/E yaw  Space stop  "
                       "R/F alt +/-  H hold", DIM, anchor="w").pack(fill="x")
+        self._lbl(kb, "Arrows gimbal tilt/pan  C centre pan", DIM, anchor="w").pack(fill="x")
 
         # movement pad
         mv = tk.Frame(self, bg=PANEL, padx=10, pady=8)
@@ -149,20 +161,33 @@ class CommandPanel(tk.Toplevel):
         self.alt_lbl = self._lbl(ah, "", FG, justify="left")
         self.alt_lbl.grid(row=0, column=2, rowspan=2, sticky="w")
 
-        # gimbal
+        # gimbal (degrees; limits come from the servo calibration)
         gb = tk.Frame(self, bg=PANEL, padx=10, pady=8)
         gb.pack(fill="x", padx=8, pady=4)
-        self.tilt = tk.Scale(gb, from_=100, to=-100, orient="vertical", label="Tilt %",
-                             length=110, bg=PANEL, fg=FG, highlightthickness=0,
+        lim = self.ctrl.gimbal.limits()
+        t_lo, t_hi = lim["tilt"]
+        p_lo, p_hi = lim["pan"]
+        pan0, tilt0 = self.ctrl.gimbal.target()
+        self._lbl(gb, "Camera gimbal (arrows, C)", DIM).grid(row=0, column=0, columnspan=3, sticky="w")
+        # vertical scale: top = forward (small tilt), bottom = straight down
+        self.tilt = tk.Scale(gb, from_=t_lo, to=t_hi, orient="vertical", label="Tilt deg",
+                             resolution=1, length=120, bg=PANEL, fg=FG, highlightthickness=0,
                              troughcolor=BG, font=FONT, takefocus=0, command=self._on_tilt)
-        self.tilt.set(0)
-        self.tilt.pack(side="left")
-        bx = tk.Frame(gb, bg=PANEL)
-        bx.pack(side="left", padx=10)
-        for text, val in (("Level", 0), ("Down ~45 deg*", -50), ("Down*", -100)):
-            tk.Button(bx, text=text, width=14, font=FONT, bg=BTN, fg=FG, relief="flat",
-                      takefocus=0, command=lambda v=val: self.tilt.set(v)).pack(pady=2)
-        self._lbl(bx, "* depends on servo setup", DIM).pack()
+        self.tilt.set(tilt0)
+        self.tilt.grid(row=1, column=0, rowspan=4, sticky="ns")
+        self.pan = tk.Scale(gb, from_=p_lo, to=p_hi, orient="horizontal", label="Pan deg (- left, + right)",
+                            resolution=1, length=240, bg=PANEL, fg=FG, highlightthickness=0,
+                            troughcolor=BG, font=FONT, takefocus=0, command=self._on_pan)
+        self.pan.set(pan0)
+        self.pan.grid(row=1, column=1, columnspan=2, sticky="w", padx=(10, 0))
+        presets = (("Forward", None, 0.0), ("Down 45", None, 45.0), ("Down 90", None, 90.0),
+                   ("Pan centre (C)", 0.0, None))
+        for i, (text, p, t) in enumerate(presets):
+            tk.Button(gb, text=text, width=14, font=FONT, bg=BTN, fg=FG, relief="flat",
+                      takefocus=0, command=lambda p=p, t=t, x=text: self._gimbal_preset(p, t, x)
+                      ).grid(row=2 + i // 2, column=1 + i % 2, padx=(10, 2), pady=2, sticky="w")
+        self.gimbal_lbl = self._lbl(gb, "", FG, justify="left", anchor="w")
+        self.gimbal_lbl.grid(row=4, column=1, columnspan=2, sticky="w", padx=(10, 0), pady=(4, 0))
 
         # last key action + radio echo
         self.event_lbl = self._lbl(self, "", CYAN, FONT_B, anchor="w")
@@ -244,7 +269,28 @@ class CommandPanel(tk.Toplevel):
         self._paint_request()
 
     def _on_tilt(self, v):
-        self.ctrl.set_gimbal_tilt(float(v))
+        self.ctrl.set_gimbal(tilt_deg=float(v))
+
+    def _on_pan(self, v):
+        self.ctrl.set_gimbal(pan_deg=float(v))
+
+    def _gimbal_step(self, d_pan, d_tilt):
+        self.ctrl.nudge_gimbal(d_pan, d_tilt)
+        self._sync_gimbal_scales()
+        pan, tilt = self.ctrl.gimbal.target()
+        self._flash(f"gimbal target pan {pan:+.0f} deg, tilt {tilt:.0f} deg")
+
+    def _gimbal_preset(self, pan=None, tilt=None, text="preset"):
+        self.ctrl.set_gimbal(pan, tilt)
+        self._sync_gimbal_scales()
+        self._flash(f"gimbal: {text}")
+
+    def _sync_gimbal_scales(self):
+        pan, tilt = self.ctrl.gimbal.target()
+        if abs(float(self.pan.get()) - pan) > 0.5:
+            self.pan.set(pan)
+        if abs(float(self.tilt.get()) - tilt) > 0.5:
+            self.tilt.set(tilt)
 
     def _toggle_hold(self, from_key=False):
         st = self.ctrl.get_status()
@@ -322,9 +368,20 @@ class CommandPanel(tk.Toplevel):
                     + ("  STALE" if s.get("hold_stale") else "")) if engaged else ""
         self.alt_lbl.configure(text=f"altitude {alt_txt}\n{hold_txt}")
 
+        g = s.get("gimbal")
+        if g:
+            src = {"usb": "USB servo out", "radio": "radio CH8/CH9", "cmd": "command only"}
+            pan_note = "" if g.get("pan_supported", True) else "\npan needs a rebuilt DroneBackend.pyd"
+            self.gimbal_lbl.configure(
+                text=(f"target  pan {g['target_pan_deg']:+5.1f}  tilt {g['target_tilt_deg']:5.1f}\n"
+                      f"actual  pan {g['pan_deg']:+5.1f}  tilt {g['tilt_deg']:5.1f}"
+                      f"  {'MOVING' if g['moving'] else 'steady'}\n"
+                      f"from {src.get(g['source'], g['source'])}{pan_note}"),
+                fg=YELLOW if g["moving"] else FG)
+
         ch = s.get("radio_channels_us", [])
         self.radio_lbl.configure(text=(
-            "radio out  " + "  ".join(f"CH{i + 1} {v:.0f}" for i, v in enumerate(ch[:8]))
+            "radio out  " + "  ".join(f"CH{i + 1} {v:.0f}" for i, v in enumerate(ch[:9]))
             if ch else "radio out  --") + f"\nLua period {s.get('script_period_ms', 0)} ms,"
             f" frames {s.get('frames_sent', 0)}, write errors {s.get('write_errors', 0)},"
             f" laptop loop max {s.get('loop_max_ms', 0):.0f} ms")
