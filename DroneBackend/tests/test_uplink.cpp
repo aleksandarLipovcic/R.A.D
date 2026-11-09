@@ -126,6 +126,9 @@ static void testProtocol() {
     CHECK(Uplink::decodeBridgeStatus(v2, b) && b.hasPan && b.outPan == -500);
     auto v1 = statusFrame(0x01, 5, 1);
     CHECK(Uplink::decodeBridgeStatus(v1, b) && !b.hasPan && b.outPan == 0);
+    auto fl = statusFrame(0x20 | 0x40, 5);
+    CHECK(Uplink::decodeBridgeStatus(fl, b) && b.pilotOverride && b.angleOn);
+    CHECK(Uplink::decodeBridgeStatus(v2, b) && !b.pilotOverride && !b.angleOn);
 }
 
 static void testCommandLink() {
@@ -301,11 +304,12 @@ static int cmdDecode(const char* path) {
             std::printf(", \"fresh\": %d, \"gate\": %d, \"stk\": %d, \"thr\": %d, \"live\": %d, \"echo\": %d,"
                         " \"rx\": %u, \"thr_stick\": %d, \"thr_delta\": %d, \"out_roll\": %d,"
                         " \"out_pitch\": %d, \"out_yaw\": %d, \"out_tilt\": %d, \"age_ms\": %d,"
-                        " \"version\": %d, \"has_pan\": %d, \"out_pan\": %d",
+                        " \"version\": %d, \"has_pan\": %d, \"out_pan\": %d,"
+                        " \"override\": %d, \"angle\": %d",
                         bs.fresh, bs.gateOn, bs.sticksActive, bs.throttleActive, bs.telemetryLive,
                         bs.echoAlive, bs.rxFrames, bs.throttleStick, bs.throttleDelta, bs.outRoll,
                         bs.outPitch, bs.outYaw, bs.outTilt, bs.cmdAgeMs,
-                        bs.version, bs.hasPan, bs.outPan);
+                        bs.version, bs.hasPan, bs.outPan, bs.pilotOverride, bs.angleOn);
         else if (fr.type == Crsf::Type::RC_CHANNELS && Uplink::unpackChannels(fr.payload, ch)) {
             std::printf(", \"us\": [");
             for (int k = 0; k < 16; ++k) std::printf("%s%.1f", k ? ", " : "", Uplink::crsfToUs(ch[k]));

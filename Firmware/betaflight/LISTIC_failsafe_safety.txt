@@ -1,0 +1,26 @@
+# Betaflight 4.5.5 - failsafe for laptop control (Project R.A.D.)
+# Paste into the CLI AFTER LISTIC_BF4.5.5_servo_mag_20261103.txt, drone on
+# USB and DISARMED.
+# Why: the 2026-11-03 configuration has failsafe_procedure = AUTO-LAND with
+# failsafe_throttle = 1020 (motors practically off -> the drone falls on link
+# loss). The cockpit reads these values over USB and refuses laptop control
+# while they are unsafe.
+# Details: docs/modules/command-uplink-uputstvo.md, chapter 7.2.
+#
+# DO NOT GUESS the landing throttle: hover steadily for 10-20 s (rod rig or
+# flight) with the cockpit running, then use "Copy CLI" in the Laptop Control
+# panel (frame "FC AUTO-LAND"). It computes failsafe_throttle from the learnt
+# hover throttle and battery voltage (descends >= 0.5 m/s on a full pack,
+# <= 3 m/s on an empty one) and failsafe_landing_time from the flight height.
+# The throttle and landing time below are placeholders only:
+# replace them with the copied values (the cockpit checks them too).
+#
+# GPS is off for now (indoor rig): AUTO-LAND, and AUX3 (GPS Rescue box) is no
+# longer forced on in stage 1. With GPS on later: see chapter 7.3
+# (GPS-RESCUE, gps_rescue_allow_arming_without_fix = OFF, rxfail 6 s 2000).
+set failsafe_delay = 15
+set failsafe_procedure = AUTO-LAND
+set failsafe_throttle = 1300
+set failsafe_landing_time = 60
+rxfail 6 h
+save

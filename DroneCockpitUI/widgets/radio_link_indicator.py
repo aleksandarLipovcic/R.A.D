@@ -23,12 +23,13 @@ once per UI tick; classify() is pure so it can be unit-tested headless.
 """
 import time
 import tkinter as tk
+from core.theme import C as _T, F as _F   # cockpit theme (core/theme.py)
 
-GREEN = "#00ff88"
-YELLOW = "#ffcc00"
-RED = "#ff3344"
-GREY = "#667088"
-BG = "#0d0d1a"
+GREEN = _T("#00ff88")
+YELLOW = _T("#ffcc00")
+RED = _T("#ff3344")
+GREY = _T("#667088")
+BG = _T("#0d0d1a")
 
 STALE_MS = 3000   # a data group older than this counts as "missing"
 
@@ -108,7 +109,7 @@ class RadioLinkIndicator(tk.Frame):
         self._text = tk.Label(self, text="RADIO: …", fg=GREY, bg=BG,
                               font=("Consolas", 10, "bold"))
         self._text.pack(side="left")
-        self._src = tk.Label(self, text="", fg="#a0b8d8", bg=BG,
+        self._src = tk.Label(self, text="", fg=_T("#a0b8d8"), bg=BG,
                              font=("Consolas", 9))
         self._src.pack(side="left", padx=(8, 0))
         self.detail_text = ""
@@ -130,6 +131,6 @@ class RadioLinkIndicator(tk.Frame):
             self._dot.itemconfig(self._dot_id, fill=shown)
             self._text.config(text=headline, fg=color)
             self._src.config(text=f"▶ {src}",
-                             fg="#a0b8d8" if src != "NONE" else RED)
+                             fg=_T("#a0b8d8") if src != "NONE" else RED)
             self._last = key
         self.detail_text = detail

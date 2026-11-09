@@ -41,6 +41,7 @@ import time
 import collections
 
 from core import link_mode
+from core.theme import C as _T, F as _F   # cockpit theme (core/theme.py)
 
 
 class BaroWidget(tk.Frame):
@@ -81,17 +82,17 @@ class BaroWidget(tk.Frame):
     VARIO_THR = 0.02
 
     # ── Cockpit palette ───────────────────────────────────────────────────────
-    C_BG      = "#0d0d1a"
-    C_FRAME   = "#111120"
-    C_SPINE   = "#6868a8"
-    C_LABEL   = "#e8e8ff"
-    C_MIN     = "#484870"
-    C_BOX_BG  = "#000010"
-    C_SAFE    = "#00e07a"
-    C_WARN    = "#ffd700"
-    C_CRIT    = "#ff3333"
-    C_DIM     = "#9090b8"
-    C_SEP     = "#2a2a44"
+    C_BG      = _T("#0d0d1a")
+    C_FRAME   = _T("#111120")
+    C_SPINE   = _T("#6868a8")
+    C_LABEL   = _T("#e8e8ff")
+    C_MIN     = _T("#484870")
+    C_BOX_BG  = _T("#000010")
+    C_SAFE    = _T("#00e07a")
+    C_WARN    = _T("#ffd700")
+    C_CRIT    = _T("#ff3333")
+    C_DIM     = _T("#9090b8")
+    C_SEP     = _T("#2a2a44")
 
     CM_TO_M = 0.01
     M_TO_FT = 3.28084
@@ -196,8 +197,8 @@ class BaroWidget(tk.Frame):
         self._qnh_btn = tk.Button(
             qnh_row, text="SET QNH",
             command=self._set_qnh,
-            bg="#1e1e38", fg="#c0c0e0",
-            activebackground="#2e2e58", activeforeground="#ffffff",
+            bg=_T("#1e1e38"), fg=_T("#c0c0e0"),
+            activebackground=_T("#2e2e58"), activeforeground=_T("#ffffff"),
             font=("Consolas", 10, "bold"),
             relief="raised", bd=2, padx=14, pady=6, cursor="hand2"
         )
@@ -504,4 +505,4 @@ class BaroWidget(tk.Frame):
     def _alt_color(self, alt_m: float) -> str:
         if alt_m >= self.CRIT_ALT_M: return self.C_CRIT
         if alt_m >= self.WARN_ALT_M: return self.C_WARN
-        return self.C_SAFE
+        return self.C_SAFE

@@ -32,6 +32,12 @@ class VideoWorker:
         self._running = False
         self._thread = None
         self.is_connected = False
+        # Video health for the safety gates (DroneBackend with get_link_state):
+        # state name ("Connected", "SignalLost", "NoVideoInput", ...) and the
+        # age of the newest frame in ms (None = not known / no frame yet).
+        self._link_state = "Disconnected"
+        self._frame_age_ms = None
+        self._has_health = hasattr(video_link, "get_link_state")
 
     def start(self):
         self._running = True
@@ -47,6 +53,17 @@ class VideoWorker:
         while self._running:
             connected = self._link.is_connected()
             self.is_connected = connected
+            state, age = ("Connected" if connected else "Disconnected"), None
+            if self._has_health:
+                try:
+                    state = self._link.get_link_state().name
+                    age = int(self._link.get_ms_since_last_frame())
+                    if age >= 2 ** 62:                    # UINT64_MAX: no frame yet
+                        age = None
+                except Exception:
+                    pass
+            with self._lock:
+                self._link_state, self._frame_age_ms = state, age
             if connected:
                 fps = self._link.get_measured_fps()
                 name = self._link.get_device_name()
@@ -59,3 +76,8 @@ class VideoWorker:
         """Non-blocking. Returns (connected, fps, device_name)."""
         with self._lock:
             return self.is_connected, self._latest_fps, self._device_name
+
+    def get_health(self):
+        """Non-blocking. Returns (state_name, frame_age_ms or None)."""
+        with self._lock:
+            return self._link_state, self._frame_age_ms

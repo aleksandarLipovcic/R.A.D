@@ -1,3 +1,4 @@
+from core.theme import C as _T, F as _F   # cockpit theme (core/theme.py)
 """
 link_mode.py  —  what the active telemetry link can show
 =========================================================
@@ -27,11 +28,11 @@ USB = "USB"
 RADIO = "ELRS"
 
 # ── Shared look for "not on this link" and "stale" ───────────────────────────
-C_NA_FG    = "#50657a"   # grey-blue: readable, but clearly not a live value
-C_NA_BG    = "#0c1420"
-C_STALE_FG = "#d0a040"   # muted amber: old value, still shown
-C_RADIO    = "#44aaff"   # source tag colour for the radio link
-C_USB      = "#8fa8c0"   # source tag colour for the cable link
+C_NA_FG    = _T("#50657a")   # grey-blue: readable, but clearly not a live value
+C_NA_BG    = _T("#0c1420")
+C_STALE_FG = _T("#d0a040")   # muted amber: old value, still shown
+C_RADIO    = _T("#44aaff")   # source tag colour for the radio link
+C_USB      = _T("#8fa8c0")   # source tag colour for the cable link
 
 NA_SHORT = "USB"         # fits in a number cell
 NA_LONG  = "USB ONLY"    # for labels with more room

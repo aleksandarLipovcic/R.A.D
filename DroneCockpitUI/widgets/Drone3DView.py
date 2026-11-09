@@ -2,6 +2,7 @@ import tkinter as tk
 import math
 
 from core import link_mode
+from core.theme import C as _T, F as _F   # cockpit theme (core/theme.py)
 
 
 class Drone3DView(tk.Canvas):
@@ -61,30 +62,30 @@ class Drone3DView(tk.Canvas):
     DRIFT_CRIT_DEG = 30.0
 
     # ── Aviation colour palette ───────────────────────────────────────────────
-    C_SKY_SAFE  = "#1565C0"
-    C_SKY_WARN  = "#0a2a0a"
-    C_SKY_CRIT  = "#3a0808"
-    C_GND_SAFE  = "#7B3F00"
-    C_GND_WARN  = "#4a3000"
-    C_GND_CRIT  = "#4a0808"
-    C_HORIZON      = "#FFFFFF"
-    C_AIRCRAFT     = "#FFD700"
-    C_PITCH_LADDER = "#FFFFFF"
-    C_BANK_ARC     = "#FFFFFF"
-    C_BANK_PTR     = "#FFD700"
-    C_WARN         = "#FFD700"
-    C_CRITICAL     = "#FF3333"
-    C_SAFE_HUD     = "#00FF44"
-    C_BLACK        = "#000000"
-    C_COMP_BG      = "#0a0a0a"
-    C_COMP_SEP     = "#444444"
+    C_SKY_SAFE  = _T("#1565C0")
+    C_SKY_WARN  = _T("#0a2a0a")
+    C_SKY_CRIT  = _T("#3a0808")
+    C_GND_SAFE  = _T("#7B3F00")
+    C_GND_WARN  = _T("#4a3000")
+    C_GND_CRIT  = _T("#4a0808")
+    C_HORIZON      = _T("#FFFFFF")
+    C_AIRCRAFT     = _T("#FFD700")
+    C_PITCH_LADDER = _T("#FFFFFF")
+    C_BANK_ARC     = _T("#FFFFFF")
+    C_BANK_PTR     = _T("#FFD700")
+    C_WARN         = _T("#FFD700")
+    C_CRITICAL     = _T("#FF3333")
+    C_SAFE_HUD     = _T("#00FF44")
+    C_BLACK        = _T("#000000")
+    C_COMP_BG      = _T("#0a0a0a")
+    C_COMP_SEP     = _T("#444444")
 
     # ── Dual-source compass colours ───────────────────────────────────────────
-    C_MAG_MARKER   = "#FFFFFF"   # primary mag heading  — white centre triangle
-    C_GYRO_MARKER  = "#00CCFF"   # secondary gyro yaw   — cyan ghost diamond
-    C_HDG_AGREE    = "#00AA44"   # HDG box border when headings agree
-    C_HDG_WARN     = "#CCAA00"   # HDG box border when warn
-    C_HDG_CRIT     = "#FF2222"   # HDG box border when critical
+    C_MAG_MARKER   = _T("#FFFFFF")   # primary mag heading  — white centre triangle
+    C_GYRO_MARKER  = _T("#00CCFF")   # secondary gyro yaw   — cyan ghost diamond
+    C_HDG_AGREE    = _T("#00AA44")   # HDG box border when headings agree
+    C_HDG_WARN     = _T("#CCAA00")   # HDG box border when warn
+    C_HDG_CRIT     = _T("#FF2222")   # HDG box border when critical
 
     def __init__(self, parent, width=500, height=450):
         super().__init__(
@@ -376,7 +377,7 @@ class Drone3DView(tk.Canvas):
                          fill=clr, width=bar_w, capstyle=tk.ROUND)
         r = 6
         self.create_oval(cx - r, cy - r, cx + r, cy + r,
-                         fill=clr, outline="#333333", width=1)
+                         fill=clr, outline=_T("#333333"), width=1)
 
     # ══════════════════════════════════════════════════════════════════════════
     # 5. HORIZON REFERENCE BARS
@@ -384,8 +385,8 @@ class Drone3DView(tk.Canvas):
 
     def _draw_horizon_ref_bars(self):
         cx = self.cx;  cy = self.adi_cy
-        self.create_line(cx - 11, cy, cx - 4,  cy, fill="#CCCCCC", width=2)
-        self.create_line(cx + 4,  cy, cx + 11, cy, fill="#CCCCCC", width=2)
+        self.create_line(cx - 11, cy, cx - 4,  cy, fill=_T("#CCCCCC"), width=2)
+        self.create_line(cx + 4,  cy, cx + 11, cy, fill=_T("#CCCCCC"), width=2)
 
     # ══════════════════════════════════════════════════════════════════════════
     # 6. ADI BEZEL
@@ -394,7 +395,7 @@ class Drone3DView(tk.Canvas):
     def _draw_adi_bezel(self):
         M = self.MARGIN
         self.create_rectangle(M, M, self.W - M - 1, self.adi_y1 - 1,
-                              outline="#666666", width=1, fill="")
+                              outline=_T("#666666"), width=1, fill="")
         self.create_line(M, self.adi_y1, self.W - M, self.adi_y1,
                          fill=self.C_COMP_SEP, width=2)
 
@@ -441,7 +442,7 @@ class Drone3DView(tk.Canvas):
         # ── Background ────────────────────────────────────────────────────────
         self.create_rectangle(x0, y0, x1, y1,
                               fill=self.C_COMP_BG, outline="")
-        self.create_line(x0, y1 - 1, x1, y1 - 1, fill="#444444", width=1)
+        self.create_line(x0, y1 - 1, x1, y1 - 1, fill=_T("#444444"), width=1)
 
         strip_half_deg = (x1 - x0) / ppd / 2.0 + 15.0
 
@@ -451,7 +452,7 @@ class Drone3DView(tk.Canvas):
             sx = cx + off * ppd
             if x0 <= sx <= x1:
                 self.create_line(sx, y0 + 3, sx, y0 + 8,
-                                 fill="#555555", width=1)
+                                 fill=_T("#555555"), width=1)
             off += 5.0
 
         # ── Major ticks + labels every 10° ───────────────────────────────────
@@ -474,7 +475,7 @@ class Drone3DView(tk.Canvas):
                 is_30    = (hdg_norm % 30 == 0)
                 tick_h   = 14 if is_30 else 9
                 tick_w   =  2 if is_30 else 1
-                tick_clr = "#EEEEEE" if is_30 else "#888888"
+                tick_clr = _T("#EEEEEE") if is_30 else _T("#888888")
 
                 self.create_line(sx, y0 + 3, sx, y0 + 3 + tick_h,
                                  fill=tick_clr, width=tick_w)
@@ -487,7 +488,7 @@ class Drone3DView(tk.Canvas):
                     self.create_text(
                         sx, y0 + 26,
                         text=label,
-                        fill="#FFFFFF" if is_card else "#BBBBBB",
+                        fill=_T("#FFFFFF") if is_card else _T("#BBBBBB"),
                         font=("Consolas", 9, "bold") if is_card else ("Consolas", 8)
                     )
 
@@ -526,7 +527,7 @@ class Drone3DView(tk.Canvas):
         # ── Source badge (top-left of strip) ─────────────────────────────────
         # Tape is always GYRO.  Show MAG LOCK when mag provides a ghost marker.
         badge_txt = "FC·RF" if radio else "GYRO"
-        badge_clr = link_mode.C_RADIO if radio else "#FFAA00"
+        badge_clr = link_mode.C_RADIO if radio else _T("#FFAA00")
         self.create_text(x0 + 4, y0 + 4, anchor="nw",
                          text=badge_txt,
                          fill=badge_clr,
@@ -547,10 +548,10 @@ class Drone3DView(tk.Canvas):
         bx  = cx - box_w // 2
         by  = ccy + 1
         self.create_rectangle(bx, by, bx + box_w, by + box_h,
-                              fill="#0a1a0a", outline=box_outline, width=2)
+                              fill=_T("#0a1a0a"), outline=box_outline, width=2)
         self.create_text(cx, by + box_h // 2,
                          text=f"HDG  {tape_heading % 360:05.1f}\u00b0",
-                         fill="#00FF88",
+                         fill=_T("#00FF88"),
                          font=("Consolas", 10, "bold"))
 
         # ── Drift badge inside the HDG box (only when meaningful) ────────────
@@ -602,4 +603,4 @@ class Drone3DView(tk.Canvas):
                               self.cx + bw, M + 57,
                               fill=self.C_BLACK, outline=clr, width=1)
         self.create_text(self.cx, M + 46,
-                         text=txt, fill=clr, font=fnt)
+                         text=txt, fill=clr, font=fnt)

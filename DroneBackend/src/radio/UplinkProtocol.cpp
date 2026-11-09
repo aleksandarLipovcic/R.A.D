@@ -93,6 +93,8 @@ bool decodeBridgeStatus(const Crsf::Frame& f, BridgeStatus& o) {
     o.sticksActive   = (fl & 0x04) != 0;
     o.throttleActive = (fl & 0x08) != 0;
     o.telemetryLive  = (fl & 0x10) != 0;
+    o.pilotOverride  = (fl & 0x20) != 0;
+    o.angleOn        = (fl & 0x40) != 0;
     const uint16_t echo = be16(p + 2);
     o.echoAlive      = echo == 0xFFFF ? -1 : echo;
     o.rxFrames       = be16(p + 4);

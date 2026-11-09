@@ -51,6 +51,7 @@ import json
 import os
 import tkinter as tk
 from tkinter import ttk
+from core.theme import C as _T, F as _F   # cockpit theme (core/theme.py)
 
 
 def _osd_anchor_enum():
@@ -181,7 +182,7 @@ class OsdSettingsPanel:
 
         self._win = tk.Toplevel(parent_widget)
         self._win.title("OSD Overlay")
-        self._win.configure(bg="#1a1a1a")
+        self._win.configure(bg=_T("#1a1a1a"))
         # Was resizable(False, False) with every element row stacked
         # straight into self._win -- fine for the original handful of
         # elements, but stopped fitting once the list grew (and never fit
@@ -201,16 +202,16 @@ class OsdSettingsPanel:
         self._anchor_btns = {}   # elem_id -> {anchor_name: Button}
 
         row = 0
-        master_frame = tk.Frame(self._win, bg="#1a1a1a")
+        master_frame = tk.Frame(self._win, bg=_T("#1a1a1a"))
         master_frame.grid(row=row, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 4))
         self._master_var = tk.BooleanVar(value=video_link.is_osd_overlay_enabled())
         tk.Checkbutton(master_frame, text="Show OSD overlay", variable=self._master_var,
-                        command=self._on_master_toggle, bg="#1a1a1a", fg="#ffffff",
-                        selectcolor="#333333", activebackground="#1a1a1a").pack(side="left")
+                        command=self._on_master_toggle, bg=_T("#1a1a1a"), fg=_T("#ffffff"),
+                        selectcolor=_T("#333333"), activebackground=_T("#1a1a1a")).pack(side="left")
         self._lock_var = tk.BooleanVar(value=video_link.is_osd_locked())
         tk.Checkbutton(master_frame, text="Lock positions", variable=self._lock_var,
-                        command=self._on_lock_toggle, bg="#1a1a1a", fg="#ffffff",
-                        selectcolor="#333333", activebackground="#1a1a1a").pack(side="left", padx=(16, 0))
+                        command=self._on_lock_toggle, bg=_T("#1a1a1a"), fg=_T("#ffffff"),
+                        selectcolor=_T("#333333"), activebackground=_T("#1a1a1a")).pack(side="left", padx=(16, 0))
         row += 1
 
         ttk.Separator(self._win, orient="horizontal").grid(
@@ -225,18 +226,18 @@ class OsdSettingsPanel:
         # doesn't fit. Master toggle row and the button row below stay
         # outside this frame, so they never scroll out of view.
         # -----------------------------------------------------------
-        list_container = tk.Frame(self._win, bg="#1a1a1a")
+        list_container = tk.Frame(self._win, bg=_T("#1a1a1a"))
         list_container.grid(row=row, column=0, columnspan=2, sticky="nsew", padx=(10, 0), pady=2)
         list_container.grid_rowconfigure(0, weight=1)
         list_container.grid_columnconfigure(0, weight=1)
 
-        self._canvas = tk.Canvas(list_container, bg="#1a1a1a", highlightthickness=0)
+        self._canvas = tk.Canvas(list_container, bg=_T("#1a1a1a"), highlightthickness=0)
         self._canvas.grid(row=0, column=0, sticky="nsew")
         scrollbar = tk.Scrollbar(list_container, orient="vertical", command=self._canvas.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self._canvas.configure(yscrollcommand=scrollbar.set)
 
-        self._elements_frame = tk.Frame(self._canvas, bg="#1a1a1a")
+        self._elements_frame = tk.Frame(self._canvas, bg=_T("#1a1a1a"))
         self._elements_window = self._canvas.create_window((0, 0), window=self._elements_frame, anchor="nw")
         self._elements_frame.bind("<Configure>", self._on_elements_frame_configure)
         self._canvas.bind("<Configure>", self._on_canvas_configure)
@@ -252,7 +253,7 @@ class OsdSettingsPanel:
             elem_row = self._build_element_row(elem_id, elem_row)
 
         row += 1
-        btn_frame = tk.Frame(self._win, bg="#1a1a1a")
+        btn_frame = tk.Frame(self._win, bg=_T("#1a1a1a"))
         btn_frame.grid(row=row, column=0, columnspan=2, pady=(6, 10))
         tk.Button(btn_frame, text="Edit Positions (drag)", command=self._toggle_edit_mode
                   ).pack(side="left", padx=4)
@@ -293,11 +294,11 @@ class OsdSettingsPanel:
         self._enabled_vars[elem_id] = var
         tk.Checkbutton(self._elements_frame, text=label, variable=var,
                         command=lambda e=elem_id: self._on_enabled_toggle(e),
-                        bg="#1a1a1a", fg="#ffffff", selectcolor="#333333",
-                        activebackground="#1a1a1a", anchor="w"
+                        bg=_T("#1a1a1a"), fg=_T("#ffffff"), selectcolor=_T("#333333"),
+                        activebackground=_T("#1a1a1a"), anchor="w"
                         ).grid(row=row, column=0, sticky="w", padx=10)
 
-        grid_frame = tk.Frame(self._elements_frame, bg="#1a1a1a")
+        grid_frame = tk.Frame(self._elements_frame, bg=_T("#1a1a1a"))
         grid_frame.grid(row=row, column=1, padx=(0, 10), pady=2)
         self._anchor_btns[elem_id] = {}
         current_anchor = layout.anchor.name
@@ -305,8 +306,8 @@ class OsdSettingsPanel:
             is_current = (anchor_name == current_anchor)
             btn = tk.Button(
                 grid_frame, text="●" if is_current else "○", width=2,
-                fg="#00ff88" if is_current else "#666666",
-                bg="#111111", relief="flat",
+                fg=_T("#00ff88") if is_current else _T("#666666"),
+                bg=_T("#111111"), relief="flat",
                 command=lambda e=elem_id, a=anchor_name: self._on_anchor_pick(e, a))
             btn.grid(row=r, column=c, padx=1, pady=1)
             self._anchor_btns[elem_id][anchor_name] = btn
@@ -319,7 +320,7 @@ class OsdSettingsPanel:
         for anchor_name, btn in self._anchor_btns[elem_id].items():
             is_current = (anchor_name == current_anchor)
             btn.configure(text="●" if is_current else "○",
-                          fg="#00ff88" if is_current else "#666666")
+                          fg=_T("#00ff88") if is_current else _T("#666666"))
 
     # -------------------------------------------------------------------
     # Callbacks
@@ -404,7 +405,7 @@ class OsdSettingsPanel:
 # boxes + guides on top. Positions are committed to VideoLink only on
 # mouse release; nothing here talks to VideoLink per mouse-move.
 
-_TRANSPARENT_KEY = "#010203"   # arbitrary color unlikely to appear in real UI chrome
+_TRANSPARENT_KEY = _T("#010203")   # arbitrary color unlikely to appear in real UI chrome
 _SNAP_PX = 18                  # how close to a guide before it snaps
 _GHOST_SIZE = {                # approximate footprint for the drag ghost box --
     "altitude": (110, 30),     # cosmetic only, real sizing happens in GDI
@@ -499,11 +500,11 @@ class OsdDragOverlay:
         # a drag, not just once one is in progress.
         for frac in (1 / 3, 2 / 3):
             self._canvas.create_line(self._w * frac, 0, self._w * frac, self._h,
-                                      fill="#444444", dash=(3, 3))
+                                      fill=_T("#444444"), dash=(3, 3))
             self._canvas.create_line(0, self._h * frac, self._w, self._h * frac,
-                                      fill="#444444", dash=(3, 3))
-        self._canvas.create_line(self._w / 2, 0, self._w / 2, self._h, fill="#666666", dash=(2, 4))
-        self._canvas.create_line(0, self._h / 2, self._w, self._h / 2, fill="#666666", dash=(2, 4))
+                                      fill=_T("#444444"), dash=(3, 3))
+        self._canvas.create_line(self._w / 2, 0, self._w / 2, self._h, fill=_T("#666666"), dash=(2, 4))
+        self._canvas.create_line(0, self._h / 2, self._w, self._h / 2, fill=_T("#666666"), dash=(2, 4))
 
         for elem_id in self._video_link.get_osd_element_ids():
             layout = self._video_link.get_osd_element_layout(elem_id)
@@ -512,7 +513,7 @@ class OsdDragOverlay:
                 cx, cy = drag_pos
             else:
                 cx, cy = self._element_center_px(elem_id)
-            color = "#00ff88" if layout.enabled else "#555555"
+            color = _T("#00ff88") if layout.enabled else _T("#555555")
             self._canvas.create_rectangle(cx - gw / 2, cy - gh / 2, cx + gw / 2, cy + gh / 2,
                                            outline=color, width=2, dash=() if layout.enabled else (4, 2))
             self._canvas.create_text(cx, cy, text=_ELEMENT_LABELS.get(elem_id, elem_id),
@@ -524,8 +525,8 @@ class OsdDragOverlay:
             snap = self._nearest_snap(*drag_pos)
             if snap is not None:
                 sx, sy = snap
-                self._canvas.create_line(sx, 0, sx, self._h, fill="#ffcc00", width=2)
-                self._canvas.create_line(0, sy, self._w, sy, fill="#ffcc00", width=2)
+                self._canvas.create_line(sx, 0, sx, self._h, fill=_T("#ffcc00"), width=2)
+                self._canvas.create_line(0, sy, self._w, sy, fill=_T("#ffcc00"), width=2)
 
     # -------------------------------------------------------------------
     # Snapping
@@ -630,4 +631,4 @@ class OsdDragOverlay:
             pass
         self._win.destroy()
         if self._on_close:
-            self._on_close()
+            self._on_close()

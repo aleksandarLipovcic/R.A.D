@@ -32,6 +32,7 @@
   <Folder Name="/docs/frontend/">
     <File Path="docs/frontend/app-shell.md" />
     <File Path="docs/frontend/arming-widget.md" />
+    <File Path="docs/frontend/cockpit-ui.md" />
     <File Path="docs/frontend/baro-widget.md" />
     <File Path="docs/frontend/detection-map-widget.md" />
     <File Path="docs/frontend/drone3d-view.md" />

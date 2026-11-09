@@ -125,6 +125,16 @@ from tkinter import ttk
 
 from core import MapTiles
 from core import detection_report
+from core.theme import C as _T, F as _F   # cockpit theme (core/theme.py)
+from core import theme
+
+# ── Responsive copilot window (see _apply_density) ─────────────────────────
+# Priority when the window shrinks: 1 object list, 2 map, 3 live feed /
+# saved screenshot, 4 scene search. Below the minimum size the window
+# cannot be made smaller (the list columns and map controls would clip).
+MIN_W, MIN_H = 860, 520
+SCENES_MIN = (1180, 720)     # scene search rows + scene table from this size
+PREVIEW_MIN_H = 620          # live feed / screenshot pane from this height
 
 try:
     from PIL import Image, ImageTk
@@ -240,7 +250,7 @@ class DetectionMapWidget(tk.Toplevel):
         super().__init__(master, **kwargs)
         self.title("Detections & map")
         self.geometry("1100x760")   # room for the search panel above the list
-        self.configure(bg="#1a1a1a")
+        self.configure(bg=_T("#1a1a1a"))
 
         # In-memory record store. Kept here (not just in DetectionWorker)
         # because this widget owns the display-facing view of the data --
@@ -296,6 +306,93 @@ class DetectionMapWidget(tk.Toplevel):
         self._build_layout()
         self._poll_tile_downloads()
 
+        self.minsize(MIN_W, MIN_H)
+        self._density = None
+        self._force_scenes = False
+        self._force_preview = False
+        self._density_job = None
+        self.bind("<Configure>", self._on_window_configure, add="+")
+
+    # =====================================================================
+    # Responsive layout
+    # =====================================================================
+
+    def _on_window_configure(self, event=None) -> None:
+        if event is not None and event.widget is not self:
+            return
+        if self._density_job is not None:
+            try:
+                self.after_cancel(self._density_job)
+            except Exception:
+                pass
+        self._density_job = self.after(80, self._apply_density)
+
+    def _apply_density(self) -> None:
+        """Show what fits: scene search only in a big window (or when asked
+        for), the live/screenshot pane only when there is height for it --
+        the object list and the map always stay."""
+        self._density_job = None
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 50:
+            return
+        scenes = self._force_scenes or (w >= SCENES_MIN[0] and h >= SCENES_MIN[1])
+        preview = self._force_preview or h >= PREVIEW_MIN_H
+        short = w < 1180                     # map header: icons / short names
+        state = (scenes, preview, short)
+        if state == self._density:
+            return
+        self._density = state
+        self._center_btn.config(text="\u2299" if short else "\u2299 Center on drone")
+        for key, b in self._provider_btns.items():
+            full = MapTiles.PROVIDERS[key]["label"]
+            abbr = {"Satellite": "SAT", "Topographic": "TOPO"}.get(full, full[:4].upper())
+            b.config(text=(abbr if short else full))
+        # scene search rows + scene table
+        for r in self._scene_rows:
+            r.pack_forget()
+        if scenes:
+            for r in self._scene_rows:
+                r.pack(fill="x", pady=(4, 0), before=self._search_status_row)
+        panes = [str(p) for p in self._left_split.panes()]
+        if scenes and str(self._scene_frame) not in panes:
+            self._left_split.insert(0, self._scene_frame, weight=1)
+        elif not scenes and str(self._scene_frame) in panes:
+            self._left_split.forget(self._scene_frame)
+        self._scenes_btn.config(text=("▾ SCENES" if scenes else "▸ SCENES"))
+        # live feed / saved screenshot pane
+        panes = [str(p) for p in self._right_split.panes()]
+        if preview and str(self._preview_frame) not in panes:
+            self._right_split.add(self._preview_frame, weight=1)
+        elif not preview and str(self._preview_frame) in panes:
+            self._right_split.forget(self._preview_frame)
+        self._preview_btn.config(text=("▾ LIVE" if preview else "▸ LIVE"))
+
+    def _toggle_scenes(self) -> None:
+        on = not (self._density and self._density[0])
+        self._force_scenes = on
+        self._density = None
+        self._apply_density()
+
+    def _toggle_preview(self) -> None:
+        on = not (self._density and self._density[1])
+        self._force_preview = on
+        self._density = None
+        self._apply_density()
+
+    def _section_header(self, parent, text: str) -> tk.Frame:
+        """Section legend in the cockpit style (accent tick + upper case)."""
+        bar = tk.Frame(parent, bg=_T("#1a1a1a"))
+        if theme.MILITARY:
+            tk.Frame(bar, bg=theme.P.ADVISORY, width=3).pack(side="left", fill="y", padx=(0, 6))
+        tk.Label(bar, text=theme.title(text), fg=_T("#ffffff"), bg=_T("#1a1a1a"),
+                 font=(_F("Segoe UI"), 11, "bold")).pack(side="left")
+        return bar
+
+    def _mini_btn(self, parent, text, command) -> tk.Button:
+        return tk.Button(parent, text=text, command=command, fg=_T("#cccccc"), bg=_T("#2a2a2a"),
+                         activebackground=_T("#3a3a3a"), activeforeground=_T("#ffffff"),
+                         relief="flat", padx=6, borderwidth=1, font=(_F("Segoe UI"), 8, "bold"))
+
     # =====================================================================
     # Layout
     # =====================================================================
@@ -311,8 +408,8 @@ class DetectionMapWidget(tk.Toplevel):
         self._status_var = tk.StringVar(value="●  Detection engine: unknown")
         self._status_lbl = tk.Label(
             self, textvariable=self._status_var,
-            fg="#888888", bg="#1a1a1a",
-            font=("Segoe UI", 9, "bold"), anchor="w",
+            fg=_T("#888888"), bg=_T("#1a1a1a"),
+            font=(_F("Segoe UI"), 9, "bold"), anchor="w",
         )
         self._status_lbl.pack(fill="x", padx=8, pady=(8, 0))
 
@@ -328,20 +425,23 @@ class DetectionMapWidget(tk.Toplevel):
         self._telemetry_status_var = tk.StringVar(value="●  Telemetry: unknown")
         self._telemetry_status_lbl = tk.Label(
             self, textvariable=self._telemetry_status_var,
-            fg="#888888", bg="#1a1a1a",
-            font=("Segoe UI", 9), anchor="w",
+            fg=_T("#888888"), bg=_T("#1a1a1a"),
+            font=(_F("Segoe UI"), 9), anchor="w",
         )
         self._telemetry_status_lbl.pack(fill="x", padx=8, pady=(2, 0))
 
         paned = ttk.PanedWindow(self, orient="horizontal")
         paned.pack(fill="both", expand=True, pady=(6, 0))
+        self._paned = paned
 
         # ── Left: detection list ────────────────────────────────────
-        left = tk.Frame(paned, bg="#1a1a1a")
+        left = tk.Frame(paned, bg=_T("#1a1a1a"))
         paned.add(left, weight=1)
 
-        tk.Label(left, text="Detections", fg="#ffffff", bg="#1a1a1a",
-                 font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=8, pady=(8, 2))
+        hdr = self._section_header(left, "Detections")
+        hdr.pack(fill="x", padx=8, pady=(8, 4))
+        self._scenes_btn = self._mini_btn(hdr, "\u25be SCENES", self._toggle_scenes)
+        self._scenes_btn.pack(side="right")
 
         self._build_search_panel(left)
 
@@ -349,8 +449,9 @@ class DetectionMapWidget(tk.Toplevel):
         # drag the sash between the two tables to give either more rows.
         left_split = ttk.PanedWindow(left, orient="vertical")
         left_split.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        scene_frame = tk.Frame(left_split, bg="#1a1a1a")
-        list_frame = tk.Frame(left_split, bg="#1a1a1a")
+        self._left_split = left_split
+        scene_frame = self._scene_frame = tk.Frame(left_split, bg=_T("#1a1a1a"))
+        list_frame = tk.Frame(left_split, bg=_T("#1a1a1a"))
         left_split.add(scene_frame, weight=1)
         left_split.add(list_frame, weight=3)
 
@@ -393,34 +494,38 @@ class DetectionMapWidget(tk.Toplevel):
         self._sort_desc = False
 
         # ── Right: pin map + screenshot preview ───────────────────────
-        right = tk.Frame(paned, bg="#1a1a1a")
+        right = tk.Frame(paned, bg=_T("#1a1a1a"))
         paned.add(right, weight=2)
         # Map above the preview, in a vertical PanedWindow: drag the sash
         # to give the map or the screenshot/live feed more height.
         right_split = ttk.PanedWindow(right, orient="vertical")
         right_split.pack(fill="both", expand=True)
-        map_frame = tk.Frame(right_split, bg="#1a1a1a")
-        preview_frame = tk.Frame(right_split, bg="#1a1a1a")
+        self._right_split = right_split
+        map_frame = tk.Frame(right_split, bg=_T("#1a1a1a"))
+        preview_frame = self._preview_frame = tk.Frame(right_split, bg=_T("#1a1a1a"))
         right_split.add(map_frame, weight=1)
         right_split.add(preview_frame, weight=1)
 
-        map_header = tk.Frame(map_frame, bg="#1a1a1a")
+        map_header = tk.Frame(map_frame, bg=_T("#1a1a1a"))
         map_header.pack(fill="x", padx=8, pady=(8, 0))
-        tk.Label(map_header, text="Map", fg="#ffffff", bg="#1a1a1a",
-                 font=("Segoe UI", 11, "bold")).pack(side="left")
+        self._section_header(map_header, "Map").pack(side="left")
+        self._preview_btn = self._mini_btn(map_header, "\u25be LIVE", self._toggle_preview)
+        self._preview_btn.pack(side="left", padx=(10, 0))
 
         # Satellite / topographic toggle. Each provider's tiles are
         # cached to disk independently (see MapTiles.TileCache) --
         # switching back and forth never re-downloads anything that was
         # already fetched under either one.
         self._map_provider_var = tk.StringVar(value=self._map_provider)
+        self._provider_btns = {}
         for key, cfg in MapTiles.PROVIDERS.items():
-            tk.Radiobutton(
+            self._provider_btns[key] = tk.Radiobutton(
                 map_header, text=cfg["label"], value=key, variable=self._map_provider_var,
-                command=self._on_map_provider_change, fg="#cccccc", bg="#1a1a1a",
-                selectcolor="#333333", activebackground="#1a1a1a", activeforeground="#ffffff",
+                command=self._on_map_provider_change, fg=_T("#cccccc"), bg=_T("#1a1a1a"),
+                selectcolor=_T("#333333"), activebackground=_T("#1a1a1a"), activeforeground=_T("#ffffff"),
                 indicatoron=False, padx=10, relief="flat", borderwidth=1,
-            ).pack(side="right", padx=(4, 0))
+            )
+            self._provider_btns[key].pack(side="right", padx=(4, 0))
 
         # Zoom +/- and "Center on drone" -- packed after the provider
         # loop above so they land just to its left (see _build_layout
@@ -428,31 +533,31 @@ class DetectionMapWidget(tk.Toplevel):
         # from the right edge). Center on drone re-enables follow mode
         # (see _on_center_on_drone); +/- and drag/scroll disable it
         # (see _adjust_zoom / _zoom_at_point / _on_map_press).
-        zoom_controls = tk.Frame(map_header, bg="#1a1a1a")
+        zoom_controls = tk.Frame(map_header, bg=_T("#1a1a1a"))
         zoom_controls.pack(side="right", padx=(4, 10))
 
         self._center_btn = tk.Button(
             zoom_controls, text="\u2299 Center on drone", command=self._on_center_on_drone,
-            fg="#cccccc", bg="#2a2a2a", activebackground="#3a3a3a", activeforeground="#ffffff",
+            fg=_T("#cccccc"), bg=_T("#2a2a2a"), activebackground=_T("#3a3a3a"), activeforeground=_T("#ffffff"),
             relief="flat", padx=8, borderwidth=1,
         )
         self._center_btn.pack(side="left", padx=(0, 8))
 
         self._zoom_out_btn = tk.Button(
             zoom_controls, text="\u2212", command=lambda: self._adjust_zoom(-1),
-            fg="#cccccc", bg="#2a2a2a", activebackground="#3a3a3a", activeforeground="#ffffff",
+            fg=_T("#cccccc"), bg=_T("#2a2a2a"), activebackground=_T("#3a3a3a"), activeforeground=_T("#ffffff"),
             relief="flat", width=2, borderwidth=1,
         )
         self._zoom_out_btn.pack(side="left")
 
         self._zoom_in_btn = tk.Button(
             zoom_controls, text="+", command=lambda: self._adjust_zoom(1),
-            fg="#cccccc", bg="#2a2a2a", activebackground="#3a3a3a", activeforeground="#ffffff",
+            fg=_T("#cccccc"), bg=_T("#2a2a2a"), activebackground=_T("#3a3a3a"), activeforeground=_T("#ffffff"),
             relief="flat", width=2, borderwidth=1,
         )
         self._zoom_in_btn.pack(side="left", padx=(2, 0))
 
-        self._map_canvas = tk.Canvas(map_frame, bg="#111a14", height=260, highlightthickness=0)
+        self._map_canvas = tk.Canvas(map_frame, bg=_T("#111a14"), height=260, highlightthickness=0)
         self._map_canvas.pack(fill="both", expand=True, padx=8, pady=(4, 2))
         self._map_canvas.bind("<Configure>", self._on_map_canvas_resize)
 
@@ -469,7 +574,7 @@ class DetectionMapWidget(tk.Toplevel):
 
         self._map_attribution_var = tk.StringVar(value="")
         tk.Label(map_frame, textvariable=self._map_attribution_var,
-                 fg="#888888", bg="#1a1a1a", font=("Segoe UI", 8)).pack(anchor="w", padx=8)
+                 fg=_T("#888888"), bg=_T("#1a1a1a"), font=(_F("Segoe UI"), 8)).pack(anchor="w", padx=8)
 
         # ── Live annotated feed (primary view for this pane) ──────────
         # On by default: this pane's job, day to day, is to show what
@@ -482,20 +587,20 @@ class DetectionMapWidget(tk.Toplevel):
         # row); the live poll keeps running underneath the whole time
         # (see _poll_live_frame), so switching back is instant, not a
         # re-buffer.
-        live_row = tk.Frame(preview_frame, bg="#1a1a1a")
+        live_row = tk.Frame(preview_frame, bg=_T("#1a1a1a"))
         live_row.pack(fill="x", padx=8, pady=(4, 0))
         self._live_enabled = tk.BooleanVar(value=True)
         self._live_check = tk.Checkbutton(
             live_row, text="Live annotated feed (~20-25 fps)", variable=self._live_enabled,
-            command=self._on_live_toggle, fg="#cccccc", bg="#1a1a1a",
-            selectcolor="#1a1a1a", activebackground="#1a1a1a", activeforeground="#ffffff",
+            command=self._on_live_toggle, fg=_T("#cccccc"), bg=_T("#1a1a1a"),
+            selectcolor=_T("#1a1a1a"), activebackground=_T("#1a1a1a"), activeforeground=_T("#ffffff"),
         )
         self._live_check.pack(side="left", anchor="w")
 
         self._preview_status_var = tk.StringVar(value="●  LIVE")
         self._preview_status_lbl = tk.Label(
-            live_row, textvariable=self._preview_status_var, fg="#00ff88", bg="#1a1a1a",
-            font=("Segoe UI", 9, "bold"),
+            live_row, textvariable=self._preview_status_var, fg=_T("#00ff88"), bg=_T("#1a1a1a"),
+            font=(_F("Segoe UI"), 9, "bold"),
         )
         self._preview_status_lbl.pack(side="left", padx=(12, 0))
 
@@ -504,7 +609,7 @@ class DetectionMapWidget(tk.Toplevel):
         # _hide_back_to_live_button().
         self._back_to_live_btn = tk.Button(
             live_row, text="\u25c0 Back to live", command=self._return_to_live,
-            fg="#000000", bg="#00e0ff", relief="flat", padx=6,
+            fg=_T("#000000"), bg=_T("#00e0ff"), relief="flat", padx=6,
         )
         self._back_to_live_btn_visible = False
 
@@ -514,17 +619,17 @@ class DetectionMapWidget(tk.Toplevel):
         # the app has told us where reports live (set_report_dir).
         self._open_report_btn = tk.Button(
             live_row, text="Open report", command=self._open_report,
-            fg="#000000", bg="#ffaa00", relief="flat", padx=6,
+            fg=_T("#000000"), bg=_T("#ffaa00"), relief="flat", padx=6,
         )
         self._open_report_btn_visible = False
         self._report_dir = None
         self._report_rec = None     # record whose report the button opens
 
-        self._preview_label = tk.Label(preview_frame, bg="#000000")
+        self._preview_label = tk.Label(preview_frame, bg=_T("#000000"))
         self._preview_label.pack(fill="both", expand=True, padx=8, pady=8)
 
         self._detail_lbl = tk.Label(preview_frame, text="Live feed -- click a detection for its saved screenshot",
-                                     fg="#cccccc", bg="#1a1a1a", font=("Segoe UI", 9), justify="left")
+                                     fg=_T("#cccccc"), bg=_T("#1a1a1a"), font=(_F("Segoe UI"), 9), justify="left")
         self._detail_lbl.pack(anchor="w", padx=8, pady=(0, 8))
 
         # Set by the owning app via set_detection_link() -- needed for
@@ -540,19 +645,19 @@ class DetectionMapWidget(tk.Toplevel):
     # =====================================================================
 
     def _build_search_panel(self, parent) -> None:
-        lbl = dict(fg="#cccccc", bg="#1a1a1a", font=("Segoe UI", 9))
-        spin = dict(width=5, bg="#2a2a2a", fg="#ffffff", insertbackground="#ffffff",
-                    buttonbackground="#2a2a2a", relief="flat", font=("Segoe UI", 9))
-        btn = dict(fg="#cccccc", bg="#2a2a2a", activebackground="#3a3a3a",
-                   activeforeground="#ffffff", relief="flat", padx=6, borderwidth=1,
-                   font=("Segoe UI", 9))
+        lbl = dict(fg=_T("#cccccc"), bg=_T("#1a1a1a"), font=(_F("Segoe UI"), 9))
+        spin = dict(width=5, bg=_T("#2a2a2a"), fg=_T("#ffffff"), insertbackground=_T("#ffffff"),
+                    buttonbackground=_T("#2a2a2a"), relief="flat", font=(_F("Segoe UI"), 9))
+        btn = dict(fg=_T("#cccccc"), bg=_T("#2a2a2a"), activebackground=_T("#3a3a3a"),
+                   activeforeground=_T("#ffffff"), relief="flat", padx=6, borderwidth=1,
+                   font=(_F("Segoe UI"), 9))
         classes = ("all", "vehicle") + SEARCH_CLASSES
 
-        box = tk.Frame(parent, bg="#1a1a1a")
+        box = tk.Frame(parent, bg=_T("#1a1a1a"))
         box.pack(fill="x", padx=8, pady=(0, 4))
 
         # Row 1: object filter
-        r1 = tk.Frame(box, bg="#1a1a1a")
+        r1 = tk.Frame(box, bg=_T("#1a1a1a"))
         r1.pack(fill="x")
         tk.Label(r1, text="Class", **lbl).pack(side="left")
         self._flt_class = tk.StringVar(value="all")
@@ -568,25 +673,26 @@ class DetectionMapWidget(tk.Toplevel):
                    **spin).pack(side="left", padx=(2, 0))
 
         # Row 2: time window, map-only, text
-        r2 = tk.Frame(box, bg="#1a1a1a")
+        r2 = tk.Frame(box, bg=_T("#1a1a1a"))
         r2.pack(fill="x", pady=(3, 0))
         self._flt_window = tk.StringVar(value="all time")
         ttk.Combobox(r2, textvariable=self._flt_window, values=tuple(_TIME_WINDOWS), width=11,
                      state="readonly").pack(side="left")
         self._flt_geo = tk.BooleanVar(value=False)
-        tk.Checkbutton(r2, text="on map only", variable=self._flt_geo, selectcolor="#1a1a1a",
-                       activebackground="#1a1a1a", activeforeground="#ffffff",
+        tk.Checkbutton(r2, text="on map only", variable=self._flt_geo, selectcolor=_T("#1a1a1a"),
+                       activebackground=_T("#1a1a1a"), activeforeground=_T("#ffffff"),
                        **lbl).pack(side="left", padx=(6, 6))
         tk.Label(r2, text="Find", **lbl).pack(side="left")
         self._flt_text = tk.StringVar(value="")
-        tk.Entry(r2, textvariable=self._flt_text, width=10, bg="#2a2a2a", fg="#ffffff",
-                 insertbackground="#ffffff", relief="flat",
-                 font=("Segoe UI", 9)).pack(side="left", padx=(2, 6))
+        tk.Entry(r2, textvariable=self._flt_text, width=10, bg=_T("#2a2a2a"), fg=_T("#ffffff"),
+                 insertbackground=_T("#ffffff"), relief="flat",
+                 font=(_F("Segoe UI"), 9)).pack(side="left", padx=(2, 6))
         tk.Button(r2, text="Reset", command=self.reset_search, **btn).pack(side="left")
 
         # Row 3: scene search over the frame index
-        r3 = tk.Frame(box, bg="#1a1a1a")
+        r3 = tk.Frame(box, bg=_T("#1a1a1a"))
         r3.pack(fill="x", pady=(5, 0))
+        self._scene_rows = [r3]
         tk.Label(r3, text="Frames with", **lbl).pack(side="left")
         self._q_op = tk.StringVar(value=">=")
         ttk.Combobox(r3, textvariable=self._q_op, values=(">=", "="), width=3,
@@ -601,8 +707,9 @@ class DetectionMapWidget(tk.Toplevel):
         tk.Button(r3, text="Search", command=self.run_scene_search, **btn).pack(side="left", padx=(6, 0))
 
         # Row 4: quick queries (the report's section 15.2 examples)
-        r4 = tk.Frame(box, bg="#1a1a1a")
+        r4 = tk.Frame(box, bg=_T("#1a1a1a"))
         r4.pack(fill="x", pady=(3, 0))
+        self._scene_rows.append(r4)
         tk.Label(r4, text="Quick:", **lbl).pack(side="left")
         for text, q in (("Person", ("person", ">=", 1)), ("\u2265 2 persons", ("person", ">=", 2)),
                         ("Vehicle", ("vehicle", ">=", 1)), ("\u2265 2 vehicles", ("vehicle", ">=", 2)),
@@ -611,10 +718,10 @@ class DetectionMapWidget(tk.Toplevel):
                       **btn).pack(side="left", padx=(4, 0))
 
         self._search_status = tk.StringVar(value="")
-        status_row = tk.Frame(box, bg="#1a1a1a")
+        status_row = self._search_status_row = tk.Frame(box, bg=_T("#1a1a1a"))
         status_row.pack(fill="x", pady=(2, 0))
         tk.Label(status_row, textvariable=self._search_status, anchor="w", justify="left",
-                 fg="#e0d060", bg="#1a1a1a", font=("Segoe UI", 9)).pack(side="left", fill="x", expand=True)
+                 fg=_T("#e0d060"), bg=_T("#1a1a1a"), font=(_F("Segoe UI"), 9)).pack(side="left", fill="x", expand=True)
         self._clear_scene_btn = tk.Button(status_row, text="Clear scene", command=self.clear_scene, **btn)
 
         for var in (self._flt_class, self._flt_conf, self._flt_seen, self._flt_window,
@@ -789,6 +896,11 @@ class DetectionMapWidget(tk.Toplevel):
             self._sync_row(key, now_ms)
 
     def run_scene_search(self, wanted=None, op=None, n=None) -> list:
+        d = getattr(self, "_density", None)
+        if d is not None and not d[0]:          # results go to the scene table: show it
+            self._force_scenes = True
+            self._density = None
+            self._apply_density()
         if wanted is not None:
             self._q_class.set(wanted)
             self._q_op.set(op)
@@ -849,13 +961,13 @@ class DetectionMapWidget(tk.Toplevel):
         """
         if running:
             self._status_var.set("●  Detection engine running")
-            self._status_lbl.config(fg="#00ff88")
+            self._status_lbl.config(fg=_T("#00ff88"))
         else:
             msg = "●  Detection engine stopped"
             if detail:
                 msg += f"  —  {detail}"
             self._status_var.set(msg)
-            self._status_lbl.config(fg="#ff5566")
+            self._status_lbl.config(fg=_T("#ff5566"))
 
     def set_drone_telemetry(self, latitude: float, longitude: float, valid: bool) -> None:
         """
@@ -895,13 +1007,13 @@ class DetectionMapWidget(tk.Toplevel):
         """
         if valid:
             self._telemetry_status_var.set(f"●  Telemetry: {detail}" if detail else "●  Telemetry: usable")
-            self._telemetry_status_lbl.config(fg="#00ff88")
+            self._telemetry_status_lbl.config(fg=_T("#00ff88"))
         else:
             msg = "●  Telemetry: not usable -- new detections won't be georeferenced"
             if detail:
                 msg += f"  —  {detail}"
             self._telemetry_status_var.set(msg)
-            self._telemetry_status_lbl.config(fg="#ffaa00")
+            self._telemetry_status_lbl.config(fg=_T("#ffaa00"))
 
     def set_detection_link(self, detection_link) -> None:
         """
@@ -1140,11 +1252,11 @@ class DetectionMapWidget(tk.Toplevel):
         top_left_y = cpy - h / 2.0
 
         if not _PIL_AVAILABLE:
-            self._map_canvas.create_rectangle(0, 0, w, h, fill="#111a14", outline="")
+            self._map_canvas.create_rectangle(0, 0, w, h, fill=_T("#111a14"), outline="")
             self._map_canvas.create_text(
-                12, h - 14, anchor="w", fill="#888888",
+                12, h - 14, anchor="w", fill=_T("#888888"),
                 text="Pillow not installed -- showing flat background instead of map tiles",
-                font=("Segoe UI", 8))
+                font=(_F("Segoe UI"), 8))
             return
 
         n_tiles = 2 ** zoom
@@ -1153,7 +1265,7 @@ class DetectionMapWidget(tk.Toplevel):
         tile_y_min = int(math.floor(top_left_y / MapTiles.TILE_SIZE))
         tile_y_max = int(math.floor((top_left_y + h) / MapTiles.TILE_SIZE))
 
-        mosaic = Image.new("RGB", (max(int(w), 1), max(int(h), 1)), "#111a14")
+        mosaic = Image.new("RGB", (max(int(w), 1), max(int(h), 1)), _T("#111a14"))
         for ty in range(tile_y_min, tile_y_max + 1):
             if ty < 0 or ty >= n_tiles:
                 continue  # off the top/bottom of the world -- nothing to paste
@@ -1198,10 +1310,10 @@ class DetectionMapWidget(tk.Toplevel):
             # Neither a detection nor a drone GPS fix has ever arrived --
             # there is no coordinate yet to center a map on. This is the
             # only case with genuinely nothing to show.
-            self._map_canvas.create_rectangle(0, 0, 400, 260, fill="#111a14", outline="")
+            self._map_canvas.create_rectangle(0, 0, 400, 260, fill=_T("#111a14"), outline="")
             self._map_canvas.create_text(
-                12, 14, anchor="nw", fill="#888888",
-                text="Waiting for GPS fix...", font=("Segoe UI", 9))
+                12, 14, anchor="nw", fill=_T("#888888"),
+                text="Waiting for GPS fix...", font=(_F("Segoe UI"), 9))
             return
 
         w = self._map_canvas.winfo_width() or 400
@@ -1253,10 +1365,10 @@ class DetectionMapWidget(tk.Toplevel):
             selected_track_id = self._key_from_iid(focus_iid)
 
         if not self._track_positions:
-            self._map_canvas.create_rectangle(8, 8, 210, 26, fill="#000000", stipple="gray50", outline="")
+            self._map_canvas.create_rectangle(8, 8, 210, 26, fill=_T("#000000"), stipple="gray50", outline="")
             self._map_canvas.create_text(
-                14, 17, anchor="w", fill="#dddddd",
-                text="No georeferenced detections yet", font=("Segoe UI", 9))
+                14, 17, anchor="w", fill=_T("#dddddd"),
+                text="No georeferenced detections yet", font=(_F("Segoe UI"), 9))
 
         meters_per_pixel = 156543.03392804097 * math.cos(math.radians(center_lat)) / (2 ** zoom)
         px_per_m = (1.0 / meters_per_pixel) if meters_per_pixel > 0 else 0.0
@@ -1274,7 +1386,7 @@ class DetectionMapWidget(tk.Toplevel):
                 rpx = max(4.0, radius_m * px_per_m)
                 self._map_canvas.create_oval(
                     cx - rpx, cy - rpx, cx + rpx, cy + rpx,
-                    outline="#00e0ff" if is_selected else "#ffaa00",
+                    outline=_T("#00e0ff") if is_selected else _T("#ffaa00"),
                     width=2 if is_selected else 1, dash=(4, 3))
 
             if len(positions) > 1:
@@ -1283,7 +1395,7 @@ class DetectionMapWidget(tk.Toplevel):
                     x, y = to_canvas(lat, lon)
                     coords.extend([x, y])
                 self._map_canvas.create_line(
-                    *coords, fill="#2fb8c9" if is_selected else "#e0d060", width=2)
+                    *coords, fill=_T("#2fb8c9") if is_selected else _T("#e0d060"), width=2)
 
             last_idx = len(positions) - 1
             for idx, (lat, lon) in enumerate(positions):
@@ -1292,17 +1404,17 @@ class DetectionMapWidget(tk.Toplevel):
                     # Most recent sighting of this track -- the "current"
                     # pin, drawn bright and larger, with a dark outline so
                     # it stays visible against both light and dark imagery.
-                    color = "#00e0ff" if is_selected else "#ffaa00"
+                    color = _T("#00e0ff") if is_selected else _T("#ffaa00")
                     radius = 6
                 else:
                     # Older sighting of the SAME object -- a faded
                     # breadcrumb, not a separate detection to read on
                     # its own.
-                    color = "#998833"
+                    color = _T("#998833")
                     radius = 3
                 self._map_canvas.create_oval(
                     x - radius, y - radius, x + radius, y + radius,
-                    fill=color, outline="#000000", width=1)
+                    fill=color, outline=_T("#000000"), width=1)
 
         # Drone marker: driven by set_drone_telemetry() (continuous, from
         # the app's own poll loop) rather than digging through
@@ -1314,14 +1426,14 @@ class DetectionMapWidget(tk.Toplevel):
             dx, dy = to_canvas(*self._drone_telemetry)
             self._map_canvas.create_polygon(
                 dx, dy - 8, dx - 7, dy + 6, dx + 7, dy + 6,
-                fill="#00ff88", outline="#003318", width=1)
+                fill=_T("#00ff88"), outline=_T("#003318"), width=1)
             self._map_canvas.create_text(
-                dx, dy + 17, text="drone", fill="#00ff88", font=("Segoe UI", 7, "bold"))
+                dx, dy + 17, text="drone", fill=_T("#00ff88"), font=(_F("Segoe UI"), 7, "bold"))
 
         # North-up compass mark -- fixed, since the map is always drawn
         # north-up (standard Web Mercator orientation, same as the tiles).
         self._map_canvas.create_text(
-            w - 24, 16, text="N ↑", fill="#ffffff", font=("Segoe UI", 9, "bold"))
+            w - 24, 16, text="N ↑", fill=_T("#ffffff"), font=(_F("Segoe UI"), 9, "bold"))
 
         meters_per_pixel = 156543.03392804097 * math.cos(math.radians(center_lat)) / (2 ** zoom)
         scale_px_per_m = (1.0 / meters_per_pixel) if meters_per_pixel > 0 else 1.0
@@ -1348,12 +1460,12 @@ class DetectionMapWidget(tk.Toplevel):
 
         x0 = pad * 0.6
         y0 = canvas_h - 16
-        self._map_canvas.create_line(x0, y0, x0 + bar_px, y0, fill="#ffffff", width=2)
-        self._map_canvas.create_line(x0, y0 - 4, x0, y0 + 4, fill="#ffffff")
-        self._map_canvas.create_line(x0 + bar_px, y0 - 4, x0 + bar_px, y0 + 4, fill="#ffffff")
+        self._map_canvas.create_line(x0, y0, x0 + bar_px, y0, fill=_T("#ffffff"), width=2)
+        self._map_canvas.create_line(x0, y0 - 4, x0, y0 + 4, fill=_T("#ffffff"))
+        self._map_canvas.create_line(x0 + bar_px, y0 - 4, x0 + bar_px, y0 + 4, fill=_T("#ffffff"))
         label = f"{nice_m:.0f} m" if nice_m >= 1 else f"{nice_m:.1f} m"
         self._map_canvas.create_text(x0 + bar_px / 2.0, y0 - 10, text=label,
-                                      fill="#ffffff", font=("Segoe UI", 8))
+                                      fill=_T("#ffffff"), font=(_F("Segoe UI"), 8))
 
     # =====================================================================
     # Internals — detection list / preview
@@ -1397,7 +1509,7 @@ class DetectionMapWidget(tk.Toplevel):
         self._viewing_saved_id = best.id
         self._preview_status_var.set(f"●  SAVED FRAME  (object {getattr(rec, 'track_id', 0)}, "
                                      f"best sighting #{best.id})")
-        self._preview_status_lbl.config(fg="#ffaa00")
+        self._preview_status_lbl.config(fg=_T("#ffaa00"))
         self._show_back_to_live_button()
         self._report_rec = best
         if self._report_dir and not self._open_report_btn_visible:
@@ -1424,17 +1536,17 @@ class DetectionMapWidget(tk.Toplevel):
 
         if self._live_enabled.get():
             self._preview_status_var.set("●  LIVE")
-            self._preview_status_lbl.config(fg="#00ff88")
+            self._preview_status_lbl.config(fg=_T("#00ff88"))
             if self._live_photo is not None:
                 self._preview_label.config(image=self._live_photo, text="")
             else:
                 self._preview_label.config(image="", text="(waiting for live feed...)",
-                                            fg="#888888", bg="#000000")
+                                            fg=_T("#888888"), bg=_T("#000000"))
         else:
             self._preview_status_var.set("●  LIVE (paused)")
-            self._preview_status_lbl.config(fg="#888888")
+            self._preview_status_lbl.config(fg=_T("#888888"))
             self._preview_label.config(image="", text="(live feed paused)",
-                                        fg="#888888", bg="#000000")
+                                        fg=_T("#888888"), bg=_T("#000000"))
 
         self._detail_lbl.config(text="Live feed -- click a detection for its saved screenshot")
         self._redraw_map()  # clear the track highlight tied to the deselected row
@@ -1479,7 +1591,7 @@ class DetectionMapWidget(tk.Toplevel):
     def _load_preview(self, path: str) -> None:
         if not path or not _PIL_AVAILABLE:
             self._preview_label.config(image="", text="(no preview available)",
-                                        fg="#888888", bg="#000000")
+                                        fg=_T("#888888"), bg=_T("#000000"))
             return
         try:
             img = Image.open(path)
@@ -1488,7 +1600,7 @@ class DetectionMapWidget(tk.Toplevel):
             self._preview_label.config(image=self._selected_photo, text="")
         except (OSError, ValueError):
             self._preview_label.config(image="", text="(screenshot unavailable)",
-                                        fg="#888888", bg="#000000")
+                                        fg=_T("#888888"), bg=_T("#000000"))
 
     # =====================================================================
     # Live feed (on by default, ~5-6fps, see set_detection_link/_build_layout)
@@ -1501,7 +1613,7 @@ class DetectionMapWidget(tk.Toplevel):
                 return
             if self._viewing_saved_id is None:
                 self._preview_status_var.set("●  LIVE")
-                self._preview_status_lbl.config(fg="#00ff88")
+                self._preview_status_lbl.config(fg=_T("#00ff88"))
             if self._live_job is None:
                 self._poll_live_frame()
         else:
@@ -1513,9 +1625,9 @@ class DetectionMapWidget(tk.Toplevel):
             # the pilot out of a screenshot they clicked into.
             if self._viewing_saved_id is None:
                 self._preview_status_var.set("●  LIVE (paused)")
-                self._preview_status_lbl.config(fg="#888888")
+                self._preview_status_lbl.config(fg=_T("#888888"))
                 self._preview_label.config(image="", text="(live feed paused)",
-                                            fg="#888888", bg="#000000")
+                                            fg=_T("#888888"), bg=_T("#000000"))
 
     def _poll_live_frame(self) -> None:
         if not self._live_enabled.get() or self._link is None:
@@ -1554,4 +1666,4 @@ class DetectionMapWidget(tk.Toplevel):
         # frame; now the backend genuinely has a fresh one this often.
         # Raise this if JPEG-decode/PhotoImage cost on the Tk thread ever
         # turns out to matter more than feed smoothness on your hardware.
-        self._live_job = self.after(40, self._poll_live_frame)
+        self._live_job = self.after(40, self._poll_live_frame)

@@ -3,6 +3,7 @@ import tkinter.font as tkfont
 import math
 
 from core import link_mode
+from core.theme import C as _T, F as _F   # cockpit theme (core/theme.py)
 
 # Pixel extent (width, linespace) of the worst-case heading string per font
 # size. Measuring needs a Tk font object, and creating one is slow — the two
@@ -80,31 +81,31 @@ class MagWidget(tk.Frame):
     """
 
     # ── Cockpit colour palette ───────────────────────────────────────────────
-    C_BG         = "#0a0a10"
-    C_ROSE_BG    = "#0d1117"
-    C_ROSE_RING  = "#1e3040"
-    C_LUBBER     = "#FFD700"
-    C_CARDINAL   = "#c8d8e8"
-    C_CARDINAL_N = "#FF4444"
-    C_TICK_MINOR = "#1e2e3e"
-    C_SAFE       = "#00d4ff"
-    C_GREEN      = "#00ff88"
-    C_WARN       = "#FFD700"
-    C_CRIT       = "#FF4444"
-    C_OFF        = "#444455"
-    C_BAR_BG     = "#111118"
-    C_TEXT       = "#a0b8c8"
-    C_LABEL      = "#445566"
-    C_NOSIG_FG   = "#FF4444"
-    C_HINT       = "#664400"
-    C_SEP        = "#1e2a3a"
-    C_HDG_BG     = "#080f18"
-    C_HDG_BORDER = "#1e4a6a"
-    C_BTN_MAG_BG = "#082210"
-    C_BTN_MAG_FG = "#00ff88"
-    C_BTN_ACC_BG = "#080a20"
-    C_BTN_ACC_FG = "#44aaff"
-    C_HOME       = "#00e5ff"   # home-direction marker (both links)
+    C_BG         = _T("#0a0a10")
+    C_ROSE_BG    = _T("#0d1117")
+    C_ROSE_RING  = _T("#1e3040")
+    C_LUBBER     = _T("#FFD700")
+    C_CARDINAL   = _T("#c8d8e8")
+    C_CARDINAL_N = _T("#FF4444")
+    C_TICK_MINOR = _T("#1e2e3e")
+    C_SAFE       = _T("#00d4ff")
+    C_GREEN      = _T("#00ff88")
+    C_WARN       = _T("#FFD700")
+    C_CRIT       = _T("#FF4444")
+    C_OFF        = _T("#444455")
+    C_BAR_BG     = _T("#111118")
+    C_TEXT       = _T("#a0b8c8")
+    C_LABEL      = _T("#445566")
+    C_NOSIG_FG   = _T("#FF4444")
+    C_HINT       = _T("#664400")
+    C_SEP        = _T("#1e2a3a")
+    C_HDG_BG     = _T("#080f18")
+    C_HDG_BORDER = _T("#1e4a6a")
+    C_BTN_MAG_BG = _T("#082210")
+    C_BTN_MAG_FG = _T("#00ff88")
+    C_BTN_ACC_BG = _T("#080a20")
+    C_BTN_ACC_FG = _T("#44aaff")
+    C_HOME       = _T("#00e5ff")   # home-direction marker (both links)
 
     MAG_SCALE_MIN = 800.0
     _mag_scale    = 800.0
@@ -627,7 +628,7 @@ class MagWidget(tk.Frame):
     def _build_bars_into(self, parent, start_row=0, bar_height=13):
         bars = {}
         for i, (axis, color) in enumerate(
-                [("X", "#4488FF"), ("Y", "#FF8844"), ("Z", "#44FF88")]):
+                [("X", _T("#4488FF")), ("Y", _T("#FF8844")), ("Z", _T("#44FF88"))]):
             r = start_row + i
 
             tk.Label(parent, text=f" {axis} ",
@@ -694,7 +695,7 @@ class MagWidget(tk.Frame):
                            fill=self.C_ROSE_BG, outline=self.C_ROSE_RING, width=2)
             r2 = int(r * 0.88)
             cv.create_oval(cx - r2, cy - r2, cx + r2, cy + r2,
-                           fill="", outline="#152535", width=1)
+                           fill="", outline=_T("#152535"), width=1)
             cv.create_text(cx, cy - int(r * 0.12), text="NO SIG",
                            fill=self.C_NOSIG_FG,
                            font=("Consolas", f_nosig, "bold"))
@@ -732,7 +733,7 @@ class MagWidget(tk.Frame):
                        fill=self.C_ROSE_BG, outline=self.C_ROSE_RING, width=2)
         r2 = int(r * 0.88)
         cv.create_oval(cx - r2, cy - r2, cx + r2, cy + r2,
-                       fill="", outline="#152535", width=1)
+                       fill="", outline=_T("#152535"), width=1)
 
         tick_step = 5 if r > 70 else (10 if r > 40 else 30)
         for deg in range(0, 360, tick_step):
@@ -745,10 +746,10 @@ class MagWidget(tk.Frame):
                 tick_w, tick_clr = 2, self.C_CARDINAL
             elif is_semi:
                 tick_len = max(4, int(r * 0.13))
-                tick_w, tick_clr = 1, "#3a6a8a"
+                tick_w, tick_clr = 1, _T("#3a6a8a")
             elif is_10:
                 tick_len = max(3, int(r * 0.09))
-                tick_w, tick_clr = 1, "#254555"
+                tick_w, tick_clr = 1, _T("#254555")
             else:
                 tick_len = max(1, int(r * 0.05))
                 tick_w, tick_clr = 1, self.C_TICK_MINOR
@@ -769,7 +770,7 @@ class MagWidget(tk.Frame):
                 lx  = cx + num_r * math.cos(rad)
                 ly  = cy + num_r * math.sin(rad)
                 cv.create_text(lx, ly, text=str(deg // 10),
-                               fill="#2a5a7a",
+                               fill=_T("#2a5a7a"),
                                font=("Consolas", f_numeral))
 
         label_r = int(r * 0.72)
@@ -788,7 +789,7 @@ class MagWidget(tk.Frame):
                 rad = math.radians((hdg_fixed - heading) - 90)
                 lx  = cx + inter_r * math.cos(rad)
                 ly  = cy + inter_r * math.sin(rad)
-                cv.create_text(lx, ly, text=label, fill="#3a7a9a",
+                cv.create_text(lx, ly, text=label, fill=_T("#3a7a9a"),
                                font=("Consolas", f_intercardinal))
 
         tip_y  = cy - r + 2
@@ -798,7 +799,7 @@ class MagWidget(tk.Frame):
             cx - half_w, base_y,
             cx + half_w, base_y,
             cx,          tip_y,
-            fill=self.C_LUBBER, outline="#b09000", width=1)
+            fill=self.C_LUBBER, outline=_T("#b09000"), width=1)
 
         ptr_r = int(r * 0.55)
         arrow = (max(4, int(r * 0.10)),
@@ -1020,7 +1021,7 @@ class MagWidget(tk.Frame):
                 W = cv.winfo_width() or 120
                 H = cv.winfo_height() or 13
                 cv.create_rectangle(1, 1, W - 1, H - 1,
-                                    fill=self.C_BAR_BG, outline="#1a2535")
+                                    fill=self.C_BAR_BG, outline=_T("#1a2535"))
                 entry["label"].config(text=link_mode.NA_SHORT.rjust(5),
                                       fg=link_mode.C_NA_FG)
             return
@@ -1041,8 +1042,8 @@ class MagWidget(tk.Frame):
             mid = W // 2
 
             cv.create_rectangle(1, 1, W - 1, H - 1,
-                                 fill=self.C_BAR_BG, outline="#1a2535")
-            cv.create_line(mid, 1, mid, H - 1, fill="#1e2e40", width=1)
+                                 fill=self.C_BAR_BG, outline=_T("#1a2535"))
+            cv.create_line(mid, 1, mid, H - 1, fill=_T("#1e2e40"), width=1)
 
             norm   = max(-1.0, min(1.0, raw / self._mag_scale))
             bar_px = int(abs(norm) * (mid - 3))
@@ -1238,7 +1239,7 @@ if __name__ == "__main__":
     root = tk.Tk()
     root.title("MagWidget — resize test")
     root.geometry("720x320")
-    root.configure(bg="#0a0a10")
+    root.configure(bg=_T("#0a0a10"))
     root.minsize(285, 145)
 
     widget = MagWidget(
@@ -1265,4 +1266,4 @@ if __name__ == "__main__":
         root.after(1200, next_heading)
 
     root.after(300, next_heading)
-    root.mainloop()
+    root.mainloop()

@@ -12,7 +12,7 @@
 | # | Requirement | Status |
 |---|---|---|
 | R1 | Gimbal pan + tilt from the laptop, angles for georeferencing | implemented (CH8 tilt → servo 0 on M5, CH9 pan → servo 1 on M6; `control/gimbal.py`) |
-| R2 | Emergency actions (RTH / land) from the laptop | **not implemented** — stays on the pilot's switches |
+| R2 | Emergency actions (RTH / land) from the laptop | **land** implemented (L key / LAND, also automatic on video loss and critical battery); RTH stays on the pilot's switch |
 | R3 | Movement: forward/back/left/right/yaw, altitude hold | implemented (stick offsets in ANGLE mode, laptop-side baro altitude hold) |
 | R4 | Pilot keeps final authority | radio-side gate switch, ADD mixing, bounded throttle delta |
 | R5 | Losing the laptop never affects flight | radio watchdog 500 ms, laptop lease 300 ms |
@@ -53,7 +53,8 @@ same bytes also fit EdgeTX's proposed "CRSF Trainer over USB-VCP" mode.
 ## RAD_STATUS (0x7E, Pocket → laptop, USB only, never over RF)
 
 24 bytes (version 2), big-endian: version, flags (fresh, gate, sticks
-active, throttle active, telemetry live), echoed alive value (round-trip
+active, throttle active, telemetry live, pilot override 0x20, ANGLE switch
+on 0x40), echoed alive value (round-trip
 time), command frames received, CRC errors, command age, pilot throttle
 stick, applied throttle delta, script period, applied roll/pitch/yaw/tilt
 outputs, applied pan output. Version 1 bridges (22 bytes, no pan) are still
@@ -64,6 +65,9 @@ accepted (`BridgeStatus.hasPan = false`).
 | Layer | Where | Rule |
 |---|---|---|
 | Gate switch | radio (Lua + switch condition SD on the CH1–4 mixer lines) | Pilot switch off → roll/pitch/yaw/throttle outputs 0 |
+| ANGLE check | radio | CH6 outside the ANGLE range (600…1200 = 1800–2100 µs) → outputs 0 |
+| Pilot override | radio | Pilot moves roll/pitch/yaw > ≈30 % → stick offsets 0 until 0.3 s after release (laptop throttle keeps running); haptic pulse, RAD_STATUS flag 0x20 |
+| Alerts | radio | Laptop commands stop while the gate is on → haptic + tone on the Pocket |
 | Watchdog | radio | No new alive counter for 500 ms → neutral, gimbal holds |
 | Authority | radio mixer | Laptop offsets are ADDed to the pilot's sticks |
 | Throttle | radio | Delta to the pilot's stick, ±THR_BAND (≈100 µs), only with stick > ≈1200 µs |
@@ -71,6 +75,13 @@ accepted (`BridgeStatus.hasPan = false`).
 | UI heartbeat | laptop | Command panel (Tk thread) silent for 500 ms → movement 0, altitude hold continues |
 | Lease | laptop | Command older than 300 ms → sticks/throttle disabled |
 | Flight state | laptop | Commands only when ELRS telemetry is live, armed, ANGLE (bench override: `COCKPIT_UPLINK_BENCH=1`) |
+| Hard stop | laptop | FC failsafe unsafe (MSP_FAILSAFE_CONFIG, checked against the learnt hover throttle) → everything off |
+| Movement stops | laptop | FPV video lost 0.5 s, LQ < 30 % for 1 s, battery critical, pilot override, ANGLE off on the radio, UI frozen → offsets 0, throttle loop continues |
+| Auto-land | laptop | Video lost 5 s or battery critical while the laptop flies, or L → controlled descent (1.5 m/s, 0.7 m/s in the last 20 m above the arming point); video back aborts a video-loss landing; touchdown detection, then throttle kept below the stick (never above), pilot disarms |
+| Geofence | laptop | > 5 km (radio range) from home → only movement toward home (±60°), yaw free; warning from 4 km |
+| Ceiling | laptop | Altitude-hold target ≤ 5000 m above the arming point |
+| Alarms | laptop | `core/safety_monitor.py`: banner under the toolbar, sound (CRITICAL repeats every 10 s), `logs/safety_*.log` |
+| Process | laptop | `core/runtime_guard.py`: crash log, one instance only, no sleep/USB suspend, 1 ms timer, ABOVE_NORMAL priority |
 | Log | laptop | Every command change → `logs/uplink_*.csv` |
 
 **Change to the original rule "never command throttle":** replaced by the
@@ -80,7 +91,21 @@ stick with a jump of at most that band. Altitude hold engages bumplessly
 from the throttle the radio is transmitting (RC_CHANNELS echo).
 
 Arming, flight modes, failsafe and GPS Rescue are never touched by the
-laptop.
+laptop. The flight controller's own failsafe is the last layer for every
+failure, so it must be configured for a controlled descent or GPS Rescue
+(`failsafe_procedure = AUTO-LAND` with `failsafe_throttle = 1020`, as found
+in the 2026-11-03 configuration, drops the drone). The cockpit reads it over
+USB and refuses laptop control while it is unsafe.
+
+`control/landing_model.py` learns the hover throttle from every steady
+flight (normalised throttle (thr − 1000)·V = a + b·vz, exponentially
+weighted least squares, level and non-accelerating samples only) and
+computes one `failsafe_throttle` that descends ≥ 0.5 m/s on a full and
+≤ 3 m/s on an empty pack, plus `failsafe_landing_time` for the highest
+altitude flown (Betaflight max 250 s; above what that covers the cockpit
+warns, GPS-RESCUE is then the only proper failsafe). The panel copies the
+CLI lines. Failure table, procedure and bench tests:
+command-uplink-uputstvo.md §7.
 
 ## Gimbal
 
@@ -123,7 +148,7 @@ snapshots under short locks.
 |---|---|---|---|
 | Tk (main) | events + 10 Hz panel refresh | keys/buttons → intents; draws status | nothing in the control path |
 | `UplinkController` (Python) | 25 Hz | gates, `AltitudeHold`, `CommandLink.setCommand()` | GIL only (buffered log, flushed ≤ 1 Hz) |
-| `CrsfLink` worker (C++) | ReadFile ≤ 20 ms | COM port: telemetry in, command frames out (~33 Hz) | the port only; no GIL |
+| `CrsfLink` worker (C++, ABOVE_NORMAL) | ReadFile ≤ 20 ms | COM port: telemetry in, command frames out (~33 Hz) | the port only; no GIL |
 | `VideoLink`, `DetectionLink` (C++) | stream rate | video decode, detections | their own sockets/devices |
 | `TelemetryWorker` (Python) | 60 Hz | reads snapshots for the widgets | GIL only |
 
@@ -149,6 +174,9 @@ snapshots under short locks.
   | `UplinkController` thread | `CommandLink` lease, 300 ms | sticks + throttle neutral |
   | `CrsfLink` worker, USB cable, whole app | `radcmd.lua` watchdog, 500 ms | radio back to pilot sticks |
   | ELRS link | Betaflight failsafe | as configured on the FC |
+  | FPV video | VideoLink state / frame age 1 s | movement 0, altitude hold continues |
+  | Exception in the controller | `UplinkController._run` | `neutral()`, error counted, CRITICAL alarm |
+  | FPV video 5 s | same | auto-land (throttle loop keeps running in its own thread) |
 
 Tests: `test_uplink.cpp::testConcurrency` (three real threads hammering
 `CommandLink`; also run with `-fsanitize=thread`, no races),
@@ -173,9 +201,12 @@ UT-UPL-B1 (MSP override over CRSF) is no longer needed for R3.
 
 ## Not done / next
 
-- R2 (RTH/land request from the laptop): would be one more Lua output on a
-  free AUX channel mapped in the Modes tab, behind a two-step confirm.
-- Position hold: needs a laptop GPS position loop on top of the movement
-  offsets (drift with wind is not corrected today).
+- RTH from the laptop: one more Lua output on a free AUX channel mapped to
+  GPS Rescue, behind a two-step confirm (once GPS is on).
+- Height above ground: without a rangefinder the landing only knows the
+  altitude above the arming point.
+- Position hold: Betaflight 4.5 has none; a landing without video drifts
+  with the wind. Betaflight 2025.12 adds POS HOLD / ALT HOLD (GPS +
+  compass); alternatively a laptop GPS position loop on top of the offsets.
 - If EdgeTX ships CRSF Trainer over USB-VCP with telemetry back on the same
   port, the laptop side stays the same and only the radio mixing changes.

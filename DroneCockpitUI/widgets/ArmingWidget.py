@@ -49,20 +49,21 @@ LAYOUT / SCROLL FIXES:
 import tkinter as tk
 
 from core import link_mode
+from core.theme import C as _T, F as _F   # cockpit theme (core/theme.py)
 
 # ── Palette ───────────────────────────────────────────────────────────────────
-_BG       = "#0f0f1a"
-_BG2      = "#12121f"
-_BG3      = "#0a0a14"
-_BORDER   = "#1e2a3a"
-_LABEL_FG = "#4a6080"
-_VALUE_FG = "#c8dff0"
-_GREEN    = "#00ff88"
-_ORANGE   = "#ffaa00"
-_RED      = "#ff3355"
-_DIM      = "#1a2a3a"
-_DIM_FG   = "#263a4a"
-_TICK_OK  = "#00cc66"
+_BG       = _T("#0f0f1a")
+_BG2      = _T("#12121f")
+_BG3      = _T("#0a0a14")
+_BORDER   = _T("#1e2a3a")
+_LABEL_FG = _T("#4a6080")
+_VALUE_FG = _T("#c8dff0")
+_GREEN    = _T("#00ff88")
+_ORANGE   = _T("#ffaa00")
+_RED      = _T("#ff3355")
+_DIM      = _T("#1a2a3a")
+_DIM_FG   = _T("#263a4a")
+_TICK_OK  = _T("#00cc66")
 
 _F_SECTION = ("Consolas",  8, "bold")
 _F_ITEM    = ("Consolas",  9)
@@ -556,4 +557,4 @@ class ArmingWidget(tk.Frame):
         for item_id, (var, cv, box, tick, lbl) in self._cb_widgets.items():
             var.set(False)
             self._update_checkbox(var, cv, box, tick, lbl)
-        self._refresh_banner()
+        self._refresh_banner()

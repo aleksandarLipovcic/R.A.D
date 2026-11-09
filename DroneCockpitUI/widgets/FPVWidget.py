@@ -25,11 +25,12 @@ import tkinter as tk
 from tkinter import messagebox
 
 from widgets.osd_overlay_controls import OsdSettingsPanel, load_layout
+from core.theme import C as _T, F as _F   # cockpit theme (core/theme.py)
 
 
 class FPVWidget(tk.Frame):
     def __init__(self, master, **kwargs):
-        super().__init__(master, bg="#000000", **kwargs)
+        super().__init__(master, bg=_T("#000000"), **kwargs)
 
         self._video_link = None
         self._attached = False
@@ -43,18 +44,18 @@ class FPVWidget(tk.Frame):
         # in the same screen region, so text placed "on top" of the video
         # area would never actually be visible once VideoLink starts
         # painting into it.
-        self._status_bar = tk.Frame(self, bg="#000000")
+        self._status_bar = tk.Frame(self, bg=_T("#000000"))
         self._status_bar.pack(side="top", fill="x")
 
         self._status_lbl = tk.Label(
             self._status_bar, text="FPV: searching for capture device...",
-            fg="#ffaa00", bg="#000000", font=("Consolas", 9), anchor="w",
+            fg=_T("#ffaa00"), bg=_T("#000000"), font=("Consolas", 9), anchor="w",
         )
         self._status_lbl.pack(side="left", padx=6, pady=2)
 
         self._fps_lbl = tk.Label(
             self._status_bar, text="",
-            fg="#00ff88", bg="#000000", font=("Consolas", 9, "bold"), anchor="e",
+            fg=_T("#00ff88"), bg=_T("#000000"), font=("Consolas", 9, "bold"), anchor="e",
         )
         self._fps_lbl.pack(side="right", padx=6, pady=2)
 
@@ -86,7 +87,7 @@ class FPVWidget(tk.Frame):
         # Nothing is ever drawn into it from the Python side -- it exists
         # purely to give the native render window a parent and a place in
         # the panel's layout.
-        self._video_host = tk.Frame(self, bg="#000000")
+        self._video_host = tk.Frame(self, bg=_T("#000000"))
         self._video_host.pack(side="top", fill="both", expand=True)
         self._video_host.bind("<Configure>", self._on_host_resize)
 
@@ -202,4 +203,4 @@ class FPVWidget(tk.Frame):
 
         self._status_lbl.config(text="")
         fps_txt = f"{device_name}  {fps:4.1f} fps" if device_name else f"{fps:4.1f} fps"
-        self._fps_lbl.config(text=fps_txt)
+        self._fps_lbl.config(text=fps_txt)

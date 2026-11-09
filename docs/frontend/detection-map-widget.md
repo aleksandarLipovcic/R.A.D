@@ -24,6 +24,17 @@ and displays them with ordinary Tk widgets (a `Treeview` list + a Canvas
 map). See [../modules/detectionlink.md](../modules/detectionlink.md) for
 what a `DetectionRecord` actually contains.
 
+## Responsive layout
+
+Minimum window size 860x520. Priority when the window shrinks: object list,
+map, live feed / saved screenshot, scene search. `_apply_density()` (on
+`<Configure>`, debounced) shows the scene-search rows and the scene table
+from 1180x720 (or on **▸ SCENES**, or automatically when a scene search
+runs), the live / screenshot pane from a height of 620 (or on **▸ LIVE**),
+and shortens the map header buttons below a width of 1180. Same cockpit
+theme as the pilot window (`core/theme.py`, `theme.apply_ttk`); details in
+[cockpit-ui.md](cockpit-ui.md).
+
 ## One row per object
 
 `DetectionLink` writes a record when an object is first confirmed, when it

@@ -35,11 +35,17 @@
     <Compile Include="control\__init__.py" />
     <Compile Include="control\altitude_hold.py" />
     <Compile Include="control\gimbal.py" />
+    <Compile Include="control\landing_model.py" />
+    <Compile Include="control\safety.py" />
     <Compile Include="core\MapTiles.py" />
     <Compile Include="core\detection_report.py" />
     <Compile Include="core\__init__.py" />
     <Compile Include="core\dual_layer.py" />
     <Compile Include="core\link_mode.py" />
+    <Compile Include="core\cockpit_layout.py" />
+    <Compile Include="core\runtime_guard.py" />
+    <Compile Include="core\safety_monitor.py" />
+    <Compile Include="core\theme.py" />
     <Compile Include="core\ui_perf.py" />
     <Compile Include="tests\conftest.py" />
     <Compile Include="tests\integration\conftest.py" />
@@ -61,6 +67,8 @@
     <Compile Include="tests\unit\test_link_mode.py" />
     <Compile Include="tests\unit\test_lua_bridge.py" />
     <Compile Include="tests\unit\test_gimbal.py" />
+    <Compile Include="tests\unit\test_safety.py" />
+    <Compile Include="tests\unit\test_cockpit_layout.py" />
     <Compile Include="tests\unit\test_uplink_python.py" />
     <Compile Include="tools\DroneTest.py" />
     <Compile Include="tools\Setup_Project.py" />

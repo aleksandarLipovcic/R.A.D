@@ -71,6 +71,9 @@ class EdgeTxMock:
         g.serialRead = self._serial_read
         g.serialWrite = self._serial_write
         g.getOutputValue = lambda i: self.outputs[int(i)]
+        self.alerts = []
+        g.playHaptic = lambda *a: self.alerts.append("haptic")
+        g.playTone = lambda *a: self.alerts.append("tone")
         with open(SCRIPT, "rb") as f:
             self.mod = self.lua.execute(f.read())
         self.run_fn = self.mod[b"run"]
@@ -238,6 +241,7 @@ def py_decode(data):
             echo = _u16(p, 2)
             d.update(fresh=int(bool(f & 1)), gate=int(bool(f & 2)), stk=int(bool(f & 4)),
                      thr=int(bool(f & 8)), live=int(bool(f & 16)),
+                     override=int(bool(f & 32)), angle=int(bool(f & 64)),
                      echo=-1 if echo == 0xFFFF else echo, rx=_u16(p, 4),
                      thr_stick=_s16(p, 9), thr_delta=_s16(p, 11), out_roll=_s16(p, 14),
                      out_pitch=_s16(p, 16), out_yaw=_s16(p, 18), out_tilt=_s16(p, 20),
@@ -302,7 +306,8 @@ def main():
     f0, f1, f2 = frames[:flen], frames[flen:2 * flen], frames[2 * flen:]
 
     m = EdgeTxMock()
-    m.values.update({"sd": -1024, "thr": 0, "RQly": 0})
+    m.values.update({"sd": -1024, "thr": 0, "RQly": 0, "ch6": 1024,
+                     "ail": 0, "ele": 0, "rud": 0})
 
     # --- no laptop: everything neutral -------------------------------------
     out = m.run()
@@ -333,6 +338,35 @@ def main():
     check(out[2] == 0, "no laptop throttle with stick near idle")
     m.values["thr"] = 0
 
+    # --- radio-side ANGLE gate: offsets only with the ANGLE switch on ------
+    m.values["ch6"] = -1024                        # ACRO
+    out = m.run()
+    check(out[:4] == (0, 0, 0, 0), f"ANGLE switch off -> no offsets/throttle {out}")
+    near(out[4], -0.60 * 1024, 2, "gimbal still follows without ANGLE")
+    m.values["ch6"] = 1024
+    out = m.run()
+    check(out[0] != 0, "ANGLE back on -> offsets again")
+
+    # --- pilot priority: stick deflection > 30 % stops the laptop ----------
+    m.alerts.clear()
+    m.values["ele"] = 500
+    out = m.run()
+    check((out[0], out[1], out[3]) == (0, 0, 0), f"pilot override -> laptop offsets 0 {out}")
+    near(out[2], -100, 2, "pilot override keeps the laptop throttle (no height jump)")
+    check("haptic" in m.alerts, "override start buzzes the radio")
+    m.values["ele"] = 0
+    out = m.run()
+    check((out[0], out[1], out[3]) == (0, 0, 0), "override held after the pilot releases (0.3 s)")
+    m.tx.clear()
+    for _ in range(8):                              # let a RAD_STATUS go out
+        m.run(0)
+    st = [d for d in py_decode(bytes(m.tx))["frames"] if d["type"] == 0x7E]
+    check(st and st[-1].get("override") == 1 and st[-1].get("angle") == 1,
+          "RAD_STATUS reports override + ANGLE flags")
+    out = m.run(28)                                 # 0.31 s after release, frame still fresh
+    check(out[0] != 0 and out[3] != 0, f"offsets back 0.3 s after the pilot released {out}")
+    m.tick += 101                                   # laptop now stale
+
     # --- same alive counter again is NOT fresh -----------------------------
     m.tick += 60                   # 600 ms
     m.rx += f1                     # replay: same counter as before
@@ -348,9 +382,12 @@ def main():
     m.tick += 49
     out = m.run(0)
     check(out[0] != 0, "still fresh at 490 ms")
+    m.alerts.clear()
     m.tick += 2
     out = m.run(0)
     check(out[:4] == (0, 0, 0, 0), "watchdog neutral after 510 ms")
+    check("haptic" in m.alerts and "tone" in m.alerts,
+          "laptop dropped out while flying -> haptic + tone on the radio")
     near(out[5], 0.45 * 1024, 2, "gimbal pan held after watchdog")
 
     # --- corrupted frame is rejected ---------------------------------------

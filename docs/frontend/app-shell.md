@@ -83,8 +83,19 @@ single recurring update loop that feeds fresh data to each widget.
 
 ## Panel workspace
 
-Every instrument lives in a `DraggablePanel(tk.Frame)` on a free-form
-`tk.Canvas` workspace rather than a fixed grid:
+Two layout modes, saved per layout profile (`"mode"` key; profiles without
+it open in COCKPIT mode). Details, priorities and formats:
+[cockpit-ui.md](cockpit-ui.md) (Serbian).
+
+- **◧ COCKPIT (default):** `_apply_cockpit_layout()` places the panels from
+  the workspace size with `core/cockpit_layout.py` (formats ESSENTIAL /
+  STANDARD / EXTENDED / FULL, priority FPV > ADI, ALT/VSI, FC status >
+  heading > GPS > checklist, IMU). Panels are `managed` (no drag/resize),
+  the window has a `minsize` of the ESSENTIAL format plus the toolbar.
+- **✥ FREE:** the free-form workspace described below.
+
+Every instrument lives in a `DraggablePanel(tk.Frame)` on a
+`tk.Canvas` workspace:
 
 - **Drag** by the title bar, **resize** via edge/corner handles,
   **right-click** for a z-order context menu (raise/lower/snap-to-neighbor).
@@ -129,13 +140,22 @@ Toolbar actions built in `_setup_ui()`:
 
 | Button | Action |
 |---|---|
-| 🗂 Layouts ▾ | Opens `LayoutManagerDialog` |
+| MASTER WARN / CAUT | Annunciators driven by `SafetyMonitor`: red = CRITICAL, amber = WARNING, flashing until clicked (acknowledge: stops flashing and the repeating alarm until a new alert) |
+| 🗂 Layouts ▾ | Profiles, `LayoutManagerDialog`, layout mode switch, color theme (military / classic, applied at next start) |
 | 🧩 Panels ▾ | Per-panel show/hide checkboxes |
 | 🎯 Detections | Opens the detection/map window |
 | 📐 Camera Angle | Manual (or future gimbal-auto) camera mount angle, used for detection georeferencing, persisted with the active layout |
-| ↺ Revert to Saved | Discards unsaved panel-position changes |
-| 🏭 Factory Default | Resets all panels to built-in default positions (does not touch any saved profile) |
-| 🔓 Save & Lock Layout | Saves the current layout and disables drag/resize |
+| ◧ COCKPIT / ✥ FREE | Layout mode; next to it the current cockpit format (hover: which panels are left out) |
+| ↺ Revert to Saved | FREE mode only: discards unsaved panel-position changes |
+| 🏭 Factory Default | FREE mode only: resets all panels to the built-in defaults (the FULL cockpit format at 1600x920, no overlaps) |
+| 🔓 Save & Lock Layout | FREE mode only: saves the current layout and disables drag/resize |
+
+The toolbar is responsive (`_fit_toolbar`): as the window narrows the
+labelled buttons collapse to icons, then the info labels, the format label,
+Help / Layouts / Camera Angle and finally Panels are dropped. Annunciators,
+link status, Detections, Laptop Control and the mode switch always stay.
+
+Colors go through `core/theme.py` (`_T("#rrggbb")`, see cockpit-ui.md).
 
 Icon-only buttons are used throughout (each with a hover tooltip via the
 internal `_Tooltip` class) — mixing wide unicode glyphs with long text

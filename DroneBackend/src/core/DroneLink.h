@@ -15,6 +15,7 @@
 namespace MSP {
     constexpr uint8_t STATUS = 101;
     constexpr uint8_t RAW_IMU = 102;
+    constexpr uint8_t FAILSAFE_CONFIG = 75; // MSP_FAILSAFE_CONFIG — stage 1/2 failsafe settings
     constexpr uint8_t SERVO = 103;   // MSP_SERVO         — servo outputs (gimbal on M5/M6)
     constexpr uint8_t MOTOR = 104;   // MSP_MOTOR         — motor throttle outputs
     constexpr uint8_t RC = 105;   // MSP_RC            — RC channel inputs
@@ -109,6 +110,10 @@ static constexpr int SERVO_POLL_TICKS = 5;
 // with an MSP error, which costs sendMSP()'s full 80 ms timeout), back off
 // to one attempt every ~5 s so the 100 Hz loop is not slowed down.
 static constexpr int SERVO_BACKOFF_TICKS = 500;
+// FAILSAFE_POLL_TICKS — MSP_FAILSAFE_CONFIG (75) right after connecting and
+//   then every ~5 s: the cockpit's pre-flight safety check verifies that the
+//   flight controller will do something sane when the radio link is lost.
+static constexpr int FAILSAFE_POLL_TICKS = 500;
 
 // =============================================================================
 // Motor / RC channel array sizes
@@ -344,6 +349,21 @@ struct DroneState {
     uint16_t servoValues[MAX_SERVOS] = {};
     bool     servoValid = false;      // at least one MSP_SERVO reply parsed
 
+    // ── Failsafe configuration — MSP_FAILSAFE_CONFIG (75), every ~5 s ──────
+    // What the flight controller does when the RC link is lost. Read so the
+    // cockpit can refuse laptop control with an unsafe setup (e.g. DROP, or
+    // AUTO-LAND with a throttle that cannot hold the drone up).
+    //   fsDelay        stage-1 guard time, 0.1 s units (failsafe_delay)
+    //   fsLandingTime  failsafe_landing_time as reported (AUTO-LAND duration)
+    //   fsThrottle     failsafe_throttle, µs (AUTO-LAND descent throttle)
+    //   fsProcedure    0 = AUTO-LAND, 1 = DROP, 2 = GPS-RESCUE
+    bool     fsConfigValid = false;
+    uint8_t  fsDelay = 0;
+    uint8_t  fsLandingTime = 0;
+    uint16_t fsThrottle = 0;
+    uint8_t  fsSwitchMode = 0;
+    uint8_t  fsProcedure = 0;
+
     // ── GPS — NEO-M10 via MSP_RAW_GPS (106) + MSP_COMP_GPS (107) ─────────────
     GPSReading gps;
 
@@ -455,6 +475,7 @@ private:
     int slowPollTickCounter_ = 0;
     int servoPollTickCounter_ = 0;      // servo outputs, every SERVO_POLL_TICKS (~50 ms)
     int servoFailCount_ = 0;            // consecutive MSP_SERVO failures (back-off)
+    int failsafePollTickCounter_ = 0;   // failsafe config, at connect then every ~5 s
 
     // Calibration countdown state (worker-thread only, committed via commitState)
     bool                                  magCalActive_;
@@ -500,6 +521,7 @@ private:
     bool parseMotors(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseRCChannels(const std::vector<uint8_t>& buf, DroneState& s);
     bool parseServos(const std::vector<uint8_t>& buf, DroneState& s);
+    bool parseFailsafeConfig(const std::vector<uint8_t>& buf, DroneState& s);
 
     // ── Decode helpers (static — no hardware access) ──────────────────────────
     // decodeFlightMode: translates flightModeFlags bitmask → display string.

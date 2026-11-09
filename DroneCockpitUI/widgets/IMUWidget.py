@@ -2,6 +2,7 @@ import tkinter as tk
 import time
 
 from core import link_mode
+from core.theme import C as _T, F as _F   # cockpit theme (core/theme.py)
 
 
 class IMUWidget(tk.Frame):
@@ -85,39 +86,39 @@ class IMUWidget(tk.Frame):
     _PAD      = 10
 
     # ── Base cockpit palette ──────────────────────────────────────────────────
-    C_BG          = "#0a0a10"
-    C_HEADER_BG   = "#0d1520"
-    C_GRID_BG     = "#0b0b15"
-    C_CELL_BG     = "#0d1520"
-    C_CELL_BORDER = "#1e2a3a"
-    C_COL_HDR_BG  = "#111828"
-    C_COL_HDR_FG  = "#4a7a9a"
-    C_AXIS_FG     = "#6a8a9a"
-    C_TEXT        = "#c0d0e0"
-    C_LABEL       = "#3a5a6a"
-    C_SEP         = "#1e2a3a"
-    C_NEUTRAL     = "#00d4ff"
-    C_BTN_NORMAL  = "#0a1520"
-    C_BTN_FG      = "#00d4ff"
-    C_BTN_FLASH_A = "#FF2222"
-    C_BTN_FLASH_B = "#880000"
+    C_BG          = _T("#0a0a10")
+    C_HEADER_BG   = _T("#0d1520")
+    C_GRID_BG     = _T("#0b0b15")
+    C_CELL_BG     = _T("#0d1520")
+    C_CELL_BORDER = _T("#1e2a3a")
+    C_COL_HDR_BG  = _T("#111828")
+    C_COL_HDR_FG  = _T("#4a7a9a")
+    C_AXIS_FG     = _T("#6a8a9a")
+    C_TEXT        = _T("#c0d0e0")
+    C_LABEL       = _T("#3a5a6a")
+    C_SEP         = _T("#1e2a3a")
+    C_NEUTRAL     = _T("#00d4ff")
+    C_BTN_NORMAL  = _T("#0a1520")
+    C_BTN_FG      = _T("#00d4ff")
+    C_BTN_FLASH_A = _T("#FF2222")
+    C_BTN_FLASH_B = _T("#880000")
 
     # ── Alert state colours (aviation standard) ───────────────────────────────
     # SAFE
-    C_SAFE_BG   = "#0d1520"   # dark cockpit cell
-    C_SAFE_FG   = "#00ff88"   # green value text
-    C_SAFE_BDR  = "#1e2a3a"   # subtle border
+    C_SAFE_BG   = _T("#0d1520")   # dark cockpit cell
+    C_SAFE_FG   = _T("#00ff88")   # green value text
+    C_SAFE_BDR  = _T("#1e2a3a")   # subtle border
 
     # WARN  — amber caution (EASA CS-25 / FAA AC 25.1322 amber = caution)
-    C_WARN_BG   = "#C87000"   # solid amber fill
-    C_WARN_FG   = "#000000"   # black text — contrast 4.6:1 on amber (WCAG AA)
-    C_WARN_BDR  = "#FF9900"   # bright amber border for extra pop
+    C_WARN_BG   = _T("#C87000")   # solid amber fill
+    C_WARN_FG   = _T("#000000")   # black text — contrast 4.6:1 on amber (WCAG AA)
+    C_WARN_BDR  = _T("#FF9900")   # bright amber border for extra pop
 
     # CRIT  — red warning, flashing
-    C_CRIT_BG_A = "#CC0000"   # flash phase A — bright red   (white-on-red 5.1:1)
-    C_CRIT_BG_B = "#500000"   # flash phase B — dark red     (white-on-dark 8.0:1)
-    C_CRIT_FG   = "#FFFFFF"   # white text — readable on both phases
-    C_CRIT_BDR  = "#FF4444"   # red border
+    C_CRIT_BG_A = _T("#CC0000")   # flash phase A — bright red   (white-on-red 5.1:1)
+    C_CRIT_BG_B = _T("#500000")   # flash phase B — dark red     (white-on-dark 8.0:1)
+    C_CRIT_FG   = _T("#FFFFFF")   # white text — readable on both phases
+    C_CRIT_BDR  = _T("#FF4444")   # red border
 
     # Flash cadence: 500 ms per half-period (1 Hz total)
     _FLASH_MS = 500
@@ -432,7 +433,7 @@ class IMUWidget(tk.Frame):
                 command=self._on_latency_toggle,
                 font=("Consolas", 8), width=2,
                 fg=self.C_LABEL, bg=self.C_HEADER_BG,
-                selectcolor="#1e3a50",
+                selectcolor=_T("#1e3a50"),
                 activebackground=self.C_HEADER_BG,
                 activeforeground=self.C_NEUTRAL,
                 bd=0, highlightthickness=0,
@@ -627,10 +628,10 @@ class IMUWidget(tk.Frame):
             # currently cleaning up.
             try:
                 if self._flash_on:
-                    btn.config(bg=self.C_BTN_FLASH_A, fg="#ffffff",
+                    btn.config(bg=self.C_BTN_FLASH_A, fg=_T("#ffffff"),
                                text="⚠  ADJUST HEADING")
                 else:
-                    btn.config(bg=self.C_BTN_FLASH_B, fg="#FF9999",
+                    btn.config(bg=self.C_BTN_FLASH_B, fg=_T("#FF9999"),
                                text="⚠  ADJUST HEADING")
             except tk.TclError:
                 # Widget is gone — stop flashing silently.
@@ -960,4 +961,4 @@ class IMUWidget(tk.Frame):
         self._cell_flash_job = None
         self._flash_job      = None
         self._crit_cells.clear()
-        super().destroy()
+        super().destroy()

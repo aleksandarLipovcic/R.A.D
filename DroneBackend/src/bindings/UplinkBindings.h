@@ -39,6 +39,8 @@ inline void RegisterUplinkBindings(pybind11::module_& m) {
         .def_readonly("sticks_active", &Uplink::BridgeStatus::sticksActive)
         .def_readonly("throttle_active", &Uplink::BridgeStatus::throttleActive)
         .def_readonly("telemetry_live", &Uplink::BridgeStatus::telemetryLive)
+        .def_readonly("pilot_override", &Uplink::BridgeStatus::pilotOverride)
+        .def_readonly("angle_on", &Uplink::BridgeStatus::angleOn)
         .def_readonly("echo_alive", &Uplink::BridgeStatus::echoAlive)
         .def_readonly("rx_frames", &Uplink::BridgeStatus::rxFrames)
         .def_readonly("crc_errors", &Uplink::BridgeStatus::crcErrors)

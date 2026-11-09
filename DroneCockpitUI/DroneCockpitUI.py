@@ -118,6 +118,7 @@ from pathlib import Path
 from typing import Optional
 
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import simpledialog, messagebox
 
 from workers.telemetry_worker import TelemetryWorker
@@ -126,8 +127,11 @@ from core import link_mode
 from core.dual_layer import DualLayerPanel, LayerSwitch
 from core import ui_perf
 from widgets.radio_panels import RadioAttitudePanel, RadioFlightPanel
-from workers.uplink_controller import UplinkController
+from workers.uplink_controller import UplinkController, MODEL_PATH as UPLINK_MODEL_PATH
 from control.gimbal import GimbalAxisConfig, GimbalModel, ServoModelConfig
+from control import safety
+from core.safety_monitor import SafetyMonitor, CRITICAL, WARNING
+from core import runtime_guard
 from widgets.command_panel import CommandPanel
 from workers.video_worker      import VideoWorker
 from workers.detection_worker  import DetectionWorker
@@ -142,6 +146,10 @@ from widgets.FCStatusWidget      import FCStatusWidget
 from widgets.ArmingWidget        import ArmingWidget
 from widgets.FPVWidget           import FPVWidget
 from widgets.DetectionMapWidget  import DetectionMapWidget
+from core.theme import C as _T, F as _F   # cockpit theme (core/theme.py)
+from core import theme
+from core.theme import P as _P
+from core import cockpit_layout
 
 # ── Path configuration ────────────────────────────────────────────────────────
 script_dir   = os.path.dirname(os.path.abspath(__file__))
@@ -258,6 +266,14 @@ RADIO_BATTERY_CELLS = 4
 # readable FPS counter, not fast enough for smooth video.
 VIDEO_POLL_HZ  = 15
 VIDEO_PROBE_RETRY_MS = 3000   # how often to retry connect_auto() if no device found yet
+
+# ── Safety monitor (core/safety_monitor.py) ──────────────────────────────────
+# Evaluated 10x per second on the Tk thread: one banner under the toolbar,
+# an alarm sound, and logs/safety_YYYYMMDD.log. Crash/exception logs go to
+# logs/crash_YYYYMMDD.log (core/runtime_guard.py).
+LOG_DIR = os.path.join(script_dir, "logs")
+SAFETY_EVAL_S = 0.1
+SAFETY_ERROR_HOLD_S = 10.0     # an exception keeps its alert this long
 
 # ── Object detection (DetectionLink / DetectionWorker / DetectionMapWidget) ──
 #
@@ -450,17 +466,17 @@ CAMERA_MOUNT_TILT_DEG = 0.0    # 0=forward-level, 90=down, 180=backward-level, n
 DETECTION_TRIANGULATION_MIN_BASELINE_M = 5.0
 DETECTION_TRIANGULATION_MIN_BEARING_SPREAD_DEG = 5.0
 
-BG_WORKSPACE   = "#1a1a2e"
-PANEL_BG       = "#0f0f1a"
-PANEL_TITLE_BG = "#16213e"
-PANEL_TITLE_FG = "#00d4ff"
-GRIP_COLOR     = "#2a2a4a"
+BG_WORKSPACE   = _P.BG if theme.MILITARY else "#1a1a2e"
+PANEL_BG       = _P.PANEL if theme.MILITARY else "#0f0f1a"
+PANEL_TITLE_BG = _P.BEZEL if theme.MILITARY else "#16213e"
+PANEL_TITLE_FG = "#b8c8b0" if theme.MILITARY else "#00d4ff"
+GRIP_COLOR     = _P.BEZEL_HI if theme.MILITARY else "#2a2a4a"
 GRIP_SIZE      = 8
 MIN_PANEL_W    = 120
 MIN_PANEL_H    = 60
 
 SNAP_PX        = 14
-SNAP_COLOR     = "#00d4ff"
+SNAP_COLOR     = _T("#00d4ff")
 GUIDE_DASH     = (4, 3)
 
 # ── Layout persistence ────────────────────────────────────────────────────────
@@ -493,7 +509,10 @@ _THROTTLE = {
 }
 
 # ── Default panel layout (x, y, w, h) ────────────────────────────────────────
-_DEFAULT_PANELS = {
+# FREE mode factory layout = the FULL cockpit format at 1600x920, so no two
+# panels overlap (the old hand-placed defaults stacked FC status / arming on
+# top of IMU / magnetometer). _DEFAULT_PANELS_OLD is kept for reference.
+_DEFAULT_PANELS_OLD = {
     "imu":       {"x":  10, "y":  10, "w": 460, "h": 260, "visible": True},
     "mag":       {"x":  10, "y": 280, "w": 460, "h": 210, "visible": True},
     "adi":       {"x": 480, "y":  10, "w": 450, "h": 430, "visible": True},
@@ -502,6 +521,12 @@ _DEFAULT_PANELS = {
     "fc_status": {"x":  10, "y":  10, "w": 440, "h": 140, "visible": True},
     "arming":    {"x":  10, "y": 160, "w": 440, "h": 300, "visible": True},
     "fpv":       {"x": 480, "y": 450, "w": 480, "h": 320, "visible": True},
+}
+
+_DEFAULT_PANELS = {
+    name: {"x": r[0], "y": r[1], "w": r[2], "h": r[3], "visible": True}
+    for name, r in cockpit_layout.place(cockpit_layout.format_tree("XL"),
+                                        (4, 4, 1592, 912)).items()
 }
 
 # Title-bar text per face for the dual-layer panels: (USB, radio)
@@ -513,7 +538,7 @@ _LAYER_TITLES = {
     "fc_status": ("FC Status  —  Armed · Mode · Sensors · CPU",
                   "RADIO  —  Flight & ELRS Link"),
 }
-PANEL_TITLE_RADIO_FG = "#44aaff"
+PANEL_TITLE_RADIO_FG = _T("#44aaff")
 
 _PANEL_LABELS = {
     "imu":       "IMU / Attitude",
@@ -577,11 +602,11 @@ class _Tooltip:
             self._tip.attributes("-topmost", True)
         except Exception:
             pass
-        frame = tk.Frame(self._tip, bg="#00d4ff", padx=1, pady=1)
+        frame = tk.Frame(self._tip, bg=_T("#00d4ff"), padx=1, pady=1)
         frame.pack()
         tk.Label(
             frame, text=self._text,
-            bg="#0f1428", fg="#dce6fa",
+            bg=_T("#0f1428"), fg=_T("#dce6fa"),
             font=("Consolas", 8), padx=8, pady=5,
             justify="left", wraplength=260,
         ).pack()
@@ -624,11 +649,49 @@ class DraggablePanel(tk.Frame):
     Floating, draggable, resizable instrument panel on a Canvas workspace.
     """
 
+    # In COCKPIT layout mode the app places the panels by the window size:
+    # a managed panel cannot be dragged or resized by hand.
+    managed = False
+
     def set_title(self, title: str, fg: str = None) -> None:
         """Change the title-bar text (e.g. USB ↔ radio face). Geometry,
         z-order, visibility and the saved layout are untouched."""
         self._title_text = title
-        self._title_lbl.config(text=f"  {title}", fg=fg or PANEL_TITLE_FG)
+        self._title_lbl.config(fg=fg or PANEL_TITLE_FG)
+        self._fit_title()
+
+    def _fit_title(self, event=None) -> None:
+        """Full legend if it fits, else only the part before " — " (an MFD
+        legend is short: "ALT / VSI", not "ALT / VSI — Altitude & ...")."""
+        full = theme.title(self._title_text)
+        short = full.split("—")[0].strip()
+        try:
+            avail = self.winfo_width() - 40
+            if avail < 10:
+                avail = int(float(self._ws.itemcget(self._item, "width"))) - 40
+            fnt = tkfont.Font(font=self._title_lbl.cget("font"))
+            text = full if fnt.measure(" " + full) <= avail else short
+        except Exception:
+            text = full
+        if self._title_lbl.cget("text") != " " + text:
+            self._title_lbl.config(text=" " + text)
+
+    def set_managed(self, on: bool) -> None:
+        """COCKPIT mode: no drag, no resize grips, plain arrow cursor."""
+        self.managed = bool(on)
+        for g, kw in ((self._grip, dict(relx=1.0, rely=1.0, anchor="se")),
+                      (self._right_edge, dict(relx=1.0, rely=0, anchor="ne", relheight=1.0, height=0)),
+                      (self._bottom_edge, dict(relx=0, rely=1.0, anchor="sw", relwidth=1.0, width=0))):
+            if on:
+                g.place_forget()
+            else:
+                g.place(**kw)
+        cur = "arrow" if on else "fleur"
+        for w_ in (self._title_bar, self._title_lbl):
+            try:
+                w_.configure(cursor=cur)
+            except tk.TclError:
+                pass
 
     def __init__(self, workspace: tk.Canvas, name: str, title: str,
                  x: int, y: int, w: int, h: int,
@@ -639,7 +702,8 @@ class DraggablePanel(tk.Frame):
                  **kwargs):
         super().__init__(workspace, bg=PANEL_BG,
                          highlightthickness=1,
-                         highlightbackground="#2a3a5a",
+                         highlightbackground=_T("#2a3a5a"),
+                         highlightcolor=_T("#2a3a5a"),
                          **kwargs)
 
         self._ws            = workspace
@@ -668,20 +732,25 @@ class DraggablePanel(tk.Frame):
         self._item = workspace.create_window(x, y, anchor="nw",
                                              window=self, width=w, height=h)
 
-        # Title bar
+        # Title bar (military theme: MFD-style legend -- accent tick, upper
+        # case DIN-style text on the bezel color)
         self._title_bar = tk.Frame(self, bg=PANEL_TITLE_BG, cursor="fleur")
         self._title_bar.pack(fill="x", side="top")
+        if theme.MILITARY:
+            tk.Frame(self._title_bar, bg=_P.ADVISORY, width=3).pack(side="left", fill="y")
         self._title_lbl = tk.Label(
-            self._title_bar, text=f"  {title}",
+            self._title_bar, text=f" {theme.title(title)}",
             bg=PANEL_TITLE_BG, fg=PANEL_TITLE_FG,
-            font=("Consolas", 9, "bold"), anchor="w",
+            font=theme.FONT_TITLE if theme.MILITARY else ("Consolas", 9, "bold"),
+            anchor="w", pady=1,
         )
         self._title_lbl.pack(side="left", fill="x", expand=True)
         self._title_text = title
+        self.bind("<Configure>", self._fit_title, add="+")
 
         self._z_btn = tk.Label(
             self._title_bar, text="⬆⬇",
-            bg=PANEL_TITLE_BG, fg="#2a4a6a",
+            bg=PANEL_TITLE_BG, fg=_T("#2a4a6a"),
             font=("Consolas", 8), cursor="hand2",
         )
         self._z_btn.pack(side="right", padx=(0, 4))
@@ -765,7 +834,7 @@ class DraggablePanel(tk.Frame):
             self._z_btn.config(fg=PANEL_TITLE_FG)
         else:
             self.lower_panel()
-            self._z_btn.config(fg="#2a4a6a")
+            self._z_btn.config(fg=_T("#2a4a6a"))
 
     # =========================================================================
     # Geometry helpers
@@ -831,12 +900,12 @@ class DraggablePanel(tk.Frame):
     # =========================================================================
 
     def _drag_start(self, event):
-        if self._locked_ref[0]: return
+        if self._locked_ref[0] or self.managed: return
         self._drag_x, self._drag_y = event.x_root, event.y_root
         self.raise_panel()
 
     def _drag_motion(self, event):
-        if self._locked_ref[0]: return
+        if self._locked_ref[0] or self.managed: return
         dx = event.x_root - self._drag_x
         dy = event.y_root - self._drag_y
         self._drag_x, self._drag_y = event.x_root, event.y_root
@@ -844,7 +913,7 @@ class DraggablePanel(tk.Frame):
         self._queue_geometry(xy=(cx + dx, cy + dy))
 
     def _drag_end(self, event):
-        if self._locked_ref[0]: return
+        if self._locked_ref[0] or self.managed: return
         self._flush_geometry()
         self._apply_snap()
         self._clear_snap_guides()
@@ -965,11 +1034,11 @@ class DraggablePanel(tk.Frame):
     # =========================================================================
 
     def _resize_start(self, event):
-        if self._locked_ref[0]: return
+        if self._locked_ref[0] or self.managed: return
         self._drag_x, self._drag_y = event.x_root, event.y_root
 
     def _resize_both(self, event):
-        if self._locked_ref[0]: return
+        if self._locked_ref[0] or self.managed: return
         dx = event.x_root - self._drag_x
         dy = event.y_root - self._drag_y
         self._drag_x, self._drag_y = event.x_root, event.y_root
@@ -977,21 +1046,21 @@ class DraggablePanel(tk.Frame):
         self._queue_geometry(wh=(cw + dx, ch + dy))
 
     def _resize_h(self, event):
-        if self._locked_ref[0]: return
+        if self._locked_ref[0] or self.managed: return
         dx = event.x_root - self._drag_x
         self._drag_x = event.x_root
         _, _, cw, ch = self._target_xywh()
         self._queue_geometry(wh=(cw + dx, ch))
 
     def _resize_v(self, event):
-        if self._locked_ref[0]: return
+        if self._locked_ref[0] or self.managed: return
         dy = event.y_root - self._drag_y
         self._drag_y = event.y_root
         _, _, cw, ch = self._target_xywh()
         self._queue_geometry(wh=(cw, ch + dy))
 
     def _resize_end(self, event):
-        if self._locked_ref[0]: return
+        if self._locked_ref[0] or self.managed: return
         self._flush_geometry()
 
     # =========================================================================
@@ -1000,9 +1069,9 @@ class DraggablePanel(tk.Frame):
 
     def _show_context_menu(self, event):
         menu = tk.Menu(self._ws, tearoff=0,
-                       bg="#0f1428", fg="#c0d0f0",
-                       activebackground="#1e3060",
-                       activeforeground="#ffffff",
+                       bg=_T("#0f1428"), fg=_T("#c0d0f0"),
+                       activebackground=_T("#1e3060"),
+                       activeforeground=_T("#ffffff"),
                        font=("Consolas", 9), bd=1, relief="solid")
 
         menu.add_command(label="  ⬆  Bring to Front", command=self.raise_panel)
@@ -1217,8 +1286,8 @@ class _LayoutPreviewCanvas(tk.Canvas):
 
     def __init__(self, master, **kwargs):
         super().__init__(master, width=self._MIN_W, height=self._MIN_H,
-                         bg="#0a0a14", highlightthickness=1,
-                         highlightbackground="#2a3a5a", **kwargs)
+                         bg=_T("#0a0a14"), highlightthickness=1,
+                         highlightbackground=_T("#2a3a5a"), **kwargs)
         self._last_profile: Optional[dict] = None
         self.bind("<Configure>", self._on_resize)
 
@@ -1236,7 +1305,7 @@ class _LayoutPreviewCanvas(tk.Canvas):
         if not profile:
             self.create_text(pw // 2, ph // 2,
                              text="No profile selected",
-                             fill="#445566", font=("Consolas", 9))
+                             fill=_T("#445566"), font=("Consolas", 9))
             return
 
         all_panels = profile.get("panels", {})
@@ -1252,13 +1321,13 @@ class _LayoutPreviewCanvas(tk.Canvas):
         if not all_panels:
             self.create_text(pw // 2, ph // 2,
                              text="(empty layout)",
-                             fill="#445566", font=("Consolas", 9))
+                             fill=_T("#445566"), font=("Consolas", 9))
             return
 
         if not panels:
             self.create_text(pw // 2, ph // 2,
                              text="(no visible panels)",
-                             fill="#445566", font=("Consolas", 9))
+                             fill=_T("#445566"), font=("Consolas", 9))
             return
 
         # Scale factor relative to the floor size — used to grow label
@@ -1281,19 +1350,19 @@ class _LayoutPreviewCanvas(tk.Canvas):
             y0 = margin + geo["y"] * scale
             x1 = x0 + geo["w"] * scale
             y1 = y0 + geo["h"] * scale
-            self.create_rectangle(x0, y0, x1, y1, fill="#16213e", outline="#00d4ff")
+            self.create_rectangle(x0, y0, x1, y1, fill=_T("#16213e"), outline=_T("#00d4ff"))
             label = _PANEL_LABELS.get(name, name)
             if (x1 - x0) > 20 and (y1 - y0) > 10:
                 self.create_text(
                     (x0 + x1) / 2, (y0 + y1) / 2,
-                    text=label, fill="#5588aa",
+                    text=label, fill=_T("#5588aa"),
                     font=("Consolas", label_font_px), width=max(10, x1 - x0 - 4),
                 )
 
         lock_txt = "🔒 locked" if profile.get("locked") else "🔓 unlocked"
         self.create_text(margin, ph - margin // 2 - lock_font_px,
                          anchor="w",
-                         text=lock_txt, fill="#5a6a8a", font=("Consolas", lock_font_px))
+                         text=lock_txt, fill=_T("#5a6a8a"), font=("Consolas", lock_font_px))
 
 
 class LayoutManagerDialog(tk.Toplevel):
@@ -1306,7 +1375,7 @@ class LayoutManagerDialog(tk.Toplevel):
     """
 
     def __init__(self, master, store: LayoutStore, on_load, on_save_current_as, on_overwrite):
-        super().__init__(master, bg="#0f0f1a")
+        super().__init__(master, bg=_T("#0f0f1a"))
         self.title("Layout Profiles")
         self.transient(master)
 
@@ -1338,17 +1407,17 @@ class LayoutManagerDialog(tk.Toplevel):
     # ---- UI construction ---------------------------------------------------
 
     def _build_ui(self):
-        left = tk.Frame(self, bg="#0f0f1a")
+        left = tk.Frame(self, bg=_T("#0f0f1a"))
         left.pack(side="left", fill="y", padx=(10, 6), pady=10)
 
-        tk.Label(left, text="Saved Layouts", bg="#0f0f1a", fg="#00d4ff",
+        tk.Label(left, text="Saved Layouts", bg=_T("#0f0f1a"), fg=_T("#00d4ff"),
                  font=("Consolas", 10, "bold")).pack(anchor="w")
 
         self._listbox = tk.Listbox(
             left, width=26, height=15,
-            bg="#0a0a14", fg="#c0d0f0",
-            selectbackground="#1e3060", selectforeground="#ffffff",
-            highlightthickness=1, highlightbackground="#2a3a5a",
+            bg=_T("#0a0a14"), fg=_T("#c0d0f0"),
+            selectbackground=_T("#1e3060"), selectforeground=_T("#ffffff"),
+            highlightthickness=1, highlightbackground=_T("#2a3a5a"),
             font=("Consolas", 9), activestyle="none",
         )
         self._listbox.pack(fill="y")
@@ -1357,10 +1426,10 @@ class LayoutManagerDialog(tk.Toplevel):
         self._listbox.bind("<Delete>", lambda e: self._delete_selected())
         self._listbox.bind("<ButtonPress-3>", self._show_row_context_menu)
 
-        right = tk.Frame(self, bg="#0f0f1a")
+        right = tk.Frame(self, bg=_T("#0f0f1a"))
         right.pack(side="left", fill="both", expand=True, padx=(6, 10), pady=10)
 
-        self._name_lbl = tk.Label(right, text="—", bg="#0f0f1a", fg="#ffffff",
+        self._name_lbl = tk.Label(right, text="—", bg=_T("#0f0f1a"), fg=_T("#ffffff"),
                                   font=("Consolas", 10, "bold"))
         self._name_lbl.pack(anchor="w")
 
@@ -1373,33 +1442,33 @@ class LayoutManagerDialog(tk.Toplevel):
         # text) instead of leaving it pinned at a small fixed size.
 
         tk.Button(right, text="Close", command=self.destroy,
-                 font=("Consolas", 9), bg="#1a1a2e", fg="#8899aa",
+                 font=("Consolas", 9), bg=_T("#1a1a2e"), fg=_T("#8899aa"),
                  relief="raised", bd=1, cursor="hand2",
-                 activebackground="#252540").pack(side="bottom", anchor="e", pady=(10, 0))
+                 activebackground=_T("#252540")).pack(side="bottom", anchor="e", pady=(10, 0))
 
         self._mkbtn(right, "💾  Save Current Layout As New Profile…",
                     self._save_current_as).pack(side="bottom", fill="x")
 
-        sep = tk.Frame(right, bg="#2a3a5a", height=1)
+        sep = tk.Frame(right, bg=_T("#2a3a5a"), height=1)
         sep.pack(side="bottom", fill="x", pady=10)
 
-        btn_row2 = tk.Frame(right, bg="#0f0f1a")
+        btn_row2 = tk.Frame(right, bg=_T("#0f0f1a"))
         btn_row2.pack(side="bottom", fill="x", pady=(0, 4))
         self._mkbtn(btn_row2, "Rename…", self._rename_selected).pack(side="left", padx=(0, 6))
-        self._mkbtn(btn_row2, "Delete", self._delete_selected, "#ff5566").pack(side="left", padx=(0, 6))
+        self._mkbtn(btn_row2, "Delete", self._delete_selected, _T("#ff5566")).pack(side="left", padx=(0, 6))
 
-        btn_row1 = tk.Frame(right, bg="#0f0f1a")
+        btn_row1 = tk.Frame(right, bg=_T("#0f0f1a"))
         btn_row1.pack(side="bottom", fill="x", pady=(6, 4))
-        self._mkbtn(btn_row1, "▶  Load", self._load_selected, "#00d4ff").pack(side="left", padx=(0, 6))
+        self._mkbtn(btn_row1, "▶  Load", self._load_selected, _T("#00d4ff")).pack(side="left", padx=(0, 6))
         self._mkbtn(btn_row1, "Overwrite w/ Current", self._overwrite_selected).pack(side="left", padx=(0, 6))
 
         self._preview = _LayoutPreviewCanvas(right)
         self._preview.pack(side="top", fill="both", expand=True, pady=(6, 6))
 
-    def _mkbtn(self, parent, text, command, fg="#a0b8d8"):
+    def _mkbtn(self, parent, text, command, fg=_T("#a0b8d8")):
         return tk.Button(parent, text=text, command=command,
-                         font=("Consolas", 9), bg="#162040", fg=fg,
-                         activebackground="#1e3060", activeforeground="#ffffff",
+                         font=("Consolas", 9), bg=_T("#162040"), fg=fg,
+                         activebackground=_T("#1e3060"), activeforeground=_T("#ffffff"),
                          relief="raised", bd=1, padx=8, pady=3, cursor="hand2")
 
     # ---- data plumbing -------------------------------------------------
@@ -1450,8 +1519,8 @@ class LayoutManagerDialog(tk.Toplevel):
         self._show_preview(self._selected_name())
 
         menu = tk.Menu(self, tearoff=0,
-                       bg="#0f1428", fg="#c0d0f0",
-                       activebackground="#1e3060", activeforeground="#ffffff",
+                       bg=_T("#0f1428"), fg=_T("#c0d0f0"),
+                       activebackground=_T("#1e3060"), activeforeground=_T("#ffffff"),
                        font=("Consolas", 9), bd=1, relief="solid")
         menu.add_command(label="  ▶  Load", command=self._load_selected)
         menu.add_command(label="  Overwrite w/ Current", command=self._overwrite_selected)
@@ -1536,7 +1605,7 @@ class DroneCockpitApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Drone Control Ground Station")
-        self.root.configure(bg="#0d0d1a")
+        self.root.configure(bg=_P.BG if theme.MILITARY else "#0d0d1a")
         self.root.resizable(True, True)
 
         # ── Camera mount angle (manual toolbar control) ──────────────────────
@@ -1592,12 +1661,28 @@ class DroneCockpitApp:
         # over USB; it just cannot be commanded then.
         self.gimbal = GimbalModel(GIMBAL_PAN_CAL, GIMBAL_TILT_CAL, GIMBAL_SERVO_MODEL,
                                   axis=GIMBAL_MOUNT_AXIS)
+        # Safety state, filled on the Tk thread by _update_safety() and read
+        # (plain attribute reads) by the controller thread.
+        self._fc_failsafe_cache = None     # MSP_FAILSAFE_CONFIG dict, kept after USB unplug
+        self._video_ever_live = False
+        self._radio_ever_live = False
+        self._ctrl_err_seen = 0
+        self._ctrl_err_t = -1e9
+        self._ui_err_seen = 0
+        self._ui_err_t = -1e9
+        self._safety_last_eval = 0.0
+        self._safety_alerts = []
+        self._safety = SafetyMonitor(LOG_DIR,
+                                     sound=lambda lvl: runtime_guard.alarm_sound(lvl, self.root))
         if self.radio is not None and hasattr(DroneBackend, "CommandLink"):
             self.cmd_link = DroneBackend.CommandLink()
             self.radio.set_uplink(self.cmd_link)
             self.uplink = UplinkController(self.cmd_link, self.radio, backend=DroneBackend,
                                            gimbal=self.gimbal,
-                                           servo_feedback=self._usb_servo_feedback)
+                                           servo_feedback=self._usb_servo_feedback,
+                                           video_ok=self._video_ok,
+                                           fc_failsafe=lambda: self._fc_failsafe_cache,
+                                           model_path=UPLINK_MODEL_PATH)
 
         # USB auto-connect runs on a background thread (auto_detect_fc sends
         # an MSP probe to each port, which takes a few hundred ms per port --
@@ -1635,6 +1720,11 @@ class DroneCockpitApp:
         self._tooltips: dict[tk.Widget, _Tooltip] = {}
 
         # ── Multi-profile layout persistence ─────────────────────────────────
+        self._layout_mode = "cockpit"
+        self._layout_format = None
+        theme.apply_ttk(self.root)
+        theme.apply_tk_defaults(self.root)
+
         self._layout_store = LayoutStore(_LAYOUTS_FILE, _LEGACY_LAYOUT_FILE)
         if not self._layout_store.has_any():
             self._layout_store.upsert_profile(_DEFAULT_PROFILE_NAME, self._default_snapshot())
@@ -1643,6 +1733,7 @@ class DroneCockpitApp:
         self._apply_layout(self._layout_store.get_profile(self._layout_store.active_name())
                             or self._default_snapshot())
         self._refresh_active_layout_label()
+        self._apply_min_window_size()
 
         # ── Background telemetry worker ────────────────────────────────────
         # Starts after UI is built so widgets exist before first frame arrives.
@@ -1981,6 +2072,15 @@ class DroneCockpitApp:
         with self._camera_angle_lock:
             return self._camera_tilt_deg, self._camera_pan_deg
 
+    def _video_ok(self) -> bool:
+        """Controller thread, 25 Hz: FPV video live and fresh. Reads the
+        VideoWorker's polled copy (no call into VideoLink from here)."""
+        vw = getattr(self, "_video_worker", None)
+        if vw is None:
+            return False
+        state, age = vw.get_health()
+        return state == "Connected" and (age is None or age < safety.VIDEO_LOSS_S * 1000)
+
     def _usb_servo_feedback(self):
         """Betaflight's servo outputs in us (MSP_SERVO) while the USB link is
         up and healthy, else None. Called at 25 Hz from UplinkController's
@@ -2089,14 +2189,14 @@ class DroneCockpitApp:
 
         win.protocol("WM_DELETE_WINDOW", on_close)
         win.title("Camera Angle")
-        win.configure(bg="#0f1428")
+        win.configure(bg=_T("#0f1428"))
         win.resizable(False, False)
         win.transient(self.root)
 
         pad = dict(padx=14, pady=(10, 0))
 
         tk.Label(
-            win, text="Camera mount angle", fg="#00d4ff", bg="#0f1428",
+            win, text="Camera mount angle", fg=_T("#00d4ff"), bg=_T("#0f1428"),
             font=("Consolas", 11, "bold"),
         ).pack(anchor="w", **pad)
         tk.Label(
@@ -2104,12 +2204,12 @@ class DroneCockpitApp:
             text="Used for detection georeferencing (DetectionLink).\n"
                  "Auto: live gimbal angles (servo feedback + model; aim it in\n"
                  "Laptop Control). Manual: camera fixed at the angles below.",
-            fg="#8098c0", bg="#0f1428", font=("Consolas", 8),
+            fg=_T("#8098c0"), bg=_T("#0f1428"), font=("Consolas", 8),
             justify="left",
         ).pack(anchor="w", padx=14, pady=(2, 8))
 
         # ── Mode toggle ──────────────────────────────────────────────
-        mode_row = tk.Frame(win, bg="#0f1428")
+        mode_row = tk.Frame(win, bg=_T("#0f1428"))
         mode_row.pack(fill="x", padx=14, pady=(0, 10))
 
         mode_var = tk.StringVar(value=self._camera_angle_mode)
@@ -2126,19 +2226,19 @@ class DroneCockpitApp:
 
         tk.Radiobutton(
             mode_row, text="🕹 Manual", variable=mode_var, value="manual",
-            command=apply_mode, fg="#c0d0f0", bg="#0f1428",
-            selectcolor="#1e3060", activebackground="#0f1428",
-            activeforeground="#ffffff", font=("Consolas", 10),
+            command=apply_mode, fg=_T("#c0d0f0"), bg=_T("#0f1428"),
+            selectcolor=_T("#1e3060"), activebackground=_T("#0f1428"),
+            activeforeground=_T("#ffffff"), font=("Consolas", 10),
         ).pack(side="left", padx=(0, 16))
         tk.Radiobutton(
             mode_row, text="⟳ Auto", variable=mode_var, value="auto",
-            command=apply_mode, fg="#c0d0f0", bg="#0f1428",
-            selectcolor="#1e3060", activebackground="#0f1428",
-            activeforeground="#ffffff", font=("Consolas", 10),
+            command=apply_mode, fg=_T("#c0d0f0"), bg=_T("#0f1428"),
+            selectcolor=_T("#1e3060"), activebackground=_T("#0f1428"),
+            activeforeground=_T("#ffffff"), font=("Consolas", 10),
         ).pack(side="left")
 
         # ── Manual controls ──────────────────────────────────────────
-        manual_frame = tk.Frame(win, bg="#0f1428")
+        manual_frame = tk.Frame(win, bg=_T("#0f1428"))
         manual_frame.pack(fill="x", padx=14, pady=(0, 6))
 
         def on_tilt(v):
@@ -2153,26 +2253,26 @@ class DroneCockpitApp:
 
         tk.Label(
             manual_frame, text="Tilt (0=forward, 90=down, 180=back, -=up)",
-            fg="#a0b8d8", bg="#0f1428", font=("Consolas", 8),
+            fg=_T("#a0b8d8"), bg=_T("#0f1428"), font=("Consolas", 8),
         ).pack(anchor="w")
         tilt_scale = tk.Scale(
             manual_frame, from_=-180, to=180, orient="horizontal",
             resolution=1, length=280, command=on_tilt,
-            bg="#0f1428", fg="#c0d0f0", troughcolor="#1c2c54",
-            highlightthickness=0, activebackground="#00d4ff",
+            bg=_T("#0f1428"), fg=_T("#c0d0f0"), troughcolor=_T("#1c2c54"),
+            highlightthickness=0, activebackground=_T("#00d4ff"),
             font=("Consolas", 8),
         )
         tilt_scale.set(self._camera_tilt_deg)
         tilt_scale.pack(fill="x", pady=(0, 6))
         interactive_widgets.append(tilt_scale)
 
-        preset_row = tk.Frame(manual_frame, bg="#0f1428")
+        preset_row = tk.Frame(manual_frame, bg=_T("#0f1428"))
         preset_row.pack(fill="x", pady=(0, 10))
         for label, val in (("Up", -90), ("Forward", 0), ("Down", 90), ("Backward", 180)):
             preset_btn = tk.Button(
                 preset_row, text=label, command=lambda v=val: tilt_scale.set(v),
-                relief="flat", bg="#162040", fg="#a0b8d8",
-                activebackground="#1e3060", activeforeground="#ffffff",
+                relief="flat", bg=_T("#162040"), fg=_T("#a0b8d8"),
+                activebackground=_T("#1e3060"), activeforeground=_T("#ffffff"),
                 font=("Consolas", 8), padx=6, pady=2, cursor="hand2",
             )
             preset_btn.pack(side="left", padx=(0, 6))
@@ -2180,13 +2280,13 @@ class DroneCockpitApp:
 
         tk.Label(
             manual_frame, text="Pan (0=centered)",
-            fg="#a0b8d8", bg="#0f1428", font=("Consolas", 8),
+            fg=_T("#a0b8d8"), bg=_T("#0f1428"), font=("Consolas", 8),
         ).pack(anchor="w")
         pan_scale = tk.Scale(
             manual_frame, from_=-180, to=180, orient="horizontal",
             resolution=1, length=280, command=on_pan,
-            bg="#0f1428", fg="#c0d0f0", troughcolor="#1c2c54",
-            highlightthickness=0, activebackground="#00d4ff",
+            bg=_T("#0f1428"), fg=_T("#c0d0f0"), troughcolor=_T("#1c2c54"),
+            highlightthickness=0, activebackground=_T("#00d4ff"),
             font=("Consolas", 8),
         )
         pan_scale.set(self._camera_pan_deg)
@@ -2202,20 +2302,20 @@ class DroneCockpitApp:
         # A dashed arrow marks the drone's fixed forward-flight
         # direction so tilt/pan reads as "relative to the nose", which
         # is what matters when interpreting georeferenced detections.
-        indicator_frame = tk.Frame(win, bg="#0f1428")
+        indicator_frame = tk.Frame(win, bg=_T("#0f1428"))
         indicator_frame.pack(fill="x", padx=14, pady=(4, 4))
 
         _CANVAS_W, _CANVAS_H = 252, 190
         indicator_canvas = tk.Canvas(
-            indicator_frame, width=_CANVAS_W, height=_CANVAS_H, bg="#0a0e1e",
-            highlightthickness=1, highlightbackground="#1c2c54",
+            indicator_frame, width=_CANVAS_W, height=_CANVAS_H, bg=_T("#0a0e1e"),
+            highlightthickness=1, highlightbackground=_T("#1c2c54"),
         )
         indicator_canvas.pack()
 
         tk.Label(
             indicator_frame,
             text="Dashed = drone nose (forward flight)   Solid cone = camera view",
-            fg="#5a7098", bg="#0f1428", font=("Consolas", 7),
+            fg=_T("#5a7098"), bg=_T("#0f1428"), font=("Consolas", 7),
         ).pack(anchor="w", pady=(3, 0))
 
         _ISO_COS30 = math.cos(math.radians(30))
@@ -2269,11 +2369,11 @@ class DroneCockpitApp:
             ground = [(-1.3, -1.3, -hh - 0.02), (1.3, -1.3, -hh - 0.02),
                       (1.3, 1.3, -hh - 0.02), (-1.3, 1.3, -hh - 0.02)]
             gpts = [c for p in ground for c in _project(p)]
-            indicator_canvas.create_polygon(*gpts, outline="#1c2c54", fill="", width=1)
+            indicator_canvas.create_polygon(*gpts, outline=_T("#1c2c54"), fill="", width=1)
             nose_from = _project((0, -1.3, -hh - 0.02))
             nose_to = _project((0, 1.55, -hh - 0.02))
             indicator_canvas.create_line(
-                *nose_from, *nose_to, fill="#5a7098", width=2,
+                *nose_from, *nose_to, fill=_T("#5a7098"), width=2,
                 dash=(4, 3), arrow="last",
             )
 
@@ -2281,16 +2381,16 @@ class DroneCockpitApp:
             world = [_rotate(p, tilt_deg, pan_deg) for p in _BODY]
             proj = [_project(p) for p in world]
             for a, b in _BODY_EDGES:
-                indicator_canvas.create_line(*proj[a], *proj[b], fill="#00d4ff", width=2)
+                indicator_canvas.create_line(*proj[a], *proj[b], fill=_T("#00d4ff"), width=2)
 
             # Lens cone: front face corners fanning out to a tip point,
             # so the "pointy end" visually reads as where the lens looks.
             tip_proj = _project(_rotate(_LENS_TIP, tilt_deg, pan_deg))
             for idx in _LENS_FRONT_CORNERS:
-                indicator_canvas.create_line(*proj[idx], *tip_proj, fill="#ffb020", width=1)
+                indicator_canvas.create_line(*proj[idx], *tip_proj, fill=_T("#ffb020"), width=1)
             indicator_canvas.create_oval(
                 tip_proj[0] - 3, tip_proj[1] - 3, tip_proj[0] + 3, tip_proj[1] + 3,
-                fill="#ffb020", outline="",
+                fill=_T("#ffb020"), outline="",
             )
 
         redraw_indicator()
@@ -2299,8 +2399,8 @@ class DroneCockpitApp:
 
         tk.Button(
             win, text="Close", command=on_close,
-            relief="flat", bg="#162040", fg="#a0b8d8",
-            activebackground="#1e3060", activeforeground="#ffffff",
+            relief="flat", bg=_T("#162040"), fg=_T("#a0b8d8"),
+            activebackground=_T("#1e3060"), activeforeground=_T("#ffffff"),
             font=("Consolas", 9), padx=10, pady=4, cursor="hand2",
         ).pack(pady=(0, 12))
 
@@ -2512,25 +2612,25 @@ class DroneCockpitApp:
             win.focus_force()
             return
 
-        win = tk.Toplevel(self.root, bg="#0f1428")
+        win = tk.Toplevel(self.root, bg=_T("#0f1428"))
         self._help_window = win
         win.title("Cockpit Help")
         win.transient(self.root)
 
-        header = tk.Frame(win, bg="#0f1428")
+        header = tk.Frame(win, bg=_T("#0f1428"))
         header.pack(fill="x", padx=16, pady=(14, 6))
         tk.Label(
             header, text="ℹ  Drone Cockpit — Help & Controls",
-            fg="#66d9ff", bg="#0f1428", font=("Consolas", 13, "bold"),
+            fg=_T("#66d9ff"), bg=_T("#0f1428"), font=("Consolas", 13, "bold"),
         ).pack(side="left")
 
-        body = tk.Frame(win, bg="#0f1428")
+        body = tk.Frame(win, bg=_T("#0f1428"))
         body.pack(fill="both", expand=True, padx=16, pady=(0, 8))
 
         text = tk.Text(
-            body, wrap="word", bg="#0a0e1c", fg="#c0d0f0",
+            body, wrap="word", bg=_T("#0a0e1c"), fg=_T("#c0d0f0"),
             font=("Consolas", 10), relief="flat", padx=14, pady=12,
-            highlightthickness=1, highlightbackground="#26365a",
+            highlightthickness=1, highlightbackground=_T("#26365a"),
             cursor="arrow",
         )
         scroll = tk.Scrollbar(body, orient="vertical", command=text.yview)
@@ -2538,12 +2638,12 @@ class DroneCockpitApp:
         scroll.pack(side="right", fill="y")
         text.pack(side="left", fill="both", expand=True)
 
-        text.tag_configure("h1", foreground="#66d9ff",
+        text.tag_configure("h1", foreground=_T("#66d9ff"),
                             font=("Consolas", 11, "bold"),
                             spacing3=4, spacing1=10)
-        text.tag_configure("body", foreground="#c0d0f0",
+        text.tag_configure("body", foreground=_T("#c0d0f0"),
                             font=("Consolas", 10), spacing3=2)
-        text.tag_configure("bullet", foreground="#a0b8d8",
+        text.tag_configure("bullet", foreground=_T("#a0b8d8"),
                             font=("Consolas", 10), lmargin1=14, lmargin2=28,
                             spacing3=1)
 
@@ -2556,7 +2656,27 @@ class DroneCockpitApp:
         def bullet(t):
             text.insert("end", "•  " + t + "\n", "bullet")
 
-        h1("Panel layout")
+        h1("Cockpit layout (◧ COCKPIT, default)")
+        bullet("The instruments are arranged by the window size, like the formats "
+               "of a glass cockpit. Bigger window = more instruments; smaller "
+               "window = only what is needed to fly.")
+        bullet("ESSENTIAL: FPV video, ADI, ALT/VSI tape (right of the ADI), FC status. "
+               "STANDARD: + heading. EXTENDED: + GPS/map. FULL: + pre-flight "
+               "checklist and IMU detail. The current format is shown next to "
+               "the ◧ button; hover it to see what is left out.")
+        bullet("The window cannot be made smaller than the ESSENTIAL format.")
+        bullet("Panels hidden in Panels ▾ stay hidden; the others take their room.")
+        bullet("◧ switches to FREE mode (✥): drag, resize and snap by hand, as before.")
+        h1("Master WARN / CAUT")
+        bullet("Red MASTER WARN = a CRITICAL alert (act now), amber MASTER CAUT = "
+               "a WARNING. Flashing = not yet acknowledged. Click to acknowledge: "
+               "flashing and the repeating alarm stop until a NEW alert comes. "
+               "The text of the alerts is in the banner under the toolbar.")
+        bullet("Colors follow the aviation convention everywhere: red = warning, "
+               "amber = caution, green = normal / engaged, cyan = selected / info, "
+               "white = measured value.")
+
+        h1("Panel layout (FREE mode)")
         bullet("Drag a panel's title bar to move it anywhere in the workspace.")
         bullet("Click any panel to bring it to the front of the stack.")
         bullet("Right-click a title bar for snap-to-edge and z-order options.")
@@ -2606,10 +2726,10 @@ class DroneCockpitApp:
 
         close_btn = tk.Button(
             win, text="Close", command=win.destroy,
-            bg="#162040", fg="#a0b8d8", activebackground="#1e3060",
-            activeforeground="#ffffff", relief="flat", padx=16, pady=6,
+            bg=_T("#162040"), fg=_T("#a0b8d8"), activebackground=_T("#1e3060"),
+            activeforeground=_T("#ffffff"), relief="flat", padx=16, pady=6,
             cursor="hand2", bd=0,
-            highlightthickness=1, highlightbackground="#26365a",
+            highlightthickness=1, highlightbackground=_T("#26365a"),
         )
         close_btn.pack(pady=(0, 14))
 
@@ -2871,16 +2991,22 @@ class DroneCockpitApp:
         profile so restoring a layout also restores how the camera was
         mounted when that layout was last used."""
         tilt_deg, pan_deg = self._get_camera_mount_angle()
+        panels = {
+            name: {**panel.get_geometry(), "visible": self._vis_vars[name].get()}
+            for name, panel in self._panels.items()
+        }
+        if self._layout_mode == "cockpit":
+            # cockpit positions are computed; keep the hand-made free
+            # layout that is already in the profile
+            old = (self._layout_store.get_profile(self._layout_store.active_name()) or {}).get("panels") or {}
+            for name, geo in panels.items():
+                if name in old and "x" in old[name]:
+                    panels[name] = {**old[name], "visible": geo["visible"]}
         return {
             "geometry": self.root.geometry(),
             "locked":   self._locked_ref[0],
-            "panels": {
-                name: {
-                    **panel.get_geometry(),
-                    "visible": self._vis_vars[name].get(),
-                }
-                for name, panel in self._panels.items()
-            },
+            "mode":     self._layout_mode,
+            "panels": panels,
             "camera_angle": {
                 "mode": self._camera_angle_mode,
                 "tilt_deg": tilt_deg,
@@ -2938,7 +3064,11 @@ class DroneCockpitApp:
             self._camera_pan_deg = float(pan_deg)
         self._refresh_camera_angle_label()
 
-        self.root.after_idle(self._clamp_all_panels)
+        # COCKPIT (default; also for profiles saved before the mode existed)
+        # or FREE. The free geometry above stays the profile's hand layout.
+        self._set_layout_mode(layout.get("mode", "cockpit"))
+        if self._layout_mode == "free":
+            self.root.after_idle(self._clamp_all_panels)
 
     # =========================================================================
     # Viewport clamping
@@ -2949,6 +3079,8 @@ class DroneCockpitApp:
             self._clamp_panel(name)
 
     def _clamp_panel(self, name: str) -> None:
+        if self._layout_mode == "cockpit":
+            return
         self.root.update_idletasks()
         ws_w = self._workspace.winfo_width()
         ws_h = self._workspace.winfo_height()
@@ -2979,11 +3111,11 @@ class DroneCockpitApp:
         """Set the lock icon, colors, and tooltip text to match state."""
         if locked:
             self._lock_btn.config(text="🔒", relief="sunken",
-                                  bg="#1a2a1a", fg="#00ff88")
+                                  bg=_T("#1a2a1a"), fg=_T("#00ff88"))
             tip = "Locked — click to unlock and allow panels to be moved/resized again"
         else:
             self._lock_btn.config(text="🔓", relief="raised",
-                                  bg="#162040", fg="#00d4ff")
+                                  bg=_T("#162040"), fg=_T("#00d4ff"))
             tip = ("Save & Lock Layout — saves the current layout and locks "
                    "panels from being dragged or resized")
         if self._lock_btn in self._tooltips:
@@ -2998,7 +3130,7 @@ class DroneCockpitApp:
         """Snap panels back to the hardcoded factory defaults (in-memory
         only — does NOT touch any saved profile). Use 'Revert to Saved' to
         undo unsaved changes to the active profile instead."""
-        if self._locked_ref[0]:
+        if self._locked_ref[0] or self._layout_mode == "cockpit":
             return
         for name, panel in self._panels.items():
             geo = _DEFAULT_PANELS.get(name, {})
@@ -3048,8 +3180,8 @@ class DroneCockpitApp:
         self._refresh_active_layout_label()
 
     def _show_layouts_menu(self) -> None:
-        menu_kw = dict(bg="#0f1428", fg="#c0d0f0",
-                       activebackground="#1e3060", activeforeground="#ffffff",
+        menu_kw = dict(bg=_T("#0f1428"), fg=_T("#c0d0f0"),
+                       activebackground=_T("#1e3060"), activeforeground=_T("#ffffff"),
                        font=("Consolas", 10), bd=1, relief="solid")
         menu = tk.Menu(self.root, tearoff=0, **menu_kw)
         active = self._layout_store.active_name()
@@ -3068,6 +3200,15 @@ class DroneCockpitApp:
         menu.add_separator()
         menu.add_command(label="  🔎  Preview & Manage…", command=self._open_layout_manager)
         menu.add_command(label="  💾  Save Current As New…", command=self._prompt_save_current_as)
+        menu.add_separator()
+        mode = "COCKPIT" if self._layout_mode == "cockpit" else "FREE"
+        menu.add_command(label=f"  ◧  Layout mode: {mode}  (switch)",
+                         command=self._toggle_layout_mode)
+        tsub = tk.Menu(menu, tearoff=0, **menu_kw)
+        for t in theme.THEMES:
+            tsub.add_command(label=("●  " if t == theme.NAME else "    ") + t.capitalize(),
+                             command=lambda t=t: self._choose_theme(t))
+        menu.add_cascade(label="  🎨  Color theme", menu=tsub)
 
         btn = self._layouts_btn
         x = btn.winfo_rootx()
@@ -3076,6 +3217,15 @@ class DroneCockpitApp:
             menu.tk_popup(x, y)
         finally:
             menu.grab_release()
+
+    def _choose_theme(self, name: str) -> None:
+        if name == theme.NAME:
+            return
+        theme.save_choice(name)
+        messagebox.showinfo("Color theme",
+                            f"Theme \"{name}\" is saved and takes effect on the next start "
+                            "of the cockpit (instrument colors are built at start-up).",
+                            parent=self.root)
 
     def _prompt_save_current_as(self) -> None:
         name = simpledialog.askstring("Save Layout", "Profile name:", parent=self.root)
@@ -3111,10 +3261,10 @@ class DroneCockpitApp:
 
     def _show_panels_menu(self) -> None:
         menu = tk.Menu(self.root, tearoff=0,
-                       bg="#0f1428", fg="#c0d0f0",
-                       activebackground="#1e3060",
-                       activeforeground="#ffffff",
-                       selectcolor="#ffffff",
+                       bg=_T("#0f1428"), fg=_T("#c0d0f0"),
+                       activebackground=_T("#1e3060"),
+                       activeforeground=_T("#ffffff"),
+                       selectcolor=_T("#ffffff"),
                        font=("Consolas", 10), bd=1, relief="solid")
         for name, label in _PANEL_LABELS.items():
             menu.add_checkbutton(
@@ -3145,6 +3295,9 @@ class DroneCockpitApp:
             menu.grab_release()
 
     def _toggle_panel(self, name: str) -> None:
+        if self._layout_mode == "cockpit":
+            self._apply_cockpit_layout()
+            return
         if self._vis_vars[name].get():
             self._panels[name].show()
             self.root.after_idle(lambda n=name: self._clamp_panel(n))
@@ -3154,8 +3307,12 @@ class DroneCockpitApp:
     def _show_all(self):
         for name in self._panels:
             self._vis_vars[name].set(True)
-            self._panels[name].show()
-        self.root.after_idle(self._clamp_all_panels)
+            if self._layout_mode != "cockpit":
+                self._panels[name].show()
+        if self._layout_mode == "cockpit":
+            self._apply_cockpit_layout()
+        else:
+            self.root.after_idle(self._clamp_all_panels)
 
     def _hide_all(self):
         for name in self._panels:
@@ -3186,39 +3343,62 @@ class DroneCockpitApp:
     # =========================================================================
 
     def _mk_icon_btn(self, parent, icon: str, command, tooltip: str,
-                      fg: str = "#a0b8d8", active_fg: str = "#ffffff",
+                      fg: str = _T("#a0b8d8"), active_fg: str = _T("#ffffff"),
                       label: str = "") -> tk.Button:
         """Build a toolbar button: an icon by itself, or an icon plus a
         short text label (for the Layouts/Panels dropdowns, so their
         purpose is obvious without needing the tooltip). Flat relief plus
         a hover highlight give it a more modern, less boxy feel than the
         old fixed 'raised' icon buttons."""
-        base_bg  = "#162040"
-        hover_bg = "#1c2c54"
+        base_bg  = _T("#162040")
+        hover_bg = _T("#1c2c54")
         btn = tk.Button(
             parent, text=(f"{icon}  {label}" if label else icon), command=command,
-            font=("Segoe UI", 10) if label else ("Segoe UI Emoji", 11),
+            font=(_F("Segoe UI"), 10) if label else ("Segoe UI Emoji", 11),
             width=0 if label else 3,
             relief="flat", padx=10 if label else 2, pady=4 if label else 2,
             bg=base_bg, fg=fg,
-            activebackground="#1e3060", activeforeground=active_fg,
+            activebackground=_T("#1e3060"), activeforeground=active_fg,
             cursor="hand2", bd=0,
-            highlightthickness=1, highlightbackground="#26365a",
+            highlightthickness=1, highlightbackground=_T("#26365a"),
         )
-        btn.bind("<Enter>", lambda e, b=btn: b.config(bg=hover_bg, highlightbackground="#3a6ab0"))
-        btn.bind("<Leave>", lambda e, b=btn: b.config(bg=base_bg, highlightbackground="#26365a"))
+        btn.bind("<Enter>", lambda e, b=btn: b.config(bg=hover_bg, highlightbackground=_T("#3a6ab0")))
+        btn.bind("<Leave>", lambda e, b=btn: b.config(bg=base_bg, highlightbackground=_T("#26365a")))
         self._tooltips[btn] = _Tooltip(btn, tooltip)
         return btn
 
     def _setup_ui(self) -> None:
 
         # ── Toolbar ───────────────────────────────────────────────────────────
-        toolbar = tk.Frame(self.root, bg="#0d0d1a", pady=6)
+        toolbar = tk.Frame(self.root, bg=_T("#0d0d1a"), pady=6)
         toolbar.pack(side="top", fill="x", padx=10)
+        self._toolbar = toolbar
+
+        # Safety banner: packed right under the toolbar only while an alert
+        # is active (see _update_safety). Click for the full list.
+        self.safety_banner = tk.Label(self.root, text="", fg=_T("#ffffff"), bg=_T("#b00020"),
+                                      font=("Consolas", 11, "bold"), anchor="w",
+                                      padx=12, pady=3, cursor="hand2")
+        self.safety_banner.bind("<Button-1>", lambda _e: self._show_safety_details())
+        self._safety_banner_shown = False
+
+        # Master WARNING / CAUTION annunciators (aviation convention): lit
+        # red / amber while a CRITICAL / WARNING alert is active, flashing
+        # until the operator clicks to acknowledge (acknowledging also
+        # stops the repeating alarm sound until a NEW alert comes).
+        self._ann_warn = self._mk_annunciator(toolbar, "MASTER\nWARN")
+        self._ann_warn.pack(side="left", padx=(0, 3))
+        self._ann_caut = self._mk_annunciator(toolbar, "MASTER\nCAUT")
+        self._ann_caut.pack(side="left", padx=(0, 12))
+        for a in (self._ann_warn, self._ann_caut):
+            a.bind("<Button-1>", lambda _e: self._acknowledge_alerts())
+            self._tooltips[a] = _Tooltip(a, "Master warning / caution -- click to "
+                                            "acknowledge (stops flashing and the "
+                                            "repeating alarm until a new alert)")
 
         self.status_label = tk.Label(
             toolbar, text="Status: Searching...",
-            fg="orange", bg="#0d0d1a",
+            fg=_T("#ffaa00"), bg=_T("#0d0d1a"),
             font=("Consolas", 10, "bold"),
         )
         self.status_label.pack(side="left", padx=(0, 16))
@@ -3248,10 +3428,10 @@ class DroneCockpitApp:
 
         self._active_layout_lbl = tk.Label(
             toolbar, text="",
-            fg="#66aadd", bg="#13203a",
+            fg=_T("#66aadd"), bg=_T("#13203a"),
             font=("Consolas", 9, "bold"),
             padx=8, pady=3,
-            highlightthickness=1, highlightbackground="#2a4a76",
+            highlightthickness=1, highlightbackground=_T("#2a4a76"),
         )
         self._active_layout_lbl.pack(side="left", padx=(0, 16))
 
@@ -3294,15 +3474,15 @@ class DroneCockpitApp:
 
         self._camera_angle_lbl = tk.Label(
             toolbar, text="",
-            fg="#66aadd", bg="#13203a",
+            fg=_T("#66aadd"), bg=_T("#13203a"),
             font=("Consolas", 9, "bold"),
             padx=8, pady=3,
-            highlightthickness=1, highlightbackground="#2a4a76",
+            highlightthickness=1, highlightbackground=_T("#2a4a76"),
         )
         self._camera_angle_lbl.pack(side="left", padx=(0, 16))
         self._refresh_camera_angle_label()
 
-        info_btn = self._mk_icon_btn(
+        info_btn = self._info_btn = self._mk_icon_btn(
             toolbar, "ℹ", self._show_help_window,
             "Help — click for the full guide to panels, the toolbar, and "
             "the instruments (drag title bars to move panels, click to "
@@ -3310,11 +3490,29 @@ class DroneCockpitApp:
         )
         info_btn.pack(side="left")
 
+        # COCKPIT (panels placed by window size, priority formats) vs FREE
+        # (drag / resize / snap, the old workspace). Saved with the profile.
+        self._mode_btn = self._mk_icon_btn(
+            toolbar, "◧", self._toggle_layout_mode,
+            "Layout mode -- COCKPIT: instruments are arranged by window size "
+            "(more instruments in a bigger window, only the essential ones in "
+            "a small one; the window cannot get smaller than the essential "
+            "format). FREE: drag, resize and snap panels by hand.",
+            label="COCKPIT",
+        )
+        self._format_lbl = tk.Label(
+            toolbar, text="", fg=_P.LABEL if theme.MILITARY else "#66aadd",
+            bg=_T("#13203a"), font=("Consolas", 9, "bold"), padx=8, pady=3,
+            highlightthickness=1, highlightbackground=_T("#2a4a76"),
+        )
+        self._format_tip = _Tooltip(self._format_lbl, "")
+        self._tooltips[self._format_lbl] = self._format_tip
+
         self._lock_btn = self._mk_icon_btn(
             toolbar, "🔓", self._toggle_lock,
             "Save & Lock Layout — saves the current layout and locks panels "
             "from being dragged or resized",
-            fg="#00d4ff", active_fg="#00ffff",
+            fg=_T("#00d4ff"), active_fg=_T("#00ffff"),
         )
         self._lock_btn.pack(side="right", padx=(6, 0))
 
@@ -3332,12 +3530,48 @@ class DroneCockpitApp:
         )
         self._revert_btn.pack(side="right", padx=(6, 0))
 
+        # Toolbar priority (what goes first when the window gets narrow):
+        # level 1 buttons collapse to icons, 2 the info labels go, 3 the
+        # format label, 4 the set-up buttons (Help, Layouts, Camera angle),
+        # 5 Panels. Annunciators, link status, Detections, Laptop Control
+        # and the mode switch always stay.
+        self._toolbar_compact = False
+        self._toolbar_level = None
+        self._labeled_btns = [self._layouts_btn, self._panels_btn, self._detections_btn,
+                              self._camera_angle_btn, self._command_btn, self._mode_btn]
+        self._btn_texts = {b: b.cget("text") for b in self._labeled_btns}
+        # (widget, pack options, hidden from this level on)
+        self._tb_left = [
+            (self._ann_warn, dict(padx=(0, 3)), 99),
+            (self._ann_caut, dict(padx=(0, 12)), 99),
+            (self.status_label, dict(padx=(0, 16)), 99),
+            (self.radio_indicator, dict(padx=(0, 16)), 99),
+            (self._layouts_btn, dict(padx=(0, 8)), 4),
+            (self._active_layout_lbl, dict(padx=(0, 16)), 2),
+            (self._panels_btn, dict(padx=(0, 6)), 5),
+            (self._detections_btn, dict(padx=(0, 6)), 99),
+            (self._camera_angle_btn, dict(padx=(0, 8)), 4),
+            (self._command_btn, dict(padx=(0, 8)), 99),
+            (self._camera_angle_lbl, dict(padx=(0, 16)), 2),
+            (self._info_btn, dict(), 4),
+        ]
+        self._tb_right = [               # packed right-to-left
+            (self._lock_btn, dict(padx=(6, 0)), "free"),
+            (self._reset_btn, dict(padx=(6, 0)), "free"),
+            (self._revert_btn, dict(padx=(6, 0)), "free"),
+            (self._mode_btn, dict(padx=(6, 0)), 99),
+            (self._format_lbl, dict(padx=(6, 0)), 3),
+        ]
+        self._tb_job = None
+        self.root.bind("<Configure>", self._on_root_configure, add="+")
+
         # ── Workspace canvas ──────────────────────────────────────────────────
         self._workspace = tk.Canvas(
             self.root, bg=BG_WORKSPACE, highlightthickness=0,
         )
         self._workspace.pack(fill="both", expand=True, padx=4, pady=(0, 4))
         self._workspace.bind("<Configure>", self._on_workspace_resize)
+        self._cockpit_job = None
 
         # ── Panel factory ─────────────────────────────────────────────────────
         def _panel(name: str, title: str) -> DraggablePanel:
@@ -3422,15 +3656,170 @@ class DroneCockpitApp:
 
     def _on_workspace_resize(self, event=None) -> None:
         self._draw_grid(event)
+        if self._layout_mode == "cockpit":
+            self._schedule_cockpit_layout()
+
+    # ── COCKPIT layout mode (core/cockpit_layout.py) ─────────────────────
+
+    def _mk_annunciator(self, parent, text: str) -> tk.Label:
+        return tk.Label(parent, text=text, width=7, justify="center",
+                        font=(theme.F("Segoe UI"), 7, "bold"),
+                        bg=_P.BEZEL, fg=_P.DIM, bd=0, padx=2, pady=1,
+                        highlightthickness=1, highlightbackground=_P.BEZEL_HI,
+                        cursor="hand2")
+
+    def _schedule_cockpit_layout(self, delay_ms: int = 80) -> None:
+        if self._cockpit_job is not None:
+            try:
+                self.root.after_cancel(self._cockpit_job)
+            except Exception:
+                pass
+        self._cockpit_job = self.root.after(delay_ms, self._apply_cockpit_layout)
+
+    def _apply_cockpit_layout(self) -> None:
+        """Place the panels for the current workspace size. Panels the user
+        hid stay hidden; panels the format has no room for are hidden too
+        (without touching the user's choice) and come back when the window
+        grows again."""
+        self._cockpit_job = None
+        if self._layout_mode != "cockpit":
+            return
+        ws_w = self._workspace.winfo_width()
+        ws_h = self._workspace.winfo_height()
+        if ws_w < 50 or ws_h < 50:
+            self._schedule_cockpit_layout(100)
+            return
+        wanted = [n for n in self._panels if self._vis_vars[n].get()]
+        fmt, rects, hidden = cockpit_layout.layout(ws_w, ws_h, wanted, self._layout_format)
+        self._layout_format = fmt
+        for name, panel in self._panels.items():
+            r = rects.get(name)
+            if r is None:
+                if panel._ws.itemcget(panel._item, "state") != "hidden":
+                    panel.hide()
+                continue
+            panel.set_geometry(*r)
+            if panel._ws.itemcget(panel._item, "state") == "hidden":
+                panel.show()
+        names = cockpit_layout.FORMAT_NAMES.get(fmt, fmt)
+        self._format_lbl.config(text=names)
+        tip = (f"Cockpit format {names} for {ws_w}x{ws_h} px.\n"
+               + (("Not shown for lack of room: "
+                   + ", ".join(_PANEL_LABELS.get(h, h) for h in hidden)
+                   + "\nEnlarge the window to bring them back.") if hidden
+                  else "All selected instruments are shown."))
+        self._format_tip.set_text(tip)
+
+    def _set_layout_mode(self, mode: str) -> None:
+        mode = "free" if mode == "free" else "cockpit"
+        self._layout_mode = mode
+        cockpit = mode == "cockpit"
+        for p in self._panels.values():
+            p.set_managed(cockpit)
+        self._btn_texts[self._mode_btn] = "◧  COCKPIT" if cockpit else "✥  FREE"
+        self._mode_btn.config(text=self._btn_texts[self._mode_btn]
+                              if not self._toolbar_compact else ("◧" if cockpit else "✥"))
+        self._fit_toolbar()
+        if cockpit:
+            self._schedule_cockpit_layout(10)
+        else:
+            # back to the free layout saved in the profile
+            prof = self._layout_store.get_profile(self._layout_store.active_name()) or {}
+            for name, panel in self._panels.items():
+                geo = (prof.get("panels") or {}).get(name) or _DEFAULT_PANELS.get(name)
+                if geo and "x" in geo:
+                    panel.set_geometry(geo["x"], geo["y"], geo["w"], geo["h"])
+                vis = self._vis_vars[name].get()
+                panel.show() if vis else panel.hide()
+            self.root.after_idle(self._clamp_all_panels)
+
+    def _toggle_layout_mode(self) -> None:
+        if self._layout_mode == "cockpit":
+            self._set_layout_mode("free")
+        else:
+            # keep the hand-made free layout in the profile before leaving it
+            self._persist_active()
+            self._set_layout_mode("cockpit")
+        self._persist_active()
+
+    def _apply_min_window_size(self) -> None:
+        """The window cannot shrink below the ESSENTIAL format (video,
+        attitude, altitude, flight status) plus the toolbar."""
+        self.root.update_idletasks()
+        ws_w, ws_h = cockpit_layout.minimum_workspace()
+        bar_h = self._toolbar.winfo_reqheight() + 12
+        self.root.minsize(ws_w + 8, ws_h + bar_h + 8)
+
+    def _on_root_configure(self, event=None) -> None:
+        if event is not None and event.widget is not self.root:
+            return
+        if self._tb_job is not None:
+            try:
+                self.root.after_cancel(self._tb_job)
+            except Exception:
+                pass
+        self._tb_job = self.root.after(60, self._fit_toolbar)
+
+    def _pack_toolbar(self, level: int) -> None:
+        cockpit = self._layout_mode == "cockpit"
+        compact = level >= 1
+        if compact != self._toolbar_compact:
+            self._toolbar_compact = compact
+            for b in self._labeled_btns:
+                full = self._btn_texts[b]
+                b.config(text=full.split("  ")[0] if compact else full,
+                         width=3 if compact else 0, padx=2 if compact else 10)
+        for w_, _, _ in self._tb_left + self._tb_right:
+            w_.pack_forget()
+        for w_, opts, hide_at in self._tb_left:
+            if level < hide_at:
+                w_.pack(side="left", **opts)
+        for w_, opts, hide_at in self._tb_right:
+            if hide_at == "free":
+                if not cockpit:
+                    w_.pack(side="right", **opts)
+            elif level < hide_at and (w_ is not self._format_lbl or cockpit):
+                w_.pack(side="right", **opts)
+        self._toolbar_level = level
+
+    def _fit_toolbar(self) -> None:
+        """Pick the richest toolbar that fits the window width."""
+        self._tb_job = None
+        avail = self._toolbar.winfo_width() or (self.root.winfo_width() - 24)
+        if avail < 100:
+            return
+        for level in range(0, 6):
+            self._pack_toolbar(level)
+            self._toolbar.update_idletasks()
+            if self._toolbar.winfo_reqwidth() <= avail:
+                return
+
+    def _acknowledge_alerts(self) -> None:
+        self._safety.acknowledge()
+        self._paint_annunciators(force=True)
+
+    def _paint_annunciators(self, force: bool = False) -> None:
+        alerts = self._safety_alerts
+        lvl = max((a.level for a in alerts), default=0)
+        unacked = self._safety.has_unacknowledged()
+        blink_on = (int(time.monotonic() * 2.5) % 2 == 0) or not unacked
+        warn = lvl >= CRITICAL
+        caut = (not warn) and lvl >= WARNING
+        self._ann_warn.config(
+            bg=(_P.WARNING if blink_on else _P.WARNING_BG) if warn else _P.BEZEL,
+            fg="#000000" if (warn and blink_on) else (_P.DATA if warn else _P.DIM))
+        self._ann_caut.config(
+            bg=(_P.CAUTION if blink_on else _P.CAUTION_BG) if caut else _P.BEZEL,
+            fg="#000000" if (caut and blink_on) else (_P.DATA if caut else _P.DIM))
 
     def _draw_grid(self, event=None) -> None:
         self._workspace.delete("grid")
         w = self._workspace.winfo_width()
         h = self._workspace.winfo_height()
         for x in range(0, w, 40):
-            self._workspace.create_line(x, 0, x, h, fill="#1e1e34", tags="grid")
+            self._workspace.create_line(x, 0, x, h, fill=_T("#1e1e34"), tags="grid")
         for y in range(0, h, 40):
-            self._workspace.create_line(0, y, w, y, fill="#1e1e34", tags="grid")
+            self._workspace.create_line(0, y, w, y, fill=_T("#1e1e34"), tags="grid")
         self._workspace.tag_lower("grid")
 
     # =========================================================================
@@ -3448,7 +3837,7 @@ class DroneCockpitApp:
         if self._usb_probe_running or self.hub.is_connected():
             return
         self._usb_probe_running = True
-        self.status_label.config(text="USB: searching...", fg="orange")
+        self.status_label.config(text="USB: searching...", fg=_T("#ffaa00"))
 
         def _probe():
             port, ok = "NOT_FOUND", False
@@ -3485,7 +3874,7 @@ class DroneCockpitApp:
         """
         self._usb_port = None
         self._usb_unhealthy_since = None
-        self.status_label.config(text="USB: link lost — reconnecting...", fg="red")
+        self.status_label.config(text="USB: link lost — reconnecting...", fg=_T("#ff3355"))
 
         def _drop():
             try:
@@ -3542,7 +3931,7 @@ class DroneCockpitApp:
             if link.get("usb_healthy"):
                 self._usb_unhealthy_since = None
                 self.status_label.config(
-                    text=f"USB: connected {self._usb_port or ''}".rstrip(), fg="#00ff88")
+                    text=f"USB: connected {self._usb_port or ''}".rstrip(), fg=_T("#00ff88"))
             else:
                 now = time.monotonic()
                 if self._usb_unhealthy_since is None:
@@ -3550,14 +3939,14 @@ class DroneCockpitApp:
                 if now - self._usb_unhealthy_since >= self.USB_DROP_AFTER_S:
                     self._reconnect()
                 else:
-                    self.status_label.config(text="USB: link degraded", fg="orange")
+                    self.status_label.config(text="USB: link degraded", fg=_T("#ffaa00"))
         elif self._usb_probe_running:
-            self.status_label.config(text="USB: searching...", fg="orange")
+            self.status_label.config(text="USB: searching...", fg=_T("#ffaa00"))
         else:
             # Not an error when flying: the radio carries telemetry then.
             self.status_label.config(
                 text="USB: not connected" + (" (radio active)" if src == "ELRS" else ""),
-                fg="#8090a8" if src == "ELRS" else "orange")
+                fg=_T("#8090a8") if src == "ELRS" else "orange")
             self._schedule_usb_retry()
 
     # =========================================================================
@@ -3604,6 +3993,13 @@ class DroneCockpitApp:
         # Runs every tick, even when no telemetry source is live, so the
         # pilot always sees WHY the instruments aren't moving.
         self._update_link_status()
+
+        # ── Safety monitor (10 Hz): banner, alarm sound, safety log ──────────
+        try:
+            self._update_safety()
+        except Exception as exc:          # never let the monitor stop the pump
+            runtime_guard.errors.bump()
+            print(f"[Safety] monitor error: {exc!r}")
 
         # ── Connection health check ───────────────────────────────────────────
         # No live source (neither USB nor ELRS): instruments keep their last
@@ -3673,6 +4069,81 @@ class DroneCockpitApp:
         self._reschedule_update(t0)
 
     # =========================================================================
+    # Safety monitor  —  Tk main thread only
+    # =========================================================================
+
+    def _update_safety(self) -> None:
+        now = time.monotonic()
+        if now - self._safety_last_eval < SAFETY_EVAL_S:
+            return
+        self._safety_last_eval = now
+
+        # FC failsafe settings: read over USB, kept for the whole session.
+        if self.hub.is_connected():
+            st = self.hub.get_latest_state()
+            if getattr(st, "fs_config_valid", False):
+                self._fc_failsafe_cache = {
+                    "procedure": int(st.fs_procedure), "throttle": int(st.fs_throttle),
+                    "delay": int(st.fs_delay), "landing_time": int(st.fs_landing_time)}
+
+        link = self._worker.get_link_status() or {}
+        radio_status = link.get("radio_status", "NO_RADIO")
+        if radio_status in ("TELEMETRY_OK", "DEGRADED"):
+            self._radio_ever_live = True
+        vstate, vage = self._video_worker.get_health()
+        if vstate == "Connected":
+            self._video_ever_live = True
+        active = self._worker.get_active_state()
+        armed = bool(getattr(active, "armed", False)) or bool(link.get("radio_armed", False))
+
+        up = dict(self.uplink.get_status()) if self.uplink is not None else {}
+        n = int(up.get("controller_errors", 0) or 0)
+        if n > self._ctrl_err_seen:
+            self._ctrl_err_seen, self._ctrl_err_t = n, now
+        up["controller_errors_new"] = (now - self._ctrl_err_t) < SAFETY_ERROR_HOLD_S
+        n = runtime_guard.errors.count
+        if n > self._ui_err_seen:
+            self._ui_err_seen, self._ui_err_t = n, now
+
+        facts = {
+            "armed": armed,
+            "laptop_enabled": bool(up.get("enabled")),
+            "video_state": vstate,
+            "video_ever_live": self._video_ever_live,
+            "video_age_ms": vage or 0,
+            "radio_status": radio_status,
+            "radio_ever_live": self._radio_ever_live,
+            "lq": link.get("uplink_lq", "?"),
+            "battery_state": str(getattr(active, "battery_state", "")),
+            "uplink": up,
+            # the controller checks it against the learnt hover throttle
+            "fc_failsafe": (tuple(up["fc_failsafe"]) if up.get("fc_failsafe")
+                            else safety.assess_failsafe(self._fc_failsafe_cache)),
+            "ui_errors_new": (now - self._ui_err_t) < SAFETY_ERROR_HOLD_S,
+        }
+        alerts = self._safety.evaluate(facts)
+        self._safety_alerts = alerts
+        self._paint_annunciators()
+        shown = [a for a in alerts if a.level >= WARNING]
+        if shown:
+            top = shown[0]
+            more = f"   (+{len(shown) - 1} more — click)" if len(shown) > 1 else ""
+            self.safety_banner.config(text=f"⚠ {top.text}{more}",
+                                      bg=_T("#b00020") if top.level >= CRITICAL else _T("#c86400"))
+            if not self._safety_banner_shown:
+                self.safety_banner.pack(side="top", fill="x", after=self._toolbar)
+                self._safety_banner_shown = True
+        elif self._safety_banner_shown:
+            self.safety_banner.pack_forget()
+            self._safety_banner_shown = False
+
+    def _show_safety_details(self) -> None:
+        names = {3: "CRITICAL", 2: "WARNING", 1: "INFO"}
+        lines = [f"{names.get(a.level, '?'):8s}  {a.text}" for a in self._safety_alerts]
+        messagebox.showinfo("Safety", "\n".join(lines) or "No active alerts.\n\n"
+                            f"Log: {LOG_DIR}")
+
+    # =========================================================================
     # Laptop control window (command uplink)
     # =========================================================================
 
@@ -3711,6 +4182,7 @@ class DroneCockpitApp:
         if self.radio is not None:
             self.radio.set_uplink(None)
             self.radio.disconnect()
+        self._safety.close()
         self._video_worker.stop()
         self.fpv_view.detach()
         self.video_link.disconnect()
@@ -3731,7 +4203,25 @@ if __name__ == "__main__":
     # Tk redraw delay the controller by 100+ ms; 2 ms keeps it near 40 ms.
     # Video, detection and the radio port run in C++ threads without the GIL.
     sys.setswitchinterval(0.002)
+    # Process-level protections (core/runtime_guard.py): crash log, one
+    # instance only, no sleep / USB suspend, 1 ms timer, higher priority.
+    runtime_guard.install_crash_logging(LOG_DIR)
     root = tk.Tk()
-    app  = DroneCockpitApp(root)
-    root.protocol("WM_DELETE_WINDOW", app.shutdown)
-    root.mainloop()
+    if not runtime_guard.single_instance():
+        root.withdraw()
+        messagebox.showerror("DroneCockpitUI",
+                             "The cockpit is already running.\n"
+                             "A second instance would fight it for the Pocket and the camera.")
+        root.destroy()
+        sys.exit(1)
+    runtime_guard.install_crash_logging(LOG_DIR, tk_root=root)
+    runtime_guard.keep_awake(True)
+    runtime_guard.timer_resolution(True)
+    runtime_guard.raise_priority()
+    try:
+        app = DroneCockpitApp(root)
+        root.protocol("WM_DELETE_WINDOW", app.shutdown)
+        root.mainloop()
+    finally:
+        runtime_guard.timer_resolution(False)
+        runtime_guard.keep_awake(False)

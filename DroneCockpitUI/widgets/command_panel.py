@@ -9,6 +9,7 @@ Keys (this window must have keyboard focus -- see the "Keyboard" line):
     Q / E      yaw left / right          Space   stop all movement
     R / F      altitude target +0.5 / -0.5 m (while holding)
     H          altitude hold on / off
+    L          land now (controlled descent) / abort the landing
     Up / Down  gimbal tilt -5 / +5 deg   (0 = forward, 90 = straight down)
     Left/Right gimbal pan  -5 / +5 deg   C  centre the pan
 Gimbal commands work without "Laptop control" and without the pilot
@@ -29,10 +30,11 @@ Windows and rendered as empty boxes.
 """
 
 import tkinter as tk
+from core.theme import C as _T, F as _F   # cockpit theme (core/theme.py)
 
-BG, PANEL, FG, DIM = "#0d0d1a", "#16213e", "#e6e6e6", "#7a8599"
-GREEN, YELLOW, RED, CYAN = "#33dd77", "#ffcc33", "#ff4455", "#00d4ff"
-BTN, BTN_ACTIVE, BTN_HELD = "#26365a", "#33508a", "#2f7de1"
+BG, PANEL, FG, DIM = _T("#0d0d1a"), _T("#16213e"), _T("#e6e6e6"), _T("#7a8599")
+GREEN, YELLOW, RED, CYAN = _T("#33dd77"), _T("#ffcc33"), _T("#ff4455"), _T("#00d4ff")
+BTN, BTN_ACTIVE, BTN_HELD = _T("#26365a"), _T("#33508a"), _T("#2f7de1")
 FONT = ("Consolas", 10)
 FONT_B = ("Consolas", 10, "bold")
 
@@ -76,6 +78,8 @@ class CommandPanel(tk.Toplevel):
             self.bind(f"<KeyPress-{key}>", lambda e, d=delta: self._nudge(d))
         self.bind("<KeyPress-h>", lambda e: self._toggle_hold(from_key=True))
         self.bind("<KeyPress-H>", lambda e: self._toggle_hold(from_key=True))
+        self.bind("<KeyPress-l>", lambda e: self._toggle_land(from_key=True))
+        self.bind("<KeyPress-L>", lambda e: self._toggle_land(from_key=True))
         for key, dp, dt in (("Up", 0, -GIMBAL_STEP_DEG), ("Down", 0, GIMBAL_STEP_DEG),
                             ("Left", -GIMBAL_STEP_DEG, 0), ("Right", GIMBAL_STEP_DEG, 0)):
             self.bind(f"<KeyPress-{key}>", lambda e, a=dp, b=dt: self._gimbal_step(a, b))
@@ -114,6 +118,10 @@ class CommandPanel(tk.Toplevel):
         self.block_lbl = self._lbl(self, "", YELLOW, FONT, justify="left",
                                    anchor="w", wraplength=420)
         self.block_lbl.pack(fill="x", padx=12)
+        # safety summary: video, link quality, FC failsafe, geofence/ceiling
+        self.safety_lbl = self._lbl(self, "", DIM, FONT, justify="left",
+                                    anchor="w", wraplength=420)
+        self.safety_lbl.pack(fill="x", padx=12)
 
         # keyboard status
         kb = tk.Frame(self, bg=PANEL, padx=10, pady=4)
@@ -134,7 +142,7 @@ class CommandPanel(tk.Toplevel):
             if axis is None:
                 b.configure(command=lambda: self._key_action("STOP", self._stop_all,
                                                              "all movement stopped"),
-                            bg="#5a2630", activebackground="#7a3340")
+                            bg=_T("#5a2630"), activebackground=_T("#7a3340"))
             else:
                 self._buttons[(axis, val)] = b
                 b.bind("<ButtonPress-1>", lambda e, a=axis, v=val: self._hold(a, v))
@@ -160,6 +168,19 @@ class CommandPanel(tk.Toplevel):
                   command=lambda: self._nudge(-0.5)).grid(row=1, column=1, padx=6)
         self.alt_lbl = self._lbl(ah, "", FG, justify="left")
         self.alt_lbl.grid(row=0, column=2, rowspan=2, sticky="w")
+        self.land_btn = self._btn(ah, "LAND (L)", 22, command=self._toggle_land)
+        self.land_btn.configure(bg=_T("#5a2630"), activebackground=_T("#7a3340"))
+        self.land_btn.grid(row=2, column=0, pady=(6, 0))
+        self.land_lbl = self._lbl(ah, "", FG, justify="left", anchor="w", wraplength=300)
+        self.land_lbl.grid(row=2, column=1, columnspan=2, sticky="w", pady=(6, 0))
+
+        # Betaflight AUTO-LAND values learnt from this drone's hover
+        fs = tk.Frame(self, bg=PANEL, padx=10, pady=6)
+        fs.pack(fill="x", padx=8, pady=4)
+        self.fsrec_lbl = self._lbl(fs, "", DIM, FONT, justify="left", anchor="w", wraplength=330)
+        self.fsrec_lbl.pack(side="left", fill="x", expand=True)
+        tk.Button(fs, text="Copy CLI", font=FONT, bg=BTN, fg=FG, relief="flat", takefocus=0,
+                  command=self._copy_fs_cli).pack(side="right")
 
         # gimbal (degrees; limits come from the servo calibration)
         gb = tk.Frame(self, bg=PANEL, padx=10, pady=8)
@@ -292,6 +313,22 @@ class CommandPanel(tk.Toplevel):
         if abs(float(self.tilt.get()) - tilt) > 0.5:
             self.tilt.set(tilt)
 
+    def _toggle_land(self, from_key=False):
+        st = self.ctrl.get_status()
+        want = not st.get("landing", False)
+        self.ctrl.request_land(want)
+        if from_key:
+            self._flash(f"L: {'landing requested' if want else 'landing aborted, holding height'}")
+
+    def _copy_fs_cli(self):
+        rec = self.ctrl.get_status().get("landing_model") or {}
+        if not rec.get("ok"):
+            self._flash("no landing values yet: hover steadily first")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(rec["cli"])
+        self._flash("Betaflight CLI lines copied (paste with the drone on USB, disarmed)")
+
     def _toggle_hold(self, from_key=False):
         st = self.ctrl.get_status()
         want = not st.get("hold_engaged", False)
@@ -349,6 +386,19 @@ class CommandPanel(tk.Toplevel):
         if s.get("hold_reason"):
             notes.append(f"altitude hold: {s['hold_reason']}")
         self.block_lbl.configure(text="\n".join("- " + n for n in notes))
+        if "video_live" in s:
+            fs = s.get("fc_failsafe") or ("unknown", "")
+            ov = s.get("pilot_override")
+            self.safety_lbl.configure(
+                text=(f"video {'LIVE' if s.get('video_live') else 'LOST'}   "
+                      f"LQ {s.get('link_quality', '?')} %   "
+                      f"ANGLE on radio {'yes' if s.get('angle_on_radio') else 'no/?'}"
+                      f"{'   PILOT OVERRIDE' if ov else ''}\n"
+                      f"FC failsafe: {fs[1] or fs[0]}\n"
+                      f"ceiling {s.get('alt_ceiling_m', 0):.0f} m"
+                      + (f"   {s['geofence']}" if s.get("geofence") else "")),
+                fg=RED if fs[0] == "unsafe" or not s.get("video_live") else
+                   (YELLOW if ov or s.get("geofence") else DIM))
 
         self._check_focus()
         self._paint_request()
@@ -359,7 +409,7 @@ class CommandPanel(tk.Toplevel):
 
         engaged = s.get("hold_engaged", False)
         self.hold_btn.configure(text=f"Altitude hold: {'ON' if engaged else 'OFF'} (H)",
-                                bg="#1f6b3a" if engaged else BTN)
+                                bg=_T("#1f6b3a") if engaged else BTN)
         alt = s.get("altitude_m")
         alt_txt = "--" if alt is None else f"{alt:6.2f} m ({s.get('altitude_age_ms', -1)} ms)"
         hold_txt = (f"target {s.get('hold_target_m', 0):.2f} -> {s.get('hold_request_m', 0):.2f} m\n"
@@ -367,6 +417,31 @@ class CommandPanel(tk.Toplevel):
                     f"  radio delta {s.get('lua_throttle_delta_us', 0):+.0f} us"
                     + ("  STALE" if s.get("hold_stale") else "")) if engaged else ""
         self.alt_lbl.configure(text=f"altitude {alt_txt}\n{hold_txt}")
+
+        landing, landed = s.get("landing", False), s.get("landed", False)
+        self.land_btn.configure(text="ABORT LANDING (L)" if landing else "LAND (L)")
+        if landed:
+            land_txt, fg = "LANDED: throttle down and disarm", RED
+        elif landing:
+            land_txt = f"landing ({s.get('land_reason', '')}) {s.get('land_rate_mps', 0):.1f} m/s"
+            fg = YELLOW
+        elif s.get("land_fail"):
+            land_txt, fg = f"cannot land: {s['land_fail']}", RED
+        elif s.get("video_lost_s", 0) >= 0.5 and s.get("gate_on"):
+            land_txt, fg = f"no video {s['video_lost_s']:.0f} s: auto-land at 5 s", RED
+        else:
+            land_txt, fg = "", FG
+        self.land_lbl.configure(text=land_txt, fg=fg)
+
+        rec = s.get("landing_model") or {}
+        hover = s.get("model_hover_us")
+        head = (f"learnt hover {hover:.0f} us at {s.get('battery_voltage', 0):.1f} V"
+                if hover else "hover not learnt yet")
+        body = rec.get("text", "")
+        notes = rec.get("notes") or []
+        self.fsrec_lbl.configure(
+            text=f"FC AUTO-LAND  {head}\n{body}" + ("".join("\n- " + n for n in notes[:2])),
+            fg=FG if rec.get("ok") else DIM)
 
         g = s.get("gimbal")
         if g:

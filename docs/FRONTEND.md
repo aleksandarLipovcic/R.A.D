@@ -19,6 +19,7 @@ small tightly-related group of files) in detail.
 | [frontend/ui-performance.md](frontend/ui-performance.md) | How the Tk thread is kept free: fixed-rate pump, per-instrument rates, redraw-only-on-change, batched drag/resize, bounded tile downloads — with before/after measurements |
 | [frontend/dual-layer.md](frontend/dual-layer.md) | `dual_layer.py`, `radio_panels.py` — the IMU, Magnetometer and FC Status panels swap to a dedicated radio-link face in place, within about 1 s of the telemetry source changing |
 | [frontend/link-mode.md](frontend/link-mode.md) | `link_mode.py` — how every instrument adapts to the USB cable vs the ELRS radio link (placeholders, stale data, unverifiable checks) |
+| [frontend/cockpit-ui.md](frontend/cockpit-ui.md) | `theme.py`, `cockpit_layout.py` — military cockpit theme (aviation color coding), responsive cockpit formats by window size, minimum window size, MASTER WARN/CAUT, responsive copilot window (Serbian) |
 | [frontend/radio-link-indicator.md](frontend/radio-link-indicator.md) | `radio_link_indicator.py` — toolbar traffic light for the ELRS radio link + active-source tag |
 
 ## Instrument-panel widgets

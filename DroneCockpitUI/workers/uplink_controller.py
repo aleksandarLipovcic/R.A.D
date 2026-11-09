@@ -20,11 +20,19 @@ What the laptop can do
     The same thread feeds the gimbal model with the best servo feedback
     (MSP_SERVO over USB, else the radio's channel echo), and the cockpit
     reads the resulting angles for georeferencing.
+  * land: the altitude-hold loop as a controlled descent (L key, or by
+    itself after VIDEO_LAND_S without video or on a critical battery while
+    the laptop flies), touchdown detection; see control/safety.py.
+  * learn the hover throttle from steady flight (control/landing_model.py)
+    and check / recommend Betaflight's AUTO-LAND failsafe values.
 What it can never do: arm, disarm, change flight mode, trigger failsafe.
 
 Gates, checked every tick (any failing gate -> neutral, hold dropped):
   enabled by the user, Lua bridge detected, ELRS telemetry live, drone armed,
-  flight mode ANGLE. The pilot's switch is checked on the radio itself.
+  flight mode ANGLE, FC failsafe not unsafe. The pilot's switch is checked
+  on the radio itself. Movement-only gates (throttle loop keeps running):
+  video lost, low link quality, battery critical, pilot override, ANGLE
+  switch off on the radio, geofence (only toward home), UI frozen.
 Set COCKPIT_UPLINK_BENCH=1 to drop the armed/ANGLE gates for bench tests
 with the propellers OFF -- the panel shows a red BENCH label.
 
@@ -55,10 +63,13 @@ import os
 import collections
 import threading
 import time
+import traceback
 from typing import Callable, Optional, Sequence
 
 from control.altitude_hold import AltitudeHold, AltitudeHoldConfig
+from control.landing_model import LandingModel
 from control.gimbal import GimbalModel
+from control import safety
 
 UPLINK_HZ = 25
 RADIO_LIVE = ("TELEMETRY_OK", "DEGRADED")
@@ -68,15 +79,27 @@ UI_TIMEOUT_S = 0.5                 # no panel heartbeat this long -> movement ne
 LOG_FLUSH_S = 1.0                  # command log is flushed at most this often
 THROTTLE_CH = 2                     # CH3 (0-based) in the radio channel echo
 
+MODEL_SAVE_S = 30.0                # learnt landing model written to disk this often
+GPS_FIX_MIN_SATS = 6               # CRSF GPS carries satellites, not a fix type
+
 # DroneCockpitUI/logs (this file lives in DroneCockpitUI/workers/)
-_LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+_APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_LOG_DIR = os.path.join(_APP_DIR, "logs")
+MODEL_PATH = os.path.join(_APP_DIR, "landing_model.json")   # passed by the cockpit
 
 
 class UplinkController:
     def __init__(self, command_link, radio, hold_cfg: Optional[AltitudeHoldConfig] = None,
                  backend=None, log_dir: str = _LOG_DIR, bench: bool = BENCH_MODE,
                  gimbal: Optional[GimbalModel] = None,
-                 servo_feedback: Optional[Callable[[], Optional[Sequence[float]]]] = None) -> None:
+                 servo_feedback: Optional[Callable[[], Optional[Sequence[float]]]] = None,
+                 video_ok: Optional[Callable[[], bool]] = None,
+                 fc_failsafe: Optional[Callable[[], Optional[dict]]] = None,
+                 model_path: Optional[str] = None) -> None:
+        # video_ok: True while the FPV video is live (VideoLink connected and
+        #   frames younger than safety.VIDEO_LOSS_S). None = not checked.
+        # fc_failsafe: last known MSP_FAILSAFE_CONFIG as a dict (see
+        #   control/safety.assess_failsafe) or None if never read.
         # servo_feedback: returns Betaflight's servo outputs in us (MSP_SERVO
         # over USB) or None when USB is not connected/healthy. Called from
         # this thread at 25 Hz, so it must be quick and thread-safe
@@ -96,7 +119,10 @@ class UplinkController:
         self._yaw_pct = 15.0
         self.gimbal = gimbal if gimbal is not None else GimbalModel()
         self._servo_feedback = servo_feedback
+        self._video_ok = video_ok
+        self._fc_failsafe = fc_failsafe
         self._pan_supported = True        # False with an old .pyd (no gimbal_pan_pct)
+        self._errors = 0                  # exceptions caught in the worker loop
         self._hold_requested = False
         self._ui_beat = float("-inf")                  # last CommandPanel heartbeat
         self._last_flush = 0.0
@@ -104,6 +130,20 @@ class UplinkController:
 
         self.hold = AltitudeHold(hold_cfg)
         self._stale_since: Optional[float] = None
+
+        # Landing: learnt hover/descent model (also used to check and
+        # recommend Betaflight's AUTO-LAND values), auto-land state.
+        self.model = LandingModel()
+        self._model_path = model_path
+        if model_path:
+            self.model.load(model_path)
+        self._model_saved = 0.0
+        self._land_requested = False      # operator pressed Land
+        self._land_reason = ""            # why the current landing runs ("" = none)
+        self._land_fail = ""              # why an auto-land could not start
+        self._land_fail_until = 0.0
+        self._video_lost_since: Optional[float] = None
+        self._lq_low_since: Optional[float] = None
 
         # Published state (read by the Tk thread; replaced as a whole dict)
         self._status: dict = {"blockers": ["not started"], "hold_engaged": False}
@@ -130,6 +170,8 @@ class UplinkController:
         if self._log_file:
             self._log_file.close()
             self._log_file = None
+        if self._model_path and self.model.known:
+            self.model.save(self._model_path)
 
     def set_enabled(self, on: bool) -> None:
         with self._lock:
@@ -174,10 +216,19 @@ class UplinkController:
         with self._lock:
             self._hold_requested = bool(on)
 
+    def request_land(self, on: bool) -> None:
+        """Operator: land now (controlled descent with the altitude-hold
+        loop) or abort a landing (hold the altitude where the drone is)."""
+        with self._lock:
+            self._land_requested = bool(on)
+            if on:
+                self._hold_requested = True
+
     def nudge_altitude(self, delta_m: float) -> None:
         with self._lock:
-            if self.hold.engaged:
+            if self.hold.engaged and not self.hold.landing:
                 self.hold.nudge_target(delta_m)
+                self.hold.set_target(safety.clamp_altitude_target(self.hold.request_m))
 
     def get_status(self) -> dict:
         return self._status
@@ -196,9 +247,18 @@ class UplinkController:
             try:
                 self._tick(dt, now)
             except Exception as exc:            # never let the loop die silently
-                self._status = {"blockers": [f"error: {exc}"], "hold_engaged": False}
+                self._errors += 1
+                self._status = {"state": "ERROR", "enabled": self._enabled,
+                                "blockers": [f"controller error: {exc}"],
+                                "hold_engaged": False, "error": repr(exc),
+                                "controller_errors": self._errors}
+                if self._errors <= 3 or self._errors % 250 == 0:   # not 25x per second
+                    traceback.print_exc()
                 if self._cmd is not None:
-                    self._cmd.neutral()
+                    try:
+                        self._cmd.neutral()
+                    except Exception:
+                        pass
             time.sleep(max(0.0, period - (time.monotonic() - now)))
 
     def _values(self):
@@ -213,6 +273,7 @@ class UplinkController:
             fwd, right, yaw = self._fwd, self._right, self._yaw
             speed, yaw_speed = self._speed_pct, self._yaw_pct
             hold_req = self._hold_requested
+            land_req = self._land_requested
         # UI heartbeat: a frozen Tk thread must not leave a held key driving
         # the drone. Only movement is cancelled; altitude hold and gimbal keep
         # running, they don't depend on a key being held.
@@ -251,8 +312,67 @@ class UplinkController:
                 blockers.append("drone not armed")
             if not mode.startswith("ANGLE"):
                 blockers.append(f"flight mode {mode or '?'} (needs ANGLE)")
+        batt = str(getattr(rs, "battery_state", "")) if rs is not None else ""
+        batt_critical = "CRITICAL" in batt
+        volt = float(getattr(rs, "battery_voltage", 0.0) or 0.0) if rs is not None else 0.0
+        gps = getattr(rs, "gps", None) if rs is not None else None
+        gps_fix = (int(getattr(gps, "num_sat", 0)) >= GPS_FIX_MIN_SATS) if gps is not None else None
+        # what the flight controller does on link loss (read over USB),
+        # checked against the learnt hover throttle
+        fs_cfg = self._fc_failsafe() if self._fc_failsafe is not None else None
+        fs_level, fs_text = safety.assess_failsafe(fs_cfg, self.model, volt, gps_fix, armed)
+        fs_cover = safety.failsafe_cover_m(fs_cfg, self.model, volt)
+        if fs_level == "unsafe" and not self.bench:
+            blockers.append(f"FC failsafe unsafe: {fs_text}")
         sticks_ok = not blockers
         gate_on = bool(st.bridge.gate_on)
+
+        # Movement-only blockers: stick offsets stop, altitude hold goes on
+        # (holding height level is the safest thing while the operator is
+        # blind or the link is weak; the pilot takes over from there).
+        move_blockers = []
+        video_live = True
+        if self._video_ok is not None:
+            try:
+                video_live = bool(self._video_ok())
+            except Exception:
+                video_live = False
+        if video_live:
+            self._video_lost_since = None
+        elif self._video_lost_since is None:
+            self._video_lost_since = now
+        video_lost_s = 0.0 if self._video_lost_since is None else now - self._video_lost_since
+        if video_lost_s >= safety.VIDEO_STOP_S and not self.bench:
+            move_blockers.append("FPV video lost")
+        lq = int(getattr(rs.radio, "uplink_lq", 100)) if rs is not None else 0
+        if radio_status in RADIO_LIVE and lq < safety.MIN_LQ_PCT:
+            self._lq_low_since = self._lq_low_since or now
+            if now - self._lq_low_since >= safety.LQ_LOW_S:
+                move_blockers.append(f"link quality {lq} % (< {safety.MIN_LQ_PCT} %)")
+        else:
+            self._lq_low_since = None
+        if batt_critical:
+            move_blockers.append("battery CRITICAL")
+        pilot_override = bool(getattr(st.bridge, "pilot_override", False))
+        if pilot_override:
+            move_blockers.append("pilot override (sticks moved)")
+        angle_radio = getattr(st.bridge, "angle_on", None)
+        if st.bridge_detected and angle_radio is False and getattr(st.bridge, "version", 0) >= 2 \
+                and not self.bench:
+            move_blockers.append("ANGLE switch off on the radio")
+        if not ui_alive:
+            move_blockers.append("command window not responding")
+        move_ok = sticks_ok and not move_blockers
+
+        # geofence: outside it only movement toward home survives
+        fence_note = ""
+        if rs is not None and move_ok:
+            gps = getattr(rs, "gps", None)
+            home = bool(getattr(rs.radio, "home_set", False))
+            dist = float(getattr(gps, "dist_to_home_m", 0)) if (gps is not None and home) else None
+            brg = float(getattr(gps, "bearing_to_home", 0)) if dist is not None else None
+            fwd, right, fence_note = safety.geofence_filter(
+                fwd, right, float(getattr(rs, "yaw", 0)), dist, brg)
 
         # ── altitude ───────────────────────────────────────────────────────
         alt_m = vz = None
@@ -286,10 +406,70 @@ class UplinkController:
                 with self._lock:
                     self._hold_requested = False
 
+        # ── landing ───────────────────────────────────────────────────────
+        # Triggers while the laptop is flying (control on, pilot switch on,
+        # armed): operator Land, video lost VIDEO_LAND_S, battery critical.
+        # It uses the altitude-hold loop as a controlled descent, so it needs
+        # the same things (baro, throttle echo, pilot switch).
+        flying = enabled and gate_on and sticks_ok and (armed or self.bench)
+        trigger = ""
+        if land_req:
+            trigger = "operator"
+        elif flying and batt_critical:
+            trigger = "battery critical"
+        elif flying and not self.bench and video_lost_s >= safety.VIDEO_LAND_S:
+            trigger = "video lost"
+        if self._land_reason == "video lost" and video_live and not land_req:
+            self.hold.stop_landing()            # picture back: hold here, operator decides
+            self._land_reason = ""
+            trigger = ""
+        if trigger and not self.hold.landing:
+            if not self.hold.engaged and gate_on and sticks_ok:
+                hover = self._radio_throttle_us(st)
+                if alt_m is not None and 0 <= alt_age <= self.hold.cfg.stale_ms and hover is not None:
+                    self.hold.engage(hover, alt_m)
+            if self.hold.engaged:
+                self.hold.start_landing()
+                self._land_reason, self._land_fail = trigger, ""
+                with self._lock:
+                    self._hold_requested = True
+                hold_req = True
+            else:
+                self._land_fail = ("no baro altitude" if alt_m is None else
+                                   "pilot switch off" if not gate_on else
+                                   blockers[0] if blockers else "no throttle echo")
+                self._land_fail_until = now + 5.0
+                if trigger == "operator":       # never start later by surprise
+                    with self._lock:
+                        self._land_requested = False
+                    land_req = False
+        if self._land_fail and not trigger and now > self._land_fail_until:
+            self._land_fail = ""
+        if not land_req and self._land_reason == "operator" and self.hold.landing:
+            self.hold.stop_landing()            # operator aborted
+            self._land_reason = ""
+        if not self.hold.engaged:
+            self._land_reason = ""
+            if not trigger:
+                with self._lock:
+                    self._land_requested = False
+        self.hold.land_rate_mps = safety.land_rate(alt_m)
+
+        # altitude ceiling: the hold never targets more than ALT_CEILING_M
+        # above the arming point (if engaged higher, it descends to it)
+        if self.hold.engaged and self.hold.request_m > safety.ALT_CEILING_M:
+            self.hold.set_target(safety.ALT_CEILING_M)
+
         thr_us = 1000.0
         if self.hold.engaged:
             thr_us = self.hold.update(alt_m if alt_m is not None else self.hold.target_m,
                                       dt, alt_age, vz)
+            if self.hold.landed:
+                # on the ground: lowest throttle target (CommandLink clamps
+                # it to its minimum, the radio to at most THR_BAND below the
+                # pilot's stick): never above the stick, so lowering the
+                # stick lowers the throttle. The laptop can never disarm.
+                thr_us = 1000.0
             if self.hold.stale:
                 self._stale_since = self._stale_since or now
                 if now - self._stale_since > ALT_HOLD_DROP_STALE_S:
@@ -300,6 +480,19 @@ class UplinkController:
             else:
                 self._stale_since = None
 
+        # ── learn hover / descent from every steady flight ─────────────────
+        if rs is not None and armed and radio_status in RADIO_LIVE \
+                and 0 <= alt_age <= self.hold.cfg.stale_ms:
+            self.model.add(now, self._radio_throttle_us(st), vz, volt,
+                           getattr(rs, "roll", 0) / 10.0, getattr(rs, "pitch", 0) / 10.0, alt_m)
+        if self._model_path and now - self._model_saved >= MODEL_SAVE_S:
+            self._model_saved = now
+            if self.model.known:
+                self.model.save(self._model_path)
+        cells = int(getattr(rs, "battery_cell_count", 0) or 0) if rs is not None else 0
+        land_rec = self.model.recommend(cells)
+        hover_now = self.model.hover_us(volt)
+
         # ── command ────────────────────────────────────────────────────────
         cv = self._values()
         cv.gimbal_tilt_pct = tilt_pct
@@ -308,10 +501,10 @@ class UplinkController:
                 cv.gimbal_pan_pct = pan_pct
             except AttributeError:          # DroneBackend.pyd older than the pan channel
                 self._pan_supported = False
-        cv.sticks_enabled = sticks_ok
-        cv.roll_pct = right * speed if sticks_ok else 0.0
-        cv.pitch_pct = fwd * speed if sticks_ok else 0.0
-        cv.yaw_pct = yaw * yaw_speed if sticks_ok else 0.0
+        cv.sticks_enabled = move_ok
+        cv.roll_pct = right * speed if move_ok else 0.0
+        cv.pitch_pct = fwd * speed if move_ok else 0.0
+        cv.yaw_pct = yaw * yaw_speed if move_ok else 0.0
         cv.throttle_enabled = self.hold.engaged
         cv.throttle_us = thr_us
         if enabled:
@@ -329,9 +522,35 @@ class UplinkController:
             "loop_max_ms": max((g for _, g in list(self._gaps)), default=0.0) * 1000.0,
             "bench": self.bench,
             "state": st.state,
-            "blockers": blockers,
+            "blockers": blockers + move_blockers,
+            "hold_blockers": blockers,          # stop everything incl. altitude hold
+            "move_blockers": move_blockers,     # stop movement only
             "gate_on": gate_on,
-            "sticks_ok": sticks_ok,
+            "sticks_ok": move_ok,
+            "hold_ok": sticks_ok,
+            "video_live": video_live,
+            "link_quality": lq,
+            "pilot_override": pilot_override,
+            "angle_on_radio": angle_radio,
+            "geofence": fence_note,
+            "fc_failsafe": (fs_level, fs_text),
+            "fc_failsafe_cover_m": fs_cover,
+            "landing": self.hold.landing,
+            "landed": self.hold.landed,
+            "land_reason": self._land_reason,
+            "land_fail": self._land_fail,
+            "land_rate_mps": self.hold.land_rate_mps,
+            "video_lost_s": video_lost_s,
+            "landing_model": land_rec,
+            "model_hover_us": hover_now,
+            "battery_voltage": volt,
+            "gps_fix": gps_fix,
+            "range_m": (float(getattr(gps, "dist_to_home_m", 0))
+                        if (gps is not None and rs is not None
+                            and getattr(rs.radio, "home_set", False)) else None),
+            "battery_state": batt,
+            "controller_errors": self._errors,
+            "alt_ceiling_m": safety.ALT_CEILING_M,
             "armed": armed,
             "flight_mode": mode,
             "radio_status": radio_status,

@@ -89,6 +89,8 @@ struct BridgeStatus {
     bool     sticksActive = false;   // roll/pitch/yaw offsets are applied
     bool     throttleActive = false; // throttle delta is applied
     bool     telemetryLive = false;  // drone telemetry is arriving (RQly > 0)
+    bool     pilotOverride = false;  // pilot moved a stick > ~30 %: laptop offsets off (bridge ≥ v2)
+    bool     angleOn = false;        // ANGLE switch on, read on the radio (bridge ≥ v2)
     int      echoAlive = -1;         // last ch8 value the script accepted
     uint16_t rxFrames = 0;           // command frames received (mod 65536)
     uint16_t crcErrors = 0;

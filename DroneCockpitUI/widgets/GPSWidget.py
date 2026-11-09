@@ -36,6 +36,7 @@ import base64
 import time
 
 from core import link_mode
+from core.theme import C as _T, F as _F   # cockpit theme (core/theme.py)
 
 
 # ── Thresholds ─────────────────────────────────────────────────────────────
@@ -49,34 +50,34 @@ _M_TO_FT    = 3.28084
 
 # ── Aviation colour palette ─────────────────────────────────────────────────
 _C = {
-    "bg":           "#0d1117",
-    "frame_bg":     "#141920",
-    "border":       "#1e2730",
+    "bg":           _T("#0d1117"),
+    "frame_bg":     _T("#141920"),
+    "border":       _T("#1e2730"),
     "hud_bg":       "#0a0e14cc",
-    "text":         "#e8edf4",
-    "label":        "#6b7885",
-    "unit":         "#8a9aaa",
-    "dim":          "#3a4555",
-    "green":        "#00e676",
-    "amber":        "#ffb300",
-    "red":          "#ff3d3d",
-    "cyan":         "#00e5ff",
-    "magenta":      "#ff4081",
-    "compass_bg":   "#080c10",
-    "compass_rim":  "#2a3545",
-    "track_needle": "#00e676",
-    "home_arrow":   "#00e5ff",
-    "hb_on":        "#00e676",
-    "hb_off":       "#1e2730",
-    "map_bg":       "#1a2030",
-    "map_btn":      "#1e2a38",
-    "map_marker":   "#ffb300",
-    "map_home":     "#00e5ff",
-    "sv_row_even":  "#0d1117",
-    "sv_row_odd":   "#111820",
-    "sv_used":      "#00e676",
-    "sv_locked":    "#ffb300",
-    "sv_nodata":    "#2a3545",
+    "text":         _T("#e8edf4"),
+    "label":        _T("#6b7885"),
+    "unit":         _T("#8a9aaa"),
+    "dim":          _T("#3a4555"),
+    "green":        _T("#00e676"),
+    "amber":        _T("#ffb300"),
+    "red":          _T("#ff3d3d"),
+    "cyan":         _T("#00e5ff"),
+    "magenta":      _T("#ff4081"),
+    "compass_bg":   _T("#080c10"),
+    "compass_rim":  _T("#2a3545"),
+    "track_needle": _T("#00e676"),
+    "home_arrow":   _T("#00e5ff"),
+    "hb_on":        _T("#00e676"),
+    "hb_off":       _T("#1e2730"),
+    "map_bg":       _T("#1a2030"),
+    "map_btn":      _T("#1e2a38"),
+    "map_marker":   _T("#ffb300"),
+    "map_home":     _T("#00e5ff"),
+    "sv_row_even":  _T("#0d1117"),
+    "sv_row_odd":   _T("#111820"),
+    "sv_used":      _T("#00e676"),
+    "sv_locked":    _T("#ffb300"),
+    "sv_nodata":    _T("#2a3545"),
 }
 
 # ── Fonts ───────────────────────────────────────────────────────────────────
@@ -116,8 +117,8 @@ _QUALITY_LABEL = [
     "c-lock", "f-lock", "f-lock", "f-lock",
 ]
 _QUALITY_COLOR = [
-    "#2a3545", "#2a3545", "#ffb300", "#ff3d3d",
-    "#ffb300", "#00e676", "#00e676", "#00e676",
+    _T("#2a3545"), _T("#2a3545"), _T("#ffb300"), _T("#ff3d3d"),
+    _T("#ffb300"), _T("#00e676"), _T("#00e676"), _T("#00e676"),
 ]
 
 
@@ -174,14 +175,14 @@ class _SatPanel(tk.Frame):
     _BAR_MAX    = 72
 
     _GNSS_COLOR = {
-        "GPS":     "#00e676",
-        "SBAS":    "#ffb300",
-        "Galileo": "#cc88ff",
-        "BeiDou":  "#00e5ff",
-        "IMES":    "#888888",
-        "QZSS":    "#ff8844",
-        "GLONASS": "#dd4444",
-        "Unknown": "#2a3545",
+        "GPS":     _T("#00e676"),
+        "SBAS":    _T("#ffb300"),
+        "Galileo": _T("#cc88ff"),
+        "BeiDou":  _T("#00e5ff"),
+        "IMES":    _T("#888888"),
+        "QZSS":    _T("#ff8844"),
+        "GLONASS": _T("#dd4444"),
+        "Unknown": _T("#2a3545"),
     }
     _GNSS_ALIASES = {
         "beidou": "BeiDou", "bei dou": "BeiDou",
@@ -607,7 +608,7 @@ class _MapCanvas(tk.Frame):
                 else:
                     self._cv.create_rectangle(
                         px, py, px + self.TILE_SIZE, py + self.TILE_SIZE,
-                        fill="#1a2030", outline="#1e2730")
+                        fill=_T("#1a2030"), outline=_T("#1e2730"))
                     self._request_tile(self._zoom, tx, ty)
 
     def _draw_marker(self, w, h):
@@ -619,7 +620,7 @@ class _MapCanvas(tk.Frame):
 
         # 1. Dark shadow halo — punches through any map tile colour
         self._cv.create_oval(mx - r - 4, my - r - 4, mx + r + 4, my + r + 4,
-                             fill="#000000", outline="", stipple="gray50")
+                             fill=_T("#000000"), outline="", stipple="gray50")
 
         # 2. Outer dashed range ring (cyan, slightly heavier)
         self._cv.create_oval(mx - r*2, my - r*2, mx + r*2, my + r*2,
@@ -627,11 +628,11 @@ class _MapCanvas(tk.Frame):
 
         # 3. Solid black backing disc — guarantees contrast for the dot itself
         self._cv.create_oval(mx - r - 1, my - r - 1, mx + r + 1, my + r + 1,
-                             fill="#000000", outline="")
+                             fill=_T("#000000"), outline="")
 
         # 4. Main marker — magenta is perceptually opposite to OSM's greens/yellows
         self._cv.create_oval(mx - r, my - r, mx + r, my + r,
-                             fill=_C["magenta"], outline="#ffffff", width=2)
+                             fill=_C["magenta"], outline=_T("#ffffff"), width=2)
 
         # 5. Track arrow — white shadow then green on top for legibility
         trk  = self._hud.get("trk", 0)
@@ -640,7 +641,7 @@ class _MapCanvas(tk.Frame):
         tip_x = mx + math.cos(rad) * vlen
         tip_y = my + math.sin(rad) * vlen
         self._cv.create_line(mx, my, tip_x, tip_y,
-                             fill="#000000", width=4,
+                             fill=_T("#000000"), width=4,
                              arrow="last", arrowshape=(8, 10, 4))
         self._cv.create_line(mx, my, tip_x, tip_y,
                              fill=_C["green"], width=2,
@@ -672,7 +673,7 @@ class _MapCanvas(tk.Frame):
                                   fill="", outline=border_col, width=3)
         # Inner box
         self._cv.create_rectangle(x0, y0, x1, y1,
-                                  fill="#110408", outline=border_col, width=2)
+                                  fill=_T("#110408"), outline=border_col, width=2)
 
         # Main warning text
         self._cv.create_text(cx, y0 + 22,
@@ -704,9 +705,9 @@ class _MapCanvas(tk.Frame):
     def _hud_box(self, x0, y0, w_px, h_px):
         x1, y1 = x0 + w_px, y0 + h_px
         self._cv.create_rectangle(x0, y0, x1, y1,
-            fill="#080c14", outline="#1e2a38", stipple="gray75")
+            fill=_T("#080c14"), outline=_T("#1e2a38"), stipple="gray75")
         self._cv.create_rectangle(x0 + 1, y0 + 1, x1 - 1, y1 - 1,
-            fill="#0a0e14", outline="")
+            fill=_T("#0a0e14"), outline="")
         return x0, y0
 
     def _draw_hud_rose(self, cx, cy, r, label, angle_deg, needle_col):
@@ -1224,7 +1225,7 @@ class _NavPanel(tk.Frame):
             bg=_C["map_btn"], fg=_C["amber"],
             relief="flat", padx=5, pady=1,
             font=(_FF, 8, "bold"),
-            activebackground="#2a3545", activeforeground=_C["amber"],
+            activebackground=_T("#2a3545"), activeforeground=_C["amber"],
             cursor="hand2",
         )
         self._sat_btn.pack(side="right", padx=(0, 2))
@@ -1507,7 +1508,7 @@ class GPSWidget(tk.Frame):
             bg=_C["map_btn"], fg=_C["text"],
             relief="flat", padx=5, pady=2,
             font=_FTB,
-            activebackground="#2a3545", activeforeground=_C["text"],
+            activebackground=_T("#2a3545"), activeforeground=_C["text"],
             cursor="hand2",
         )
 
@@ -1558,7 +1559,7 @@ class GPSWidget(tk.Frame):
             bg=_C["map_btn"], fg=_C["amber"],
             relief="flat", padx=5, pady=2,
             font=(_FF, 8, "bold"),
-            activebackground="#2a3545", activeforeground=_C["amber"],
+            activebackground=_T("#2a3545"), activeforeground=_C["amber"],
             cursor="hand2",
         )
         self._sat_btn.pack(side="right", padx=(0, 5), pady=3)
@@ -1775,4 +1776,4 @@ class GPSWidget(tk.Frame):
         self._sat_panel.update_satellites(norm, sv_note)
         if (self._sat_toplevel and self._sat_toplevel.winfo_exists()
                 and hasattr(self, "_sat_toplevel_panel")):
-            self._sat_toplevel_panel.update_satellites(norm, sv_note)
+            self._sat_toplevel_panel.update_satellites(norm, sv_note)

@@ -320,6 +320,17 @@ PYBIND11_MODULE(DroneBackend, m) {
             })
         .def_readonly("servo_valid", &DroneState::servoValid)
 
+        // ── Failsafe configuration (MSP_FAILSAFE_CONFIG, USB only) ────────────
+        .def_readonly("fs_config_valid", &DroneState::fsConfigValid)
+        .def_readonly("fs_delay", &DroneState::fsDelay,
+            "Stage-1 guard time in 0.1 s units (failsafe_delay).")
+        .def_readonly("fs_landing_time", &DroneState::fsLandingTime)
+        .def_readonly("fs_throttle", &DroneState::fsThrottle,
+            "failsafe_throttle in us (AUTO-LAND descent throttle).")
+        .def_readonly("fs_switch_mode", &DroneState::fsSwitchMode)
+        .def_readonly("fs_procedure", &DroneState::fsProcedure,
+            "0 = AUTO-LAND, 1 = DROP, 2 = GPS-RESCUE.")
+
         // ── RC channel inputs ─────────────────────────────────────────────────
         .def_property_readonly("rc_channels",
             [](const DroneState& s) {
@@ -726,8 +737,22 @@ PYBIND11_MODULE(DroneBackend, m) {
     // dragged, resized, or brought to front -- both symptoms share this
     // one root cause.
     // =========================================================================
+    // Video link state for the safety monitor / laptop-control gate
+    // (VideoLink.h: LinkState). Python name avoids clashing with other enums.
+    py::enum_<LinkState>(m, "VideoLinkState")
+        .value("Disconnected", LinkState::Disconnected)
+        .value("Searching", LinkState::Searching)
+        .value("Connected", LinkState::Connected)
+        .value("SignalLost", LinkState::SignalLost)
+        .value("NoVideoInput", LinkState::NoVideoInput);
+
     py::class_<VideoLink>(m, "VideoLink")
         .def(py::init<>())
+        .def("get_link_state", &VideoLink::getLinkState,
+            "Disconnected / Searching / Connected / SignalLost / NoVideoInput "
+            "(blank receiver output detected from frame content).")
+        .def("get_ms_since_last_frame", &VideoLink::getMsSinceLastFrame,
+            "Milliseconds since the capture thread last stored a frame.")
         .def_static("enumerate_devices", &VideoLink::enumerateDevices,
             "List available video capture devices (index + friendly name).")
         .def("connect_auto", &VideoLink::connectAuto,

@@ -231,6 +231,11 @@ void CrsfLink::disconnect() {
 // workerLoop
 // =============================================================================
 void CrsfLink::workerLoop() {
+    // Real-time priority order of the ground station: video capture and this
+    // radio link (commands out, telemetry in) come first. The thread sleeps
+    // in ReadFile almost all the time, so the higher priority costs nothing
+    // but makes a busy UI or detection pass unable to delay a command frame.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     int64_t nextScanMs = 0, lastRefreshMs = 0;
     uint8_t buf[READ_CHUNK];
     std::vector<Crsf::Frame> frames;
@@ -380,4 +385,4 @@ void CrsfLink::setCellVoltageThresholds(float w, float cr) { CRSF_CFG(c.warningC
 void CrsfLink::setBatteryCapacityMah(int mah) { CRSF_CFG(c.capacityMah = static_cast<uint16_t>((std::max)(0, mah))); }
 void CrsfLink::setMinSatsForFix(int s) { CRSF_CFG(c.minSatsForFix = static_cast<uint8_t>((std::max)(0, s))); }
 void CrsfLink::setGpsAltitudeFallback(bool on) { CRSF_CFG(c.gpsAltitudeFallback = on); }
-#undef CRSF_CFG
+#undef CRSF_CFG

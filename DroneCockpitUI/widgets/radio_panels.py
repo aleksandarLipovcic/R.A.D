@@ -31,22 +31,23 @@ import math
 import tkinter as tk
 
 from core import link_mode
+from core.theme import C as _T, F as _F   # cockpit theme (core/theme.py)
 
 # ── Shared palette (matches the USB widgets) ─────────────────────────────────
-BG        = "#0a0a10"
-BG_HDR    = "#0d1520"
-BG_CELL   = "#0d1520"
-BORDER    = "#1e2a3a"
-LABEL     = "#4a6a8a"
-TEXT      = "#c8dff0"
-GREEN     = "#00ff88"
-AMBER_BG  = "#C87000"
-AMBER     = "#ffaa00"
-RED       = "#ff3355"
-CRIT_A    = "#CC0000"
-CRIT_B    = "#500000"
-CYAN      = "#00d4ff"
-DIM       = "#2a4055"
+BG        = _T("#0a0a10")
+BG_HDR    = _T("#0d1520")
+BG_CELL   = _T("#0d1520")
+BORDER    = _T("#1e2a3a")
+LABEL     = _T("#4a6a8a")
+TEXT      = _T("#c8dff0")
+GREEN     = _T("#00ff88")
+AMBER_BG  = _T("#C87000")
+AMBER     = _T("#ffaa00")
+RED       = _T("#ff3355")
+CRIT_A    = _T("#CC0000")
+CRIT_B    = _T("#500000")
+CYAN      = _T("#00d4ff")
+DIM       = _T("#2a4055")
 
 F_HDR   = ("Consolas", 8, "bold")
 F_SMALL = ("Consolas", 8)
@@ -127,7 +128,7 @@ class _Bar(tk.Canvas):
         w, h = self.winfo_width(), self.winfo_height()
         if w < 4:
             return
-        self.create_rectangle(0, 0, w - 1, h - 1, fill="#111827", outline=BORDER)
+        self.create_rectangle(0, 0, w - 1, h - 1, fill=_T("#111827"), outline=BORDER)
         if self._ratio > 0:
             self.create_rectangle(1, 1, max(2, int((w - 2) * self._ratio)), h - 2,
                                   fill=self._colour, outline="")
@@ -160,7 +161,7 @@ class RadioAttitudePanel(tk.Frame):
         tk.Checkbutton(hdr, text="⏱", indicatoron=False, width=2,
                        variable=self._show_footer, command=self._apply_footer,
                        font=("Consolas", 8), fg=LABEL, bg=BG_HDR,
-                       selectcolor="#1e3a50", activebackground=BG_HDR,
+                       selectcolor=_T("#1e3a50"), activebackground=BG_HDR,
                        bd=0, highlightthickness=0).pack(side="left", padx=(0, 4))
 
         self._values = {}
@@ -214,11 +215,11 @@ class RadioAttitudePanel(tk.Frame):
         if state == "stale":
             lbl.config(text=text, bg=BG_CELL, fg=link_mode.C_STALE_FG)
         elif state == "warn":
-            lbl.config(text=text, bg=AMBER_BG, fg="#000000")
+            lbl.config(text=text, bg=AMBER_BG, fg=_T("#000000"))
         elif state == "crit":
             self._crit.add(key)
             lbl.config(text=text, bg=CRIT_A if self._flash_on else CRIT_B,
-                       fg="#FFFFFF")
+                       fg=_T("#FFFFFF"))
         else:
             lbl.config(text=text, bg=BG_CELL, fg=GREEN)
         if self._crit and self._flash_job is None:

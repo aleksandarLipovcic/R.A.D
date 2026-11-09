@@ -22,6 +22,7 @@ DroneLink::DroneLink()
     , slowPollTickCounter_(0)
     , servoPollTickCounter_(0)
     , servoFailCount_(0)
+    , failsafePollTickCounter_(0)
     , magCalActive_(false)
     , accCalActive_(false)
 {
@@ -253,6 +254,14 @@ void DroneLink::communicationLoop() {
             }
         }
         --servoPollTickCounter_;
+
+        // ── Failsafe settings — MSP_FAILSAFE_CONFIG (75), every ~5 s ─────────
+        if (failsafePollTickCounter_ <= 0) {
+            auto buf = sendMSP(MSP::FAILSAFE_CONFIG);
+            parseFailsafeConfig(buf, pending);
+            failsafePollTickCounter_ = FAILSAFE_POLL_TICKS;
+        }
+        --failsafePollTickCounter_;
 
         // ── Battery detail — MSP_BATTERY_STATE (242), every ~500 ms ──────────
         if (slowPollTickCounter_ <= 0) {
@@ -944,6 +953,28 @@ bool DroneLink::parseServos(const std::vector<uint8_t>& buf, DroneState& s) {
             (static_cast<uint16_t>(buf[6 + i * 2]) << 8);
     }
     s.servoValid = true;
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// parseFailsafeConfig() — MSP_FAILSAFE_CONFIG (75)
+//
+// Payload (Betaflight msp.c): u8 failsafe_delay, u8 failsafe_landing_time,
+// u16 failsafe_throttle, u8 failsafe_switch_mode, u16
+// failsafe_throttle_low_delay, u8 failsafe_procedure
+// (0 = AUTO-LAND, 1 = DROP, 2 = GPS-RESCUE).
+// Min frame: header(5) + payload(8) + checksum(1) = 14 bytes
+// -----------------------------------------------------------------------------
+
+bool DroneLink::parseFailsafeConfig(const std::vector<uint8_t>& buf, DroneState& s) {
+    if (buf.size() < 14 || buf[4] != MSP::FAILSAFE_CONFIG || buf[3] < 8) return false;
+    const uint8_t* p = buf.data() + 5;
+    s.fsDelay = p[0];
+    s.fsLandingTime = p[1];
+    s.fsThrottle = static_cast<uint16_t>(p[2] | (p[3] << 8));
+    s.fsSwitchMode = p[4];
+    s.fsProcedure = p[7];
+    s.fsConfigValid = true;
     return true;
 }
 

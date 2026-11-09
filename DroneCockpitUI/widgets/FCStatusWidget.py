@@ -36,20 +36,21 @@ import tkinter as tk
 import time
 
 from core import link_mode
+from core.theme import C as _T, F as _F   # cockpit theme (core/theme.py)
 
 # ── Palette ───────────────────────────────────────────────────────────────────
-_BG       = "#0f0f1a"
-_BG2      = "#12121f"
-_BG3      = "#0d1525"
-_BORDER   = "#1e2a3a"
-_LABEL_FG = "#4a6080"
-_VALUE_FG = "#c8dff0"
-_GREEN    = "#00ff88"
-_ORANGE   = "#ffaa00"
-_RED      = "#ff3355"
-_DIM      = "#1a2a3a"
-_DIM_FG   = "#2a4055"
-_BLUE     = "#00aaff"
+_BG       = _T("#0f0f1a")
+_BG2      = _T("#12121f")
+_BG3      = _T("#0d1525")
+_BORDER   = _T("#1e2a3a")
+_LABEL_FG = _T("#4a6080")
+_VALUE_FG = _T("#c8dff0")
+_GREEN    = _T("#00ff88")
+_ORANGE   = _T("#ffaa00")
+_RED      = _T("#ff3355")
+_DIM      = _T("#1a2a3a")
+_DIM_FG   = _T("#2a4055")
+_BLUE     = _T("#00aaff")
 
 _F_MICRO  = ("Consolas",  7)
 _F_TINY   = ("Consolas",  7, "bold")
@@ -1011,4 +1012,4 @@ class FCStatusWidget(tk.Frame):
             if rc_count > 0 and 800 <= rc_roll <= 2200:
                 self._lq_lbl.config(text=f"{rc_count} CH  (CRSF)", fg=_GREEN)
             else:
-                self._lq_lbl.config(text="—%", fg=_DIM_FG)
+                self._lq_lbl.config(text="—%", fg=_DIM_FG)

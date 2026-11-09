@@ -28,6 +28,12 @@
 --     where the pilot holds the stick, and switching the gate off returns
 --     throttle to the stick with a jump of at most THR_BAND.
 --   * Arming, flight modes and failsafe are NOT touched by this script.
+--   * Stick offsets and throttle also need the ANGLE switch ON (read on the
+--     radio, CH6). Any pilot roll/pitch/yaw deflection > ~30 % stops the
+--     laptop's stick offsets until 0.3 s after release (pilot priority);
+--     the laptop throttle (altitude hold, landing) keeps running.
+--   * The pilot feels/hears it: haptic + tone when the laptop stops while
+--     it was flying, a short buzz when a pilot override starts.
 --   * Gimbal tilt (Tlt) and pan (Pan) follow the laptop while commands are
 --     fresh and hold their last value when they stop. They are not gated by
 --     the switch.
@@ -54,6 +60,24 @@ local CFG = {
   THR_MIN_STICK  = -600,   -- laptop throttle only above ~1200 us stick
   ATT_IN_DEGREES = false,  -- true if Ptch/Roll/Yaw sensors read in degrees
   TLM_PER_RUN    = 2,      -- telemetry frames written per script run
+  -- Radio-side flight-mode gate: stick offsets and throttle only while the
+  -- ANGLE switch is ON. Betaflight: "aux 1 1 1 1800 2100" = ANGLE on AUX2
+  -- (CH6) at 1800..2100 us = mixer units 600..1200. Checked on the radio
+  -- itself, so a late or wrong flight-mode telemetry on the laptop can never
+  -- put offsets on the sticks in ACRO (where they would be rotation rates).
+  ANGLE_CH       = "ch6",
+  ANGLE_MIN      = 600,
+  ANGLE_MAX      = 1200,
+  -- Pilot priority: if the pilot moves roll/pitch/yaw more than this, the
+  -- laptop's stick offsets stop at once and stay off until the pilot's
+  -- sticks have been back below the threshold for OVERRIDE_HOLD. The pilot
+  -- has full control the whole time (his sticks always pass through); the
+  -- hold only stops laptop and pilot from alternating while the stick
+  -- springs back. Laptop throttle (altitude hold / landing) is NOT stopped:
+  -- touching roll to correct drift must not make the drone jump in height.
+  OVERRIDE       = 300,    -- ~30 % stick
+  OVERRIDE_HOLD  = 30,     -- 10 ms ticks = 0.3 s
+  ALERTS         = true,   -- haptic + tone when the laptop drops out / pilot overrides
 }
 
 -- Telemetry sensor names as they appear on the Pocket's TELEMETRY page.
@@ -131,9 +155,11 @@ local function s16(v) return clamp(rnd(v), 32767) end
 -- ---- State ------------------------------------------------------------------
 local cmd = { roll = 0, pitch = 0, thr = 0, yaw = 0, tilt = 0, pan = 0,
               stk = false, thrOn = false }
-local st = { ctr = -1, freshT = -10000, rxFrames = 0, crcErr = 0, lastRun = 0 }
+local st = { ctr = -1, freshT = -10000, rxFrames = 0, crcErr = 0, lastRun = 0,
+             ovrT = -10000, wasActive = false, wasOvr = false }
 local out = { rol = 0, pit = 0, thr = 0, yaw = 0, tlt = 0, pan = 0 }
-local flags = { fresh = false, gate = false, stk = false, thr = false, live = false }
+local flags = { fresh = false, gate = false, stk = false, thr = false, live = false,
+                ovr = false, angle = false }
 local thrStick = -1024
 local rxbuf = ""
 local chIn = {}
@@ -304,6 +330,8 @@ local function sendStatus(now)
   if flags.stk   then f = bor(f, 4) end
   if flags.thr   then f = bor(f, 8) end
   if flags.live  then f = bor(f, 16) end
+  if flags.ovr   then f = bor(f, 32) end        -- pilot override active
+  if flags.angle then f = bor(f, 64) end        -- ANGLE switch on (radio side)
   local p = {}
   u8(p, STATUS_VERSION); u8(p, f)
   u16(p, st.ctr >= 0 and st.ctr or 0xFFFF)
@@ -337,6 +365,21 @@ local function sendTelemetry(now)
   end
 end
 
+-- Haptic + tone for the pilot. playHaptic/playTone are general EdgeTX
+-- functions; guarded so a firmware without them (or the test mock) only
+-- skips the alert and never kills the script.
+local function alert(kind)
+  if not CFG.ALERTS then return end
+  if kind == "lost" then
+    if playHaptic then pcall(playHaptic, 300, 100) end
+    if playTone then pcall(playTone, 600, 400, 100) end
+  else
+    if playHaptic then pcall(playHaptic, 60, 0) end
+  end
+end
+
+local function abs(v) return v < 0 and -v or v end
+
 -- ---- Mixer script entry points ----------------------------------------------
 local function init()
   for k = 1, 16 do chIn[k] = 992 end
@@ -361,11 +404,19 @@ local function run()
   flags.live  = num(S.rqly) > 0
   thrStick    = num("thr")
 
+  local ang = num(CFG.ANGLE_CH)
+  flags.angle = ang >= CFG.ANGLE_MIN and ang <= CFG.ANGLE_MAX
+  if abs(num("ail")) > CFG.OVERRIDE or abs(num("ele")) > CFG.OVERRIDE
+     or abs(num("rud")) > CFG.OVERRIDE then
+    st.ovrT = now
+  end
+  flags.ovr = (now - st.ovrT) <= CFG.OVERRIDE_HOLD
+
   out.rol, out.pit, out.yaw, out.thr = 0, 0, 0, 0
   flags.stk, flags.thr = false, false
 
-  if flags.fresh and flags.gate then
-    if cmd.stk then
+  if flags.fresh and flags.gate and flags.angle then
+    if cmd.stk and not flags.ovr then
       out.rol = clamp(cmd.roll, CFG.MAX_STICK)
       out.pit = clamp(cmd.pitch, CFG.MAX_STICK)
       out.yaw = clamp(cmd.yaw, CFG.MAX_STICK)
@@ -380,6 +431,17 @@ local function run()
     out.tlt = clamp(cmd.tilt, 1024)
     out.pan = clamp(cmd.pan, 1024)
   end
+
+  -- Alerts on the radio: the laptop was flying and its commands stopped
+  -- (app frozen/crashed, USB unplugged), or the pilot took over.
+  local active = flags.stk or flags.thr
+  if st.wasActive and not active and not flags.fresh and flags.gate then
+    alert("lost")
+  end
+  if flags.ovr and not st.wasOvr and flags.gate and flags.fresh then
+    alert("override")
+  end
+  st.wasActive, st.wasOvr = active, flags.ovr
 
   -- 3. Telemetry back to the laptop.
   if serialWrite then sendTelemetry(now) end
